@@ -61,6 +61,11 @@ namespace dxvk { namespace tf2 {
   extern std::atomic<uint32_t> g_areaSeedAreas[16];
   extern std::atomic<uint64_t> g_areaSeedCalls;
   extern std::atomic<uint32_t> g_areaSeedInstalled;
+  extern std::atomic<uint32_t> g_areaSeedLive;
+  extern std::atomic<uint32_t> g_areaSeedLiveN;
+  extern std::atomic<uint32_t> g_areaSeedLiveAreas[16];
+  extern std::atomic<uint32_t> g_areaSeedPending;
+  extern std::atomic<uint32_t> g_clipDegenMaxBit;
 
   // NV-DXVK [DrainProbe]: same arrangement, for the worker's output.
   extern std::atomic<uint64_t> g_drainProbeCalls;
@@ -1887,6 +1892,15 @@ namespace tf2_decal_hook {
     constexpr std::uintptr_t kRvaDispEf090   = 0x2EF090;   // sub_1802EF090
     constexpr std::uintptr_t kRvaAreaOrder   = 0x11FE920;  // word_1811FE920, the order list
     constexpr std::uintptr_t kRvaAreaCount   = 0x1748D8C;  // dword_181748D8C, its bound
+    // dword_1811FF91C, the per-area record selector. memset to -1 at 0x2EB765
+    // on entry, and each area's entry is consumed back to -1 at 0x2EB88A when
+    // the queue loop VISITS it. So an entry still holding a non -1 value when
+    // EB620 returns is an area that was ENQUEUED AND NEVER VISITED — which is
+    // exactly the distinction the pitch/yaw well needs and it costs no new hook.
+    constexpr std::uintptr_t kRvaAreaSelector = 0x11FF91C;
+    // dword_1811FC0D8, the pending count. Should be 0 at exit; anything else
+    // means the loop left work on the table.
+    constexpr std::uintptr_t kRvaAreaPending  = 0x11FC0D8;
     // Sanity bound on dword_181748D8C before it is used as a loop count. The map
     // this is measured on reports ~180 areas; anything past 8192 means the read
     // landed on garbage (module not fully loaded, or the wrong build) and the
@@ -2166,6 +2180,25 @@ namespace tf2_decal_hook {
           }
           dxvk::tf2::g_areaSeedListLen.store(len, std::memory_order_relaxed);
           dxvk::tf2::g_areaSeedN.store(kept, std::memory_order_relaxed);
+
+          // Areas left holding a selector: enqueued, never visited. See
+          // kRvaAreaSelector — this separates "the crossing into it never
+          // happened" from "it was queued and the loop lost it", which is the
+          // one thing the 2D well has not distinguished.
+          const auto* sel = reinterpret_cast<const std::int32_t*>(client + kRvaAreaSelector);
+          std::uint32_t live = 0, liveKept = 0;
+          for (std::uint32_t i = 0; i < nAreas; ++i) {
+            if (sel[i] == -1)
+              continue;
+            ++live;
+            if (liveKept < 16u)
+              dxvk::tf2::g_areaSeedLiveAreas[liveKept++].store(i, std::memory_order_relaxed);
+          }
+          dxvk::tf2::g_areaSeedLive.store(live, std::memory_order_relaxed);
+          dxvk::tf2::g_areaSeedLiveN.store(liveKept, std::memory_order_relaxed);
+          dxvk::tf2::g_areaSeedPending.store(
+            *reinterpret_cast<const std::uint32_t*>(client + kRvaAreaPending),
+            std::memory_order_relaxed);
         } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
       }
@@ -2458,6 +2491,410 @@ namespace tf2_decal_hook {
       return true;
     }
 
+    // =======================================================================
+    // Counting trampoline for a CONDITIONAL branch.
+    //
+    // WHY NOT AN ISLAND AT THE TARGET. Both branches this is used on jump to
+    // loc_1802EC8ED, which has several other predecessors (0x2EBCDC before it
+    // was retargeted, 0x2EC702, 0x2EC8A6, 0x2EC8AF, and the fallthrough at
+    // 0x2EC8E5). A counter placed at the target would merge all of them and
+    // report a number that means nothing — the [OccProbe] v1 failure shape.
+    //
+    // WHY NOT THE UNCONDITIONAL INSTALLERS ABOVE. Both of those overwrite the
+    // site with `E9 rel32`. Doing that to a conditional branch would make it
+    // unconditional, i.e. it would CHANGE BEHAVIOUR while pretending to measure
+    // it. That is the one thing a diagnostic must never do.
+    //
+    // WHAT THIS DOES INSTEAD. The branch keeps its opcode, its length and its
+    // condition; only the 4-byte displacement is rewritten to point at a stub
+    // that increments a counter and jumps on to where the branch always went.
+    // Semantically a no-op — the same instruction, taken under exactly the same
+    // flags, arriving at exactly the same place. Same edit shape as the site-13
+    // CullOff patch, which is a retarget for the same reason.
+    //
+    //   +0x00  F0 48 FF 05 28 00 00 00   lock inc qword [rip+0x28] -> +0x30
+    //   +0x08  FF 25 00 00 00 00         jmp qword ptr [rip+0]
+    //   +0x0E  <qword> original target   = client + origTargetRva
+    //   +0x30  <qword> counter
+    //
+    // Flags: `lock inc` writes them, but the branch's own condition was already
+    // consumed by the branch itself, and loc_1802EC8ED opens with
+    // `mov rdx, cs:qword_181748CF8`, which does not read flags.
+    //
+    // branchSize must be the whole instruction and dispOffset where its rel32
+    // begins (2 for the 0F 8x form, 1 for the EB/7x short forms, which this does
+    // not support — a short branch cannot reach an allocated page).
+    bool InstallBranchCounter(const char* tag, std::uintptr_t rva,
+                              std::size_t branchSize, std::size_t dispOffset,
+                              const std::uint8_t* expect,
+                              std::uintptr_t origTargetRva,
+                              volatile std::uint64_t** counterOut) {
+      HMODULE client = GetModuleHandleA("client.dll");
+      if (client == nullptr)
+        return false;
+      auto* base   = reinterpret_cast<std::uint8_t*>(client);
+      auto* target = base + rva;
+
+      if (std::memcmp(target, expect, branchSize) != 0) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] byte mismatch at client.dll+0x", std::hex, rva,
+          std::dec, " — not this build, counter skipped"));
+        return false;
+      }
+
+      // Cross-check the encoded destination against what the caller claims, so a
+      // build whose branch survived the memcmp but points somewhere else cannot
+      // be silently miscounted.
+      std::int32_t curDisp = 0;
+      std::memcpy(&curDisp, expect + dispOffset, sizeof(curDisp));
+      const std::uintptr_t encodedTarget = rva + branchSize + curDisp;
+      if (encodedTarget != origTargetRva) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] branch at client.dll+0x", std::hex, rva, " targets 0x",
+          encodedTarget, ", expected 0x", origTargetRva, std::dec,
+          " — counter skipped"));
+        return false;
+      }
+
+      std::uint8_t* page = AllocateNearPage(base);
+      if (page == nullptr) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] no page within rel32 range of client.dll"));
+        return false;
+      }
+      std::memset(page, 0xCC, 0x40);
+
+      std::size_t o = 0;
+      page[o++] = 0xF0; page[o++] = 0x48; page[o++] = 0xFF; page[o++] = 0x05;
+      const std::int32_t lockDisp = 0x28;
+      std::memcpy(page + o, &lockDisp, 4); o += 4;              // o == 0x08
+      page[o++] = 0xFF; page[o++] = 0x25;
+      const std::int32_t zero = 0;
+      std::memcpy(page + o, &zero, 4); o += 4;
+      const auto contAddr = reinterpret_cast<std::uint64_t>(base + origTargetRva);
+      std::memcpy(page + o, &contAddr, sizeof(contAddr));
+      const std::uint64_t zero64 = 0;
+      std::memcpy(page + 0x30, &zero64, sizeof(zero64));
+
+      const std::int64_t rel =
+        static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(page)) -
+        (static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(target)) +
+         static_cast<std::int64_t>(branchSize));
+      if (rel > INT32_MAX || rel < INT32_MIN) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] stub out of rel32 range, counter skipped"));
+        return false;
+      }
+
+      DWORD oldProt = 0;
+      if (!VirtualProtect(target + dispOffset, 4, PAGE_EXECUTE_READWRITE, &oldProt)) {
+        dxvk::Logger::warn(dxvk::str::format("[", tag, "] VirtualProtect failed"));
+        return false;
+      }
+      const std::int32_t rel32 = static_cast<std::int32_t>(rel);
+      std::memcpy(target + dispOffset, &rel32, sizeof(rel32));
+      DWORD tmp = 0;
+      VirtualProtect(target + dispOffset, 4, oldProt, &tmp);
+      FlushInstructionCache(GetCurrentProcess(), target, branchSize);
+
+      *counterOut = reinterpret_cast<volatile std::uint64_t*>(page + 0x30);
+
+      dxvk::Logger::warn(dxvk::str::format(
+        "[", tag, "] INSTALLED at client.dll+0x", std::hex, rva,
+        " stub=0x", reinterpret_cast<std::uintptr_t>(page),
+        " -> client.dll+0x", origTargetRva, std::dec,
+        " (branch retarget: condition and length unchanged)"));
+      return true;
+    }
+
+    // =======================================================================
+    // [ClipDegen] PORTAL RECORDER — identity, not volume.
+    //
+    // WHY THE COUNTER WAS NOT ENOUGH, and this is a correction of an earlier
+    // reading in this file: clipDegen was dismissed as "anti-correlated with
+    // the collapse, therefore not the gate". That does not follow. It is a
+    // per-frame total over every portal of every area, while the mechanism is
+    // ONE crossing failing and cascading — areas 113/141/148/153 appear and
+    // vanish as a group. One portal dying moves a total of 17-40 by one, which
+    // is invisible, and the total falls in the well simply because there are
+    // fewer areas left to iterate. Same statistic-vs-mechanism mistake that had
+    // ed900's flat call count reading as an acquittal.
+    //
+    // So record WHICH portal is abandoned. At 0x2EC675 the neighbour area has
+    // not been read yet (that is 0x2EC716), but the portal index is live in
+    // var_7B8, which IDA renders as [rbp+8B0h+var_7B8] = [rbp+0xF8]. It holds
+    // portalIdx*3 (0x2EB93F stores rcx = eax*3), and the consumer at 0x2EC708
+    // does [portalTable + rcx*4 + 6], so neighbourArea =
+    // *(uint16*)(qword_181748D00 + bit*4 + 6) for a recorded bit.
+    //
+    // A BIT-SET, NOT A RING. Setting bit[portalIdx*3] needs no index variable
+    // and therefore no second scratch register: `bts [rip+disp], rax` takes the
+    // register as a bit-string offset and addresses the right qword itself. rax
+    // is masked to 0xFFF first so the write can never leave the 512-byte table
+    // even if the slot is garbage.
+    //
+    // COST: two scratch registers, saved and restored, and two memory writes.
+    // Flags (from `and`, `bts` and the two `cmp`s) are dead at loc_1802EC8ED,
+    // which opens with `mov rdx, cs:qword_181748CF8`. This is the first probe
+    // here that reads through rbp — legitimate, since sub_1802EB620 keeps a
+    // real frame pointer and var_7B8 is live across the whole portal iteration
+    // — but it is also the first thing to switch off if the game misbehaves.
+    //
+    // Windows x64 has no red zone, so the two pushes are simply 16 bytes of
+    // stack that the pops give straight back; nothing is called in between and
+    // nothing can fault, so there is no unwind to get wrong.
+    //
+    //   0x00  F0 48 FF 05 58 00 00 00   lock inc qword [rip+0x58] -> +0x60
+    //   0x08  50                        push rax
+    //   0x09  51                        push rcx
+    //   0x0A  48 8B 85 F8 00 00 00      mov  rax, [rbp+0xF8]      (var_7B8)
+    //   0x11  48 25 FF 3F 00 00         and  rax, 3FFFh
+    //   0x17  48 0F AB 05 E1 00 00 00   bts  [rip+0xE1], rax  -> +0x100
+    //   0x1F  4C 89 D8                  mov  rax, r11             (edge count)
+    //   0x22  48 83 F8 03               cmp  rax, 3
+    //   0x26  72 05                     jb   +5
+    //   0x28  B8 03 00 00 00            mov  eax, 3               (clamp)
+    //   0x2D  4C 89 C9                  mov  rcx, r9              (plane count)
+    //   0x30  48 83 F9 0F               cmp  rcx, 15
+    //   0x34  72 05                     jb   +5
+    //   0x36  B9 0F 00 00 00            mov  ecx, 15              (clamp)
+    //   0x3B  48 8D 04 88               lea  rax, [rax+rcx*4]     (cell index)
+    //   0x3F  48 8D 0D BA 08 00 00      lea  rcx, [rip+0x8BA] -> +0x900
+    //   0x46  F0 48 FF 04 C1            lock inc qword [rcx+rax*8]
+    //   0x4B  59                        pop  rcx
+    //   0x4C  58                        pop  rax
+    //   0x4D  FF 25 00 00 00 00         jmp  qword ptr [rip+0]
+    //   0x53  <qword> continuation
+    //   0x60  <qword> counter
+    //   0x100 <2048-byte portal bit-set>
+    //   0x900 <64-qword (r11,r9) histogram>
+    // WIDENED 2026-08-05. The first version masked to 0xFFF (4096 bits), and the
+    // very first capture reported area 180 as the most frequent degenTo target
+    // on a map where dword_181748D8C = 179, i.e. OUT OF RANGE. That is either an
+    // engine sentinel — 0x2EC8A8 does `cmp r10d, dword_181748D8C / jnb`, so
+    // out-of-range neighbours genuinely occur — or the mask wrapping a portal
+    // index above 4095 onto the wrong table entry. Those are not distinguishable
+    // from the data, so the table is widened past any plausible portal count and
+    // the drain now reports the highest bit it actually saw. maxBit comfortably
+    // below the limit means no aliasing and the attribution stands; maxBit at or
+    // near it means the numbers above were fiction.
+    constexpr std::size_t kPortalBitsOffset  = 0x100;
+    constexpr std::size_t kPortalBitsBytes   = 2048;     // 16384 bits, matches the mask
+    constexpr std::uintptr_t kRvaPortalTable = 0x1748D00;  // qword_181748D00
+
+    // =======================================================================
+    // [DegenPair] — the JOINT (r11, r9) distribution at each degen reject.
+    //
+    // WHY THIS AND NOT ANOTHER COUNTER. Read from the disassembly 2026-08-05:
+    // the two counts are not interchangeable, and only one of them is lethal.
+    //
+    //   0x2EC671  cmp r11,3   -> r15d -> ecx -> a1 -> rec[+0]  EDGE count
+    //   0x2EC67B  cmp r9,3    -> esi  -> edx -> a2 -> rec[+2]  PLANE count
+    //   (0x2EC6A2 mov r15d,r11d / 0x2EC6AC mov esi,r9d / 0x2EC6F5-FA call E7C70)
+    //
+    // sub_1802ED900 then consumes that record. Its two count-driven loops are
+    // NOT guarded alike:
+    //
+    //   rec[+0] == 0  ->  0x1802EDA84 `test rax,rax / jz 0x1802EDD39` SKIPS the
+    //                     edge loop entirely. Safe. sub_1802E8A20 is safe too:
+    //                     its copy count is ((4*A+23)&~0xF)>>4, which floors
+    //                     at 1 even for A == 0.
+    //   rec[+2] == 0  ->  0x1802EDA30-0x1802EDA74 is a POST-TEST loop
+    //                     (rdx=0; inc rdx; cmp rdx,r11; jnz), so a bound of
+    //                     zero never terminates and it writes 16 bytes per
+    //                     iteration off the end of unk_181E60EF0. 0x1802EDA45
+    //                     is `mov [r10+rcx-18h], eax` — exactly the reported
+    //                     faulting instruction, and exactly a write.
+    //
+    // So site 14 as written (BOTH cmps relaxed to 0) can only have crashed via
+    // the r9 half. The r11 half is safe on its own — but it is a NO-OP if r9
+    // is also below 3 whenever r11 is, because the untouched `cmp r9,3` two
+    // instructions later would reject the portal anyway.
+    //
+    // That is the whole question this probe answers, and it could not be
+    // answered from what was already measured: g_clipDegenB counts the branch
+    // at 0x2EC67F, which is only REACHED once the r11 gate has passed. It read
+    // 0 on every frame of every capture, but that means "given >=3 edges,
+    // planes are never <3" — it says nothing about the planes when the edges
+    // are degenerate, which is the only case that matters here. Measuring one
+    // gate from behind another gate is the same mistake as handoff v2 §6.1/6.3.
+    //
+    // LAYOUT: cell = r9bucket*4 + r11bucket, r11 clamped to 0..3, r9 to 0..15.
+    // Both are RAW values, not thresholds — bucket 15 is the only lumped one,
+    // and it exists solely because the table has to be finite.
+    //
+    // BUILT-IN SELF-CHECK: r11bucket == 3 must read ZERO. The stub only runs on
+    // the TAKEN edge of `cmp r11,3 / jb`, and `jb` is unsigned, so every entry
+    // has r11 in {0,1,2} by construction. A non-zero 3-bucket means the stub is
+    // reading the wrong register and every number on the line is fiction —
+    // the same verify-the-probe check that caught the degenTo aliasing.
+    //
+    // Only site A gets this. Site B (0x2EC67F) stays a plain counter: it sits
+    // BEHIND the A gate, so with the code unpatched it can only ever see the
+    // r11 >= 3 population, which is not the population in question. If the
+    // r11-only salvage is ever applied, B becomes the interesting site and
+    // should be moved onto this same recorder then.
+    constexpr std::size_t kDegenHistOffset = 0x900;      // past the bit table
+    constexpr std::size_t kDegenHistCells  = 64;         // 16 r9 buckets x 4 r11
+    constexpr std::size_t kDegenHistBytes  = kDegenHistCells * sizeof(std::uint64_t);
+    constexpr std::size_t kDegenR11Max     = 3;          // clamp, inclusive
+    constexpr std::size_t kDegenR9Max      = 15;         // clamp, inclusive
+    // Where the recorder's own call counter lives. Was 0x30 while the stub was
+    // 0x2D of code; the pair histogram grew it to 0x5B, so 0x30 now falls
+    // inside an instruction. Named, asserted against the emitted length, and
+    // still comfortably below the bit table at 0x100.
+    constexpr std::size_t kStubCounterOffset = 0x60;
+    static_assert(kStubCounterOffset + sizeof(std::uint64_t) <= kPortalBitsOffset,
+                  "counter overlaps the portal bit-set");
+    static_assert(kPortalBitsOffset + kPortalBitsBytes <= kDegenHistOffset,
+                  "histogram overlaps the portal bit-set");
+    static_assert(kDegenHistOffset + kDegenHistBytes <= 4096,
+                  "stub page is one 4096-byte AllocateNearPage allocation");
+
+    std::uint8_t* s_clipDegenAPage = nullptr;
+
+    bool InstallBranchPortalRecorder(const char* tag, std::uintptr_t rva,
+                                     std::size_t branchSize, std::size_t dispOffset,
+                                     const std::uint8_t* expect,
+                                     std::uintptr_t origTargetRva,
+                                     std::int32_t rbpDisp,
+                                     volatile std::uint64_t** counterOut,
+                                     std::uint8_t** pageOut) {
+      HMODULE client = GetModuleHandleA("client.dll");
+      if (client == nullptr)
+        return false;
+      auto* base   = reinterpret_cast<std::uint8_t*>(client);
+      auto* target = base + rva;
+
+      if (std::memcmp(target, expect, branchSize) != 0) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] byte mismatch at client.dll+0x", std::hex, rva,
+          std::dec, " — not this build, recorder skipped"));
+        return false;
+      }
+      std::int32_t curDisp = 0;
+      std::memcpy(&curDisp, expect + dispOffset, sizeof(curDisp));
+      if (rva + branchSize + curDisp != origTargetRva) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] branch destination is not 0x", std::hex, origTargetRva,
+          std::dec, " — recorder skipped"));
+        return false;
+      }
+
+      std::uint8_t* page = AllocateNearPage(base);
+      if (page == nullptr) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] no page within rel32 range of client.dll"));
+        return false;
+      }
+      std::memset(page, 0xCC, kStubCounterOffset + sizeof(std::uint64_t));
+      std::memset(page + kPortalBitsOffset, 0, kPortalBitsBytes);
+      std::memset(page + kDegenHistOffset, 0, kDegenHistBytes);
+
+      std::size_t o = 0;
+      page[o++] = 0xF0; page[o++] = 0x48; page[o++] = 0xFF; page[o++] = 0x05;
+      const std::int32_t lockDisp =
+        static_cast<std::int32_t>(kStubCounterOffset) - static_cast<std::int32_t>(o + 4);
+      std::memcpy(page + o, &lockDisp, 4); o += 4;                    // 0x08
+      page[o++] = 0x50;                                               // 0x08 push rax
+      page[o++] = 0x51;                                               // 0x09 push rcx
+      page[o++] = 0x48; page[o++] = 0x8B; page[o++] = 0x85;           // mov rax,[rbp+disp32]
+      std::memcpy(page + o, &rbpDisp, 4); o += 4;                     // 0x11
+      page[o++] = 0x48; page[o++] = 0x25;                             // and rax, imm32
+      const std::int32_t mask =
+        static_cast<std::int32_t>(kPortalBitsBytes * 8u - 1u);        // 0x3FFF
+      std::memcpy(page + o, &mask, 4); o += 4;                        // 0x17
+      page[o++] = 0x48; page[o++] = 0x0F; page[o++] = 0xAB; page[o++] = 0x05;
+      const std::int32_t btsDisp =
+        static_cast<std::int32_t>(kPortalBitsOffset) - static_cast<std::int32_t>(o + 4);
+      std::memcpy(page + o, &btsDisp, 4); o += 4;                     // 0x1F
+
+      // --- [DegenPair] rax = min(r11, 3) --------------------------------
+      // r11 and r9 are the host function's live registers and must not be
+      // touched, so both counts are copied into the two pushed scratches
+      // before being clamped. `jb` is the unsigned form, matching the site's
+      // own `jb`, so a wild count clamps to the top bucket instead of
+      // indexing off the table.
+      page[o++] = 0x4C; page[o++] = 0x89; page[o++] = 0xD8;           // mov rax, r11
+      page[o++] = 0x48; page[o++] = 0x83; page[o++] = 0xF8;
+      page[o++] = static_cast<std::uint8_t>(kDegenR11Max);            // cmp rax, 3
+      page[o++] = 0x72; page[o++] = 0x05;                             // jb  +5
+      page[o++] = 0xB8;                                               // mov eax, imm32
+      { const std::int32_t v = static_cast<std::int32_t>(kDegenR11Max);
+        std::memcpy(page + o, &v, 4); o += 4; }                       // 0x2D
+      // --- rcx = min(r9, 15) --------------------------------------------
+      page[o++] = 0x4C; page[o++] = 0x89; page[o++] = 0xC9;           // mov rcx, r9
+      page[o++] = 0x48; page[o++] = 0x83; page[o++] = 0xF9;
+      page[o++] = static_cast<std::uint8_t>(kDegenR9Max);             // cmp rcx, 15
+      page[o++] = 0x72; page[o++] = 0x05;                             // jb  +5
+      page[o++] = 0xB9;                                               // mov ecx, imm32
+      { const std::int32_t v = static_cast<std::int32_t>(kDegenR9Max);
+        std::memcpy(page + o, &v, 4); o += 4; }                       // 0x3B
+      // rax = r9bucket*4 + r11bucket. Scale 4 because r11 needs two bits;
+      // x86 has no scale-16, which is why the pair is packed this way round.
+      page[o++] = 0x48; page[o++] = 0x8D; page[o++] = 0x04;
+      page[o++] = 0x88;                                               // lea rax,[rax+rcx*4]
+      page[o++] = 0x48; page[o++] = 0x8D; page[o++] = 0x0D;           // lea rcx,[rip+d]
+      const std::int32_t histDisp =
+        static_cast<std::int32_t>(kDegenHistOffset) - static_cast<std::int32_t>(o + 4);
+      std::memcpy(page + o, &histDisp, 4); o += 4;                    // 0x46
+      page[o++] = 0xF0; page[o++] = 0x48; page[o++] = 0xFF;
+      page[o++] = 0x04; page[o++] = 0xC1;                             // lock inc [rcx+rax*8]
+
+      page[o++] = 0x59;                                               // pop rcx
+      page[o++] = 0x58;                                               // pop rax
+      page[o++] = 0xFF; page[o++] = 0x25;
+      const std::int32_t zero = 0;
+      std::memcpy(page + o, &zero, 4); o += 4;                        // 0x53
+      const auto contAddr = reinterpret_cast<std::uint64_t>(base + origTargetRva);
+      std::memcpy(page + o, &contAddr, sizeof(contAddr)); o += 8;     // 0x5B
+      // The counter has to clear the code, and the code grew from 0x2D to 0x5B
+      // when the pair histogram went in — the old hard-coded 0x30 now lands in
+      // the middle of `cmp rcx, 15`. Checked rather than assumed: this runs
+      // before the branch is retargeted, so a stub that outgrew its own page
+      // layout declines to install instead of scribbling on its counter.
+      if (o > kStubCounterOffset) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] stub code is ", o, " bytes, counter sits at 0x",
+          std::hex, kStubCounterOffset, std::dec, " — recorder skipped"));
+        return false;
+      }
+      const std::uint64_t zero64 = 0;
+      std::memcpy(page + kStubCounterOffset, &zero64, sizeof(zero64));
+
+      const std::int64_t rel =
+        static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(page)) -
+        (static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(target)) +
+         static_cast<std::int64_t>(branchSize));
+      if (rel > INT32_MAX || rel < INT32_MIN) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] stub out of rel32 range, recorder skipped"));
+        return false;
+      }
+
+      DWORD oldProt = 0;
+      if (!VirtualProtect(target + dispOffset, 4, PAGE_EXECUTE_READWRITE, &oldProt)) {
+        dxvk::Logger::warn(dxvk::str::format("[", tag, "] VirtualProtect failed"));
+        return false;
+      }
+      const std::int32_t rel32 = static_cast<std::int32_t>(rel);
+      std::memcpy(target + dispOffset, &rel32, sizeof(rel32));
+      DWORD tmp = 0;
+      VirtualProtect(target + dispOffset, 4, oldProt, &tmp);
+      FlushInstructionCache(GetCurrentProcess(), target, branchSize);
+
+      *counterOut =
+        reinterpret_cast<volatile std::uint64_t*>(page + kStubCounterOffset);
+      *pageOut    = page;
+
+      dxvk::Logger::warn(dxvk::str::format(
+        "[", tag, "] RECORDER INSTALLED at client.dll+0x", std::hex, rva,
+        " stub=0x", reinterpret_cast<std::uintptr_t>(page),
+        " -> client.dll+0x", origTargetRva, " rbp+0x", rbpDisp, std::dec,
+        " (branch retarget + portal bit-set + (r11,r9) histogram)"));
+      return true;
+    }
+
     constexpr std::uintptr_t kRvaEd900 = 0x2ED900;   // sub_1802ED900
     constexpr std::uintptr_t kRvaEb620 = 0x2EB620;   // sub_1802EB620
     // [Ed900Drop] — loc_1802EBE71, the ONLY target of the `jz` at 0x2EB8D0,
@@ -2470,6 +2907,33 @@ namespace tf2_decal_hook {
     volatile std::uint64_t*  s_ed900Counter = nullptr;
     volatile std::uint64_t*  s_eb620Counter = nullptr;
     volatile std::uint64_t*  s_ed900DropCounter = nullptr;
+
+    // [ClipDegen] — the two "clipped polygon has fewer than 3 vertices, abandon
+    // the portal" rejects at the end of the clip body. These are the ONLY
+    // rejects left unpatched on the area-portal path, and they are the leading
+    // suspects for the residual PITCH dependence:
+    //   yaw   a20 across bins 9.4 - 27.5, no collapse  (sites 12+13 fixed it)
+    //   pitch a20 32.67 at +10deg -> 6.42 at -50deg, monotonic, allocFail = 0
+    // with [AreaSeed] listLen pinned at 30 (min == max) in EVERY pitch bin, so
+    // the candidate set is not the cause on this axis either.
+    //
+    // Sites 12 and 13 both neutralise predicates that treat all four frustum
+    // side planes symmetrically, and a symmetric predicate cannot produce an
+    // axis-asymmetric result — so the residual has to be a different one. These
+    // two fire only when a portal genuinely STRADDLES and the real clipper at
+    // 0x2EBCF1 runs, and that clipper clips against xmmword_1811FC030, the
+    // camera FORWARD. Grazing geometry against floor- and ceiling-adjacent
+    // portal edges is exactly what pitching produces.
+    //
+    // COUNTED, NOT PATCHED, deliberately. Neither has a clean accept target:
+    // 0x2EC685-0x2EC6B2 is the successful-clip fixup that publishes the new
+    // counts (r15d = r11d, esi = r9d) and restores rbx/r13/rdi/r12, so jumping
+    // over it would leave the clipper's register state live. Measure first.
+    constexpr std::uintptr_t kRvaClipDegenA   = 0x2EC675;  // cmp r11,3 / jb
+    constexpr std::uintptr_t kRvaClipDegenB   = 0x2EC67F;  // cmp r9,3  / jb
+    constexpr std::uintptr_t kRvaClipDegenTgt = 0x2EC8ED;  // both go here
+    volatile std::uint64_t*  s_clipDegenACounter = nullptr;
+    volatile std::uint64_t*  s_clipDegenBCounter = nullptr;
 
     bool DoInstallEd900Probe() {
       // sub_1802ED900:  mov rax,rsp / mov [rax+10h],rbx     = 3 + 4 = 7
@@ -2515,6 +2979,26 @@ namespace tf2_decal_hook {
       any |= InstallCounterIslandTailJmp("Ed900Drop", kRvaEd900Drop,
                                          sizeof(kEd900Drop), 2, kEd900Drop,
                                          kRvaEd900DropCont, &s_ed900DropCounter);
+
+      // [ClipDegen] A and B. Both are `0F 82 <rel32>` -> loc_1802EC8ED; the
+      // installer re-derives the encoded destination from these bytes and
+      // refuses if it is not 0x2EC8ED, so a build whose branch moved cannot be
+      // miscounted.
+      static constexpr std::uint8_t kClipDegenA[6] = {
+        0x0F, 0x82, 0x72, 0x02, 0x00, 0x00,               // jb loc_1802EC8ED
+      };
+      static constexpr std::uint8_t kClipDegenB[6] = {
+        0x0F, 0x82, 0x68, 0x02, 0x00, 0x00,               // jb loc_1802EC8ED
+      };
+      // A gets the recorder (it is the one that fires); B stays a plain counter
+      // because it has never incremented once across every capture so far.
+      any |= InstallBranchPortalRecorder("ClipDegenA", kRvaClipDegenA, 6, 2,
+                                         kClipDegenA, kRvaClipDegenTgt,
+                                         0xF8, &s_clipDegenACounter,
+                                         &s_clipDegenAPage);
+      any |= InstallBranchCounter("ClipDegenB", kRvaClipDegenB, 6, 2,
+                                  kClipDegenB, kRvaClipDegenTgt,
+                                  &s_clipDegenBCounter);
       return any;
     }
 
@@ -2792,6 +3276,119 @@ namespace tf2_decal_hook {
 
   bool Ed900DropProbeInstalled() {
     return s_ed900DropCounter != nullptr;
+  }
+
+  std::uint64_t DrainClipDegenACount() {
+    if (s_clipDegenACounter == nullptr)
+      return 0;
+    const std::uint64_t v = *s_clipDegenACounter;
+    *s_clipDegenACounter = 0;
+    return v;
+  }
+
+  std::uint64_t DrainClipDegenBCount() {
+    if (s_clipDegenBCounter == nullptr)
+      return 0;
+    const std::uint64_t v = *s_clipDegenBCounter;
+    *s_clipDegenBCounter = 0;
+    return v;
+  }
+
+  bool ClipDegenProbeInstalled() {
+    return s_clipDegenACounter != nullptr && s_clipDegenBCounter != nullptr;
+  }
+
+  // Read-and-clear the portal bit-set, resolving each recorded bit to the
+  // NEIGHBOUR AREA the abandoned crossing would have reached.
+  //
+  // The bit index is var_7B8 = portalIdx*3, and 0x2EC708-0x2EC716 reads the
+  // neighbour as `word [qword_181748D00 + var_7B8*4 + 6]`, so the same
+  // arithmetic applies directly to the bit index. Areas are returned rather
+  // than portal indices because the area id is what [AreaDump] and [AreaSeed]
+  // are already expressed in — 113/141/148/153 is the group to look for.
+  std::uint32_t DrainClipDegenAreas(std::uint32_t* out, std::uint32_t maxOut) {
+    if (s_clipDegenAPage == nullptr || out == nullptr || maxOut == 0)
+      return 0;
+    HMODULE client = GetModuleHandleA("client.dll");
+    if (client == nullptr)
+      return 0;
+
+    auto* bits = reinterpret_cast<volatile std::uint64_t*>(
+      s_clipDegenAPage + kPortalBitsOffset);
+    const auto words =
+      static_cast<std::uint32_t>(kPortalBitsBytes / sizeof(std::uint64_t));
+
+    const auto* pTable = reinterpret_cast<const std::uint8_t* const*>(
+      reinterpret_cast<std::uint8_t*>(client) + kRvaPortalTable);
+    const std::uint8_t* table =
+      WvReadable(pTable, sizeof(void*)) ? *pTable : nullptr;
+
+    std::uint32_t n = 0;
+    std::uint32_t maxBit = 0;
+    for (std::uint32_t w = 0; w < words; ++w) {
+      std::uint64_t v = bits[w];
+      if (v == 0)
+        continue;
+      bits[w] = 0;                                  // read and clear
+      {
+        unsigned long hi = 0;
+        _BitScanReverse64(&hi, v);
+        maxBit = w * 64u + static_cast<std::uint32_t>(hi);
+      }
+      while (v != 0 && n < maxOut) {
+        unsigned long b = 0;
+        _BitScanForward64(&b, v);
+        v &= v - 1;
+        const std::uint32_t bit = w * 64u + static_cast<std::uint32_t>(b);
+        std::uint32_t area = 0xFFFFFFFFu;           // unresolved
+        if (table != nullptr) {
+          const void* slot = table + static_cast<std::size_t>(bit) * 4u + 6u;
+          if (WvReadable(slot, sizeof(std::uint16_t)))
+            area = *reinterpret_cast<const std::uint16_t*>(slot);
+        }
+        out[n++] = area;
+      }
+    }
+    // Published even when the caller's buffer filled, because the aliasing
+    // question is about the WIDEST index seen, not the first sixteen.
+    dxvk::tf2::g_clipDegenMaxBit.store(maxBit, std::memory_order_relaxed);
+    return n;
+  }
+
+  // Read-and-clear the [DegenPair] (r11, r9) histogram from the ClipDegenA
+  // recorder. `out` receives kDegenPairCells entries, cell = r9*4 + r11 with
+  // r11 clamped at 3 and r9 at 15.
+  //
+  // WHAT TO READ. Every entry is one portal abandoned at 0x2EC675, labelled by
+  // the two counts that would have become rec[+0] (edges, r11) and rec[+2]
+  // (planes, r9). The question the capture has to settle is whether relaxing
+  // ONLY `cmp r11,3` can do anything:
+  //
+  //   cells with r9 >= 3  -> those portals would survive the untouched
+  //                          `cmp r9,3` at 0x2EC67B, reach the allocator at
+  //                          0x2EC6FA, and enqueue their neighbour area. The
+  //                          r11-only patch is worth applying, and it cannot
+  //                          produce the rec[+2]==0 record that crashed
+  //                          sub_1802ED900 — the surviving r9 gate is the
+  //                          guarantee, not an assumption.
+  //   cells with r9 < 3   -> the reject just moves four bytes down to
+  //                          0x2EC67F. The r11-only patch is a no-op and the
+  //                          intervention has to go upstream, into whatever
+  //                          makes the clip degenerate in the first place.
+  //
+  // r11 == 3 must stay empty; see the self-check note on the stub.
+  std::uint32_t DrainDegenPairs(std::uint64_t* out, std::uint32_t maxOut) {
+    if (s_clipDegenAPage == nullptr || out == nullptr)
+      return 0;
+    const std::uint32_t n =
+      maxOut < kDegenHistCells ? maxOut : static_cast<std::uint32_t>(kDegenHistCells);
+    auto* cells = reinterpret_cast<volatile std::uint64_t*>(
+      s_clipDegenAPage + kDegenHistOffset);
+    for (std::uint32_t i = 0; i < n; ++i) {
+      out[i]   = cells[i];
+      cells[i] = 0;                                   // read and clear
+    }
+    return n;
   }
 
 }  // namespace tf2_decal_hook

@@ -513,6 +513,15 @@ namespace dxvk { namespace tf2 {
   extern std::atomic<uint64_t> g_eb620ProbeCalls;
   extern std::atomic<uint64_t> g_ed900DropCount;
   extern std::atomic<uint32_t> g_ed900DropInstalled;
+  extern std::atomic<uint64_t> g_clipDegenA;
+  extern std::atomic<uint64_t> g_clipDegenB;
+  extern std::atomic<uint32_t> g_clipDegenInstalled;
+  extern std::atomic<uint32_t> g_clipDegenAreaN;
+  extern std::atomic<uint32_t> g_clipDegenAreas[16];
+  // NV-DXVK [DegenPair]: joint (r11, r9) histogram of the 0x2EC675 rejects.
+  extern std::atomic<uint32_t> g_degenPair[64];
+  extern std::atomic<uint32_t> g_degenPairInstalled;
+  extern std::atomic<uint32_t> g_cullOffAbMode;
   extern std::atomic<float> g_pilotEyeX;
   extern std::atomic<float> g_pilotEyeY;
   extern std::atomic<float> g_pilotEyeZ;
@@ -3972,6 +3981,8 @@ namespace dxvk {
     kCullOffWorldPortal  = 7,
     kCullOffAreaPortal   = 8,
     kCullOffAreaClip     = 9,
+    kCullOffAreaDegen    = 10,
+    kCullOffAreaSkipClip = 11,
     kCullOffGroupCount
   };
 
@@ -4477,6 +4488,141 @@ namespace dxvk {
       { 0x0F, 0x84, 0x0B, 0x0C, 0x00, 0x00 },
       { 0x0F, 0x84, 0xD4, 0x09, 0x00, 0x00 },
       "AREA portal exact clip reject (polygon wholly outside): jz loc_1802EC8ED -> jz loc_1802EC6B6 (engine's own trivial-accept path)" },
+
+    // ----------------------------------------------------------------------
+    // SITE 14 — THE DEGENERATE-CLIP REJECTS. This is the PITCH half of the
+    // problem; sites 12 and 13 fixed the yaw half.
+    //
+    // HOW IT WAS LOCATED. The collapse is a localised WELL in 2D, not a trend
+    // on either axis, which is why single-axis binning kept coming back flat:
+    // at yaw >= 130, a20 runs 23.6 (pitch -65) / 19.1 (-55) / 11.8 (-50) /
+    // 11.0 (-45) / 14.8 (-40) / 17.7 (-35), recovering on both shoulders. Areas
+    // 113/141/148/153 vanish AS A GROUP while sitting in the order list on
+    // every frame ([AreaSeed] listLen = 30, min == max, all pitches).
+    //
+    // The [ClipDegen] recorder — a branch retarget that bit-sets var_7B8, the
+    // portal index, and resolves it through qword_181748D00 the same way
+    // 0x2EC708 does — named the abandoned crossings directly: at the well
+    // bottom they are into areas 148 and 141, ~0.66/frame each, and ABSENT from
+    // both shoulder bins. Counting alone could never have shown this; a
+    // per-frame total of 17-40 does not move when one crossing dies, which is
+    // why the earlier "clipDegen is anti-correlated, therefore not the gate"
+    // reading was wrong. Identity, not volume.
+    //
+    // WHY NOT DISCARD THE CLIP AND KEEP THE PREVIOUS POLYGON. Because by
+    // 0x2EC675 the previous polygon no longer exists. rbx and rdi look
+    // read-only for most of the clip body but are destroyed in the final dedup
+    // pass (0x2EC554 `mov ebx,1`, 0x2EC5F1 `inc rbx`, 0x2EC61F `mov rbx,r12`,
+    // 0x2EC570 `movzx edi,[rbp+rbx+var_7B0]`), var_840's saved entry count is
+    // consumed by the loop at 0x2EC52F/0x2EC533, and the pre-clip plane count
+    // in esi died at 0x2EBD55 with its only copy (r14d) overwritten at
+    // 0x2EBE96. The engine can afford all that because on success it rebuilds
+    // rbx/rdi/r15d/esi from the output buffers at 0x2EC68A-0x2EC6AC. There is
+    // nothing left to restore, so a "discard" accept path is not writable here.
+    //
+    // WHY NOT TOUCH xmmword_1811FC030 INSTEAD. It looked like the clip plane
+    // and it is not. Its only consumer is 0x2EC2C6 `mulps xmm0, xmm7` ->
+    // horizontal sum -> `andps xmm4, xmmword_1809A9C10` (isolate sign) ->
+    // `xorps xmm4, xmm2`: the camera forward supplies the SIGN that orients
+    // each generated silhouette plane outward. Changing it would not widen the
+    // volume, it would leave planes inside-out. Ruled out on evidence.
+    //
+    // WHAT THIS DOES. Let the degenerate result through instead of discarding
+    // it. `cmp r11,3` -> `cmp r11,0` and `cmp r9,3` -> `cmp r9,0`: unsigned
+    // "< 0" is impossible, so neither `jb` can fire, r11 and r9 are untouched,
+    // and the engine's own fall-through at 0x2EC685 publishes them and swaps
+    // buffers exactly as it does for a successful clip. One byte each, same
+    // instruction, same length, same register, no stub and no rel32 arithmetic.
+    //
+    // *** THIS PATCH CRASHES. DEFAULT OFF, AND rtx.conf SETS IT FALSE. ***
+    //
+    // Measured 2026-08-05, minutes after it was written: access violation
+    // (WRITE, target 0x7ffa501d5000) at client.dll+0x2EDA45, inside
+    // sub_1802ED900, reached from EB620's `call` at 0x2EB8C5, on a tier0 job
+    // thread — preceded by a collapse to ~3 fps / 318 ms frames. Fault
+    // registers r11 = r12 = r13 = r15 = rax = rbx = 0.
+    //
+    // THE SAFETY ARGUMENT BELOW IS INCOMPLETE, and this is exactly where it
+    // failed. It reasons about the ALLOCATOR and the copy loops and stops
+    // there. But the record is consumed AGAIN at 0x2EB8C5 by sub_1802ED900
+    // whenever rec[+4] != -1, and that function does NOT decompile — it is the
+    // 0xd10-byte SIMD plane builder whose C wrapper froze the game earlier the
+    // same day. Zero entry/plane counts underflow its loop bounds and it writes
+    // past the end of its output. Checking the two consumers I could read and
+    // not the one I could not is the whole defect.
+    //
+    // Do not re-enable without first reading sub_1802ED900's disassembly to
+    // establish its minimum record requirements. If a floor of 3 is what it
+    // needs, then "let the degenerate result through" is simply the wrong
+    // shape of fix for this site and the answer lies elsewhere.
+    //
+    // ---- original (incomplete) reasoning, kept for the record ----
+    // WHY IT IS SAFE. A record with 0-2 planes is an UNDER-constrained
+    // antiportal volume, so the worker culls less — the direction every site in
+    // this table wants. The allocator handles it by its own arithmetic:
+    // (4*(0 + 4*0) + 71) >> 6 = 1 block, and every copy loop at 0x2EC74B is
+    // guarded (`test r15,r15 / jz`, `cmp rsi,4 / jl`, `cmp r11,rsi / jnb`), so
+    // zero counts copy nothing rather than running off anything.
+    //
+    // DEPENDENCY, and it is a real one: a 0-entry record makes site 11's
+    // accumulator at 0x2E941C come out empty, and its `jz loc_1802E9DB1` would
+    // then drop the node. rtx.cullOff.worldPortal forces that branch to accept,
+    // so this site REQUIRES worldPortal to be on. Turning worldPortal off while
+    // this is on would lose nodes rather than gain them.
+    //
+    // VERIFY: [DispProbe] clipDegen should fall to 0 (the recorder's branch can
+    // no longer be taken — the two coexist, the retargeted rel32 at 0x2EC677 /
+    // 0x2EC681 does not overlap these cmp bytes), degenTo should empty, and
+    // a20 should stop dipping at pitch -45..-50.
+    { kCullOffModClient, 0x2EC671, 4, kCullOffAreaDegen,
+      { 0x49, 0x83, 0xFB, 0x03 },
+      { 0x49, 0x83, 0xFB, 0x00 },
+      "AREA clip degenerate entries (<3): cmp r11,3 -> cmp r11,0 (jb at 0x2EC675 can never fire)" },
+    { kCullOffModClient, 0x2EC67B, 4, kCullOffAreaDegen,
+      { 0x49, 0x83, 0xF9, 0x03 },
+      { 0x49, 0x83, 0xF9, 0x00 },
+      "AREA clip degenerate planes (<3): cmp r9,3 -> cmp r9,0 (jb at 0x2EC67F can never fire)" },
+    // SITE 15 — skip the antiportal narrowing for the WHOLE portal, which is
+    // what areaClip (site 13) was trying to express and got half right.
+    //
+    // The loop at 0x2EBA50 walks the portal's EDGES, narrowing the volume
+    // against each edge plane in turn. Two verdicts short-circuit it:
+    //   0x2EBCDC  jz -> 0x2EC8ED   max <= 0 everywhere = WHOLLY OUTSIDE, reject
+    //   0x2EBCEB  jz -> 0x2EC6B6   min >= 0 everywhere = WHOLLY INSIDE, continue
+    // Site 13 retargets the FIRST to the SECOND's destination. That skips the
+    // narrowing for the one edge that reported wholly-outside, but the portal's
+    // REMAINING edges still enter the clipper at 0x2EBCF1 and clip normally, on
+    // a volume already known to miss the portal. They reduce it to nothing and
+    // 0x2EC675 abandons it with 0 entries and 0 planes — measured 2026-08-05,
+    // [DegenPair]: 8,940 rejects, 100% cell 0/0, and the per-area degen rate
+    // roughly halves when site 13 is switched off (0.83 -> 0.44 overall,
+    // 1.60 -> 0.68 in the well). So site 13 DEFERS the reject, it does not
+    // remove it, and site 14 then existed only to suppress the deferred one.
+    //
+    // THIS SITE falsifies the wholly-inside test instead, so the trivial-accept
+    // is taken for EVERY edge: `movmskps eax, xmm6` -> `xor eax, eax` + nop, so
+    // `test eax,eax` at 0x2EBCE9 always sets ZF and the jz at 0x2EBCEB always
+    // jumps. 0x2EBCF1 is then unreachable, r15d/esi keep the INCOMING record's
+    // counts, and 0x2EC6F5 allocates a copy of the parent volume — the
+    // neighbour is enqueued un-narrowed. Same falsify-the-condition idiom as
+    // site 12; the branch keeps its opcode, length and destination.
+    //
+    // WHY IT CANNOT CRASH THE WAY SITE 14 DID: a 0/0 record is produced by the
+    // clipper, and the clipper never runs. rec[+2] >= 3 is inherited from the
+    // parent record, so ED900's unguarded post-test loop at 0x1802EDA30 can
+    // never be handed a bound of zero. That is structural, not a bet.
+    //
+    // SUPERSEDES areaClip — do not enable both. eax and xmm6 are dead at
+    // 0x2EC6B6 (which opens `lea r8, cs:180000000h`), and xmm6 is re-initialised
+    // from xmmword_1809A9D60 at 0x2EBA82 on every iteration.
+    //
+    // COST: removes the antiportal narrowing entirely, so the flood is wider
+    // than site 13's. Watch poolHi/allocFail on [JobProbe] — site 13 alone took
+    // the pool peak from 14/4092 to 222/4092.
+    { kCullOffModClient, 0x2EBCE6, 3, kCullOffAreaSkipClip,
+      { 0x0F, 0x50, 0xC6 },
+      { 0x31, 0xC0, 0x90 },
+      "AREA clip: force trivial-accept for every portal edge — movmskps eax,xmm6 -> xor eax,eax; nop (jz at 0x2EBCEB always taken, clipper at 0x2EBCF1 unreachable)" },
   };
   static constexpr uint32_t kCullOffSiteCount =
     static_cast<uint32_t>(sizeof(kCullOffSites) / sizeof(kCullOffSites[0]));
@@ -4551,7 +4697,12 @@ namespace dxvk {
   // Called once per frame from EndFrame. Reconciles the live patch state with the
   // options, so any flag can be flipped at runtime and the engine code follows.
   static void cullOffUpdate() {
-    const bool master = RtxOptions::CullOff::enable();
+    // [CullOffAB] runtime override, cycled by PageUp. 2 = restore everything,
+    // 1 = restore only the area-layer sites. See g_cullOffAbMode for why this
+    // is a patch toggle rather than a diff against rtx.cullOff.pvs.
+    const uint32_t abMode = dxvk::tf2::g_cullOffAbMode.load(std::memory_order_relaxed);
+    const bool master = RtxOptions::CullOff::enable() && abMode != 2u;
+    const bool areaGroupOn = (abMode == 0u);
 
     // Fast path: nothing wanted and nothing applied => do NOTHING. This runs
     // every frame from EndFrame on the frame thread, and GetModuleHandleA takes
@@ -4579,8 +4730,31 @@ namespace dxvk {
     want[kCullOffStaticPropFrustum] = master && RtxOptions::CullOff::staticPropFrustum();
     want[kCullOffWorldFrustum]   = master && RtxOptions::CullOff::worldFrustum();
     want[kCullOffWorldPortal]    = master && RtxOptions::CullOff::worldPortal();
-    want[kCullOffAreaPortal]     = master && RtxOptions::CullOff::areaPortal();
-    want[kCullOffAreaClip]       = master && RtxOptions::CullOff::areaClip();
+    want[kCullOffAreaPortal]     = master && areaGroupOn && RtxOptions::CullOff::areaPortal();
+    want[kCullOffAreaClip]       = master && areaGroupOn && RtxOptions::CullOff::areaClip();
+    // Requires worldPortal: a 0-entry record empties site 11's accumulator at
+    // 0x2E941C, and only that patch stops the resulting `jz` dropping the node.
+    want[kCullOffAreaDegen]      = master && areaGroupOn && RtxOptions::CullOff::areaDegen()
+                                          && RtxOptions::CullOff::worldPortal();
+    // Site 15 REQUIRES site 13 — corrected 2026-08-05 after the first capture.
+    //
+    // The earlier wiring ANDed this with !areaClip on the theory that site 15
+    // supersedes it. That was wrong, and the byte order says so plainly:
+    //   0x2EBCDC  jz 0x2EC8ED   wholly-outside -> REJECT      <- site 13 patches
+    //   0x2EBCE6  movmskps                                    <- site 15 patches
+    //   0x2EBCEB  jz 0x2EC6B6   wholly-inside  -> continue
+    // 0x2EBCDC is evaluated FIRST and site 15 does not touch it. With areaClip
+    // off, a portal reporting wholly-outside is still rejected outright by the
+    // engine, so site 15 alone removes the NARROWING but not the REJECT — which
+    // is why it raised a20 nowhere in its first capture.
+    // The two are complementary and only the pair expresses "disable the
+    // antiportal cull": 13 turns the reject into a continue, 15 stops every
+    // other edge from narrowing. Together 0x2EBCF1 really is unreachable, so
+    // r15d/esi keep the parent record's counts, 0x2EC6F5 copies the parent
+    // volume, and a 0/0 record remains structurally impossible.
+    want[kCullOffAreaSkipClip]   = master && areaGroupOn
+                                          && RtxOptions::CullOff::areaSkipClip()
+                                          && RtxOptions::CullOff::areaClip();
 
     for (uint32_t i = 0; i < kCullOffSiteCount; ++i) {
       const CullOffSite& s = kCullOffSites[i];
@@ -39310,6 +39484,36 @@ namespace dxvk {
               dxvk::tf2::g_ed900DropInstalled.store(
                 tf2_decal_hook::Ed900DropProbeInstalled() ? 1u : 0u,
                 std::memory_order_relaxed);
+              // [ClipDegen]: the two <3-vertex rejects, counted separately so
+              // it is visible which of the pair fires.
+              dxvk::tf2::g_clipDegenA.fetch_add(
+                tf2_decal_hook::DrainClipDegenACount(), std::memory_order_relaxed);
+              dxvk::tf2::g_clipDegenB.fetch_add(
+                tf2_decal_hook::DrainClipDegenBCount(), std::memory_order_relaxed);
+              dxvk::tf2::g_clipDegenInstalled.store(
+                tf2_decal_hook::ClipDegenProbeInstalled() ? 1u : 0u,
+                std::memory_order_relaxed);
+              // Identity, not volume — see g_clipDegenAreas.
+              uint32_t degenAreas[16] = {};
+              const uint32_t nDegen =
+                tf2_decal_hook::DrainClipDegenAreas(degenAreas, 16u);
+              for (uint32_t i = 0; i < nDegen; ++i)
+                dxvk::tf2::g_clipDegenAreas[i].store(degenAreas[i],
+                                                     std::memory_order_relaxed);
+              dxvk::tf2::g_clipDegenAreaN.store(nDegen, std::memory_order_relaxed);
+              // [DegenPair]: WHICH of the two counts is degenerate, not just
+              // how often the pair-reject fires. Accumulated, not assigned:
+              // the drain runs on the d3d11 frame boundary and the consumer
+              // clears on its own, so a skew between them must not lose
+              // entries — the cells are the whole measurement.
+              uint64_t degenPair[tf2_decal_hook::kDegenPairCells] = {};
+              const uint32_t nPair = tf2_decal_hook::DrainDegenPairs(
+                degenPair, tf2_decal_hook::kDegenPairCells);
+              for (uint32_t i = 0; i < nPair; ++i)
+                dxvk::tf2::g_degenPair[i].fetch_add(
+                  static_cast<uint32_t>(degenPair[i]), std::memory_order_relaxed);
+              dxvk::tf2::g_degenPairInstalled.store(nPair != 0 ? 1u : 0u,
+                                                    std::memory_order_relaxed);
             }
           }
 
@@ -41296,6 +41500,35 @@ namespace dxvk {
               (g_dispatchCaptureEnabled ? "ON" : "OFF"),
               " â€” dispatch ring-write block is now ",
               (g_dispatchCaptureEnabled ? "active" : "bypassed")));
+          }
+        }
+
+        // [CullOffAB] PageUp cycles the culling A/B mode. Same Home/End key
+        // cluster as the two toggles above, which is the cluster already known
+        // to reach us (O and Insert were swallowed somewhere). Edge-triggered
+        // identically.
+        //
+        // 0 configured -> 1 area sites off -> 2 all sites off -> back to 0.
+        // cullOffUpdate() runs every frame from here and reconciles the applied
+        // byte patches against the options, so each press restores or reapplies
+        // them live — stand still at the angle you care about and cycle.
+        {
+          static bool s_cullOffAbKeyLatch = false;
+          const bool keyDown = (GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0;
+          const bool keyEdge = keyDown && !s_cullOffAbKeyLatch;
+          s_cullOffAbKeyLatch = keyDown;
+          if (keyEdge) {
+            const uint32_t next =
+              (dxvk::tf2::g_cullOffAbMode.load(std::memory_order_relaxed) + 1u) % 3u;
+            dxvk::tf2::g_cullOffAbMode.store(next, std::memory_order_relaxed);
+            static const char* const kModeNames[3] = {
+              "0 CONFIGURED (all flags as rtx.conf sets them)",
+              "1 AREA SITES OFF (12/13/14 restored, rest still patched)",
+              "2 ALL CULLOFF OFF (engine's own culling — the leak, unpatched)",
+            };
+            Logger::warn(str::format(
+              "[CullOffAB] mode -> ", kModeNames[next],
+              "  — watch [CullOff] ON/OFF lines below for the sites that moved"));
           }
         }
 

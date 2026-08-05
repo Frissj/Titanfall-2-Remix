@@ -408,6 +408,30 @@ namespace dxvk { namespace tf2 {
   std::atomic<uint64_t> g_areaSeedCalls{ 0 };    // EF090 invocations this frame
   std::atomic<uint32_t> g_areaSeedInstalled{ 0 };
 
+  // Areas still holding a record selector when sub_1802EB620 returns: enqueued
+  // by a portal crossing and NEVER VISITED by the queue loop. dword_1811FF91C
+  // is memset to -1 at 0x2EB765 and consumed back to -1 at 0x2EB88A on visit,
+  // so a survivor is unambiguous.
+  //
+  // THE QUESTION THIS ANSWERS. The collapse is a localised WELL in 2D, not a
+  // trend on either axis: at yaw >= 130 a20 goes 23.6 (pitch -65) -> 19.1 (-55)
+  // -> 11.8 (-50) -> 11.0 (-45) -> 14.8 (-40) -> 17.7 (-35), recovering on both
+  // shoulders. Areas 113/141/148/153 vanish AS A GROUP, and all four sit in the
+  // order list on every frame. Every known reject on the path is now patched
+  // (0x2EB9CF, 0x2EBCDC) or measured and anti-correlated (0x2EB8D0 ed900Drop,
+  // 0x2EC675 clipDegenA, 0x2EC67F never fires, allocFail = 0), so the loss is
+  // upstream of all of them.
+  //   live > 0 and it names 113/141/148/153 => they WERE enqueued and the queue
+  //     loop never reached them; the bug is the cursor/pending interaction at
+  //     0x2EC8CE-0x2EC8E5, not any reject.
+  //   live == 0 => they were never enqueued at all, so the crossing INTO them
+  //     failed and the cascade starts at their parent area's portal loop.
+  // pending should be 0 at exit; a non-zero value means the loop abandoned work.
+  std::atomic<uint32_t> g_areaSeedLive{ 0 };
+  std::atomic<uint32_t> g_areaSeedLiveN{ 0 };
+  std::atomic<uint32_t> g_areaSeedLiveAreas[16];
+  std::atomic<uint32_t> g_areaSeedPending{ 0 };
+
   // NV-DXVK [Ed900Drop] — areas dropped by sub_1802ED900's -1 at 0x2EB8D0.
   //
   // THE STATISTIC THE OLD ONE WAS NOT. ed900 (the call count) sat flat at
@@ -432,6 +456,99 @@ namespace dxvk { namespace tf2 {
   // on that path, so a bypass must first produce a valid record.
   std::atomic<uint64_t> g_ed900DropCount{ 0 };
   std::atomic<uint32_t> g_ed900DropInstalled{ 0 };
+
+  // NV-DXVK [ClipDegen] — portals abandoned at 0x2EC675 / 0x2EC67F because the
+  // clipped polygon came out with fewer than 3 vertices.
+  //
+  // WHAT THIS IS FOR. rtx.cullOff.areaPortal + areaClip removed the YAW
+  // dependence — a20 across yaw bins is 9.4 to 27.5 with no collapse — but a
+  // PITCH sweep still falls monotonically, 32.67 at +10deg to 6.42 at -50deg,
+  // with allocFail = 0 and [AreaSeed] listLen pinned at 30 (min == max) in every
+  // pitch bin. So the candidate set is not the cause on this axis either, and
+  // the loss is still between the order list and the selector.
+  //
+  // WHY THESE TWO. Sites 12 and 13 both neutralise predicates that treat all
+  // four frustum side planes symmetrically, and a symmetric predicate cannot
+  // produce an axis-asymmetric result — so the residual must be a different
+  // one. These fire only when a portal genuinely STRADDLES and the real clipper
+  // at 0x2EBCF1 runs, and that clipper clips against xmmword_1811FC030, the
+  // camera FORWARD. Grazing geometry against floor- and ceiling-adjacent portal
+  // edges is what pitching produces.
+  //
+  // READ THEM binned by pitch, next to a20 on the same line:
+  //   rising as a20 falls => this is the gate.
+  //   flat at zero        => the loss is a cascade from somewhere else, and the
+  //     next probe has to record WHICH AREA stops being visited, not which
+  //     portal is rejected.
+  //
+  // Counted rather than patched on purpose: neither branch has a clean accept
+  // target, because 0x2EC685-0x2EC6B2 is the successful-clip fixup that
+  // publishes r15d/esi and restores rbx/r13/rdi/r12.
+  std::atomic<uint64_t> g_clipDegenA{ 0 };
+  std::atomic<uint64_t> g_clipDegenB{ 0 };
+  std::atomic<uint32_t> g_clipDegenInstalled{ 0 };
+  // The neighbour areas those abandoned crossings would have reached. This is
+  // the field that matters — the counts above cannot distinguish "one specific
+  // portal died and took four areas with it" from "there was less work to do",
+  // which is why the earlier anti-correlation reading of g_clipDegenA was
+  // wrong. In the well, look for the area that feeds 113/141/148/153.
+  std::atomic<uint32_t> g_clipDegenAreaN{ 0 };
+  std::atomic<uint32_t> g_clipDegenAreas[16];
+  // Highest portal-index bit actually recorded. The stub masks the index to the
+  // table width, so an index past it aliases onto the wrong entry and every
+  // degenTo area becomes fiction. The first capture reported area 180 as the
+  // most common target on a map with dword_181748D8C = 179 — out of range —
+  // which is either an engine sentinel (0x2EC8A8 guards for exactly that) or
+  // aliasing. maxBit well below 16383 means no aliasing and the areas stand.
+  std::atomic<uint32_t> g_clipDegenMaxBit{ 0 };
+
+  // NV-DXVK [DegenPair] — the joint (r11, r9) histogram of the rejects at
+  // 0x2EC675. Cell = r9*4 + r11, r11 clamped at 3, r9 at 15.
+  //
+  // WHY A PAIR AND NOT TWO COUNTS. g_clipDegenA and g_clipDegenB are each one
+  // branch's tally, and the branches are in series: 0x2EC67F is only reached
+  // once 0x2EC675 has fallen through. So g_clipDegenB reading 0 forever never
+  // meant "planes are never degenerate", it meant "planes are never degenerate
+  // among portals that already had >=3 edges" — a different population from
+  // the one that decides anything.
+  //
+  // It decides this: r11 becomes rec[+0] and r9 becomes rec[+2] (0x2EC6A2 /
+  // 0x2EC6AC -> 0x2EC6F5-FA), and sub_1802ED900 treats the two completely
+  // differently. rec[+0] == 0 is explicitly guarded at 0x1802EDA84. rec[+2]
+  // == 0 walks a post-test loop at 0x1802EDA30 with a bound of zero and writes
+  // off the end of unk_181E60EF0 at 0x1802EDA45 — the exact instruction and
+  // exact access type of the site-14 crash. Relaxing only `cmp r11,3` cannot
+  // reach that state, because `cmp r9,3` is left in place; whether it can
+  // reach anything USEFUL is what these cells say.
+  std::atomic<uint32_t> g_degenPair[64];
+  std::atomic<uint32_t> g_degenPairInstalled{ 0 };
+
+  // NV-DXVK [CullOffAB] — in-game A/B of the culling patches, PageUp cycles it.
+  //
+  // WHY A MODE AND NOT A "FULL MAP" REFERENCE. The obvious idea is to diff
+  // against rtx.cullOff.pvs, but that site (client.dll+0x1A8470) is in
+  // BuildRenderableRenderLists and only widens RENDERABLES. World surfaces come
+  // from a different subsystem entirely — sub_1802EB620's area layer and
+  // sub_1802E8DA0's leaf walk — so pvs is not an upper bound for the geometry
+  // this investigation is about. There is no single "submit the whole map"
+  // switch on the world side; the area layer IS the mechanism.
+  //
+  // What is meaningful instead is toggling the patches themselves at a fixed
+  // camera angle and watching what appears and disappears:
+  //   0  configured    every flag exactly as rtx.conf sets it
+  //   1  area off      sites 12/13/14 restored, everything else left on — shows
+  //                    precisely what the area-layer work contributes
+  //   2  all off       every CullOff site restored, i.e. the engine's own
+  //                    culling, which is the light leak in its original form
+  //
+  // cullOffUpdate() reconciles patch state against the options every frame, so
+  // flipping this restores or reapplies the byte patches live with no restart.
+  //
+  // THE COMPLETENESS METRIC IS IN THE LOG, NOT ON SCREEN: [AreaSeed] listLen is
+  // the number of candidate areas (30 on this map) and [DispProbe] a20 is how
+  // many actually dispatched. a20 reaching listLen and staying there across a
+  // full pitch/yaw sweep is what "the area layer is fully open" looks like.
+  std::atomic<uint32_t> g_cullOffAbMode{ 0 };
 
   // NV-DXVK [Ed480Probe]: sub_1802ED480 is the DYNAMIC area enqueue —
   // dword_1811FF91C[a1] = rec; ++dword_1811FC0D8 — reached only through fn-ptr

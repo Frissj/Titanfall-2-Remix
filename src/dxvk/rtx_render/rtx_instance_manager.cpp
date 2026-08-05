@@ -80,6 +80,15 @@ namespace dxvk {
     extern std::atomic<uint64_t> g_eb620ProbeCalls;
     extern std::atomic<uint64_t> g_ed900DropCount;
     extern std::atomic<uint32_t> g_ed900DropInstalled;
+    extern std::atomic<uint64_t> g_clipDegenA;
+    extern std::atomic<uint64_t> g_clipDegenB;
+    extern std::atomic<uint32_t> g_clipDegenInstalled;
+    extern std::atomic<uint32_t> g_clipDegenAreaN;
+    extern std::atomic<uint32_t> g_clipDegenAreas[16];
+    extern std::atomic<uint32_t> g_clipDegenMaxBit;
+    extern std::atomic<uint32_t> g_degenPair[64];
+    extern std::atomic<uint32_t> g_degenPairInstalled;
+    extern std::atomic<uint32_t> g_cullOffAbMode;
     extern std::atomic<float> g_dispProbeFc000X;
     extern std::atomic<float> g_dispProbeFc000Y;
     extern std::atomic<float> g_dispProbeFc000Z;
@@ -99,6 +108,10 @@ namespace dxvk {
     extern std::atomic<uint32_t> g_areaSeedAreas[16];
     extern std::atomic<uint64_t> g_areaSeedCalls;
     extern std::atomic<uint32_t> g_areaSeedInstalled;
+    extern std::atomic<uint32_t> g_areaSeedLive;
+    extern std::atomic<uint32_t> g_areaSeedLiveN;
+    extern std::atomic<uint32_t> g_areaSeedLiveAreas[16];
+    extern std::atomic<uint32_t> g_areaSeedPending;
     extern std::atomic<uint64_t> g_dispProbeEd480Calls;
     extern std::atomic<uint32_t> g_dispProbeEd480N;
     extern std::atomic<uint32_t> g_dispProbeEd480Area[8];
@@ -1428,8 +1441,45 @@ namespace dxvk {
             // sub_1802F04F0, not EB620, so this has never been measured.
             const uint64_t dsEb6 =
               tf2::g_eb620ProbeCalls.exchange(0, std::memory_order_relaxed);
+            // Which neighbour areas the abandoned crossings would have reached.
+            // 0xffff means the portal table could not be resolved for that bit.
+            std::string degenAreas;
+            const uint32_t degenN =
+              tf2::g_clipDegenAreaN.exchange(0, std::memory_order_relaxed);
+            for (uint32_t i = 0; i < degenN && i < 16u; ++i)
+              degenAreas += str::format((i == 0 ? " degenTo=[" : ","),
+                tf2::g_clipDegenAreas[i].load(std::memory_order_relaxed));
+            if (!degenAreas.empty())
+              degenAreas += "]";
+            // [DegenPair]: only the NON-EMPTY cells, printed raw as
+            // r11/r9:count. Nothing is summed, averaged or thresholded here —
+            // the whole point of the pair is that a total cannot separate the
+            // safe count from the lethal one, so a total would throw away the
+            // measurement on the way to the log. r9=15 is the clamp bucket
+            // ("15 or more"); r11=3 must never appear, and if it does the stub
+            // is reading the wrong register.
+            std::string degenPair;
+            uint32_t degenPairTotal = 0;
+            for (uint32_t cell = 0; cell < 64u; ++cell) {
+              const uint32_t c =
+                tf2::g_degenPair[cell].exchange(0, std::memory_order_relaxed);
+              if (c == 0)
+                continue;
+              degenPairTotal += c;
+              degenPair += str::format((degenPair.empty() ? " degenPair=[" : ","),
+                                       cell & 3u,                 // r11 bucket
+                                       "/", cell >> 2,            // r9 bucket
+                                       ((cell >> 2) == 15u ? "+" : ""),
+                                       ":", c);
+            }
+            if (!degenPair.empty())
+              degenPair += str::format("] degenPairN=", degenPairTotal);
             Logger::warn(str::format(
               "[DispProbe] f=", currentFrame,
+              // Labels EVERY frame with the A/B mode so the log can just be
+              // grouped by it, instead of segmenting by timestamp around the
+              // toggle. 0 configured / 1 area sites off / 2 all off.
+              " abMode=", tf2::g_cullOffAbMode.load(std::memory_order_relaxed),
               " pitchDeg=", pitchDeg,
               " yawDeg=", yawDeg,
               " a20=", dsA20,
@@ -1446,6 +1496,25 @@ namespace dxvk {
               // flat at ~1.0 never said anything about this.
               " ed900Drop=", tf2::g_ed900DropCount.exchange(0, std::memory_order_relaxed),
               " ed900DropInst=", tf2::g_ed900DropInstalled.load(std::memory_order_relaxed),
+              // Portals abandoned because the clip produced <3 verts. The only
+              // rejects still unpatched on this path, and the suspects for the
+              // residual PITCH collapse (a20 32.67 at +10deg -> 6.42 at -50deg
+              // while yaw is flat). Bin against pitchDeg on this same line.
+              " clipDegen=", tf2::g_clipDegenA.exchange(0, std::memory_order_relaxed),
+              "/", tf2::g_clipDegenB.exchange(0, std::memory_order_relaxed),
+              " clipDegenInst=", tf2::g_clipDegenInstalled.load(std::memory_order_relaxed),
+              // Aliasing guard for degenTo — see g_clipDegenMaxBit. Near 16383
+              // means the area ids on this line are not to be believed.
+              " degenMaxBit=", tf2::g_clipDegenMaxBit.load(std::memory_order_relaxed),
+              degenAreas,
+              // WHICH count is degenerate, r11/r9, for every reject at
+              // 0x2EC675. Decides whether relaxing only `cmp r11,3` can do
+              // anything: r9 >= 3 cells would clear the untouched `cmp r9,3`
+              // and enqueue their neighbour; r9 < 3 cells would just die four
+              // bytes further down and the fix belongs upstream instead.
+              degenPair,
+              " degenPairInst=",
+              tf2::g_degenPairInstalled.load(std::memory_order_relaxed),
               " eb620=", dsEb6,
               // RAW, undecorated. Compare against camPos on the [PitchProbe]
               // line of the SAME frame: equal (in some frame) => camera origin
@@ -1489,8 +1558,20 @@ namespace dxvk {
                 tf2::g_areaSeedAreas[i].load(std::memory_order_relaxed));
             if (!seedAreas.empty())
               seedAreas += "]";
+            std::string liveAreas;
+            const uint32_t liveN = tf2::g_areaSeedLiveN.load(std::memory_order_relaxed);
+            for (uint32_t i = 0; i < liveN && i < 16u; ++i)
+              liveAreas += str::format((i == 0 ? " liveAreas=[" : ","),
+                tf2::g_areaSeedLiveAreas[i].load(std::memory_order_relaxed));
+            if (!liveAreas.empty())
+              liveAreas += "]";
             Logger::warn(str::format(
               "[AreaSeed] f=", currentFrame,
+              // pitch added 2026-08-05: sites 12+13 removed the yaw dependence
+              // and a PITCH sweep still collapses, so the axis this has to be
+              // binned on changed. Was yaw-only, which meant every pitch answer
+              // had to be recovered by joining to [DispProbe] on the frame id.
+              " pitchDeg=", pitchDeg,
               " yawDeg=", yawDeg,
               " ef090=", asCalls,
               " ef090Inst=", asInst,
@@ -1500,6 +1581,12 @@ namespace dxvk {
               ",", tf2::g_areaSeedOrgY.load(std::memory_order_relaxed),
               ",", tf2::g_areaSeedOrgZ.load(std::memory_order_relaxed),
               ",", tf2::g_areaSeedOrgW.load(std::memory_order_relaxed), ")",
+              // Enqueued but never visited, and the pending count at exit.
+              // live naming 113/141/148/153 in the well => the queue loop lost
+              // them; live=0 => the crossing into them never happened.
+              " live=", tf2::g_areaSeedLive.load(std::memory_order_relaxed),
+              " pendExit=", tf2::g_areaSeedPending.load(std::memory_order_relaxed),
+              liveAreas,
               seedAreas));
           }
 
@@ -1534,6 +1621,7 @@ namespace dxvk {
             }
             Logger::warn(str::format(
               "[AreaDump] f=", currentFrame,
+              " pitchDeg=", pitchDeg,
               " yawDeg=", yawDeg,
               " n=", slotN,
               (slotN > 8u ? " (TRUNCATED to 8)" : ""),

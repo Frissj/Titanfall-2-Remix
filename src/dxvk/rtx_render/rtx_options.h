@@ -1265,13 +1265,29 @@ namespace dxvk {
     struct CullOff {
       friend class ImGUI;
       friend class RtxOptions;
-      RTX_OPTION("rtx.cullOff", bool, enable, false,
+      // DEFAULT ON since 2026-08-05. The area-layer chain (sites 12 + 13 + 15)
+      // closed the view-dependent culling that caused the light leak: a20 went
+      // from 10.75 in the pitch/yaw well against 19-24 on the shoulders, to a
+      // FLAT 15 per view across pitch -75..+9 and all 360 degrees of yaw
+      // (662 of 670 frames exactly 15; the other 8 are one cold startup frame
+      // at eb620=74 and five two-view frames reading 30 = 2 x 15).
+      // That is the rotation-invariance criterion: flat across the whole sweep
+      // => every view-dependent cull is off. allocFail 0 on all 670 frames,
+      // pool peak 202/4092.
+      // Turning this off restores the game's own culling and the leak with it.
+      RTX_OPTION("rtx.cullOff", bool, enable, true,
                  "Master switch for the engine culling patches. Off = the game culls normally.");
       RTX_OPTION("rtx.cullOff", bool, frustum, true,
                  "Disable the per-renderable frustum cull in client.dll BuildRenderableRenderLists\n"
                  "(sub_1801A9C70 for the main view, the AABB test for shadow/sub-views). This is the\n"
                  "cull that removes off-screen shadow casters and reflection sources.");
-      RTX_OPTION("rtx.cullOff", bool, distanceFade, true,
+      // DEFAULT OFF since 2026-08-05: never validated by any measurement. It was
+      // added chasing a DISTANCE-fade theory; the actual bug was view-direction
+      // and is now fixed by sites 12/13/15. Forcing full visibility at all
+      // ranges is a permanent cost with no demonstrated benefit.
+      // Turn on only if props/renderables pop or fade with RANGE, not with view
+      // direction — and record the observation when you do.
+      RTX_OPTION("rtx.cullOff", bool, distanceFade, false,
                  "Disable the distance-fade cull (sub_1801A90E0 / sub_1801A95B0): props stop fading\n"
                  "out and being dropped from the render list at range. Patches the reject branches,\n"
                  "not the bit-clear, so the render-list entry each renderable carries is still filled\n"
@@ -1385,7 +1401,7 @@ namespace dxvk {
                  "exactly what one early drop looks like. ED900 reads xmmword_1811FC030 (camera\n"
                  "FORWARD) at four sites, so its verdict is view-dependent even where its count is\n"
                  "not. Read ed900Drop against a20 on the same line; ed900DropInst guards the zero.");
-      RTX_OPTION("rtx.cullOff", bool, worldPortal, false,
+      RTX_OPTION("rtx.cullOff", bool, worldPortal, true,
                  "THE EIGHTH REJECT — the residual that survived rtx.cullOff.worldFrustum.\n"
                  "client.dll+0x2E955C in sub_1802E8DA0. This is the AREA-PORTAL / occluder test,\n"
                  "NOT the frustum test: the loop at 0x2E941C builds 4-6 silhouette planes per job\n"
@@ -1405,7 +1421,7 @@ namespace dxvk {
                  "Before this patch it went 1425/1532/1329/1047/769/791 over 10-degree bins to 60.\n"
                  "COST: this submits nodes the area-portal system would have occluded, so it is the\n"
                  "first flag to turn off if indoor/portal-heavy areas regress on draw count.");
-      RTX_OPTION("rtx.cullOff", bool, areaPortal, false,
+      RTX_OPTION("rtx.cullOff", bool, areaPortal, true,
                  "THE AREA LAYER — three levels above every other flag here, and the reason\n"
                  "occluders still go missing with all of them on. client.dll+0x2EB9CF in\n"
                  "sub_1802EB620.\n"
@@ -1443,7 +1459,10 @@ namespace dxvk {
                  "now allocates from the 4092-block pool at unk_181380A40, which peaked at 36 with\n"
                  "the reject in place. sub_1802E7C70 returning -1 at 0x2EC6FF drops an area silently,\n"
                  "so if areas still go missing check allocFail/poolHi in [JobProbe] FIRST.");
-      RTX_OPTION("rtx.cullOff", bool, areaClip, false,
+      // DEFAULT ON, and it MUST be paired with areaSkipClip — on its own it only
+      // DEFERS the reject from 0x2EBCDC to 0x2EC675 (measured: 8,940 rejects,
+      // 100% with 0 entries and 0 planes). See areaSkipClip for the pair.
+      RTX_OPTION("rtx.cullOff", bool, areaClip, true,
                  "THE EXACT FORM OF areaPortal's TEST, and the reason that flag alone was not\n"
                  "enough. client.dll+0x2EBCDC in sub_1802EB620's per-edge clip loop.\n"
                  "MEASURED with areaPortal ON and verified: a20 rose 5 -> 23 and new areas (BSP\n"
@@ -1471,17 +1490,161 @@ namespace dxvk {
                  "because only xmm0/xmm6/eax differ between the two sites and all are dead there;\n"
                  "the displacement checks against the engine's own encoding, 0x2EBCE2 + 0x9D4 ==\n"
                  "0x2EBCF1 + 0x9C5 == 0x2EC6B6.\n"
-                 "It also keeps 0x2EC675/0x2EC67F out of play — a wholly-outside portal no longer\n"
-                 "enters the clipper, so it cannot produce a degenerate result. Those two have NO\n"
-                 "clean accept target (0x2EC685-0x2EC6B2 is the successful-clip fixup that publishes\n"
-                 "r15d/esi and restores rbx/r13/rdi/r12), so if areas still die there it needs its\n"
-                 "own answer, not a copy of this one.\n"
+                 "*** THE PARAGRAPH THAT USED TO BE HERE — 'it also keeps 0x2EC675/0x2EC67F out of\n"
+                 "*** play, a wholly-outside portal no longer enters the clipper, so it cannot\n"
+                 "*** produce a degenerate result' — IS REFUTED BY MEASUREMENT. [DegenPair],\n"
+                 "*** 2026-08-05, 570 frames incl. 164 in the well: 8,940 rejects at 0x2EC675 and\n"
+                 "*** EVERY ONE is r11=0 AND r9=0, with clipDegenB 0 throughout.\n"
+                 "THE ERROR: the branch is a verdict on ONE PORTAL EDGE, not on the portal. The loop\n"
+                 "at 0x2EBA50 walks every edge in turn, narrowing the volume against each edge plane.\n"
+                 "Retargeting the wholly-outside verdict skips the narrowing for THAT edge only; the\n"
+                 "portal's remaining edges still enter the clipper at 0x2EBCF1 and clip normally — on\n"
+                 "a volume that has already been found to miss the portal. They reduce it to nothing,\n"
+                 "and 0x2EC675 abandons it with 0 entries and 0 planes. So the reject is not kept out\n"
+                 "of play, it is DEFERRED: from 0x2EBCDC to 0x2EC675. Exactly the failure predicted\n"
+                 "two lines above for the NOP variant, arriving by a different route.\n"
+                 "This is also why 0x2EC675 must not be patched (see areaDegen): with r11=0 and r9=0\n"
+                 "the clip is telling the truth — there is no polygon — and forcing a rec[+2]==0\n"
+                 "record through it is what crashed sub_1802ED900.\n"
+                 "IF CONFIRMED BY THE abMode A/B (park in the well, PageUp to 1 and back, watch\n"
+                 "clipDegenA), the coherent form of 'disable the antiportal narrowing' is to skip the\n"
+                 "clip for the WHOLE portal rather than for one verdict:\n"
+                 "  0x2EBCE6:  0F 50 C6 -> 31 C0 90   movmskps eax,xmm6 -> xor eax,eax ; nop\n"
+                 "`test eax,eax` then always sets ZF, the jz at 0x2EBCEB always takes trivial-accept,\n"
+                 "0x2EBCF1 never runs, r15d/esi keep the INCOMING record's counts, and 0x2EC6F5\n"
+                 "allocates a copy of the parent volume — a 0/0 record becomes structurally\n"
+                 "impossible. Same falsify-the-condition idiom as areaPortal, and it REPLACES this\n"
+                 "site rather than stacking on it. eax and xmm6 are dead there (xmm6 is\n"
+                 "re-initialised at 0x2EBA82 every iteration).\n"
                  "COST: removes the antiportal narrowing for every wholly-outside portal, so the\n"
                  "flood widens well beyond areaPortal. Pool peaked at 14/4092 with allocFail=0, so\n"
                  "there is headroom — watch poolHi/allocFail in [JobProbe].\n"
                  "SEPARATE FLAG from areaPortal so the A/B can attribute the exact reject on its own.\n"
                  "VERIFY with rtx.cullOff.probeDispatch: [AreaDump] should show the dropped nodes at\n"
                  "every yaw and [DispProbe] a20 should stop falling past 140deg.");
+      // DEFAULT ON. Together with areaClip this is THE FIX for the light leak —
+      // verified 2026-08-05: a20 flat at 15 per view across pitch -75..+9 and
+      // all 360 degrees of yaw, where it had been 10.75 in the well against
+      // 19-24 on the shoulders. Neither site does it alone.
+      RTX_OPTION("rtx.cullOff", bool, areaSkipClip, true,
+                 "SITE 15 — skip the antiportal narrowing for the WHOLE portal.\n"
+                 "client.dll+0x2EBCE6. REQUIRES rtx.cullOff.areaClip = True; the code ANDs the two.\n"
+                 "*** CORRECTED 2026-08-05 AFTER ITS FIRST CAPTURE. This option originally said it\n"
+                 "*** SUPERSEDED areaClip and was ANDed with !areaClip. That was wrong. The byte\n"
+                 "*** order settles it: 0x2EBCDC (wholly-outside -> reject, the branch areaClip\n"
+                 "*** patches) is evaluated BEFORE 0x2EBCE6, and site 15 does not touch it. With\n"
+                 "*** areaClip off, a wholly-outside portal is still rejected outright, so site 15\n"
+                 "*** alone removes the NARROWING but not the REJECT — and it raised a20 in no bin\n"
+                 "*** of its first capture, which is what that looks like.\n"
+                 "The two are COMPLEMENTARY and only the pair expresses 'disable the antiportal\n"
+                 "cull': 13 turns the reject into a continue, 15 stops every other edge narrowing.\n"
+                 "WHAT IT IS: the loop at 0x2EBA50 walks the portal's EDGES, narrowing the volume\n"
+                 "against each edge plane. 0x2EBCDC short-circuits on wholly-outside (reject) and\n"
+                 "0x2EBCEB on wholly-inside (continue, no narrowing). areaClip retargets the FIRST\n"
+                 "to the SECOND's destination, which skips narrowing for the one edge that reported\n"
+                 "wholly-outside — but the portal's OTHER edges still enter the clipper at\n"
+                 "0x2EBCF1 and clip a volume already known to miss the portal down to nothing.\n"
+                 "This site falsifies the wholly-INSIDE test instead, so trivial-accept is taken\n"
+                 "for every edge: movmskps eax,xmm6 -> xor eax,eax + nop, so `test eax,eax` at\n"
+                 "0x2EBCE9 always sets ZF and 0x2EBCF1 becomes unreachable. r15d/esi keep the\n"
+                 "INCOMING record's counts and 0x2EC6F5 allocates a copy of the parent volume.\n"
+                 "MEASURED BASIS (2026-08-05, [DegenPair]): every one of 8,940 rejects at 0x2EC675\n"
+                 "is cell 0/0 — r11=0 AND r9=0 — and the per-area degen rate roughly halves with\n"
+                 "areaClip off (0.83 -> 0.44 overall, 1.60 -> 0.68 in the well). So areaClip DEFERS\n"
+                 "the reject rather than removing it, and areaDegen existed only to suppress the\n"
+                 "deferred one. Note the halving, not elimination: a residual source remains and\n"
+                 "areaPortal (site 12) is the untested candidate for it.\n"
+                 "CANNOT CRASH THE WAY areaDegen DID, structurally: a 0/0 record is produced by\n"
+                 "the clipper and the clipper never runs, so rec[+2] >= 3 is inherited from the\n"
+                 "parent and ED900's unguarded post-test loop at 0x1802EDA30 can never be handed a\n"
+                 "bound of zero.\n"
+                 "JUDGE IT ON a20 IN THE WELL, NOT ON clipDegen. clipDegen going to 0 is guaranteed\n"
+                 "by the patch and proves nothing. PASS = well a20 (pitch -45..-50, yaw >= 130)\n"
+                 "rises toward the shoulder value; baseline is 10.75 there against 19-24 on the\n"
+                 "shoulders with areaClip on, 5.44 with everything in the area layer off.\n"
+                 "FAIL = the well persists, which exonerates the area layer entirely and means the\n"
+                 "leak is elsewhere — stop patching this layer and build the rotation-invariance\n"
+                 "baseline instead.\n"
+                 "COST: removes the narrowing entirely, so the flood is wider than areaClip's.\n"
+                 "Watch poolHi/allocFail on [JobProbe] — areaClip alone took the pool peak from\n"
+                 "14/4092 to 222/4092.");
+      RTX_OPTION("rtx.cullOff", bool, areaDegen, false,
+                 "*** CRASHES. DO NOT ENABLE. *** Access violation (write) at client.dll+0x2EDA45\n"
+                 "inside sub_1802ED900, called from EB620 at 0x2EB8C5 on a tier0 job thread, after a\n"
+                 "collapse to ~3 fps. Records with 0 entries/planes are fine for the allocator and\n"
+                 "for the copy loops at 0x2EC74B — which is as far as the original check went — but\n"
+                 "sub_1802ED900 consumes the record afterwards whenever rec[+4] != -1, does NOT\n"
+                 "decompile, and underflows its loop bounds on zero counts.\n"
+                 "REQUIREMENTS NOW READ FROM DISASSEMBLY (2026-08-05). rec[+4] is the next-record\n"
+                 "link of a per-area chain; ED900 walks it, appends each record's planes to\n"
+                 "unk_181E60EF0, then frees the record. Only ONE of the two counts is lethal:\n"
+                 "  rec[+0] (edges,  from r11 at 0x2EC671) == 0 is GUARDED at 0x1802EDA84.\n"
+                 "  rec[+2] (planes, from r9  at 0x2EC67B) == 0 walks a POST-TEST loop at\n"
+                 "    0x1802EDA30 whose bound is that count, so zero never terminates and it\n"
+                 "    writes 16 bytes per iteration off the end of the array at 0x1802EDA45 —\n"
+                 "    the exact faulting instruction, and exactly a write.\n"
+                 "So the crash is the 0x2EC67B half alone. Relaxing ONLY 0x2EC671 (cmp r11,3 ->\n"
+                 "cmp r11,0) is memory-safe: the untouched cmp r9,3 guarantees rec[+2] >= 3, and\n"
+                 "ED900 is skipped entirely for a chain of length 1 (0x2EB8C0), which is the\n"
+                 "141/148 single-crossing case. NEVER relax 0x2EC67B, and do not 'soften' it to\n"
+                 "cmp r9,1 either — 1-2 planes is an unbounded volume pushed into the job array.\n"
+                 "*** ANSWERED 2026-08-05 BY [DegenPair], AND THE SALVAGE IS DEAD. 570 frames,\n"
+                 "*** 164 of them in the well: every reject is cell 0/0 — r11 = 0 AND r9 = 0,\n"
+                 "*** 8,940 of them, no exceptions, clipDegenB 0 throughout. The r11-only patch is\n"
+                 "*** a strict no-op (relaxing cmp r11,3 hands control to cmp r9,3 with r9 = 0,\n"
+                 "*** which rejects to the same 0x2EC8ED). Do not split the flag group for it.\n"
+                 "The same capture confirms the crash from live data rather than from a register\n"
+                 "dump: the degenerate records really are rec[+2] == 0, at 14-42 per frame in the\n"
+                 "well, which is precisely the input that makes ED900's post-test loop run forever.\n"
+                 "AND THERE IS NO UPSTREAM FIX EITHER — 'intervene where the clip produces the\n"
+                 "degenerate polygon' is retired. r11=0 ^ r9=0 requires the plane compaction at\n"
+                 "0x2EBD60 to keep no plane, the wholly-inside edge mask r8 to be empty AND the\n"
+                 "straddle mask var_8A0 to be empty. That is a volume entirely outside the portal:\n"
+                 "the clip is not producing a sliver, it is producing nothing, and this reject is\n"
+                 "reporting that truthfully. Nothing upstream can invent a polygon.\n"
+                 "The cause is one level up, in rtx.cullOff.areaClip — see that option.\n"
+                 "Everything below is the original rationale, kept because the ANALYSIS that located\n"
+                 "the site is sound even though the chosen fix is not.\n"
+                 "THE PITCH HALF. areaPortal and areaClip fixed the yaw axis; this is the one that\n"
+                 "closes the diagonal. client.dll+0x2EC671 and +0x2EC67B in sub_1802EB620.\n"
+                 "REQUIRES rtx.cullOff.worldPortal — see the dependency note below. The flag is\n"
+                 "ANDed with it in code, so this site simply will not apply without it.\n"
+                 "HOW IT WAS FOUND: the collapse is a localised WELL in 2D, not a trend on either\n"
+                 "axis, which is why pitch-only and yaw-only binning both looked flat. At yaw >= 130\n"
+                 "a20 runs 23.6 (pitch -65) / 19.1 (-55) / 11.8 (-50) / 11.0 (-45) / 14.8 (-40) /\n"
+                 "17.7 (-35), recovering on both shoulders, and areas 113/141/148/153 vanish as a\n"
+                 "GROUP while sitting in the order list on every frame. The [ClipDegen] recorder then\n"
+                 "named the abandoned crossings: at the well bottom they are into 148 and 141,\n"
+                 "~0.66/frame each, absent from both shoulders. A per-frame COUNT could never have\n"
+                 "shown that — one crossing dying does not move a total of 17-40, which is why the\n"
+                 "earlier 'clipDegen is anti-correlated so it is not the gate' reading was wrong.\n"
+                 "WHAT IT IS: after the per-edge clip, `cmp r11,3 / jb` and `cmp r9,3 / jb` abandon\n"
+                 "the portal when the clipped polygon has fewer than 3 entries or planes. At grazing\n"
+                 "pitch against floor- and ceiling-adjacent portal edges that is exactly what the\n"
+                 "clip produces.\n"
+                 "THE PATCH changes each immediate 3 -> 0. Unsigned '< 0' is impossible, so neither\n"
+                 "jb can fire, r11/r9 are untouched, and the engine's own fall-through at 0x2EC685\n"
+                 "publishes them and swaps buffers exactly as for a successful clip. One byte each.\n"
+                 "WHY NOT DISCARD THE CLIP INSTEAD: by 0x2EC675 the previous polygon is gone. rbx and\n"
+                 "rdi are destroyed in the final dedup pass (0x2EC554/0x2EC5F1/0x2EC61F/0x2EC570),\n"
+                 "var_840's saved entry count is consumed at 0x2EC52F, and the pre-clip plane count\n"
+                 "died at 0x2EBD55 with its only copy overwritten at 0x2EBE96. There is nothing to\n"
+                 "restore, so a discard path is not writable at that site.\n"
+                 "WHY NOT TOUCH xmmword_1811FC030: it looks like the clip plane and is not. Its only\n"
+                 "consumer is 0x2EC2C6 `mulps xmm0,xmm7` -> horizontal sum -> andps sign mask ->\n"
+                 "xorps, i.e. the camera forward supplies the SIGN that orients each silhouette plane\n"
+                 "outward. Changing it leaves planes inside-out, not the volume wider.\n"
+                 "SAFETY: a 0-2 plane record is an UNDER-constrained antiportal volume, so the worker\n"
+                 "culls less, which is the direction every flag here wants. The allocator sizes it by\n"
+                 "its own arithmetic ((4*(0+0)+71)>>6 = 1 block) and every copy loop at 0x2EC74B is\n"
+                 "guarded, so zero counts copy nothing.\n"
+                 "DEPENDENCY: a 0-entry record empties site 11's accumulator at 0x2E941C and its\n"
+                 "`jz loc_1802E9DB1` would drop the node. rtx.cullOff.worldPortal forces that branch\n"
+                 "to accept. With worldPortal off this site would LOSE nodes, hence the AND in code.\n"
+                 "VERIFY with rtx.cullOff.probeDispatch: clipDegen should fall to 0 and degenTo empty\n"
+                 "(the recorder's branch can no longer be taken; the two coexist because the\n"
+                 "retargeted rel32 at 0x2EC677/0x2EC681 does not overlap these cmp bytes), and a20\n"
+                 "should stop dipping at pitch -45..-50.");
       RTX_OPTION("rtx.cullOff", bool, probeWorldDrain, false,
                  "Diagnostic, not a fix. Wraps client.dll+0x2F04F0 (sub_1802F04F0, the DRAIN that\n"
                  "ORs accepted leaf runs into the world visibility mask) and logs one [DrainProbe]\n"
@@ -1517,7 +1680,7 @@ namespace dxvk {
                  "negative alpha past fadeEnd if only the reject is removed.\n"
                  "Note the engine caps the gathered list at 16320 props per view and then stops\n"
                  "walking, the same way the render list truncates at 4096 renderables.");
-      RTX_OPTION("rtx.cullOff", bool, staticPropFrustum, false,
+      RTX_OPTION("rtx.cullOff", bool, staticPropFrustum, true,
                  "Disable the STATIC-PROP FRUSTUM cull in engine.dll (sub_1801B2DD0 for the main\n"
                  "view, sub_1801B2FA0 for shadow views). This is the view-direction cull for props —\n"
                  "distinct from staticPropFade, which is distance only, and from frustum, which only\n"
@@ -1536,7 +1699,7 @@ namespace dxvk {
                  "value, so nothing downstream reads a partial result.\n"
                  "SCOPE: props only. World surfaces are a separate mask with a separate cull —\n"
                  "see rtx.cullOff.worldFrustum.");
-      RTX_OPTION("rtx.cullOff", bool, worldFrustum, false,
+      RTX_OPTION("rtx.cullOff", bool, worldFrustum, true,
                  "Disable the WORLD-GEOMETRY frustum cull in client.dll sub_1802E8DA0. This is the\n"
                  "one that removes walls/terrain/ground when you look away, and it lives in a\n"
                  "subsystem no other flag here touches.\n"

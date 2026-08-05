@@ -154,6 +154,39 @@ namespace tf2_decal_hook {
   std::uint64_t DrainEd900DropCount();
   bool Ed900DropProbeInstalled();
 
+  // Portals abandoned because the clipped polygon came out with fewer than 3
+  // vertices — 0x2EC675 (r11) and 0x2EC67F (r9), the only rejects left
+  // unpatched on the area-portal path and the leading suspects for the residual
+  // PITCH dependence. Instrumented by RETARGETING each branch to a counting
+  // stub, so the condition, length and destination are all unchanged; the
+  // shared target loc_1802EC8ED has too many predecessors for a counter placed
+  // there to mean anything. Check ClipDegenProbeInstalled() before reading a
+  // zero, same trap as the counters above.
+  std::uint64_t DrainClipDegenACount();
+  std::uint64_t DrainClipDegenBCount();
+  bool ClipDegenProbeInstalled();
+
+  // Which NEIGHBOUR AREAS the abandoned crossings would have reached, read and
+  // cleared. Identity rather than volume: a per-frame count cannot see one
+  // crossing failing and cascading to four areas, which is what the 2D well
+  // looks like. Returns how many were written to `out`.
+  std::uint32_t DrainClipDegenAreas(std::uint32_t* out, std::uint32_t maxOut);
+
+  // [DegenPair]: the JOINT (r11, r9) distribution of the rejects at 0x2EC675,
+  // read and cleared. Cell = r9*4 + r11, r11 clamped at 3, r9 at 15 — so 64
+  // cells, and kDegenPairCells is the size `out` must have room for.
+  //
+  // The counts are not interchangeable and only one of them is dangerous:
+  // r11 becomes rec[+0] (edges), which sub_1802ED900 guards for zero at
+  // 0x1802EDA84, while r9 becomes rec[+2] (planes), whose copy loop at
+  // 0x1802EDA30 is post-test and runs forever on a bound of zero — that loop
+  // is what site 14 crashed on. A per-branch COUNT cannot separate them, and
+  // the existing DrainClipDegenBCount() cannot either, because its branch sits
+  // behind this one and therefore never sees the degenerate-r11 population.
+  // Returns how many cells were written.
+  constexpr std::uint32_t kDegenPairCells = 64;
+  std::uint32_t DrainDegenPairs(std::uint64_t* out, std::uint32_t maxOut);
+
   // Thread-local: are we currently inside TF2's decal-render call tree?
   // Cheap (single TLS load); safe to call from any draw site.
   //
