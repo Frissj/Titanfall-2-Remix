@@ -867,6 +867,42 @@ struct DrawCallTransforms {
   // can leave this null and only fill instancesToObject.
   std::shared_ptr<const std::vector<Matrix4>> instancesToObjectOwner;
 
+  // NV-DXVK [fanout split]: true when instancesToObject holds one transform per
+  // GAME-submitted prop of a bone-instanced fanout batch (d3d11_rtx path 10),
+  // as opposed to a USD PointInstancer or the external-GPU-instancing path.
+  //
+  // Why the distinction matters: for a fanout batch the *batch* is not a stable
+  // entity — TF2 adds and drops ~6 props per frame — so one RtInstance per batch
+  // can never be deduped reliably, and every membership change destroys the
+  // temporal history of all ~54 props in it (measured 2026-08-05: 89 distinct
+  // propIds / 86 distinct set-digests across 89 reaps of one object). Only these
+  // draws may be split into one RtInstance per placement by
+  // InstanceManager::processSceneObjectFanout. A USD PointInstancer is a
+  // genuinely stable batch authored as one prim and must keep the PI expansion,
+  // and replacement draws must keep exactly one instance per replacement prim
+  // (SceneManager::drawReplacements asserts on that identity), so both clear it.
+  bool isFanoutBatch = false;
+
+  // NV-DXVK [fanout prev-transform identity] 2026-08-05: index-parallel to
+  // instancesToObject — where each placement stood LAST frame, in the same
+  // absolute world space, as reported by the engine's own per-instance struct
+  // rather than inferred by us.
+  //
+  // InstanceManager uses it as a second exact-stage SpatialMap probe: an instance
+  // was filed last frame under the hash of its transform THEN, which is exactly
+  // this matrix now, so a prop that moved still resolves by exact hash instead of
+  // falling through to the nearest-neighbour search and its 300-unit-per-frame
+  // ceiling, wrong-neighbour risk and filter rejections.
+  //
+  // Null or short means no history was available (a prop's first frame, or a
+  // frame whose camOrigin could not be reproduced); the consumer then keys purely
+  // on the current transform, which is the pre-existing behaviour. Only ever
+  // populated for isFanoutBatch draws, and only when the length matches
+  // instancesToObject — a mismatch would pair a placement with another
+  // placement's history, which is worse than having none.
+  const std::vector<Matrix4>* prevInstancesToObject = nullptr;
+  std::shared_ptr<const std::vector<Matrix4>> prevInstancesToObjectOwner;
+
   // NV-DXVK: Deterministic camera-pass classifier. Populated by d3d11_rtx
   // from the currently-bound D3D11 viewport at draw submission time. Used by
   // camera_manager to distinguish gameplay draws (viewport matches back

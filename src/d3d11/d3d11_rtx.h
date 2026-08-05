@@ -883,6 +883,63 @@ namespace dxvk {
     // can hold it alive beyond the 4-frame ring buffer's lifetime.
     std::shared_ptr<const std::vector<Matrix4>> m_currentInstancesToObjectOwner;
 
+    // NV-DXVK [fanout prev-transform identity] 2026-08-05: index-parallel to
+    // m_currentInstancesToObject — the PREVIOUS FRAME's transform for the same
+    // placement, taken from the engine's own per-instance struct (g_modelInst
+    // words 12..23, the 48 bytes immediately after the current matrix).
+    //
+    // This replaces charIdx as the identity source. charIdx was an index into a
+    // PER-DRAW scratch buffer of 2..96 entries ([T31Struct] measured the bound
+    // t31 length directly), i.e. a loop counter, so the same value in two draws
+    // named two unrelated props and merged them.
+    //
+    // The prev transform is not another transform-derived key. Hashing the
+    // CURRENT transform asks "what is at this position", which fails the moment a
+    // prop moves. The previous transform is the engine stating where THIS prop
+    // was last frame, so it resolves to last frame's instance exactly, however
+    // far the prop travelled. Verified bit-exact across f13072→13073→13074 on all
+    // three translation components and the full basis.
+    //
+    // Stored in ABSOLUTE world space (camOrigin already applied), because that is
+    // the space the SpatialMap is keyed in. See m_fanoutPrevCamOrigin for why the
+    // camOrigin used here must be the PREVIOUS frame's.
+    //
+    // Empty when the engine supplied no history (its prev block is all-zero on a
+    // prop's first frame); the consumer then behaves exactly as it does today.
+    const std::vector<Matrix4>*          m_currentPrevInstancesToObject = nullptr;
+    std::shared_ptr<const std::vector<Matrix4>> m_currentPrevInstancesToObjectOwner;
+
+    // NV-DXVK [fanout prev-transform identity]: per-VS record of the camOrigin
+    // used to absolutise the fanout matrices, so the NEXT frame can absolutise
+    // its prev block with the SAME value.
+    //
+    // Required for bit-exactness, which is the whole point. Last frame stored
+    // curAbs = curRaw + camOrigin(N-1). This frame's prev block is bit-identical
+    // to last frame's curRaw, so prevAbs reproduces curAbs exactly only if it is
+    // offset by camOrigin(N-1). Using the current frame's camOrigin would be off
+    // by one frame of camera motion and no hash would ever match.
+    //
+    // `ambiguous` guards the case where draws of one VS in one frame disagree on
+    // camOrigin (sub-views such as the 3D skybox reconstruct around a different
+    // origin). A frame flagged ambiguous supplies no prev transforms to the next
+    // one, which falls back to today's behaviour rather than matching wrongly.
+    // TWO slots, not one. A VS issues hundreds of draws per frame (248 on the
+    // dominant fanout VS), and every one of them both READS the previous frame's
+    // origin and RECORDS this frame's. With a single slot the first draw of the
+    // frame reads correctly and then overwrites it, so draws 2..N find the
+    // current frame in the record and get no history — measured as prevHit=11
+    // against prevMiss=250, 11 being the size of one draw.
+    struct FanoutCamOriginRecord {
+      uint32_t curFrameId    = 0xFFFFFFFFu;
+      float    curOrigin[3]  = { 0.0f, 0.0f, 0.0f };
+      bool     curValid      = false;
+      bool     curAmbiguous  = false;
+      uint32_t prevFrameId   = 0xFFFFFFFFu;
+      float    prevOrigin[3] = { 0.0f, 0.0f, 0.0f };
+      bool     prevValid     = false;
+    };
+    std::unordered_map<uint64_t, FanoutCamOriginRecord> m_fanoutPrevCamOrigin;
+
     // NV-DXVK [CamOrig]: provenance of the camOrigin that path-10 adds to the
     // camera-relative t31 translation (d3d11_rtx.cpp:8188). Stashed at the
     // fanout build site and consumed by [SubmitBone] in SubmitDraw, which runs

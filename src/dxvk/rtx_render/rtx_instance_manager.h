@@ -22,6 +22,7 @@
 #pragma once
 
 #include <mutex>
+#include <atomic>
 #include <vector>
 #include <unordered_set>
 #include <unordered_map>
@@ -402,6 +403,23 @@ public:
     BlasEntry& blas, const DrawCallState& drawCall, MaterialData& materialData, RtInstance* existingInstance,
     DrawCallCache* drawCallCache = nullptr);
 
+  // NV-DXVK [fanout split]: same as processSceneObject, but for a draw whose
+  // transformData carries isFanoutBatch — it resolves ONE RtInstance PER ELEMENT
+  // of instancesToObject rather than one for the whole batch, and appends them to
+  // out_instances in batch order.
+  //
+  // The caller gets every instance rather than a "representative" one on purpose:
+  // effect lights, object picking and particle emission all key off the returned
+  // instance, and silently applying them to only the first prop of a ~54-prop
+  // batch would be a real (and invisible) regression. out_instances is cleared
+  // first; it can end up shorter than the batch if two placements resolve to the
+  // same RtInstance (see the collide= field of the [FanoutSplit] log — that means
+  // two props share a propId and are merging, which is a defect, not a saving).
+  void processSceneObjectFanout(
+    const CameraManager& cameraManager, const RayPortalManager& rayPortalManager,
+    BlasEntry& blas, const DrawCallState& drawCall, MaterialData& materialData,
+    DrawCallCache* drawCallCache, std::vector<RtInstance*>& out_instances);
+
   // Binds a raytracing material to the specified instance.
   void bindMaterial(RtInstance& instance, const RtSurfaceMaterial& material);
 
@@ -429,6 +447,60 @@ public:
   const std::vector<IntersectionBillboard>& getBillboards() const { return m_billboards; }
   
 private:
+  // NV-DXVK [fanout split]: the per-prop overrides that turn one element of a
+  // fanout batch into an ordinary, independently-identified scene object. When a
+  // FanoutSplit* is non-null every place that would otherwise read the draw
+  // call's batch-wide transform identity reads this instead; when it is null the
+  // code path is bit-identical to the pre-split behaviour.
+  struct FanoutSplit {
+    // drawCall.objectToWorld * instancesToObject[i]. This is exactly the matrix
+    // RtSurface::writeGPUData would have derived for slot i of the point
+    // instancer, so the rendered placement is unchanged by the split.
+    //
+    Matrix4 objectToWorld;
+
+    // Always 0 for a split fanout placement, which selects the SpatialMap's
+    // composed-matrix-bytes key. The field is kept because processSceneObjectImpl
+    // and updateInstance share their bodies with the non-split path, where a draw
+    // call can legitimately carry a stablePropId; a split placement must never
+    // inherit the BATCH's propId, and 0 here is what prevents that.
+    //
+    // An engine handle was tried here and removed: charIdx indexes a PER-DRAW
+    // scratch buffer of 2..96 entries, so it is an array position, not a prop
+    // name, and it merged unrelated props across draws. Motion is handled by
+    // prevObjectToWorld below instead — see the note above
+    // InstanceManager::processSceneObjectFanout.
+    uint64_t stablePropId = 0;
+
+    // NV-DXVK [fanout prev-transform identity] 2026-08-05: the composed matrix
+    // this placement had LAST frame, from the engine's own per-instance history
+    // (DrawCallTransforms::prevInstancesToObject).
+    //
+    // An instance is filed in the SpatialMap under the hash of its transform at
+    // the time it was inserted. For a prop that moved, this frame's transform is
+    // not that hash — but last frame's is, exactly. So this is a second key to
+    // try on the exact stage, and it succeeds for movers without any distance
+    // tolerance, which is what makes it different from every prior candidate.
+    //
+    // Equal to objectToWorld when the engine offered no history (a prop's first
+    // frame). The probe then degenerates to a repeat of the current-transform
+    // probe, which is harmless and needs no special case.
+    Matrix4 prevObjectToWorld;
+    bool hasPrevObjectToWorld = false;
+  };
+
+  // NV-DXVK [fanout prev-transform identity]: how often the engine's history
+  // resolved a placement that its current transform could not. This is the claim
+  // the whole plumb rests on, so it is counted rather than assumed:
+  //   hit ~= (nInst - mtxStable), miss ~= 0  -> the history is bit-exact and the
+  //     movers now resolve on the exact stage instead of the nearest search.
+  //   hit ~= 0 while created/missProp persist -> the history is NOT reproducing
+  //     last frame's key; the plumb is dead weight and should be said to be.
+  // Atomic because findSimilarInstance is reachable from the scene-manager's
+  // draw-processing threads, and a torn counter would misreport the verdict.
+  std::atomic<uint32_t> m_fanoutPrevHitCount { 0 };
+  std::atomic<uint32_t> m_fanoutPrevMissCount { 0 };
+
   ResourceCache* m_pResourceCache;
 
   // Start at 1 to avoid using 0 - makes it easier to detect a 0 initialized RtInstance (which is invalid)
@@ -460,14 +532,26 @@ private:
   // of XXH64(matrix). Anchors dedup to per-prop identity. Default 0
   // preserves the original matrix-hash behavior. Source is the current
   // drawCall's transformData.stablePropId.
-  RtInstance* findSimilarInstance(BlasEntry& blas, const MaterialData& material, const Matrix4& firstInstanceObjectToWorld, CameraType::Enum cameraType, const RayPortalManager& rayPortalManager, uint64_t stablePropId = 0, DrawCallCache* drawCallCache = nullptr);
+  // prevObjectToWorld: if non-null, where this object stood LAST frame. Tried as
+  // a SECOND exact-stage key when the current transform misses, which resolves a
+  // moved object to the instance it was filed under last frame without involving
+  // the nearest-neighbour search at all. Null preserves the original behaviour.
+  RtInstance* findSimilarInstance(BlasEntry& blas, const MaterialData& material, const Matrix4& firstInstanceObjectToWorld, CameraType::Enum cameraType, const RayPortalManager& rayPortalManager, uint64_t stablePropId = 0, DrawCallCache* drawCallCache = nullptr, const Matrix4* prevObjectToWorld = nullptr);
+
+  // Shared body of processSceneObject / processSceneObjectFanout. split is null
+  // for an ordinary draw and non-null for one placement of a split fanout batch.
+  RtInstance* processSceneObjectImpl(
+    const CameraManager& cameraManager, const RayPortalManager& rayPortalManager,
+    BlasEntry& blas, const DrawCallState& drawCall, MaterialData& materialData, RtInstance* existingInstance,
+    DrawCallCache* drawCallCache, const FanoutSplit* split);
 
   RtInstance* addInstance(BlasEntry& blas);
   void processInstanceBuffers(const BlasEntry& blas, RtInstance& currentInstance) const;
 
   void updateInstance(
     RtInstance& currentInstance, const CameraManager& cameraManager,
-    const BlasEntry& blas, const DrawCallState& drawCall, MaterialData& materialData);
+    const BlasEntry& blas, const DrawCallState& drawCall, MaterialData& materialData,
+    const FanoutSplit* split = nullptr);
 
   void removeInstance(RtInstance* instance);
 

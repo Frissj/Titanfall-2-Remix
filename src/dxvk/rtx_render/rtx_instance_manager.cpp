@@ -246,7 +246,24 @@ namespace dxvk {
     // For mirrored instances (drawClockwise=1, o2wMirror=1): 1 != 1 -> no
     // FLIP, which is correct because the negative-scale o2w has already
     // reversed the apparent winding.
-    const Matrix4& objectToWorld = drawCall.getTransformData().objectToWorld;
+    //
+    // NV-DXVK [fanout split]: read the winding basis off the SURFACE, not the
+    // draw call. updateInstance has already written surface.objectToWorld from
+    // the draw's transform by the time this runs, so for every ordinary draw the
+    // two are the same matrix and this is a no-op. For a split fanout placement
+    // they are NOT: the draw carries the batch's identity matrix while the
+    // surface carries drawO2W * instancesToObject[i].
+    //
+    // DO NOT read this as "the split changes backface culling". It cannot: the
+    // parity computed here enters the flag as (drawClockwise != basis), and
+    // addBlas / addPointInstancerBlas then XOR FLIP_FACING again for a mirrored
+    // instance, so the parity cancels and the rendered flag is drawClockwise
+    // (^ the projection parity under tf2StableBackfaceCull) either way. The only
+    // consumer that sees it uncancelled is RtInstance::isFrontFaceFlipped, which
+    // feeds the USD game capturer. This reads the surface so that value describes
+    // the prop rather than the batch; the [FanoutSplit] mir= counter reports how
+    // many placements it differs for (mir=0 => literally identical behaviour).
+    const Matrix4& objectToWorld = surface.objectToWorld;
     const bool objectToWorldMirrored = isMirrorTransform(objectToWorld);
 
     // Note: Vulkan ray tracing defaults to defining the front face based on clockwise vertex order when viewed from a left-handed coordinate system. The front face
@@ -2554,21 +2571,599 @@ namespace dxvk {
     m_decalSortOrderCounter = 0;
   }
 
+  // NV-DXVK [fanout split]: NEVER DERIVE A PROP IDENTITY FROM ITS CURRENT
+  // TRANSFORM.
+  //
+  // Identity here comes from the ENGINE's own per-placement HISTORY, plumbed in as
+  // DrawCallTransforms::prevInstancesToObject — the previous-frame matrix the game
+  // stores at bytes 48..95 of each 208-byte g_modelInst entry, alongside the
+  // current one it already reads.
+  //
+  // The distinction that makes it work: hashing the CURRENT transform asks "what
+  // is at this position", which fails the instant a prop moves. The PREVIOUS
+  // transform is the engine stating where THIS prop was last frame, and an
+  // instance is filed in the SpatialMap under exactly that. So a prop that moves
+  // 5000 units in one frame still resolves on the exact stage, instead of falling
+  // through to a nearest-neighbour search bounded by rtx.uniqueObjectDistance
+  // (300 units, and a per-FRAME budget — at 12 fps a ~3750 u/s speed limit, with
+  // no velocity prediction and a wrong-neighbour failure mode).
+  //
+  // Measured 2026-08-05: bit-exact across f13072->13073->13074 on all three
+  // translation components and the full basis, and [FanoutPrev] prevHit=215-260
+  // per frame against prevMiss~0 — i.e. it resolves precisely the nInst-mtxStable
+  // movers it is supposed to.
+  //
+  // AN ENGINE HANDLE WAS TRIED HERE AND IS GONE. charIdx (the per-instance vertex
+  // attribute that selects the t31 matrix) looks like a prop handle and is not:
+  // [T31Struct] measured the bound t31 buffer at 2..96 entries, so charIdx is an
+  // array position inside a PER-DRAW scratch buffer, and the same value in two
+  // draws names two unrelated props. Live, it merged ~6000 props/frame and dropped
+  // sceneInstances from ~10400 to ~8170. Nor is a handle hiding elsewhere in the
+  // stream: all 208 bytes were dumped — matrix, prev matrix, tint, a constant
+  // uint, baked lighting, padding. There is no id field to find.
+  //
+  // Composites of (per-draw base, charIdx) are also dead, and specifically CANNOT
+  // BE TESTED by a distinct-count gate: charIdx is already unique within a draw,
+  // so any per-draw base makes the pair unique per placement by construction and
+  // scores perfectly while proving nothing about frame-to-frame persistence.
+  //
+  // An earlier version of this file instead derived a stablePropId from the
+  // placement's world translation rounded to 1 unit. It is gone, and nothing like
+  // it should come back — the 2026-08-05 key bakeoff ([FanoutSplit] mtxStable /
+  // basisStable / hybStable over 300 steady-state frames) settled it three ways:
+  //
+  //   * Rounded position MERGED REAL PROPS. 13 distinct placements shared a
+  //     rounded position while their bases differed by 90-180 degrees (maxRot
+  //     1.2-2.0 on a unit basis), so one prop of each pair was silently dropped —
+  //     16/frame on the dominant fanout VS plus 10/frame on the next.
+  //   * Rounding BOUGHT NOTHING for it. A hybrid key of rounded translation +
+  //     exact basis scored identical stability AND identical distinct-value counts
+  //     to the plain full matrix on every VS. The instability it was supposed to
+  //     absorb is not sub-unit jitter at all.
+  //   * That instability is GENUINE MOTION. ~233 placements/frame on the dominant
+  //     VS move far enough to change their rounded position too, and they are
+  //     already handled correctly by findSimilarInstance's nearest-neighbour
+  //     stage — this architecture's designed mechanism for moving objects, and
+  //     what every non-fanout object in the scene has always relied on. Were those
+  //     movers losing identity, `created` would be ~233/frame; it is 5.4, which is
+  //     the genuine rate of new props entering the batch.
+  //
+  // Any key derived from the CURRENT transform is stuck choosing between those two
+  // failures, which is why the engine's history is used instead. The current
+  // transform's bytes remain the primary key for STORING — that is what keeps a
+  // stationary prop's key constant, and therefore SpatialMap::move() a no-op for
+  // the ~95% of the population that holds still. Chaining the stored key to the
+  // history instead would re-key every instance every frame and turn ~10400
+  // no-ops into ~10400 erase+inserts, which is why the history is a second LOOKUP
+  // and not a new store key.
+  //
+  // Before reintroducing any derived id here, re-run the bakeoff. A key must win
+  // on BOTH stability (stable ~= nInst - newProp) and separation (distinct ==
+  // mtxDistinct), and a candidate must be scored BEFORE it goes live — the charIdx
+  // regression shipped because it went live first, and its 100% idStable was
+  // meaningless on a key whose value space was 0..255.
+  //
+  // NV-DXVK [FanoutSplit]: one line per fanout VS per frame — the readout for the
+  // whole fanout-split fix.
+  //
+  //   nInst    placements the game submitted this frame. Churns: the handoff
+  //            measured ~6 props entering and leaving per frame.
+  //   live     RtInstances those placements resolved to.
+  //   created  placements that had to spawn a fresh RtInstance. Raw, and on its
+  //            own AMBIGUOUS — split it with the next two fields.
+  //   newProp  of `created`, those whose transform was NOT submitted last frame:
+  //            a prop entering the batch, or one that moved. Expected, and no
+  //            identity scheme can avoid it.
+  //   missProp of `created`, those whose EXACT transform WAS submitted last frame
+  //            and still needed a new instance. That is a true dedup failure —
+  //            the exact stage had a byte-identical key available and missed it —
+  //            and it is the only part of `created` worth chasing.
+  //
+  //            newProp + missProp == created by construction. If they stop adding
+  //            up, the membership bookkeeping is wrong, not the fix.
+  //
+  //   collide  two placements that resolved to one RtInstance. Under matrix-bytes
+  //            keying this can ONLY happen when their transforms are byte-
+  //            identical, i.e. the game listed the same placement twice, which is
+  //            benign — two co-located copies of one mesh render as one. It is
+  //            therefore an invariant check now rather than a defect count:
+  //            [FanoutCollide] reporting sameBytes=0 would mean two DIFFERENT
+  //            transforms hashed to one key, which should be impossible.
+  //
+  //            The identity columns that used to sit here (withEngineId /
+  //            idStable / idDistinct) are gone with the charIdx plumb. The engine
+  //            history is scored by [FanoutPrev] instead, which is a per-frame
+  //            line rather than a per-VS one because its counters live in
+  //            findSimilarInstance and have no VS context. Read the two together:
+  //            prevHit should track (nInst - mtxStable) summed over the fanout
+  //            VSes, since that difference IS the set of movers whose current
+  //            transform cannot resolve them.
+  //
+  //   mtxStable / mtxDistinct
+  //            placements whose composed transform was byte-identical to one this
+  //            VS submitted last frame, and the distinct-transform count. Since
+  //            the transform IS the dedup key, mtxStable is the exact-stage hit
+  //            rate: a placement counted here is a stationary prop that will match
+  //            its own instance exactly, and the shortfall is props that MOVED.
+  //
+  //            Measured 2026-08-05: 99.3-100% on ten of twelve fanout VSes, and
+  //            95.1% on the dominant one — that shortfall is ~233 genuinely moving
+  //            props per frame, which findSimilarInstance's nearest-neighbour
+  //            stage matches correctly (were it not, `created` would be ~233/frame
+  //            rather than 5.4). So a falling mtxStable is not automatically a
+  //            defect; cross-check it against `created` before treating it as one.
+  //
+  //   basisStable / basisDistinct
+  //            the same for the 3x3 basis alone. Kept because it localises any
+  //            future regression: if mtxStable collapses, basisStable says whether
+  //            the props started MOVING (basis stable, translation not) or the
+  //            engine started rebuilding their ORIENTATION (basis unstable too),
+  //            and those have entirely different explanations. basisDistinct is
+  //            far below mtxDistinct in normal operation — many props share an
+  //            orientation — so the basis alone is never an identity.
+  //   mir      placements whose composed transform has NEGATIVE winding parity.
+  //            Measures the one input the split changes for the backface rule:
+  //            before the split every fanout instance took its parity from the
+  //            batch's IDENTITY objectToWorld, i.e. always 0, so mir is exactly
+  //            the number of props whose parity the split changes.
+  //
+  //            mir=0 => the split cannot have altered facing anywhere. (Measured:
+  //            0 across all 4960 rows of the first capture.)
+  //
+  //            mir>0 would not mean the picture changed either: the parity enters
+  //            the rendered flag twice and cancels — determineInstanceFlags sets
+  //            FLIP from (drawClockwise != parity), then addBlas /
+  //            addPointInstancerBlas XOR FLIP again when the instance is
+  //            mirrored, and A^M^M == A. The only consumer that sees it
+  //            uncancelled is RtInstance::isFrontFaceFlipped, which feeds the USD
+  //            game capturer and the [TlasCensus] flip tally. So mir>0 means "N
+  //            props now record their OWN winding in a capture instead of the
+  //            batch's", which is the correct value, not a regression. This
+  //            counter exists so that claim is measured rather than argued.
+  static void logFanoutSplitFrame(uint32_t frame, uint64_t vsHash, uint32_t draws,
+                                  uint32_t nInst, uint32_t live, uint32_t created,
+                                  uint32_t collide, uint32_t mir,
+                                  uint32_t newProp, uint32_t missProp,
+                                  uint32_t mtxStable, uint32_t basisStable,
+                                  uint32_t mtxDistinct, uint32_t basisDistinct,
+                                  uint32_t sceneInstances) {
+    Logger::info(str::format(
+      "[FanoutSplit] f=", frame,
+      " vs=0x", std::hex, vsHash, std::dec,
+      " draws=", draws,
+      " nInst=", nInst,
+      " live=", live,
+      " created=", created,
+      " newProp=", newProp,
+      " missProp=", missProp,
+      " collide=", collide,
+      " mir=", mir,
+      " mtxStable=", mtxStable,
+      " basisStable=", basisStable,
+      " mtxDistinct=", mtxDistinct,
+      " basisDistinct=", basisDistinct,
+      " sceneInstances=", sceneInstances));
+  }
+
   RtInstance* InstanceManager::processSceneObject(
     const CameraManager& cameraManager, const RayPortalManager& rayPortalManager,
     BlasEntry& blas, const DrawCallState& drawCall, MaterialData& materialData, RtInstance* existingInstance,
     DrawCallCache* drawCallCache) {
+    return processSceneObjectImpl(cameraManager, rayPortalManager, blas, drawCall, materialData,
+                                  existingInstance, drawCallCache, nullptr);
+  }
+
+  void InstanceManager::processSceneObjectFanout(
+    const CameraManager& cameraManager, const RayPortalManager& rayPortalManager,
+    BlasEntry& blas, const DrawCallState& drawCall, MaterialData& materialData,
+    DrawCallCache* drawCallCache, std::vector<RtInstance*>& out_instances) {
+
+    out_instances.clear();
+
+    const std::vector<Matrix4>* transforms = drawCall.getTransformData().instancesToObject;
+    if (transforms == nullptr || transforms->empty()) {
+      // Not actually a batch — fall back to the ordinary single-instance path so
+      // this entry point is safe to call unconditionally.
+      RtInstance* single = processSceneObjectImpl(cameraManager, rayPortalManager, blas, drawCall,
+                                                  materialData, nullptr, drawCallCache, nullptr);
+      if (single != nullptr) {
+        out_instances.push_back(single);
+      }
+      return;
+    }
+
+    const Matrix4& drawObjectToWorld = drawCall.getTransformData().objectToWorld;
+    const uint32_t currentFrameIdx = m_device->getCurrentFrameId();
+    const uint64_t vsHash = static_cast<uint64_t>(drawCall.getTransformData().vertexShaderHash);
+    out_instances.reserve(transforms->size());
+
+    // The engine's per-placement HISTORY. Same re-check for the same reason: the
+    // producer already length-gates it, and a desynced history would resolve a
+    // placement onto a different prop's instance with full confidence.
+    const std::vector<Matrix4>* prevTransforms = drawCall.getTransformData().prevInstancesToObject;
+    if (prevTransforms != nullptr && prevTransforms->size() != transforms->size()) {
+      ONCE(Logger::warn(str::format(
+        "[FanoutSplit] prevInstancesToObject/instancesToObject length mismatch (",
+        prevTransforms->size(), " vs ", transforms->size(),
+        ") — ignoring engine history, keying on current transform only.")));
+      prevTransforms = nullptr;
+    }
+
+    uint32_t created = 0;     // placements that had to spawn a fresh RtInstance
+    uint32_t collide = 0;     // placements that landed on an instance already
+                              // resolved earlier in THIS batch => two props share
+                              // a propId and are merging into one object
+    uint32_t mirrored = 0;    // placements whose composed transform has negative
+                              // winding parity — see logFanoutSplitFrame
+    uint32_t newProp = 0;     // created, and this transform was NOT submitted last
+                              // frame: a new prop, or one that moved
+    uint32_t missProp = 0;    // created even though this exact transform WAS
+                              // submitted last frame — a true dedup failure
+    uint32_t mtxStable = 0;   // placements whose composed transform was
+                              // byte-identical to one submitted last frame
+    uint32_t basisStable = 0; // ...whose 3x3 basis alone was
+
+    // Per-VS state carried across frames. Holds both the aggregate counters and
+    // the propId membership sets that separate genuine batch churn from residual
+    // dedup misses (see the newProp/missProp notes on logFanoutSplitFrame).
+    struct FsState {
+      uint32_t frame = 0xFFFFFFFFu;
+      uint32_t draws = 0, nInst = 0, live = 0, created = 0, collide = 0,
+               mir = 0, newProp = 0, missProp = 0,
+               mtxStable = 0, basisStable = 0;
+      // Composed transforms this VS submitted in `frame`, and in the frame before
+      // it. `prev` is the last frame this VS was SEEN in, not literally frame-1: a
+      // VS that skips a frame entirely makes no call here, so nothing rolls over
+      // and the comparison stays against its own last submission. That is the
+      // right baseline for "did this placement exist a moment ago".
+      std::unordered_set<uint64_t> cur;
+      std::unordered_set<uint64_t> prev;
+      // The same membership question asked of the 3x3 basis alone, which isolates
+      // WHERE any future instability lives — see logFanoutSplitFrame.
+      std::unordered_set<uint64_t> curBasis;
+      std::unordered_set<uint64_t> prevBasis;
+    };
+    static thread_local std::unordered_map<uint64_t, FsState> sFs;
+    FsState& st = sFs[vsHash];
+
+    // Frame rollover happens HERE, before the placement loop, so the loop can test
+    // each propId against the previous frame's set. (Doing it after the loop, as
+    // a pure aggregate would, leaves `prev` holding this frame's own inserts.)
+    if (st.frame != currentFrameIdx) {
+      if (st.frame != 0xFFFFFFFFu && st.draws > 0) {
+        logFanoutSplitFrame(st.frame, vsHash, st.draws, st.nInst, st.live, st.created,
+                            st.collide, st.mir, st.newProp, st.missProp,
+                            st.mtxStable, st.basisStable,
+                            static_cast<uint32_t>(st.cur.size()),
+                            static_cast<uint32_t>(st.curBasis.size()),
+                            static_cast<uint32_t>(m_instances.size()));
+      }
+      // NV-DXVK [fanout prev-transform identity]: one verdict line per frame.
+      // Emitted from the first VS to roll over into the new frame, because the
+      // counters are global across all fanout VSes rather than per-VS (they are
+      // incremented inside findSimilarInstance, which has no VS context).
+      {
+        static uint32_t sPrevStatFrame = 0xFFFFFFFFu;
+        if (sPrevStatFrame != currentFrameIdx) {
+          sPrevStatFrame = currentFrameIdx;
+          const uint32_t hits = m_fanoutPrevHitCount.exchange(0, std::memory_order_relaxed);
+          const uint32_t misses = m_fanoutPrevMissCount.exchange(0, std::memory_order_relaxed);
+          if (hits != 0u || misses != 0u) {
+            Logger::info(str::format(
+              "[FanoutPrev] f=", st.frame,
+              " prevHit=", hits,
+              " prevMiss=", misses,
+              " (prevHit is the count of placements the ENGINE HISTORY resolved"
+              " after the current transform missed — compare against"
+              " nInst-mtxStable in [FanoutSplit]; prevMiss falls through to the"
+              " nearest search exactly as before)"));
+          }
+        }
+      }
+      st.prev = std::move(st.cur);
+      st.cur.clear();
+      st.prevBasis = std::move(st.curBasis);
+      st.curBasis.clear();
+      st.draws = 0; st.nInst = 0; st.live = 0; st.created = 0; st.collide = 0;
+      st.mir = 0; st.newProp = 0; st.missProp = 0;
+      st.mtxStable = 0; st.basisStable = 0;
+      st.frame = currentFrameIdx;
+    }
+
+    // Parallel to out_instances: the composed transform and identity each accepted
+    // placement was resolved with. Kept because updateInstance has already
+    // overwritten surface.objectToWorld by the time a later placement is found to
+    // collide with an earlier one, so the instance can no longer report where the
+    // FIRST of the two stood. Without this the collision dump would compare a
+    // placement against itself.
+    static thread_local std::vector<Matrix4> sPlacedO2w;
+    static thread_local std::vector<uint64_t> sPlacedMtxHash;
+    sPlacedO2w.clear();
+    sPlacedMtxHash.clear();
+
+    for (size_t placement = 0; placement < transforms->size(); ++placement) {
+      FanoutSplit split;
+      // Same composition RtSurface::writeGPUData applies for point-instancer slot
+      // i, so the prop renders exactly where it did before the split.
+      split.objectToWorld = drawObjectToWorld * (*transforms)[placement];
+
+      // Composed through the SAME drawObjectToWorld as the current transform, so
+      // that for a stationary prop the product reproduces last frame's composed
+      // matrix bit-for-bit and its hash is literally the key the instance was
+      // filed under. (drawObjectToWorld is identity on this path — see the
+      // path-10 site in d3d11_rtx — but composing it explicitly keeps the two
+      // matrices in the same space if that ever changes.)
+      if (prevTransforms != nullptr) {
+        split.prevObjectToWorld = drawObjectToWorld * (*prevTransforms)[placement];
+        split.hasPrevObjectToWorld = true;
+      }
+
+      if (isMirrorTransform(split.objectToWorld)) {
+        ++mirrored;
+      }
+
+      // Health probes. Their job is to characterise the population: how much of it
+      // is stationary (mtxStable) and whether any future instability is motion or
+      // re-derived orientation (basisStable). nInst - mtxStable is the mover count
+      // the engine history is expected to resolve — compare it against prevHit in
+      // [FanoutPrev].
+      // basisHash is kept alongside because it isolates where any future
+      // instability lives: if mtxStable ever collapses, basisStable says whether
+      // the engine started moving the props or started rebuilding their
+      // orientation, and those have completely different explanations.
+      const Matrix4& mo = split.objectToWorld;
+      const float basis[9] = {
+        float(mo[0][0]), float(mo[0][1]), float(mo[0][2]),
+        float(mo[1][0]), float(mo[1][1]), float(mo[1][2]),
+        float(mo[2][0]), float(mo[2][1]), float(mo[2][2]) };
+
+      const uint64_t mtxHash = static_cast<uint64_t>(XXH64(&mo, sizeof(Matrix4), 0));
+      const uint64_t basisHash = static_cast<uint64_t>(XXH64(basis, sizeof(basis), 0));
+
+      // Read membership BEFORE inserting, or every placement looks like a repeat.
+      const bool submittedLastFrame = st.prev.count(mtxHash) != 0;
+      st.cur.insert(mtxHash);
+      if (submittedLastFrame) {
+        ++mtxStable;
+      }
+      if (st.prevBasis.count(basisHash) != 0) {
+        ++basisStable;
+      }
+      st.curBasis.insert(basisHash);
+
+      // existingInstance is always null here: a replacement draw never carries
+      // isFanoutBatch (SceneManager::drawReplacements clears it), so there is no
+      // pre-resolved instance to honour.
+      //
+      // The instance-table size is the exact "did dedup miss" test: addInstance is
+      // the only thing on this path that grows m_instances, and nothing shrinks it
+      // until garbage collection. isCreatedThisFrame would over-report, because a
+      // batch drawn twice in one frame would re-count every instance the first
+      // pass created.
+      const size_t instanceCountBefore = m_instances.size();
+      RtInstance* instance = processSceneObjectImpl(cameraManager, rayPortalManager, blas, drawCall,
+                                                    materialData, nullptr, drawCallCache, &split);
+      if (m_instances.size() > instanceCountBefore) {
+        ++created;
+        // The decisive split of `created`. A prop the game did not submit last
+        // frame HAS to be created — that is the batch churn the handoff measured
+        // (~6 props entering per frame), and it is irreducible. A prop that WAS
+        // submitted last frame and still needed a new instance is a dedup failure
+        // and is the only part of `created` worth chasing.
+        if (submittedLastFrame) {
+          ++missProp;
+        } else {
+          ++newProp;
+        }
+      }
+      if (instance == nullptr) {
+        continue;
+      }
+
+      // Duplicate detection. findSimilarInstance's EXACT stage
+      // (getDataAtTransform) returns a hit without testing m_frameLastUpdated, so
+      // two placements sharing a propId WOULD both resolve to the same instance
+      // and one prop would silently disappear. Scanning what this batch has
+      // already produced is exact — unlike a frameLastUpdated test, it cannot be
+      // confused by a legitimate second pass of the same batch in one frame.
+      // Bounded by the batch size — measured at ~19-32 placements per draw, so
+      // the scan is cheap even at 252 draws/frame.
+      size_t duplicateOf = SIZE_MAX;
+      for (size_t s = 0; s < out_instances.size(); ++s) {
+        if (out_instances[s] == instance) {
+          duplicateOf = s;
+          break;
+        }
+      }
+      if (duplicateOf != SIZE_MAX) {
+        ++collide;
+
+        // NV-DXVK [FanoutCollide]: the raw pair, at full float precision.
+        //
+        // Now an INVARIANT CHECK rather than a defect hunt. The dedup key is the
+        // composed transform's bytes, so two placements can only land on one
+        // RtInstance when their transforms are byte-identical — the game listed
+        // the same placement twice, and collapsing them is correct. sameBytes=0
+        // here would mean two different transforms resolved to one instance,
+        // which should be impossible; if it ever prints, the key is not what this
+        // code believes it is.
+        //
+        // Kept because it also caught the defect that killed the previous keying
+        // scheme: under rounded-position ids, 13 of the first 46 sightings had
+        // maxRot 1.2-2.0 on a unit basis — two props at one spot, 90-180 degrees
+        // apart, one of them silently dropped. Read the fields in this order:
+        //
+        //   sameBytes=1  the two composed matrices are byte-identical => the batch
+        //                genuinely lists this placement twice. Benign: two
+        //                co-located copies of the same geometry render as one.
+        //                DECISIVE on its own — 33 of the first 46 sightings.
+        //
+        //   sameBytes=0  says only that some byte differs. It is NOT decisive and
+        //                must not be read as "the props differ": memcmp separates
+        //                -0.0f from +0.0f and trips on a 1-ULP difference anywhere
+        //                in the matrix, neither of which means anything. The first
+        //                capture had 11 rows with sameBytes=0 AND d=(0,0,0), i.e.
+        //                identical translations, which memcmp cannot classify.
+        //                Use the two magnitudes below instead:
+        //
+        //   d=(...)      translation delta, unrounded, so the rounding is visible:
+        //                two props at x=100.4 and x=100.6 both round to 100 and
+        //                collide despite being 0.2 units apart. |d| well under 1
+        //                unit means one prop with sub-unit jitter — exactly what
+        //                the rounding exists to absorb, so merging is correct.
+        //
+        //   maxRot=      max |Δ| over the nine 3x3 basis elements. THIS is what
+        //                decides the sameBytes=0 rows:
+        //                  maxRot == 0 (with d ~ 0)  -> the matrices are
+        //                    numerically identical and differ only in bit pattern
+        //                    (signed zero). Benign, same verdict as sameBytes=1.
+        //                  maxRot small vs basisScale -> same orientation, float
+        //                    noise. Benign.
+        //                  maxRot comparable to basisScale -> two props at ONE
+        //                    position with DIFFERENT orientation. This is what
+        //                    the old rounded-position key could not distinguish;
+        //                    under matrix-bytes keying it cannot occur, so seeing
+        //                    it means the key regressed.
+        //   basisScale=  max |element| of the first matrix's 3x3, so maxRot can be
+        //                read relative to the transform's own scale rather than
+        //                against an absolute threshold (these props are not all
+        //                unit-scale).
+        //
+        // firstBasis / dupBasis are dumped whenever maxRot > 0 — the raw nine
+        // numbers each, so an orientation difference can be seen rather than
+        // inferred from a summary statistic.
+        //
+        // First occurrence per (VS, propId) only — with collide constant that is a
+        // few dozen lines for the whole session, not per frame.
+        {
+          const Matrix4& firstO2w = sPlacedO2w[duplicateOf];
+          struct CollideKey { uint64_t vs, propId; };
+          const CollideKey ck { vsHash, mtxHash };
+          const uint64_t ckHash = XXH64(&ck, sizeof(ck), 0xC0111DEull);
+          static std::mutex sCollideMu;
+          static std::unordered_set<uint64_t> sCollideSeen;
+          bool firstSighting = false;
+          {
+            std::lock_guard<std::mutex> g(sCollideMu);
+            if (sCollideSeen.size() < 400u && sCollideSeen.insert(ckHash).second) {
+              firstSighting = true;
+            }
+          }
+          if (firstSighting) {
+            const bool sameBytes =
+              memcmp(&firstO2w, &split.objectToWorld, sizeof(Matrix4)) == 0;
+            const float dx = float(split.objectToWorld[3][0]) - float(firstO2w[3][0]);
+            const float dy = float(split.objectToWorld[3][1]) - float(firstO2w[3][1]);
+            const float dz = float(split.objectToWorld[3][2]) - float(firstO2w[3][2]);
+
+            // The numeric 3x3 comparison memcmp cannot do. Columns 0..2 are the
+            // basis; column 3 is the translation, already covered by d above.
+            float maxRot = 0.0f;
+            float basisScale = 0.0f;
+            for (int bc = 0; bc < 3; ++bc) {
+              for (int br = 0; br < 3; ++br) {
+                const float a = float(firstO2w[bc][br]);
+                const float b = float(split.objectToWorld[bc][br]);
+                maxRot = std::max(maxRot, std::abs(a - b));
+                basisScale = std::max(basisScale, std::abs(a));
+              }
+            }
+
+            // Raw bases only when they actually differ, so the benign majority
+            // stays one readable line each.
+            std::string basisDump;
+            if (maxRot > 0.0f) {
+              basisDump = str::format(
+                " firstBasis=[",
+                  float(firstO2w[0][0]), ",", float(firstO2w[0][1]), ",", float(firstO2w[0][2]), " | ",
+                  float(firstO2w[1][0]), ",", float(firstO2w[1][1]), ",", float(firstO2w[1][2]), " | ",
+                  float(firstO2w[2][0]), ",", float(firstO2w[2][1]), ",", float(firstO2w[2][2]), "]",
+                " dupBasis=[",
+                  float(split.objectToWorld[0][0]), ",", float(split.objectToWorld[0][1]), ",", float(split.objectToWorld[0][2]), " | ",
+                  float(split.objectToWorld[1][0]), ",", float(split.objectToWorld[1][1]), ",", float(split.objectToWorld[1][2]), " | ",
+                  float(split.objectToWorld[2][0]), ",", float(split.objectToWorld[2][1]), ",", float(split.objectToWorld[2][2]), "]");
+            }
+
+            Logger::info(str::format(
+              "[FanoutCollide] f=", currentFrameIdx,
+              " vs=0x", std::hex, vsHash, std::dec,
+              " mtxHash=0x", std::hex, mtxHash, std::dec,
+              " firstMtxHash=0x", std::hex, sPlacedMtxHash[duplicateOf], std::dec,
+              " sameBytes=", (sameBytes ? 1 : 0),
+              " maxRot=", maxRot,
+              " basisScale=", basisScale,
+              " nInst=", static_cast<uint32_t>(transforms->size()),
+              " slotFirst=", static_cast<uint32_t>(duplicateOf),
+              " firstT=(", float(firstO2w[3][0]), ",",
+                           float(firstO2w[3][1]), ",",
+                           float(firstO2w[3][2]), ")",
+              " dupT=(", float(split.objectToWorld[3][0]), ",",
+                         float(split.objectToWorld[3][1]), ",",
+                         float(split.objectToWorld[3][2]), ")",
+              " d=(", dx, ",", dy, ",", dz, ")",
+              basisDump));
+          }
+        }
+        continue;
+      }
+
+      out_instances.push_back(instance);
+      sPlacedO2w.push_back(split.objectToWorld);
+      sPlacedMtxHash.push_back(mtxHash);
+    }
+
+    // Accumulate only — the [FanoutSplit] line for this frame is emitted by the
+    // rollover at the TOP of the next frame's first call for this VS, because the
+    // propId membership sets have to roll over before the placement loop reads
+    // them. See logFanoutSplitFrame for what each field means.
+    st.draws    += 1;
+    st.nInst    += static_cast<uint32_t>(transforms->size());
+    st.live     += static_cast<uint32_t>(out_instances.size());
+    st.created  += created;
+    st.collide  += collide;
+    st.mir         += mirrored;
+    st.newProp     += newProp;
+    st.missProp    += missProp;
+    st.mtxStable    += mtxStable;
+    st.basisStable  += basisStable;
+  }
+
+  RtInstance* InstanceManager::processSceneObjectImpl(
+    const CameraManager& cameraManager, const RayPortalManager& rayPortalManager,
+    BlasEntry& blas, const DrawCallState& drawCall, MaterialData& materialData, RtInstance* existingInstance,
+    DrawCallCache* drawCallCache, const FanoutSplit* split) {
 
     // If the RtInstance represents multiple instances, use the full transform of the first copy for the spatial map.
     // this prevents a bad de-duplication when the same replacement asset is used in multiple GeomPointInstancer prims.
-    Matrix4 firstInstanceObjectToWorld = drawCall.getTransformData().calcFirstInstanceObjectToWorld();
+    // NV-DXVK [fanout split]: a split placement is an ordinary single-placement
+    // object — its own composed transform is the dedup key, not the batch leader's.
+    Matrix4 firstInstanceObjectToWorld = split != nullptr
+      ? split->objectToWorld
+      : drawCall.getTransformData().calcFirstInstanceObjectToWorld();
+
+    // NV-DXVK [fanout split]: a split placement always carries 0 here — the
+    // codebase's "key on the composed matrix bytes" contract, which is exact for a
+    // stationary prop. Motion is handled by the engine history instead (see
+    // FanoutSplit::prevObjectToWorld), not by an override key.
+    //
+    // The batch's own propId must never be substituted: it names whichever prop is
+    // element [0] today. See the note above processSceneObjectFanout.
+    const uint64_t lookupStablePropId = split != nullptr
+      ? split->stablePropId
+      : drawCall.getTransformData().stablePropId;
 
     // If we already know which instance to use, just use that.
     RtInstance* currentInstance = existingInstance;
 
     // Search for an existing instance matching our input
     if (currentInstance == nullptr) {
-      currentInstance = findSimilarInstance(blas, materialData, firstInstanceObjectToWorld, drawCall.cameraType, rayPortalManager, drawCall.getTransformData().stablePropId, drawCallCache);
+      // NV-DXVK [fanout prev-transform identity]: hand the engine's history down
+      // so the exact stage gets a second, position-independent attempt before any
+      // distance-based search is considered. Only a split placement has one.
+      const Matrix4* prevO2W = (split != nullptr && split->hasPrevObjectToWorld)
+        ? &split->prevObjectToWorld
+        : nullptr;
+      currentInstance = findSimilarInstance(blas, materialData, firstInstanceObjectToWorld, drawCall.cameraType, rayPortalManager, lookupStablePropId, drawCallCache, prevO2W);
     }
 
     // NV-DXVK [SubView phantom check]: per-VS-per-frame counters of
@@ -2626,8 +3221,7 @@ namespace dxvk {
             " cam=", static_cast<uint32_t>(drawCall.cameraType),
             " foundSimilar=", (foundSimilar ? 1 : 0),
             " hadExisting=", (existingInstance != nullptr ? 1 : 0),
-            " propId=0x", std::hex,
-              static_cast<uint64_t>(drawCall.getTransformData().stablePropId), std::dec,
+            " propId=0x", std::hex, lookupStablePropId, std::dec,
             " spatialMapSize=", blas.getSpatialMap().size(),
             " blasPtr=0x", std::hex, reinterpret_cast<uintptr_t>(&blas), std::dec,
             " o2wCol0Len=", mdCol0,
@@ -2706,8 +3300,7 @@ namespace dxvk {
     {
       const bool svGameplay =
         tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
-      const uint64_t svPropId =
-        static_cast<uint64_t>(drawCall.getTransformData().stablePropId);
+      const uint64_t svPropId = lookupStablePropId;
       const float svSc0Sq =
           firstInstanceObjectToWorld[0][0] * firstInstanceObjectToWorld[0][0]
         + firstInstanceObjectToWorld[0][1] * firstInstanceObjectToWorld[0][1]
@@ -3016,7 +3609,7 @@ namespace dxvk {
       currentInstance = addInstance(blas);
     }
 
-    updateInstance(*currentInstance, cameraManager, blas, drawCall, materialData);
+    updateInstance(*currentInstance, cameraManager, blas, drawCall, materialData, split);
 
     return currentInstance;
   }
@@ -3257,7 +3850,7 @@ namespace dxvk {
     // NOTE: In the future we could extend this with heuristics as needed...
   }
 
-  RtInstance* InstanceManager::findSimilarInstance(BlasEntry& blas, const MaterialData& material, const Matrix4& firstInstanceObjectToWorld, CameraType::Enum cameraType, const RayPortalManager& rayPortalManager, uint64_t stablePropId, DrawCallCache* drawCallCache) {
+  RtInstance* InstanceManager::findSimilarInstance(BlasEntry& blas, const MaterialData& material, const Matrix4& firstInstanceObjectToWorld, CameraType::Enum cameraType, const RayPortalManager& rayPortalManager, uint64_t stablePropId, DrawCallCache* drawCallCache, const Matrix4* prevObjectToWorld) {
 
     // Disable temporal correlation between instances so that duplicate instances are not created
     // should a developer option change instance enough for it not to match anymore
@@ -3333,6 +3926,43 @@ namespace dxvk {
         }
         return result;
       }
+
+      // NV-DXVK [fanout prev-transform identity] 2026-08-05: SECOND exact-stage
+      // attempt, keyed on where the engine says this object stood LAST frame.
+      //
+      // The map files an instance under the hash of the transform it had when it
+      // was inserted. A prop that moved therefore cannot be found by its current
+      // transform — but its previous one is precisely the key it is filed under,
+      // so this hits exactly, at any speed, with no distance tolerance and none
+      // of the nearest stage's failure modes (the 300-unit-per-frame ceiling that
+      // shrinks with framerate, no velocity prediction, and the wrong-neighbour
+      // case where a fast prop steals a different prop's instance and inherits a
+      // bad motion vector).
+      //
+      // Only attempted when the current transform missed, so a stationary prop —
+      // 95% of the population, which hits above — pays nothing. Skipped when
+      // keying on a stablePropId, since that key is already position-independent
+      // and re-probing with the same override hash would just repeat the lookup.
+      //
+      // Nothing is restamped on a hit: the instance keeps being filed under its
+      // CURRENT transform each frame (see RtInstance's spatial cache update), so
+      // next frame's history lines up with next frame's key, and a static prop's
+      // key still never changes — which keeps SpatialMap::move() a no-op for it
+      // rather than forcing an erase+insert per instance per frame.
+      if (prevObjectToWorld != nullptr && stablePropId == 0ull) {
+        result = const_cast<RtInstance*>(blas.getSpatialMap().getDataAtTransform(*prevObjectToWorld, 0ull));
+        if (result != nullptr) {
+          // Counter only — the claim this rests on is that the engine's history
+          // is bit-exact, and this is the number that proves or refutes it in
+          // one capture. If it stays ~0 while created/missProp stay non-zero,
+          // the history is not reproducing last frame's key and I should say so
+          // rather than leave a dead branch in the hot path.
+          ++m_fanoutPrevHitCount;
+          return result;
+        }
+        ++m_fanoutPrevMissCount;
+      }
+
       // NV-DXVK [FindSim2904 exact-miss]: log propId we looked up. Pair
       // against [PropIdTrace] at the same frame to see if lookup propId
       // matches insert propId for the same physical prop. If they match
@@ -3989,7 +4619,8 @@ namespace dxvk {
                                        const CameraManager& cameraManager,
                                        const BlasEntry& blas,
                                        const DrawCallState& drawCall,
-                                       MaterialData& materialData) {
+                                       MaterialData& materialData,
+                                       const FanoutSplit* split) {
     // NV-DXVK [sticky IgnoreAntiCulling]: preserve IgnoreAntiCulling across
     // shader-variant draws that update the same RtInstance within a frame.
     // The mountain mesh is drawn with multiple d3d11 shader variants (e.g.
@@ -4027,12 +4658,26 @@ namespace dxvk {
       }
       sUpdProbe += 1;
     }
-    currentInstance.surface.instancesToObject = drawCall.getTransformData().instancesToObject;
-    // NV-DXVK: Couple lifetime of the transform vector to this RtInstance so the
-    // raw pointer above cannot dangle once the draw-call source's own ring-buffer
-    // releases its reference. Null for sources with externally-owned storage
-    // (USD replacements, etc.) — that's fine, they already manage lifetime.
-    currentInstance.surface.instancesToObjectOwner = drawCall.getTransformData().instancesToObjectOwner;
+    // NV-DXVK [fanout split]: a split placement is a plain single-placement
+    // surface. Clearing instancesToObject is what makes AccelManager take the
+    // ordinary addBlas path instead of addPointInstancerBlas, and what makes
+    // RtSurface::writeGPUData use surface.objectToWorld directly instead of
+    // deriving a transform from (surfaceIndex - surfaceIndexOfFirstInstance).
+    // surfaceIndexOfFirstInstance is reset alongside it so an RtInstance that was
+    // a point instancer before the option was toggled cannot keep a stale base
+    // slot; writeGPUData's PI branch needs BOTH to be set.
+    if (split != nullptr) {
+      currentInstance.surface.instancesToObject = nullptr;
+      currentInstance.surface.instancesToObjectOwner = nullptr;
+      currentInstance.surface.surfaceIndexOfFirstInstance = SIZE_MAX;
+    } else {
+      currentInstance.surface.instancesToObject = drawCall.getTransformData().instancesToObject;
+      // NV-DXVK: Couple lifetime of the transform vector to this RtInstance so the
+      // raw pointer above cannot dangle once the draw-call source's own ring-buffer
+      // releases its reference. Null for sources with externally-owned storage
+      // (USD replacements, etc.) — that's fine, they already manage lifetime.
+      currentInstance.surface.instancesToObjectOwner = drawCall.getTransformData().instancesToObjectOwner;
+    }
 
     // NV-DXVK: flag sub-view (3D-skybox) geometry so WriteGPUData negates its
     // shading normal — corrects the reproject's inverted-winding normal flip that
@@ -4068,8 +4713,28 @@ namespace dxvk {
     // existing non-zero value would erase the SpatialMap entry at the propId
     // slot (via move(oldHash=propIdA, overrideHash=0) → erase+insert at
     // matrix-hash slot), guaranteeing the next frame's propId lookup misses.
-    if (drawCall.getTransformData().stablePropId != 0) {
-      currentInstance.m_stablePropId = drawCall.getTransformData().stablePropId;
+    //
+    // NV-DXVK [fanout split]: mirror the SPLIT's identity, not the batch's.
+    // Inheriting the batch id would be actively wrong — it names whichever prop
+    // was element [0] when the draw was submitted, and it rolls every frame. 0
+    // here means "no engine handle available", which leaves the instance on
+    // matrix-bytes keying, matching what findSimilarInstance looked it up with.
+    const uint64_t incomingStablePropId = split != nullptr
+      ? split->stablePropId
+      : drawCall.getTransformData().stablePropId;
+    if (split != nullptr) {
+      // Assign UNCONDITIONALLY for a split placement, including 0. The
+      // non-zero-only guard above exists because a second, non-reproject draw
+      // variant of the same mountain arrives with propId 0 and would erase a good
+      // entry — that hazard does not exist here (a placement's id comes from one
+      // source and does not vary between variants), and keeping a stale id after
+      // the engine handles stopped being available would be strictly worse: the
+      // instance would sit in the map under an id that findSimilarInstance is no
+      // longer looking up with. m_stablePropId must always equal what the lookup
+      // used, or the entry is orphaned until GC.
+      currentInstance.m_stablePropId = incomingStablePropId;
+    } else if (incomingStablePropId != 0) {
+      currentInstance.m_stablePropId = incomingStablePropId;
     }
 
     // setFrameLastUpdated() must be called first as it resets instance's state on a first call in a frame
@@ -4402,7 +5067,13 @@ namespace dxvk {
         const bool isFirstUpdateAfterCreation = currentInstance.isCreatedThisFrame(m_device->getCurrentFrameId()) && isFirstUpdateThisFrame;
 
         // Note: objectToView is aliased on updates, since findSimilarInstance() doesn't discern it
-        Matrix4 objectToWorld = drawCall.getTransformData().objectToWorld;
+        // NV-DXVK [fanout split]: a split placement carries its own composed
+        // transform (drawO2W * instancesToObject[i]); the draw call itself only
+        // holds the batch-wide identity matrix, which would place every prop of
+        // the batch at the world origin.
+        Matrix4 objectToWorld = split != nullptr
+          ? split->objectToWorld
+          : drawCall.getTransformData().objectToWorld;
 
         // Hack for TREX-2272. In Portal, in the GLaDOS chamber, the monitors show a countdown timer with background, and the digits and background are coplanar.
         // We cannot reliably determine the digits material because it's a dynamic texture rendered by vgui that contains all kinds of UI things.
@@ -4812,7 +5483,13 @@ namespace dxvk {
     //     is inverted. Because the facing is determined in object space, an instance transform does not change the winding,
     //     but a geometry transform does.
     // https://registry.khronos.org/vulkan/specs/1.3-extensions/man/html/VkGeometryInstanceFlagBitsNV.html 
-    currentInstance.m_isObjectToWorldMirrored = isMirrorTransform(drawCall.getTransformData().objectToWorld);
+    // NV-DXVK [fanout split]: same basis as determineInstanceFlags above — the
+    // instance's own transform, which equals the draw call's for every
+    // non-split draw and is the per-prop composed matrix for a split placement.
+    // This value cancels out of the rendered facing flag (see the note in
+    // determineInstanceFlags); it survives only into isFrontFaceFlipped and the
+    // USD capture, where per-prop is the correct answer.
+    currentInstance.m_isObjectToWorldMirrored = isMirrorTransform(currentInstance.surface.objectToWorld);
 
     bool billboardsGotGenerated = false;
     currentInstance.m_billboardCount = 0;

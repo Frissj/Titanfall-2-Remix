@@ -8948,6 +8948,11 @@ namespace dxvk {
             // Scene manager expands to N TLAS instances via instancesToObject.
             auto tforms = std::make_shared<std::vector<Matrix4>>();
             tforms->reserve(maxInstances);
+            // NV-DXVK [fanout prev-transform identity]: where each accepted
+            // placement stood LAST frame, absolutised with LAST frame's
+            // camOrigin, index-parallel to tforms and pushed at the same site.
+            auto prevTforms = std::make_shared<std::vector<Matrix4>>();
+            prevTforms->reserve(maxInstances);
 
             const uint8_t* instData = m_instBufCache.data();
             const uint32_t stride = instVb.stride;
@@ -8987,6 +8992,87 @@ namespace dxvk {
                 if (shMf != nullptr) mtnFanoutVsXxh = static_cast<uint64_t>(shMf->getHash());
               }
             }
+            // NV-DXVK [fanout prev-transform identity]: the camOrigin this VS used
+            // last frame. Placed here rather than beside the prevTforms allocation
+            // because it keys on mtnFanoutVsXxh, which is resolved just above.
+            //
+            // The prev block in t31 is bit-identical to last frame's current
+            // block, which was absolutised with THAT frame's origin — reproducing
+            // the same absolute matrix therefore requires the same origin, not
+            // this frame's. When it is unavailable (first sighting, a dropped
+            // frame, or a frame whose draws disagreed on the origin) no history is
+            // emitted and the consumer keys on the current transform as before.
+            float prevCamOrigin[3] = { 0.0f, 0.0f, 0.0f };
+            bool  havePrevCamOrigin = false;
+            {
+              const uint32_t curFrame = m_context->m_device->getCurrentFrameId();
+              auto& rec = m_fanoutPrevCamOrigin[mtnFanoutVsXxh];
+
+              // ROLL FIRST, then record. The frame's origin retires into the prev
+              // slot exactly once, on the frame's first draw; every later draw of
+              // the same frame leaves the prev slot alone and therefore still
+              // reads it. Recording into the slot being read is what limited this
+              // to one draw per frame.
+              if (rec.curFrameId != curFrame) {
+                rec.prevFrameId   = rec.curFrameId;
+                rec.prevOrigin[0] = rec.curOrigin[0];
+                rec.prevOrigin[1] = rec.curOrigin[1];
+                rec.prevOrigin[2] = rec.curOrigin[2];
+                // A frame whose draws disagreed on the origin cannot reproduce a
+                // single absolute matrix, so it retires as unusable rather than
+                // as one of its several origins.
+                rec.prevValid     = rec.curValid && !rec.curAmbiguous;
+
+                rec.curFrameId    = curFrame;
+                rec.curOrigin[0]  = camOrigin[0];
+                rec.curOrigin[1]  = camOrigin[1];
+                rec.curOrigin[2]  = camOrigin[2];
+                rec.curValid      = haveCamOrigin;
+                rec.curAmbiguous  = false;
+              } else if (rec.curOrigin[0] != camOrigin[0]
+                      || rec.curOrigin[1] != camOrigin[1]
+                      || rec.curOrigin[2] != camOrigin[2]) {
+                // Bitwise, not epsilon: the requirement is byte-reproducibility
+                // of the sum, so any difference at all disqualifies the frame.
+                rec.curAmbiguous = true;
+              }
+
+              if (rec.prevValid && rec.prevFrameId + 1u == curFrame) {
+                prevCamOrigin[0] = rec.prevOrigin[0];
+                prevCamOrigin[1] = rec.prevOrigin[1];
+                prevCamOrigin[2] = rec.prevOrigin[2];
+                havePrevCamOrigin = true;
+              }
+
+              // Separates the two ways this can fail, which want opposite fixes:
+              // if history is unavailable HERE, the origin could not be
+              // reproduced (ambiguous sub-view origins, or a gap in frame ids)
+              // and the fix is in this function; if history IS supplied here but
+              // [FanoutPrev] still reports prevHit~0, the origin is fine and the
+              // composed hash is not reproducing the key the SpatialMap filed —
+              // a different problem in the consumer. Per VS per frame.
+              if (rec.curFrameId == curFrame && !havePrevCamOrigin) {
+                static std::mutex sPrevOrigMu;
+                static std::unordered_map<uint64_t, uint32_t> sPrevOrigFrame;
+                static uint32_t sPrevOrigLines = 0;
+                bool logIt = false;
+                {
+                  std::lock_guard<std::mutex> g(sPrevOrigMu);
+                  auto& fr = sPrevOrigFrame[mtnFanoutVsXxh];
+                  if (fr != curFrame && sPrevOrigLines < 200u) { fr = curFrame; ++sPrevOrigLines; logIt = true; }
+                }
+                if (logIt) {
+                  Logger::info(str::format(
+                    "[FanoutPrevOrig] vs=0x", std::hex, mtnFanoutVsXxh, std::dec,
+                    " f=", curFrame, " NO-HISTORY",
+                    " prevFrameId=", rec.prevFrameId,
+                    " prevValid=", rec.prevValid ? 1 : 0,
+                    " curAmbiguous=", rec.curAmbiguous ? 1 : 0,
+                    " haveCamOrigin=", haveCamOrigin ? 1 : 0));
+                }
+              }
+            }
+
             // Log EVERY VS_1baf/VS_2094 draw (not just the first per frame)
             // so the full per-frame set of mountain draws â€” how many draws,
             // each draw's instanceCount, and every instance's transform â€” is
@@ -9288,6 +9374,134 @@ namespace dxvk {
                 Vector4(m[1], m[5], m[9],  0.0f),
                 Vector4(m[2], m[6], m[10], 0.0f),
                 Vector4(adjTx, adjTy, adjTz, 1.0f)));
+              // NV-DXVK [fanout prev-transform identity] 2026-08-05: the engine's
+              // PREVIOUS-frame matrix for this placement, at bytes 48..95 of the
+              // same 208-byte g_modelInst entry the current matrix came from.
+              //
+              // Same row-major float3x4 layout as the current block, so it is
+              // transposed identically. Absolutised with LAST frame's camOrigin
+              // (see prevCamOrigin above) because the value it must reproduce is
+              // last frame's absolute matrix, byte for byte.
+              //
+              // An all-zero block means the engine has no history for this prop —
+              // its first frame in the batch, observed directly at f13071 — and a
+              // zero matrix would otherwise hash to a real key and collide with
+              // every other historyless placement. Emit identity-as-absent by
+              // pushing the CURRENT transform instead: the consumer's prev probe
+              // then simply duplicates its current probe and cannot mismatch.
+              bool pushedPrev = false;
+              if (havePrevCamOrigin && t31Off + 96 <= t31ReadLen) {
+                float pm[12];
+                std::memcpy(pm, t31Read + t31Off + 48, 48);
+                bool prevAllZero = true;
+                for (int f = 0; f < 12; ++f) {
+                  if (pm[f] != 0.0f) { prevAllZero = false; break; }
+                }
+                bool prevFinite = true;
+                for (int f = 0; f < 12; ++f) {
+                  if (!std::isfinite(pm[f])) { prevFinite = false; break; }
+                }
+                if (!prevAllZero && prevFinite) {
+                  // Identical arithmetic to the current block above — same order,
+                  // same operands — so a static prop reproduces last frame's
+                  // absolute matrix bit-for-bit rather than merely closely.
+                  const float pTx = pm[3]  + prevCamOrigin[0];
+                  const float pTy = pm[7]  + prevCamOrigin[1];
+                  const float pTz = pm[11] + prevCamOrigin[2];
+                  prevTforms->push_back(Matrix4(
+                    Vector4(pm[0], pm[4], pm[8],  0.0f),
+                    Vector4(pm[1], pm[5], pm[9],  0.0f),
+                    Vector4(pm[2], pm[6], pm[10], 0.0f),
+                    Vector4(pTx, pTy, pTz, 1.0f)));
+                  pushedPrev = true;
+                }
+              }
+              if (!pushedPrev) {
+                prevTforms->push_back(tforms->back());
+              }
+
+              // NV-DXVK [T31Struct] 2026-08-05: RAW dump of the FULL 208-byte
+              // g_modelInst entry. Everything above reads bytes 0..47 (the
+              // float3x4) and throws the other 160 away — nobody has ever looked
+              // at them, and they are the last place in the D3D11 stream where a
+              // per-prop identity could be hiding.
+              //
+              // Why this and not another key derived from what we already have:
+              // charIdx is a 256-entry PER-DRAW window (idDistinct pins to 256
+              // against mtxDistinct=3416), and every transform-derived key moves
+              // when the prop moves. Adding the SRV FirstElement to charIdx does
+              // NOT fix it — charIdx is already unique within a draw, so any
+              // per-draw base makes the pair unique per placement by
+              // construction, scoring a perfect distinct count while proving
+              // nothing about frame-to-frame persistence.
+              //
+              // Read as float AND as uint32 hex: a handle or seed is unreadable
+              // as a float, a matrix is unreadable as hex. No filtering or
+              // classification here on purpose — the first look at unknown bytes
+              // dumps them, it does not judge them.
+              //
+              // What to look for in the output, in order of value:
+              //   1. bytes 48..95 tracking the PREVIOUS frame's bytes 0..47 for
+              //      the same prop. That is the standard motion-vector packing,
+              //      and it solves identity outright — no handle needed, the
+              //      prev matrix IS the correspondence.
+              //   2. a uint32 that is constant across frames for a prop and
+              //      differs between props: a real handle, use it as the key.
+              //   3. a float3 that is constant while the prop MOVES (a lighting
+              //      or fade origin): still a usable identity, and unlike the
+              //      transform it survives motion.
+              // If all 160 bytes are per-frame-varying or constant across every
+              // prop, the identity is not in the stream and the next step is a
+              // backtrace at the buffer's Map, not another key guess.
+              if (RtxOptions::dumpFanoutInstanceStruct()
+                  && i < 4u
+                  && t31Off + BYTES_PER_INSTANCE <= t31ReadLen) {
+                // Self-limiting: one burst of frames per VS, a few placements
+                // each. A 208-byte dump is ~40 log lines' worth of text and this
+                // log is already 60 MB.
+                static std::atomic<uint32_t> sT31StructLines { 0 };
+                constexpr uint32_t kMaxT31StructLines = 240u;
+                constexpr uint32_t kDumpsPerVsPerFrame = 4u;
+                static std::mutex sT31StructMu;
+                // vs -> (frame, dumps already emitted for that frame). A plain
+                // "frame != last" gate would emit ONE placement per frame, and
+                // one placement cannot show the 48..95 prev-matrix correlation —
+                // that pattern only appears when several placements from the same
+                // frame can be lined up against the next frame's.
+                static std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> sT31StructFrame;
+                const uint32_t cf = m_context->m_device->getCurrentFrameId();
+                bool logIt = false;
+                if (sT31StructLines.load(std::memory_order_relaxed) < kMaxT31StructLines) {
+                  std::lock_guard<std::mutex> g(sT31StructMu);
+                  auto& fr = sT31StructFrame[mtnFanoutVsXxh];
+                  if (fr.first != cf) { fr.first = cf; fr.second = 0u; }
+                  if (fr.second < kDumpsPerVsPerFrame) { ++fr.second; logIt = true; }
+                }
+                if (logIt) {
+                  const uint8_t* sp = t31Read + t31Off;
+                  float fv[52];
+                  uint32_t uv[52];
+                  std::memcpy(fv, sp, BYTES_PER_INSTANCE);
+                  std::memcpy(uv, sp, BYTES_PER_INSTANCE);
+                  // Bytes 0..47 are the matrix already consumed above; printed
+                  // anyway so a prev-matrix candidate can be compared against it
+                  // inside a single line rather than across two log records.
+                  std::string fline, uline;
+                  for (uint32_t w = 0; w < 52u; ++w) {
+                    fline += str::format(" [", w, "]=", fv[w]);
+                    uline += str::format(" [", w, "]=0x", std::hex, uv[w], std::dec);
+                  }
+                  Logger::info(str::format(
+                    "[T31Struct] vsXxh=0x", std::hex, mtnFanoutVsXxh, std::dec,
+                    " frame=", cf, " inst=", i, " charIdx=", charIdx,
+                    " t31Off=", t31Off, " t31Len=", t31ReadLen,
+                    " startInstance=", startInstance,
+                    " instVbOff=", instVb.offset,
+                    "\n  F:", fline,
+                    "\n  U:", uline));
+                  sT31StructLines.fetch_add(1, std::memory_order_relaxed);
+                }
+              }
             }
             if (kInstTiming) {
               loopUs += std::chrono::duration_cast<std::chrono::microseconds>(
@@ -9645,6 +9859,13 @@ namespace dxvk {
               // consuming this survives beyond the 4-frame ring buffer.
               m_currentInstancesToObjectOwner = tforms;
               m_boneInstanceCount = static_cast<uint32_t>(tforms->size());
+              // NV-DXVK [fanout prev-transform identity]: same lifetime treatment
+              // again. prevTforms is pushed in lockstep with tforms, so the sizes
+              // agree by construction; the consumer re-checks anyway, because a
+              // silent desync would pair a placement with another placement's
+              // history and match it to the wrong instance.
+              m_currentPrevInstancesToObject = prevTforms.get();
+              m_currentPrevInstancesToObjectOwner = prevTforms;
 
               // NV-DXVK [T31Stale]: frame-staleness probe for the path-10 t31
               // instance buffer. Hash all instance matrices; track per-VS the
@@ -9922,6 +10143,12 @@ namespace dxvk {
               m_boneInstanceCount = 0;
               m_currentInstancesToObject = nullptr;
               m_currentInstancesToObjectOwner.reset();
+              // NV-DXVK [fanout prev-transform identity]: cleared in lockstep with
+              // the transforms. A stale prev array outliving its transform array
+              // would hand the next fanout draw another draw's positions and
+              // resolve its placements onto foreign instances.
+              m_currentPrevInstancesToObject = nullptr;
+              m_currentPrevInstancesToObjectOwner.reset();
             }
             handledAsBoneInstancing = true;
           } else {
@@ -25978,6 +26205,32 @@ namespace dxvk {
       dcs.transformData.instancesToObject = m_currentInstancesToObject;
       // NV-DXVK: Pass ownership too so it flows into RtInstance via instance_manager.
       dcs.transformData.instancesToObjectOwner = m_currentInstancesToObjectOwner;
+      // NV-DXVK [fanout prev-transform identity]: last frame's position for each
+      // placement, gated on the same length agreement and for the same reason —
+      // a desynced history is not a weaker identity, it is a confidently wrong
+      // one, and it would resolve a prop onto a different prop's instance.
+      if (m_currentPrevInstancesToObject != nullptr
+          && m_currentInstancesToObject != nullptr
+          && m_currentPrevInstancesToObject->size() == m_currentInstancesToObject->size()) {
+        dcs.transformData.prevInstancesToObject = m_currentPrevInstancesToObject;
+        dcs.transformData.prevInstancesToObjectOwner = m_currentPrevInstancesToObjectOwner;
+      } else {
+        dcs.transformData.prevInstancesToObject = nullptr;
+        dcs.transformData.prevInstancesToObjectOwner.reset();
+        if (m_currentPrevInstancesToObject != nullptr && m_currentInstancesToObject != nullptr) {
+          ONCE(Logger::warn(str::format(
+            "[FanoutPrev] length mismatch: prev=", m_currentPrevInstancesToObject->size(),
+            " transforms=", m_currentInstancesToObject->size(),
+            " — no history for this population, keying on current transform only.")));
+        }
+      }
+      // NV-DXVK [fanout split]: mark this as a GAME-submitted fanout batch, i.e.
+      // a set of independent props that merely happen to share one draw call and
+      // whose membership churns every frame. This is the ONLY site that sets the
+      // flag — it authorises InstanceManager::processSceneObjectFanout to give
+      // each element of instancesToObject its own RtInstance so a prop's identity
+      // survives the batch changing under it. See DrawCallTransforms::isFanoutBatch.
+      dcs.transformData.isFanoutBatch = true;
       // t31 is already the full world-space model transform.
       // objectToWorld = identity, instancesToObject = t31[i], done.
       dcs.transformData.objectToWorld = Matrix4();

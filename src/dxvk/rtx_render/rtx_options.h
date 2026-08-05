@@ -2735,6 +2735,66 @@ namespace dxvk {
                "arena rotation (fixes the missing/pops-in 3D-skybox geometry). "
                "Default off = legacy buffer-pointer identity.");
 
+    // NV-DXVK [fanout instance split]. TF2's bone-instanced fanout draws
+    // (d3d11_rtx path 10) submit ONE draw call carrying N per-prop transforms in
+    // transformData.instancesToObject, and Remix historically made ONE RtInstance
+    // for the whole batch. Dedup then has to identify a *batch*, and the batch is
+    // not a stable entity: measured 2026-08-05 with a static camera, nInst
+    // oscillates between 53/54 and 59/60 as ~6 props enter and leave every frame,
+    // giving 89 distinct propIds and 86 distinct order-independent set-digests
+    // across 89 reaps of a single object. Every one of those misses destroys the
+    // instance, and because a freshly created instance goes through teleport()
+    // (prevObjectToWorld := objectToWorld) the WHOLE batch is declared static for
+    // that frame and its motion vectors are zeroed — the one-frame blur smear on
+    // small instanced props, at 4-10 reaps/frame with ~51% of them respawns.
+    //
+    // When true, each element of instancesToObject gets its own RtInstance with
+    // objectToWorld = drawO2W * instancesToObject[i] and instancesToObject=null,
+    // keyed on a stablePropId derived from that prop's OWN rounded translation.
+    // A membership change then costs one instance instead of invalidating ~54.
+    //
+    // GPU cost is unchanged: addPointInstancerBlas already reserved N surface
+    // slots and writeGPUData already wrote a distinct transform into each, so the
+    // same N surfaces with the same N transforms are produced either way. The
+    // cost is CPU bookkeeping — m_instances grows from ~840 to roughly the PI
+    // slot count (~3940 measured), i.e. ~5x on the GC walk, the SpatialMap and
+    // instance update. Turn this off to A/B against that baseline without a
+    // rebuild; it does not affect USD PointInstancers or replacement draws, which
+    // never carry DrawCallTransforms::isFanoutBatch.
+    RTX_OPTION("rtx", bool, splitFanoutInstances, true,
+               "TF2/Titanfall2 only. Give every prop in a game-submitted bone "
+               "fanout batch its own RtInstance instead of representing the whole "
+               "batch with one, so a prop keeps its dedup identity and temporal "
+               "history when the batch's membership changes (fixes the one-frame "
+               "motion-vector blur on small instanced props). Costs ~5x CPU-side "
+               "instances; GPU surface count is unchanged. Default on.");
+
+    // NV-DXVK [T31Struct] 2026-08-05. DIAGNOSTIC, default off.
+    //
+    // Raw dump of the FULL 208-byte g_modelInst (t31) entry behind each fanout
+    // placement. Only bytes 0..47 — the float3x4 the geometry needs — have ever
+    // been read; the remaining 160 bytes per placement have never been looked at.
+    //
+    // This exists because every identity key tried so far was derived from the
+    // TRANSFORM (rounded position, hybrid, basis) or from the SLOT INDEX
+    // (charIdx), and both families are dead: transforms move, and charIdx is a
+    // 256-entry per-draw window that wraps and merges props across draws. If the
+    // engine puts a genuine per-prop handle anywhere dxvk can already see it, the
+    // unread 160 bytes are the only place left. A per-prop lighting origin, a
+    // variation seed, or — the layout worth hoping for — a PREVIOUS-FRAME matrix
+    // at bytes 48..95 would each solve it, the last one exactly: prev-frame
+    // matrix in frame N equals cur-frame matrix in frame N-1, which IS temporal
+    // correspondence, no handle required.
+    //
+    // Dumps raw floats AND raw uint32 hex, because an integer handle is
+    // unreadable as a float and vice versa. No thresholds, no classification —
+    // the point is to see the bytes before deciding what they are.
+    RTX_OPTION("rtx", bool, dumpFanoutInstanceStruct, false,
+               "DIAGNOSTIC. Dump the full 208-byte per-instance g_modelInst entry "
+               "for the first few placements of each fanout draw, once per frame, "
+               "as both float and hex. Used to find a stable per-prop identity in "
+               "the 160 bytes beyond the instance matrix. Self-limiting.");
+
     // NV-DXVK [keepStablePropIdInstancesLong] PROTOTYPE (step 2 of the
     // shadow-sourced-geometry fix). Geometry whose only submission route is
     // TF2's spot-shadow pass (VS_2947c6 3D-skybox/mountain terrain) vanishes

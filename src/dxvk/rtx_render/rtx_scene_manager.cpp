@@ -2398,6 +2398,11 @@ namespace dxvk {
       if (replacement.includeOriginal) {
         DrawCallState newDrawCallState(*input);
         newDrawCallState.categories = replacement.categories.applyCategoryFlags(newDrawCallState.categories);
+        // NV-DXVK [fanout split]: a replacement prim must resolve to exactly one
+        // RtInstance — the loop below stores it in ReplacementInstance::prims and
+        // asserts that later frames return the same pointer. Clearing the flag
+        // keeps a replaced fanout batch on the point-instancer path.
+        newDrawCallState.transformData.isFanoutBatch = false;
         const RtxParticleSystemDesc* pParticleSystemDesc = replacement.particleSystem.has_value() ? &replacement.particleSystem.value() : nullptr;
         instance = processDrawCallState(ctx, newDrawCallState, renderMaterialData, nullptr, pParticleSystemDesc);
       } else if (replacement.type == AssetReplacement::eMesh) {
@@ -2411,6 +2416,10 @@ namespace dxvk {
         } else {
           transforms.instancesToObject = nullptr;
         }
+        // NV-DXVK [fanout split]: as above — one RtInstance per replacement prim.
+        // The transforms here are the replacement's own GeomPointInstancer set,
+        // which is a stable authored batch and belongs on the PI path anyway.
+        transforms.isFanoutBatch = false;
         
         // Mesh replacements dont support these.
         transforms.textureTransform = Matrix4();
@@ -3300,9 +3309,47 @@ namespace dxvk {
       drawCallState.getGeometryData().vertexCount,
       meshtrace::Stage::BlasReady);
 
+    // NV-DXVK [fanout split]: a game-submitted bone-fanout draw carries N
+    // independent props whose membership churns every frame, so it resolves to N
+    // RtInstances rather than one. Conditions, all required:
+    //   - the option is on (off = the pre-split single-instance behaviour, so the
+    //     ~5x CPU instance count can be A/B'd against it without a rebuild)
+    //   - the draw is a game fanout batch, not a USD PointInstancer or the
+    //     external-GPU-instancing path (see DrawCallTransforms::isFanoutBatch)
+    //   - no existingInstance: a replacement sub-prim must resolve to exactly the
+    //     RtInstance the ReplacementInstance already stored
+    //   - more than one placement — a batch of one has nothing to split
+    const DrawCallTransforms& pdcsTransforms = drawCallState.getTransformData();
+    const bool splitFanout =
+      RtxOptions::splitFanoutInstances()
+      && pdcsTransforms.isFanoutBatch
+      && existingInstance == nullptr
+      && pdcsTransforms.instancesToObject != nullptr
+      && pdcsTransforms.instancesToObject->size() > 1;
+
+    // Reused across draws so the split costs no per-draw allocation. thread_local
+    // rather than a member because processDrawCallState is reached from the
+    // draw-submission path and the instance manager's own probes already assume
+    // per-thread state.
+    static thread_local std::vector<RtInstance*> sFanoutInstances;
+
     // Note: The material data can be modified in instance manager
     const auto tPdcsInst0 = std::chrono::steady_clock::now();
-    RtInstance* instance = m_instanceManager.processSceneObject(m_cameraManager, m_rayPortalManager, *pBlas, drawCallState, renderMaterialData, existingInstance, &m_drawCallCache);
+    RtInstance* instance = nullptr;
+    if (splitFanout) {
+      m_instanceManager.processSceneObjectFanout(m_cameraManager, m_rayPortalManager, *pBlas, drawCallState, renderMaterialData, &m_drawCallCache, sFanoutInstances);
+      // The first prop stands in for the draw where a single instance is all the
+      // interface allows (the ReplacementInstance identity check, which a fanout
+      // draw never reaches). Everything that can legitimately act on all of them
+      // iterates the full list below instead.
+      instance = sFanoutInstances.empty() ? nullptr : sFanoutInstances[0];
+    } else {
+      sFanoutInstances.clear();
+      instance = m_instanceManager.processSceneObject(m_cameraManager, m_rayPortalManager, *pBlas, drawCallState, renderMaterialData, existingInstance, &m_drawCallCache);
+      if (instance != nullptr) {
+        sFanoutInstances.push_back(instance);
+      }
+    }
     s_pdcsInstNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - tPdcsInst0).count();
 
@@ -3314,6 +3361,10 @@ namespace dxvk {
       instance != nullptr ? meshtrace::Stage::InstanceMade : meshtrace::Stage::InstanceNull);
 
     // Check if a light should be created for this Material
+    // NV-DXVK [fanout split]: once per DRAW, not once per instance. createEffectLight
+    // derives the light position from the draw call's own geometry centroid and
+    // objectToView and does not read the instance transform at all, so calling it
+    // per split prop would stack N coincident lights rather than distribute them.
     if (instance && RtxOptions::shouldConvertToLight(drawCallState.getMaterialData().getHash())) {
       createEffectLight(ctx, drawCallState, instance);
     }
@@ -3337,10 +3388,17 @@ namespace dxvk {
 
       {
         std::lock_guard lock { m_drawCallMeta.mutex };
-        auto [iter, isNew] = m_drawCallMeta.infos[m_drawCallMeta.ticker].emplace(instance->surface.objectPickingValue, meta);
-        ONCE_IF_FALSE(isNew, Logger::warn(
-          "Found multiple draw calls with the same \'objectPickingValue\'. "
-          "Ignoring further MetaInfo-s, some objects might be not be available through object picking"));
+        // NV-DXVK [fanout split]: every instance, not just the representative.
+        // objectPickingValue is per-RtInstance, so registering only the first
+        // would leave the other ~53 props of a split batch unpickable — the exact
+        // silent breakage that made the per-prop-instance API worth having.
+        // Non-split draws contribute a single entry here, as before.
+        for (RtInstance* pickInstance : sFanoutInstances) {
+          auto [iter, isNew] = m_drawCallMeta.infos[m_drawCallMeta.ticker].emplace(pickInstance->surface.objectPickingValue, meta);
+          ONCE_IF_FALSE(isNew, Logger::warn(
+            "Found multiple draw calls with the same \'objectPickingValue\'. "
+            "Ignoring further MetaInfo-s, some objects might be not be available through object picking"));
+        }
       }
     }
 
@@ -3357,10 +3415,18 @@ namespace dxvk {
     }
     if (instance && pParticleSystemDesc) {
       RtxParticleSystemManager& particleSystem = device()->getCommon()->metaParticleSystem();
+      // NV-DXVK [fanout split]: spawn once per DRAW. The particle count comes from
+      // the draw call (getNumberOfParticlesToSpawn(drawCallState)) and the batch
+      // emits as one emitter, so calling this per split prop would multiply the
+      // emission rate by the batch size.
       particleSystem.spawnParticles(ctx.ptr(), *pParticleSystemDesc, instance->getVectorIdx(), drawCallState, renderMaterialData);
 
       if (pParticleSystemDesc->hideEmitter) {
-        instance->setHidden(true);
+        // ...but hiding IS per instance: leaving the other props visible would
+        // show the emitter geometry the desc asked to hide.
+        for (RtInstance* emitterInstance : sFanoutInstances) {
+          emitterInstance->setHidden(true);
+        }
       }
     }
 
