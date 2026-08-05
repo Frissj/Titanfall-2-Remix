@@ -3075,6 +3075,66 @@ namespace dxvk {
                "neighbour stage, and which filter clause rejected candidates. "
                "Use to diagnose per-frame instance churn (flicker). Empty = off.");
 
+    // NV-DXVK [suppressStablePropIdVsHashes]: force stablePropId back to 0 for
+    // the listed vertex shaders, so SpatialMap dedup keys on the TRANSFORM BYTES
+    // instead of the engine-derived prop identity.
+    //
+    // WHY THIS IS NOT A HACK: 0 is already the documented contract of both
+    // producers — MakeBoneStablePropId returns 0 when no identity is available
+    // and the caller is specified to fall back to matrix-bytes hashing. This
+    // switch only lets us reach that state deliberately, per shader, without a
+    // rebuild.
+    //
+    // WHAT IT TESTS. Measured 2026-08-05 on VS 0x292b6ba0d1854f28: for a
+    // stationary object (BlasEntry pointer and SpatialMap centroid identical
+    // every frame) the propId round-robins with period EXACTLY 3 —
+    // 0x9badf6.. -> 0x19f7da.. -> 0x38d6cf.. -> repeat — because
+    // MakeBoneStablePropId hashes vbPtr/ibPtr/vbOffset/ibOffset and TF2 rotates a
+    // three-deep transient buffer arena. The map therefore always holds the
+    // PREVIOUS frame's key and getDataAtTransform misses 100% of the time. Every
+    // lookup is pushed into the nearest-neighbour fallback, which is the only
+    // stage that tests the material hash — so any material-hash wobble (texture
+    // streaming, mip promotion) turns into a respawned instance and a reap.
+    //
+    // The transform for these draws IS byte-stable, so with propId suppressed the
+    // exact stage should hit and the material hash should never be consulted.
+    // Confirm with [FindSim] stage=exact hit=1 and a drop in [ReapJoin] respawn=.
+    //
+    // If it works, the FIX belongs at the propId producer (stabilise the identity
+    // against the rotating arena), not here — this option stays diagnostic.
+    // Empty = off; cost when empty is one hash-set lookup per bone-anim draw.
+    // NV-DXVK [MvRaw aiming]: restrict rtx.logMotionVectorRaw to these vertex
+    // shaders. EMPTY = every shader, i.e. exactly the pre-existing scene-wide
+    // behaviour — this option can only ever narrow, never change what a row says.
+    //
+    // WHY IT WAS NEEDED. [MvRaw] is deliberately raw and uncapped: one row per
+    // instance per update per frame, no thresholds, no sampling, because the
+    // artifact lasts a single frame and any cap can drop the one row that
+    // matters. That is the right design and it is kept. But scene-wide it is
+    // ~840 rows/frame through the shared Logger mutex, which is not runnable
+    // long enough to catch a random flash. The probe's own comment already
+    // prescribes the fix — "narrow by id or vs AFTER a flash frame is
+    // identified" — and the churn census of 2026-08-05 identified the
+    // population: 568 objects churn, but the top 10 cause 23% of it and the top
+    // 50 cause 55%, almost all on the point-instancer fanout shaders.
+    //
+    // Narrowing by VS is lossless in the way a cap is not: every row for the
+    // selected shaders is still logged, so a one-frame flash on those objects
+    // cannot be sampled away. It only blinds you to shaders you did not select,
+    // which is a decision you make once and can see in the conf.
+    RTX_OPTION("rtx", fast_unordered_set, motionVectorRawVsHashes, {},
+               "DIAGNOSTIC: restricts rtx.logMotionVectorRaw to these vertex "
+               "shader hashes. Empty = all shaders (scene-wide, very high log "
+               "volume). Does not change what is logged per row, only which "
+               "draws are eligible.");
+
+    RTX_OPTION("rtx", fast_unordered_set, suppressStablePropIdVsHashes, {},
+               "DIAGNOSTIC: vertex-shader hashes for which stablePropId is "
+               "forced to 0, making instance dedup key on the object-to-world "
+               "matrix bytes instead of engine prop identity. Use when a prop's "
+               "propId is unstable across frames and the exact-match dedup stage "
+               "misses every frame. Empty = off.");
+
     // NV-DXVK [InstUpProbe]: the flicker's prime remaining suspect (handoff V7
     // §5.2) is the per-frame upload of m_mergedInstances into the device-local
     // m_vkInstanceBuffer — a partial or late-landing staging copy would leave a

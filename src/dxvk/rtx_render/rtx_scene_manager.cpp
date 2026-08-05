@@ -3158,6 +3158,11 @@ namespace dxvk {
 
     // Update the input state, so we always have a reference to the original draw call state
     pBlas->frameLastTouched = m_device->getCurrentFrameId();
+    // NV-DXVK [ReapJoin]: same site, but a COUNT rather than a flag — see the
+    // BlasEntry::noteDraw comment for why the flag cannot judge one instance of
+    // a multi-copy mesh. This is the only place a draw is bound to an entry, so
+    // it is the only place the count can be correct.
+    pBlas->noteDraw(m_device->getCurrentFrameId());
 
     // NV-DXVK [ShipBake]: transforms feeding the hull (0x292b) geometry bake.
     // RESULT (don't redo): objectToWorld is IDENTITY in both visible AND vanish
@@ -3806,7 +3811,24 @@ namespace dxvk {
                             : "const",
                 " emiConst=(", opaqueMaterialData.getEmissiveColorConstant().x,
                 ",", opaqueMaterialData.getEmissiveColorConstant().y,
-                ",", opaqueMaterialData.getEmissiveColorConstant().z, ")"));
+                ",", opaqueMaterialData.getEmissiveColorConstant().z, ")",
+                // NV-DXVK: EVERY field the material hash is built from, named.
+                //
+                // The describe() fields above cover five texture slots. That was
+                // not enough: on 2026-08-05 a stationary object took four
+                // material hashes on four consecutive frames while alb/nrm/rgh/
+                // met were byte-identical between two of them — so the moving
+                // input was in a slot this line never printed (tex1, AO,
+                // lightmap, lightmap2, detail, cloudMask, subsurface, or one of
+                // the constants). Five of seventeen textures is a probe that can
+                // acquit the wrong field.
+                //
+                // Emitted once per (VS, material) pair like the rest of the line.
+                // When the material hash is itself unstable that is once per
+                // frame per object, which is exactly the rate needed to diff
+                // consecutive frames — and is why this must never move to a
+                // per-draw site.
+                " | ", opaqueMaterialData.debugHashInputs()));
             }
           }
         }

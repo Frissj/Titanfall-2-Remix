@@ -1117,17 +1117,38 @@ namespace dxvk {
     // frame by the time we reap. If GC ran first this would read one frame
     // stale on every line and report a false negative every time.
     //
-    // READ IT:
-    //   drew=1  the draw for this exact mesh ARRIVED this frame and we
-    //           destroyed the instance anyway => the draw was not matched to
-    //           the existing instance. A MATCHING bug, in findSimilarInstance
-    //           / the spatial map, and it is ours.
-    //   drew=0  no draw for this geometry this frame => a genuine per-mesh
-    //           submission gap, upstream of Remix.
-    // Mixed => split by vs= and treat the two populations separately; do not
-    // average them.
-    uint32_t probeReapDrew   = 0;   // reaped WITH a draw this frame (matching bug)
-    uint32_t probeReapNoDraw = 0;   // reaped with no draw this frame (submission gap)
+    // THE ABOVE WAS WRONG, AND THE MEASUREMENT THAT KILLED IT (2026-08-05):
+    // frameLastTouched is per-GEOMETRY, and every instance of a duplicated prop
+    // shares one BlasEntry. So a single sibling's draw stamps the entry and
+    // EVERY sibling reaped that frame reports drew=1, whether or not its own
+    // draw arrived. Cross-tab over 693 frames / 5661 reaps: 4996 reaps with
+    // drew=1 and NOT ONE of them had linked==1; 1168 of 1212 drew=0 reaps had
+    // linked==1. drew= was a perfect proxy for "this mesh has siblings" and told
+    // us nothing about the reaped instance. That is the same per-shader-vs-per-
+    // mesh confound this block claimed to have fixed relative to [BulkPush] —
+    // it moved from per-VS to per-geometry instead of being removed.
+    //
+    // THE FIX IS A COUNT, NOT A FLAG. BlasEntry::drawCount says how many draws
+    // resolved to this geometry this frame; walking getLinkedInstances() splits
+    // the siblings that were claimed this frame into ones CREATED this frame
+    // (m_frameCreated == currentFrame) and ones that already existed. That makes
+    // the verdict per-instance and unambiguous:
+    //
+    //   respawn  a sibling was CREATED this frame on this same geometry while
+    //            this older instance went unclaimed. The draw existed and dedup
+    //            spent it on a new id => MATCHING failure, in findSimilarInstance
+    //            / the spatial map, and it is ours.
+    //   starved  no sibling was created; the geometry simply received fewer
+    //            draws than it had instances => the copy count genuinely fell,
+    //            a submission gap upstream of Remix.
+    //
+    // draws= is printed raw next to freshSib=/reusedSib= so the identity
+    // draws == freshSib + reusedSib can be checked rather than assumed; a
+    // shortfall means a draw resolved here and its instance was then migrated
+    // to another entry (the engine-class relink below), which is a third state
+    // and must not be silently folded into either verdict.
+    uint32_t probeReapRespawn = 0;  // reaped while a fresh sibling took its place (ours)
+    uint32_t probeReapStarved = 0;  // reaped with no replacement (submission gap)
     if constexpr (kEnableGcCensus) {
       Logger::info(str::format(
         "[GcEntry] f=", probeFrame,
@@ -2247,18 +2268,40 @@ namespace dxvk {
         if (clauseLifetime) probeRemovedLifetime += 1;
         if (forceGarbageCollection && !enableGarbageCollection && clauseLifetime) probeRemovedForce += 1;
 
-        // NV-DXVK [ReapJoin]: tally the draw-arrival split for EVERY reap.
-        // Deliberately OUTSIDE the [InstReap] detail block below, which is
-        // gated on the engine-hook capture counter — the totals must describe
-        // every reap in the pass, not only the ones that got a detail line.
-        // A summary that silently counts a subset is how the 24-line cap
-        // misreported this same churn on 2026-07-29.
+        // NV-DXVK [ReapJoin]: classify EVERY reap. Deliberately OUTSIDE the
+        // [InstReap] detail block below, which is gated on the engine-hook
+        // capture counter — the totals must describe every reap in the pass, not
+        // only the ones that got a detail line. A summary that silently counts a
+        // subset is how the 24-line cap misreported this same churn on
+        // 2026-07-29.
+        //
+        // The sibling walk is O(linked), and linked is 1-3 for the churning
+        // meshes and ~20 at its worst in the 2026-08-05 capture — bounded by how
+        // many copies of ONE mesh exist, not by scene size.
+        uint32_t reapDraws     = 0;   // draws that resolved to this geometry this frame
+        uint32_t reapFreshSib  = 0;   // siblings created this frame
+        uint32_t reapReusedSib = 0;   // siblings that pre-existed and were claimed this frame
         {
           const BlasEntry* pBlasJoin = pInstance->getBlas();
-          if (pBlasJoin != nullptr && pBlasJoin->frameLastTouched == currentFrame) {
-            probeReapDrew += 1;
+          if (pBlasJoin != nullptr) {
+            reapDraws = pBlasJoin->getDrawCount(currentFrame);
+            for (const RtInstance* sibling : pBlasJoin->getLinkedInstances()) {
+              // Skip ourselves: by construction we were not updated this frame,
+              // which is why we are being reaped.
+              if (sibling == pInstance || sibling->m_frameLastUpdated != currentFrame) {
+                continue;
+              }
+              if (sibling->m_frameCreated == currentFrame) {
+                reapFreshSib += 1;
+              } else {
+                reapReusedSib += 1;
+              }
+            }
+          }
+          if (reapFreshSib > 0) {
+            probeReapRespawn += 1;
           } else {
-            probeReapNoDraw += 1;
+            probeReapStarved += 1;
           }
         }
 
@@ -2337,20 +2380,50 @@ namespace dxvk {
             // vanished from the TLAS.
             const uint32_t vertsRp = (pBlasRp != nullptr)
               ? pBlasRp->modifiedGeometryData.vertexCount : 0u;
+            // NV-DXVK [InstReap naming]: the engine .mdl path for this geometry.
+            //
+            // Every identifier on this line is a hash, so a churn census can say
+            // "mat=0x21edeedd7e974f08 v=32 was reaped 96 times" without anyone
+            // being able to say WHAT that is. studioModelName is the engine's own
+            // name for it and costs nothing here — the BlasEntry is already in
+            // hand and the string is value-copied into DrawCallState at capture.
+            //
+            // TWO LIMITS, both real:
+            //  - Empty unless rtx.tf2DumpStudioNames (or a widow flag / the pick
+            //    tool) is on, and only ever populated for STUDIORENDER draws.
+            //    "(unnamed)" therefore means "not a studio draw, or the gate is
+            //    off" — it is NOT evidence the object has no identity.
+            //  - BlasEntry::input is overwritten by every pairing, so this names
+            //    the draw that most recently claimed the entry. For a stable
+            //    entry that is the object; for a re-bucketing one it can lag.
+            // It names the MESH, never the individual instance — a fanout batch
+            // is one draw over many props, so all of them report one name.
+            const char* nameRp = (pBlasRp != nullptr && pBlasRp->input.studioModelName[0] != '\0')
+              ? pBlasRp->input.studioModelName : "(unnamed)";
             Logger::info(str::format(
               "[InstReap] f=", currentFrame,
+              " name=", nameRp,
               " vs=0x", std::hex, static_cast<uint64_t>(vsRp),
               " mat=0x", matRp, std::dec,
               " v=", vertsRp, std::hex,
               " propId=0x", static_cast<uint64_t>(pInstance->m_stablePropId), std::dec,
               " blasPtr=0x", std::hex, reinterpret_cast<uintptr_t>(pBlasRp), std::dec,
               " mapSz=", mapSzRp,
-              // NV-DXVK [ReapJoin] per-line fields. drew= is the whole answer:
-              // 1 = a draw for THIS mesh arrived this frame and we reaped the
-              // instance anyway (matching bug), 0 = no draw arrived
-              // (submission gap). See the [ReapJoin] block at the top of
-              // garbageCollection for why frameLastTouched is the right field
-              // and why the call ordering makes it trustworthy.
+              // NV-DXVK [ReapJoin] per-line fields. verdict= is the answer:
+              // respawn = a sibling instance was CREATED this frame on this same
+              // geometry while this one went unclaimed (matching failure, ours),
+              // starved = nothing replaced it (submission gap upstream).
+              // draws/freshSib/reusedSib are the raw terms behind it — read them,
+              // not the verdict alone, when draws != freshSib + reusedSib.
+              //
+              // drew= is RETAINED ONLY as the literal restatement of
+              // (blasTouch == f). It is per-GEOMETRY and is worthless on its own
+              // for a mesh with siblings — see the block at the top of
+              // garbageCollection. Never aggregate it.
+              " verdict=", (reapFreshSib > 0 ? "respawn" : "starved"),
+              " draws=", reapDraws,
+              " freshSib=", reapFreshSib,
+              " reusedSib=", reapReusedSib,
               " drew=", (pBlasRp != nullptr && pBlasRp->frameLastTouched == currentFrame) ? 1 : 0,
               " blasTouch=", (pBlasRp != nullptr ? pBlasRp->frameLastTouched : 0u),
               // blasUpd advances only on a REAL geometry change (kUpdateBVH /
@@ -2436,10 +2509,15 @@ namespace dxvk {
 
     // NV-DXVK [ReapJoin] — one line per frame, the decisive readout.
     //
-    //   drew=N     reaps where the mesh's own draw ARRIVED this frame and we
-    //              destroyed the instance regardless => MATCHING BUG (ours).
-    //   noDraw=N   reaps with no draw for that geometry => submission gap
-    //              (upstream of Remix).
+    //   respawn=N  reaps where a sibling instance was CREATED this frame on the
+    //              same geometry => the draw arrived and dedup spent it on a new
+    //              id instead of this one. MATCHING BUG (ours).
+    //   starved=N  reaps with no replacement created => the geometry received
+    //              fewer draws than it had instances, a submission gap upstream
+    //              of Remix.
+    //
+    // Mixed => split by vs= in [InstReap] and treat the two populations
+    // separately; do not average them.
     //
     // Emitted on every GC pass including empty ones: a frame with removed=0
     // is data (it says the churn stopped), and a probe that only prints when
@@ -2452,10 +2530,10 @@ namespace dxvk {
       Logger::info(str::format(
         "[ReapJoin] f=", probeFrame,
         " removed=", probeRemovedThisPass,
-        " drew=", probeReapDrew,
-        " noDraw=", probeReapNoDraw,
-        " pctDrew=", (probeRemovedThisPass > 0
-          ? (100u * probeReapDrew) / probeRemovedThisPass : 0u),
+        " respawn=", probeReapRespawn,
+        " starved=", probeReapStarved,
+        " pctRespawn=", (probeRemovedThisPass > 0
+          ? (100u * probeReapRespawn) / probeRemovedThisPass : 0u),
         " kept=", probeKeptThisPass,
         " live=", static_cast<uint32_t>(m_instances.size())));
     }
@@ -4401,8 +4479,16 @@ namespace dxvk {
         // average a single bad instance away to nothing. Volume is the price of
         // catching it; narrow by id or vs AFTER a flash frame is identified.
         // Off by default - costs one bool load per draw when disabled.
+        // NV-DXVK [MvRaw aiming]: rtx.motionVectorRawVsHashes narrows this to a
+        // chosen set of shaders. Empty (the default) keeps the original
+        // scene-wide behaviour exactly. Checked LAST so the common disabled case
+        // still costs only the bool load, and the set lookup is skipped entirely
+        // whenever the set is empty.
         if (RtxOptions::logMotionVectorRaw()
-            && tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+            && tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u
+            && (RtxOptions::motionVectorRawVsHashes().empty()
+                || lookupHash(RtxOptions::motionVectorRawVsHashes(),
+                              drawCall.getTransformData().vertexShaderHash))) {
           const uint32_t curFrameMv = m_device->getCurrentFrameId();
           const uint64_t idMv       = currentInstance.getId();
           const Vector4  cTv        = currentInstance.surface.objectToWorld[3];

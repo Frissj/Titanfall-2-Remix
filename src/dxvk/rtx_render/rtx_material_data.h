@@ -22,6 +22,10 @@
 #pragma once
 
 #include "../../lssusd/mdl_helpers.h"
+// NV-DXVK: str::format, used by the generated debugHashInputs() below. Included
+// explicitly rather than relying on rtx_texture.h/rtx_option.h pulling it in,
+// so this header stays self-contained.
+#include "../../util/util_string.h"
 
 #include "../../lssusd/usd_include_begin.h"
 #include <pxr/base/vt/value.h>
@@ -268,6 +272,29 @@
 #define WRITE_CONSTANT_HASH(name, usd_attr, type, minVal, maxVal, defaultVal) \
       h = XXH64(&m_##name, sizeof(m_##name), h);
 
+// NV-DXVK [MatMaps]: debug counterparts of the two hash writers above. They must
+// stay next to them — a printer that drifts out of sync with the hash it claims
+// to explain is worse than none, because it acquits the field that actually moved.
+//
+// Textures print getImageHash() with NO empty-guard, exactly as
+// WRITE_TEXTURE_HASH consumes it, so the printed value is the value that fed the
+// hash. (LegacyMaterialData::debugHashInputs uses a safeHash that maps empty->0
+// while its own hash calls getImageHash() unguarded on slot 0 — do not copy that
+// here.) getImageHash() is null-safe: no image view yields 0.
+//
+// Constants print a per-field XXH64 digest rather than the value. The constants
+// are float / Vector3 / bool / uint8_t and a generic printer would need an
+// operator<< for each; a digest needs none, and for the job at hand — diffing two
+// frames of a stationary object to find which field moved — a digest is exactly
+// as good as the value.
+#define WRITE_TEXTURE_HASH_DEBUG(name, usd_attr, type, minVal, maxVal, defaultVal) \
+      s += str::format(" ", #name, "=0x", std::hex,                                \
+                       static_cast<uint64_t>(m_##name.getImageHash()), std::dec);
+
+#define WRITE_CONSTANT_HASH_DEBUG(name, usd_attr, type, minVal, maxVal, defaultVal) \
+      s += str::format(" ", #name, "=0x", std::hex,                                 \
+                       static_cast<uint64_t>(XXH64(&m_##name, sizeof(m_##name), 0)), std::dec);
+
 #define WRITE_PARAMETER_MEMBERS(name, usd_attr, type, minVal, maxVal, defaultVal) \
       type m_##name = defaultVal;
 
@@ -354,6 +381,26 @@ private:                                                                        
     X_CONSTANTS(WRITE_CONSTANT_HASH)                                                                 \
     m_cachedHash = h;                                                                                \
   }                                                                                                  \
+                                                                                                     \
+public:                                                                                              \
+  /* NV-DXVK [MatMaps]: every input updateCachedHash() consumes, in the same    */                   \
+  /* order, each tagged with its field name. This exists because the composite  */                   \
+  /* hash only ever says "something changed": a stationary TF2 object was       */                   \
+  /* measured taking four distinct material hashes on four consecutive frames   */                   \
+  /* (2026-08-05), which made findSimilarInstance's okMat clause reject the     */                   \
+  /* one correct dedup candidate and respawn the instance every frame. Naming   */                   \
+  /* the moving field is the whole job; a composite hash cannot do it.          */                   \
+  /*                                                                            */                   \
+  /* Cost is a string build per call, so call it from a first-sighting or       */                   \
+  /* otherwise throttled site - never per draw.                                 */                   \
+  std::string debugHashInputs() const {                                                              \
+    std::string s;                                                                                   \
+    X_TEXTURES(WRITE_TEXTURE_HASH_DEBUG)                                                             \
+    X_CONSTANTS(WRITE_CONSTANT_HASH_DEBUG)                                                           \
+    return s;                                                                                        \
+  }                                                                                                  \
+                                                                                                     \
+private:                                                                                             \
                                                                                                      \
   X_PARAMS(WRITE_PARAMETER_MEMBERS)                                                                  \
                                                                                                      \

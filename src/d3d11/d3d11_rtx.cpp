@@ -6887,6 +6887,21 @@ namespace dxvk {
     return p;
   }
 
+  bool D3D11Rtx::IsStablePropIdSuppressed() const {
+    // Empty set is the default and the common case — check it first so the
+    // per-draw cost is one empty() call, not a shader deref plus a hash lookup.
+    if (RtxOptions::suppressStablePropIdVsHashes().empty()) {
+      return false;
+    }
+    const auto vs = m_context->m_state.vs.shader;
+    if (vs == nullptr || vs->GetCommonShader() == nullptr) {
+      return false;
+    }
+    const auto& sh = vs->GetCommonShader()->GetShader();
+    return sh != nullptr
+        && lookupHash(RtxOptions::suppressStablePropIdVsHashes(), sh->getHash());
+  }
+
   uint64_t D3D11Rtx::MakeBoneStablePropId(const Matrix4* firstInstanceObjectToWorld) const {
     // NV-DXVK [BoneStablePropId]: per-DCS prop identity for bone-animated
     // draws. The four sites that set objectToWorld for bone-animated
@@ -6915,6 +6930,16 @@ namespace dxvk {
     // given ship / character keeps the same vbPtr / ibPtr / t30Ptr
     // across hundreds of frames, regardless of camera or animation
     // state. That is the structural identity we need.
+    // NV-DXVK [suppressStablePropIdVsHashes]: bail before any work when this
+    // shader is on the suppress list. Returning 0 is this function's OWN
+    // documented "no identity available" contract (see the block below), so the
+    // caller already does the right thing — leave stablePropId at 0 and let
+    // SpatialMap dedup key on the transform bytes. Gated first so the SRV probe
+    // and buffer reads below are skipped entirely.
+    if (IsStablePropIdSuppressed()) {
+      return 0;
+    }
+
     const auto& ia = m_context->m_state.ia;
     uint64_t vbPtr    = 0;
     uint32_t vbOffset = 0;
@@ -25980,9 +26005,43 @@ namespace dxvk {
             first = sLogged.insert(propId).second;
           }
           if (first) {
+            // NV-DXVK [fanout batch identity] 2026-08-05. MEASURED: one object
+            // (mat=0x21edeedd7e974f08 v=32) was reaped 96 times carrying 65
+            // distinct propIds, and those 65 ids resolve to 65 DIFFERENT
+            // firstInstT positions kilometres apart. So this propId does not
+            // identify the object — it identifies whichever prop is element [0]
+            // of this frame's fanout batch, and that rotates every frame.
+            //
+            // nInst + setDigest decide what to do about it, and they are the
+            // only two numbers that can:
+            //   setDigest STABLE while firstInstT rolls  -> the batch holds the
+            //     same props and only the ORDER rotates. Fix is to key the
+            //     identity on the digest (order-independent) instead of [0].
+            //   setDigest ALSO rolls                     -> batch MEMBERSHIP
+            //     genuinely changes; no ordering fix helps and the identity has
+            //     to come from something that is not the batch.
+            //
+            // The digest is a SUM of per-instance position hashes, so it is
+            // commutative by construction — reordering cannot change it. Built
+            // from the same rounded translation the propId already uses, so the
+            // two are directly comparable. Rounding to 1u matches
+            // MakeBoneStablePropId and absorbs sub-unit engine jitter.
+            uint64_t setDigest = 0;
+            const uint32_t nInst =
+              static_cast<uint32_t>(m_currentInstancesToObject->size());
+            for (uint32_t i = 0; i < nInst; ++i) {
+              const Matrix4& mi = (*m_currentInstancesToObject)[i];
+              const int32_t ri[3] = {
+                static_cast<int32_t>(std::round(float(mi[3][0]))),
+                static_cast<int32_t>(std::round(float(mi[3][1]))),
+                static_cast<int32_t>(std::round(float(mi[3][2]))) };
+              setDigest += static_cast<uint64_t>(XXH64(ri, sizeof(ri), 0xA11CEBABEull));
+            }
             Logger::info(str::format(
               "[BonePropId path10-fanout] vs=", m_currentVsHashCache.substr(0, 19),
               " propId=0x", std::hex, propId, std::dec,
+              " nInst=", nInst,
+              " setDigest=0x", std::hex, setDigest, std::dec,
               " firstInstT=(", float(firstInst[3][0]), ",",
                                float(firstInst[3][1]), ",",
                                float(firstInst[3][2]), ")",
@@ -31946,7 +32005,11 @@ namespace dxvk {
     //     project convention)
     //   - VB or IB bound (defensive â€” buffer-pointer identity needs at
     //     least one input buffer)
-    if (dcs.transformData.stablePropId == 0ull) {
+    // NV-DXVK [suppressStablePropIdVsHashes]: the sky/cubemap propId producer,
+    // gated on the same option as MakeBoneStablePropId. It hashes the same
+    // rotating IA buffer pointers, so it shares the same failure and must share
+    // the same switch — see IsStablePropIdSuppressed().
+    if (dcs.transformData.stablePropId == 0ull && !IsStablePropIdSuppressed()) {
       // (a) depth-write off
       bool tspDepthWriteOff = false;
       D3D11DepthStencilState* tspDs = m_context->m_state.om.dsState;
@@ -33813,7 +33876,16 @@ namespace dxvk {
           // convention). If XXH64 ever returns 0, bump to 1 â€” collision
           // probability with another non-zero hash is negligible.
           if (propId == 0) propId = 1;
-          dcs.transformData.stablePropId = propId;
+          // NV-DXVK [suppressStablePropIdVsHashes]: the third producer, and the
+          // one whose comment block above already ADMITS this failure ("vbPtr
+          // rotates per-frame -> same mountain gets a new propId each frame ->
+          // stale-surface churn. Accepted as the less-bad option"). Measured on
+          // 0x292b6ba0d1854f28 (2026-08-05) the rotation period is exactly 3.
+          // Suppressing restores matrix-bytes keying so that claim is testable
+          // rather than accepted. See IsStablePropIdSuppressed().
+          if (!IsStablePropIdSuppressed()) {
+            dcs.transformData.stablePropId = propId;
+          }
 
           // NV-DXVK [PropIdHashInputs.Mtn2904]: expanded per-draw probe for
           // VS_2904d2. Adds matHash + vertex/index counts + topological

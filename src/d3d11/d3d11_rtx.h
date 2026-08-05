@@ -275,6 +275,19 @@ namespace dxvk {
     // bytes).
     uint64_t MakeBoneStablePropId(const Matrix4* firstInstanceObjectToWorld) const;
 
+    // NV-DXVK [suppressStablePropIdVsHashes]: true when the currently bound
+    // vertex shader is on rtx.suppressStablePropIdVsHashes, i.e. every propId
+    // producer must leave dcs.transformData.stablePropId at 0 so SpatialMap
+    // dedup keys on the object-to-world matrix bytes instead.
+    //
+    // Shared by ALL THREE producers (MakeBoneStablePropId, the sky/cubemap
+    // buffer-id site, and the sub-view buffer-id site) on purpose. They key on
+    // the same rotating IA buffer pointers and so share the same failure; a
+    // switch that silenced only some of them would read in the log as
+    // "suppression made no difference", which is the one wrong conclusion this
+    // diagnostic must not produce.
+    bool IsStablePropIdSuppressed() const;
+
     static constexpr uint32_t kMaxConcurrentDraws = 6 * 1024;
     // NV-DXVK [BatchSubmitDraw perf]: LowLatency=FALSE so idle workers SLEEP on a
     // condition variable instead of spinning. The default (LowLatency=true) makes

@@ -1444,6 +1444,40 @@ struct BlasEntry {
   // Frame when the vertex data of this geometry was last updated, used to detect static geometries
   uint32_t frameLastUpdated = kInvalidFrameIndex;
 
+  // NV-DXVK [ReapJoin]: HOW MANY draws resolved to this entry this frame.
+  //
+  // frameLastTouched answers "did ANY draw for this geometry arrive", which is
+  // useless for judging a single instance once a mesh has more than one copy on
+  // screen: one sibling's draw stamps the entry and every sibling then looks
+  // like it drew. Measured 2026-08-05 (693 frames, 5661 reaps): of 4996 reaps
+  // reporting drew=1, ZERO had linked==1 — drew=1 was exactly equivalent to
+  // "this mesh has siblings", so the field carried no information about the
+  // reaped instance at all. A count is what distinguishes "this geometry lost a
+  // copy" from "the draw arrived and dedup put it somewhere else".
+  //
+  // Reset lazily on the first draw of a new frame rather than in an onFrameEnd
+  // sweep — entries are created and destroyed constantly and a sweep would have
+  // to walk the whole cache to keep a counter honest.
+  uint32_t drawCountFrame = kInvalidFrameIndex;
+  uint32_t drawCount = 0;
+
+  // Called once per arriving draw, from the single site that stamps
+  // frameLastTouched (SceneManager::processDrawCallState). Plain (non-atomic)
+  // like every other field here: the draw-call cache is single-threaded.
+  void noteDraw(const uint32_t frameId) {
+    if (drawCountFrame != frameId) {
+      drawCountFrame = frameId;
+      drawCount = 0;
+    }
+    ++drawCount;
+  }
+
+  // 0 when this entry saw no draw in frameId, so callers never read a count
+  // left over from an earlier frame.
+  uint32_t getDrawCount(const uint32_t frameId) const {
+    return (drawCountFrame == frameId) ? drawCount : 0u;
+  }
+
   // NV-DXVK [MvRaw]: the pairing decision DrawCallCache::get made when it last
   // handed this entry to a draw. Recorded here rather than joined by blasPtr
   // because BlasEntries are destroyed and reallocated constantly, so one
