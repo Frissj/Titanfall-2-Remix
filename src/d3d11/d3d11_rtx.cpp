@@ -4013,6 +4013,7 @@ namespace dxvk {
     kCullOffAreaClip     = 9,
     kCullOffAreaDegen    = 10,
     kCullOffAreaSkipClip = 11,
+    kCullOffAreaMergeSalvage = 12,
     kCullOffGroupCount
   };
 
@@ -4653,6 +4654,54 @@ namespace dxvk {
       { 0x0F, 0x50, 0xC6 },
       { 0x31, 0xC0, 0x90 },
       "AREA clip: force trivial-accept for every portal edge — movmskps eax,xmm6 -> xor eax,eax; nop (jz at 0x2EBCEB always taken, clipper at 0x2EBCF1 unreachable)" },
+    // SITE 16 — the ED900 merge-degenerate salvage. This is the repair the
+    // HANDOFF_AREA_CLUSTER_SITE15 open question asked for: it lets site 15 and
+    // sub_1802ED900 coexist instead of removing either.
+    //
+    // ED900 is only called (0x2EB8C5 / 0x2EC9FD) when an area's selector CHAIN
+    // has more than one record — several portals reached the same area and each
+    // appended its volume. ED900 walks the chain, classifies every edge against
+    // the frame's plane table (dword_1813009A0), frees each record into the
+    // freelist as it goes, and builds ONE merged record. Its -1 returns:
+    //   0x2EDDDD  cmp r12d,3 / jb   -> fewer than 3 surviving edges (DEGENERATE;
+    //                                  the cmpeqps path at 0x2EDED5 decrements
+    //                                  r12d — this is what clipDegen counts)
+    //   0x2EE553  built record has <3 edges or <3 planes -> free + -1
+    //   sub_1802E7C70 alloc failure -> -1 (allocFail probe reads 0, acquitted)
+    // The caller DROPS the area on -1 (0x2EB8D0 -> 0x2EBE71, the dropAreas
+    // probe site), and a dropped area takes every area behind it: measured
+    // 2026-08-06 pitch sweep, dropping hub 127 at pitch -47..-56 kills
+    // 124/125/126/149 and the whole 11-area cluster behind them (a20 4-8).
+    //
+    // With site 15 on, chains carry full inherited parent volumes, so identical
+    // planes meet in the merge, the triple product reads 0, edges collapse
+    // through the degenerate path, and r12d lands under 3 — the merge is
+    // reporting "degenerate", not "invisible". Rejecting the area on that is
+    // the residual cull the handoff said must not win.
+    //
+    // THE FIX IS THE ENGINE'S OWN FALLBACK. For merge OVERFLOW (r12d > 255,
+    // 0x2EDDE3) ED900 already refuses to intersect and instead builds a
+    // conservative quad record from ALL the chain's planes (copied to scratch
+    // unk_181E60EF0 during the walk) at 0x2EDDF0/0x2EDF9E. Retarget the
+    // degenerate branch to that same fallback: jb rel32 0x7D2 (-> 0x2EE5B5,
+    // return -1) becomes rel32 0x0D (-> 0x2EDDF0). Register state at 0x2EDDF0
+    // is identical from either entry (r12d is not read there; rbx = total
+    // plane count from the walk, r15 = 0, esi = -1, rdi = record pool — all
+    // set on both paths), so the only change is the verdict: degenerate merge
+    // yields the union's conservative record instead of dropping the area.
+    //
+    // CANNOT retrigger the areaDegen AV: the unguarded copy loop at 0x2EDA30
+    // runs during the walk, BEFORE this branch, and rec[+2] >= 3 is still
+    // structurally guaranteed by site 15 (parent counts inherited).
+    //
+    // VERIFY on [DispProbe]: dropAreas empties (incl. the every-frame 64/65
+    // background drops — same mechanism), a20 stops dipping at pitch -47..-56,
+    // and the 11-area cluster (81,84,92,96,113,141,146,148,152,153,166) stays
+    // resident through the y = -9984 step and the full pitch sweep.
+    { kCullOffModClient, 0x2EDDDD, 6, kCullOffAreaMergeSalvage,
+      { 0x0F, 0x82, 0xD2, 0x07, 0x00, 0x00 },
+      { 0x0F, 0x82, 0x0D, 0x00, 0x00, 0x00 },
+      "ED900 merge degenerate (<3 edges): jb -> retarget return -1 to the overflow fallback at 0x2EDDF0 (conservative union record, area survives)" },
   };
   static constexpr uint32_t kCullOffSiteCount =
     static_cast<uint32_t>(sizeof(kCullOffSites) / sizeof(kCullOffSites[0]));
@@ -4785,6 +4834,11 @@ namespace dxvk {
     want[kCullOffAreaSkipClip]   = master && areaGroupOn
                                           && RtxOptions::CullOff::areaSkipClip()
                                           && RtxOptions::CullOff::areaClip();
+    // Site 16 stands on its own: the background drops (areas 64/65 every frame,
+    // 92 most frames) happen in every configuration, not just with site 15 on,
+    // so the salvage is not gated on areaSkipClip.
+    want[kCullOffAreaMergeSalvage] = master && areaGroupOn
+                                            && RtxOptions::CullOff::areaMergeSalvage();
 
     for (uint32_t i = 0; i < kCullOffSiteCount; ++i) {
       const CullOffSite& s = kCullOffSites[i];

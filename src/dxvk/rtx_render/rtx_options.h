@@ -1568,6 +1568,39 @@ namespace dxvk {
                  "COST: removes the narrowing entirely, so the flood is wider than areaClip's.\n"
                  "Watch poolHi/allocFail on [JobProbe] — areaClip alone took the pool peak from\n"
                  "14/4092 to 222/4092.");
+      // DEFAULT ON. SITE 16 — the answer to HANDOFF_AREA_CLUSTER_SITE15's open
+      // question: makes site 15 and sub_1802ED900 coexist instead of removing
+      // either. Found 2026-08-06 from the pitch-sweep capture + ED900 disasm.
+      RTX_OPTION("rtx.cullOff", bool, areaMergeSalvage, true,
+                 "SITE 16 — stop sub_1802ED900's DEGENERATE merge verdict from dropping areas.\n"
+                 "client.dll+0x2EDDDD, inside ED900 itself.\n"
+                 "MECHANISM: ED900 is only called (0x2EB8C5) when an area's selector chain has more\n"
+                 "than one record — several portals reached the area and each appended its volume.\n"
+                 "It merges the chain into one record and returns -1 if fewer than 3 edges survive\n"
+                 "(cmp r12d,3 at 0x2EDDD9); the caller then DROPS the area (0x2EB8D0 -> 0x2EBE71),\n"
+                 "and a dropped area takes everything behind it. With areaSkipClip on, chains carry\n"
+                 "full inherited parent volumes, identical planes meet in the merge, their triple\n"
+                 "products read 0, and edges collapse through the degenerate path (0x2EDED5, the\n"
+                 "thing clipDegen counts — 457/frame in the 2026-08-06 capture) until r12d < 3.\n"
+                 "The merge is saying DEGENERATE, not INVISIBLE; rejecting the area on it is the\n"
+                 "residual cull that killed the 11-area cluster.\n"
+                 "MEASURED (2026-08-06 pitch sweep, fixed position): the dropped identity is purely\n"
+                 "view-dependent — pitch -47..-56 drops hub area 127, which feeds 124/125/126/149,\n"
+                 "and a20 collapses to 4-8; other pitch bands drop 64/65/92 instead. Same mechanism\n"
+                 "as the y=-9984 step (there the victims were 124/149).\n"
+                 "THE PATCH reuses the engine's own fallback: for merge OVERFLOW (r12d > 255) ED900\n"
+                 "already skips the intersection and builds a conservative quad record over ALL the\n"
+                 "chain's planes (0x2EDDF0/0x2EDF9E). The jb at 0x2EDDDD is retargeted from the\n"
+                 "return -1 epilogue (rel32 0x7D2) to that fallback (rel32 0x0D). Register state at\n"
+                 "0x2EDDF0 is identical from either entry; r12d is not read there.\n"
+                 "VISUAL RISK: none by construction — the salvage record is an over-approximation\n"
+                 "of the union, so it can only UNDER-cull (more geometry dispatched), never hide\n"
+                 "anything. Cost is perf: wider flood, more TLAS surfaces.\n"
+                 "NOT gated on areaSkipClip: the every-frame background drops (64/65, usually 92)\n"
+                 "happen in every configuration and share the mechanism.\n"
+                 "VERIFY on [DispProbe]: dropAreas empties, a20 stops dipping at pitch -47..-56,\n"
+                 "and the 81/84/92/96/113/141/146/148/152/153/166 cluster stays resident across\n"
+                 "the y=-9984 step and a full pitch sweep.");
       RTX_OPTION("rtx.cullOff", bool, areaDegen, false,
                  "*** CRASHES. DO NOT ENABLE. *** Access violation (write) at client.dll+0x2EDA45\n"
                  "inside sub_1802ED900, called from EB620 at 0x2EB8C5 on a tier0 job thread, after a\n"
