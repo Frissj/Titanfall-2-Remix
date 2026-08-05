@@ -154,6 +154,15 @@ namespace tf2_decal_hook {
   std::uint64_t DrainEd900DropCount();
   bool Ed900DropProbeInstalled();
 
+  // [DropAreas] — WHICH areas the -1 dropped, read and cleared. ed900Drop has
+  // been 4.00 flat in every capture and was read as an acquittal; the identity
+  // of those four has never been recorded, and the drop at 0x2EB8D0 is the one
+  // path that fits all five observations (enqueued, selector consumed, no
+  // portal loop, not selector-less, nothing pending).
+  // No count function: the counter is the same one DrainEd900DropCount()
+  // reports, and two readers would race to zero it.
+  std::uint32_t DrainDropAreas(std::uint32_t* out, std::uint32_t maxOut);
+
   // Portals abandoned because the clipped polygon came out with fewer than 3
   // vertices — 0x2EC675 (r11) and 0x2EC67F (r9), the only rejects left
   // unpatched on the area-portal path and the leading suspects for the residual
@@ -186,6 +195,97 @@ namespace tf2_decal_hook {
   // Returns how many cells were written.
   constexpr std::uint32_t kDegenPairCells = 64;
   std::uint32_t DrainDegenPairs(std::uint64_t* out, std::uint32_t maxOut);
+
+  // [QueueProbe] — the queue CURSOR and the selector-less skip in
+  // sub_1802EB620. Added for the POSITION axis, which every prior capture
+  // held fixed by construction.
+  //
+  // sub_1802EAD60 returns the index the queue loop starts at (0x2EB7F7
+  // `mov ebx, eax`; the loop at 0x2EB860 only ever walks FORWARD from it), so
+  // every order-list slot below the cursor is unreachable regardless of what
+  // any portal accepts. [AreaSeed] measured listLen = 30 flat and EAD60 was
+  // recorded as eliminated on that basis — but listLen and the return value
+  // are different quantities and only the first was ever read.
+  //
+  // READ THEM AS A PAIR, they are mutually exclusive explanations:
+  //   qStart falls across the step  => the cursor is the gate; the five areas
+  //     (113/141/148/149/153) are never visited and no crossing is at fault.
+  //   qStart flat AND those areas appear in qSkipAreas => the cursor is
+  //     innocent, the areas ARE visited, and no portal crossing ever wrote
+  //     them a selector — so the fault is in the crossing, upstream of
+  //     0x2EC739.
+  // Returns 0xFFFFFFFF from ReadQueueStartIndex when not installed; check
+  // QueueProbeInstalled() first, same zero-vs-absent trap as every counter
+  // above.
+  bool          QueueProbeInstalled();
+  std::uint32_t ReadQueueStartIndex();
+  std::uint64_t DrainQStartCount();
+  std::uint64_t DrainQSkipCount();
+  std::uint32_t DrainQSkipAreas(std::uint32_t* out, std::uint32_t maxOut);
+
+  // [FaceReject] — client.dll+0x2EB98F, the camera-behind-the-portal-plane
+  // test, by TARGET AREA. Measured answer to "qStart is flat and the five
+  // areas are selector-less, so which crossing declines to enqueue them".
+  //
+  // It is a signed plane-side test on the camera ORIGIN
+  // (plane . xmmword_1811FC000, times a {+1,-1} sign from dword_180911100),
+  // so it is the only reject on the portal path that reads camera POSITION
+  // rather than orientation — and it is the FIRST test in the portal body,
+  // upstream of areaPortal, areaClip/areaSkipClip, clipDegen and the
+  // allocator. That ordering is why all four of those read zero while areas
+  // still disappear.
+  //
+  // READ AGAINST qSkipAreas ON THE SAME FRAME: the same ids appearing here on
+  // the LOW side and not the HIGH side closes the chain end to end.
+  // Check FaceRejectProbeInstalled() before reading a zero.
+  bool          FaceRejectProbeInstalled();
+  std::uint64_t DrainFaceRejectCount();
+  std::uint32_t DrainFaceRejectAreas(std::uint32_t* out, std::uint32_t maxOut);
+
+  // [PortalWalk] — client.dll+0x2EB93F, the target of EVERY portal the flood
+  // iterates, before any reject. Built after [FaceReject] refuted 0x2EB98F:
+  // areas 113/141/148 appear in faceAreas zero times in BOTH states while
+  // their qSkip goes 7/91 -> 278/281, so they are neither rejected nor
+  // enqueued — which means never reached.
+  //
+  // Read per area against qSkipAreas on the same line:
+  //   in walkAreas + selector-less => a seventh reject exists on the crossing
+  //     path; the six-site enumeration is incomplete.
+  //   absent from walkAreas        => confirmed cascade; the source area never
+  //     ran its portal loop, and no reject anywhere is at fault.
+  // Areas are DEDUPED and the no-neighbour sentinel (nAreas+1, i.e. 180 on a
+  // 179-area map) is excluded from the list and counted into `oobOut` instead.
+  // Without that the list was one entry per portal bit and filled its buffer
+  // with duplicates and sentinels before reaching the high bits, so real areas
+  // read as absent — the one verdict this probe must never fake.
+  bool          PortalWalkProbeInstalled();
+  std::uint64_t DrainPortalWalkCount();
+
+  // SOURCE -> TARGET for every portal walked, deduped. Replaces the
+  // target-only drain, which could not name the owner of the cluster entry.
+  // The source is reverse-resolved from the recorded portal bit via the
+  // per-area range table (qword_181748CF8), so the island is unchanged.
+  // Source 0xFFFF means the range table did not cover that portal — listed,
+  // not dropped, so a hole is visible rather than silently thinning the list.
+  // NOTE this read-and-clears the same bitmap the target-only drain used;
+  // only one of the two may be called per frame.
+  std::uint32_t DrainPortalWalkPairs(std::uint32_t* srcOut,
+                                     std::uint32_t* dstOut,
+                                     std::uint32_t maxOut,
+                                     std::uint32_t* oobOut);
+
+  // [SelWrite] — client.dll+0x2EC739, the selector store itself, by target
+  // area. Separates the last two live possibilities for why 149 and 124 stop
+  // being dispatched while their inbound portals are still walked every frame:
+  //   present in LOW => enqueued, then abandoned by the forward cursor
+  //                     (ordering); rewinds= says whether 0x2EC8DC fired.
+  //   absent in LOW  => a reject upstream of this store that nothing counts.
+  // ReadRewindCount() is the engine's own rewind counter, cumulative since
+  // process start — difference it across frames. 0xFFFFFFFF means unreadable.
+  bool          SelWriteProbeInstalled();
+  std::uint64_t DrainSelWriteCount();
+  std::uint32_t DrainSelWriteAreas(std::uint32_t* out, std::uint32_t maxOut);
+  std::uint32_t ReadRewindCount();
 
   // Thread-local: are we currently inside TF2's decal-render call tree?
   // Cheap (single TLS load); safe to call from any draw site.

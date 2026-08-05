@@ -88,16 +88,47 @@ namespace dxvk {
     extern std::atomic<uint32_t> g_clipDegenMaxBit;
     extern std::atomic<uint32_t> g_degenPair[64];
     extern std::atomic<uint32_t> g_degenPairInstalled;
+    // NV-DXVK [QueueProbe]. Defined in rtx_camera_manager.cpp and filled by
+    // d3d11_rtx.cpp draining the islands — libdxvk.a cannot call into d3d11,
+    // so these atomics are the only channel. g_qStart is an INDEX (assigned,
+    // not accumulated); see the definition for why that distinction matters.
+    extern std::atomic<uint32_t> g_qStart;
+    extern std::atomic<uint64_t> g_qStartCalls;
+    extern std::atomic<uint64_t> g_qSkipCalls;
+    extern std::atomic<uint32_t> g_qSkipAreaN;
+    extern std::atomic<uint32_t> g_qSkipAreas[32];
+    extern std::atomic<uint32_t> g_queueProbeInstalled;
+    // NV-DXVK [FaceReject]: portals skipped at client.dll+0x2EB98F because the
+    // camera is behind the portal plane, keyed by target area.
+    extern std::atomic<uint64_t> g_faceRejectCount;
+    extern std::atomic<uint32_t> g_faceRejectAreaN;
+    extern std::atomic<uint32_t> g_faceRejectAreas[32];
+    extern std::atomic<uint32_t> g_faceRejectInstalled;
+    // NV-DXVK [PortalWalk]: client.dll+0x2EB93F, every portal iterated.
+    extern std::atomic<uint64_t> g_portalWalkCount;
+    extern std::atomic<uint32_t> g_portalWalkAreaN;
+    extern std::atomic<uint32_t> g_portalWalkAreas[48];
+    extern std::atomic<uint32_t> g_portalWalkInstalled;
+    extern std::atomic<uint32_t> g_portalWalkOob;
+    // NV-DXVK [SelWrite]: the selector store at client.dll+0x2EC739.
+    extern std::atomic<uint64_t> g_selWriteCount;
+    extern std::atomic<uint32_t> g_selWriteAreaN;
+    extern std::atomic<uint32_t> g_selWriteAreas[48];
+    extern std::atomic<uint32_t> g_selWriteInstalled;
+    extern std::atomic<uint32_t> g_rewinds;
+    // NV-DXVK [DropAreas]: the identities behind the flat ed900Drop count.
+    extern std::atomic<uint32_t> g_dropAreaN;
+    extern std::atomic<uint32_t> g_dropAreas[48];
     extern std::atomic<uint32_t> g_cullOffAbMode;
     extern std::atomic<float> g_dispProbeFc000X;
     extern std::atomic<float> g_dispProbeFc000Y;
     extern std::atomic<float> g_dispProbeFc000Z;
     extern std::atomic<float> g_dispProbeFc000W;
     extern std::atomic<uint32_t> g_dispProbeSlotN;
-    extern std::atomic<uint32_t> g_dispProbeSlotA1[8];
-    extern std::atomic<uint32_t> g_dispProbeSlotA2[8];
-    extern std::atomic<uint32_t> g_dispProbeSlotA3[8];
-    extern std::atomic<uint32_t> g_dispProbeSlotRA[8];
+    extern std::atomic<uint32_t> g_dispProbeSlotA1[32];
+    extern std::atomic<uint32_t> g_dispProbeSlotA2[32];
+    extern std::atomic<uint32_t> g_dispProbeSlotA3[32];
+    extern std::atomic<uint32_t> g_dispProbeSlotRA[32];
     extern std::atomic<float>    g_areaSeedOrgX;
     extern std::atomic<float>    g_areaSeedOrgY;
     extern std::atomic<float>    g_areaSeedOrgZ;
@@ -105,12 +136,12 @@ namespace dxvk {
     extern std::atomic<uint32_t> g_areaSeedNAreas;
     extern std::atomic<uint32_t> g_areaSeedListLen;
     extern std::atomic<uint32_t> g_areaSeedN;
-    extern std::atomic<uint32_t> g_areaSeedAreas[16];
+    extern std::atomic<uint32_t> g_areaSeedAreas[48];
     extern std::atomic<uint64_t> g_areaSeedCalls;
     extern std::atomic<uint32_t> g_areaSeedInstalled;
     extern std::atomic<uint32_t> g_areaSeedLive;
     extern std::atomic<uint32_t> g_areaSeedLiveN;
-    extern std::atomic<uint32_t> g_areaSeedLiveAreas[16];
+    extern std::atomic<uint32_t> g_areaSeedLiveAreas[48];
     extern std::atomic<uint32_t> g_areaSeedPending;
     extern std::atomic<uint64_t> g_dispProbeEd480Calls;
     extern std::atomic<uint32_t> g_dispProbeEd480N;
@@ -1223,9 +1254,44 @@ namespace dxvk {
     //
     // Cost: one camera read + one size() + one log line per frame, no O(N) walk.
     // Gameplay-gated so menu/loading frames do not fill the log.
+    //
+    // !! THE GATE MUST NOT DEPEND ON THE ENGINE HOOKS. This read
+    // !! g_engineHookCaptureCount ALONE, and that counter is incremented by an
+    // !! engine-code detour (d3d11_rtx.cpp:37758), which RTX_DISABLE_ENGINE_HOOKS=1
+    // !! switches off. The result was silent and total: [PitchProbe], [OccProbe],
+    // !! [JobProbe], [DrainProbe], [DispProbe], [AreaSeed] and [AreaDump] ALL
+    // !! emitted zero lines for an entire capture while every island cheerfully
+    // !! logged INSTALLED, because installs are deliberately not gated on that
+    // !! env var (d3d11_rtx.cpp:39770) but this emitter was gated on it by
+    // !! accident. A probe that reports nothing is indistinguishable from a probe
+    // !! that measured nothing -- the exact failure mode CULLING_BIBLE sec 10.2
+    // !! is about -- and it has now cost a session twice.
+    //
+    // m_instances.size() is the hook-independent gameplay signal: a menu or
+    // loading frame carries a handful of instances, gameplay carries thousands
+    // (5,700-10,600 in every capture on this map). OR, not AND, so the probe
+    // survives either signal being unavailable.
+    //
+    // RTX_DISABLE_ENGINE_HOOKS=1 IS THE INTENDED WORKING CONFIGURATION HERE --
+    // do not "fix" it by clearing the variable. The engine detours are not
+    // wanted for this investigation; only the bypass hooks are. So the probe
+    // has to work with the master switch OFF, permanently, and this gate is
+    // what makes that true.
+    //
+    // What the switch does and does not change:
+    //   NOT affected -- the client.dll area-culling probes ([DispProbe] a20,
+    //     qStart/qSkip, faceAreas, walkAreas). Those measure sub_1802EB620,
+    //     the GAME's own culling, which runs identically either way.
+    //   Affected -- provenance of the camera fields below. Without the
+    //     engine-hook main camera (rtx.useEngineHookMainCamera) the Main
+    //     RtCamera is whatever dxvk derives, so pitchDeg/yawDeg/camPos and the
+    //     instance counts come from a different camera path than in captures
+    //     taken with hooks on. Bin within a run, not across that boundary --
+    //     hookN on the line below says which side a frame is on.
     {
       const bool inGameplayPitch =
-        tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
+        tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u ||
+        m_instances.size() > 256u;
       if (inGameplayPitch) {
         const RtCamera& mainCam =
           m_device->getCommon()->getSceneManager().getCameraManager().getCamera(CameraType::Main);
@@ -1319,7 +1385,14 @@ namespace dxvk {
           " fwdZ=", fwdZ,
           " inst=", instNow,
           " dInst=", dInst,
-          " camPos=(", camPos.x, ",", camPos.y, ",", camPos.z, ")"));
+          " camPos=(", camPos.x, ",", camPos.y, ",", camPos.z, ")",
+          // hookN is the engine-hook main-cam capture count, on the line as a
+          // PROVENANCE label, not a warning. hookN=0 is the expected steady
+          // state here (RTX_DISABLE_ENGINE_HOOKS=1 is deliberate); hookN>16
+          // means a run was made with the detours on. Both are valid captures.
+          // It is here so the two are never silently mixed in one series --
+          // the camera fields above come from a different path on each side.
+          " hookN=", tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed)));
 
         // NV-DXVK [JobProbe]: drain the world-visibility-worker counters for
         // this frame. Emitted here, not on the job threads, for two reasons:
@@ -1512,6 +1585,96 @@ namespace dxvk {
             }
             if (!degenPair.empty())
               degenPair += str::format("] degenPairN=", degenPairTotal);
+            // [QueueProbe] — the two halves of "why were only 9 of the 30
+            // seeded areas dispatched". qStart is sub_1802EAD60's RETURN value
+            // (the order-list index the queue loop starts at); qSkipAreas are
+            // the areas the loop DID reach and skipped because their selector
+            // was still -1. Emitted on this line, not a new one, so it bins
+            // against a20 and fc000 with no extra plumbing.
+            //   qStart moves across the y~-9984 step  => cursor is the gate.
+            //   qStart flat + 113/141/148/149/153 in qSkipAreas => cursor is
+            //     innocent and no portal crossing wrote them a selector.
+            // qStartInst guards the zero: an uninstalled island and a never-
+            // called one both read 0, and qStart legitimately CAN be 0.
+            // [DropAreas] — the areas sub_1802ED900 rejected with -1.
+            const uint32_t dropAreaN =
+              tf2::g_dropAreaN.exchange(0, std::memory_order_relaxed);
+            std::string dropAreas;
+            for (uint32_t i = 0; i < dropAreaN && i < 48u; ++i)
+              dropAreas += str::format((i == 0 ? " dropAreas=[" : ","),
+                tf2::g_dropAreas[i].load(std::memory_order_relaxed));
+            if (!dropAreas.empty())
+              dropAreas += "]";
+
+            const uint32_t qInst =
+              tf2::g_queueProbeInstalled.load(std::memory_order_relaxed);
+            const uint32_t qStart = tf2::g_qStart.load(std::memory_order_relaxed);
+            const uint64_t qStartN =
+              tf2::g_qStartCalls.exchange(0, std::memory_order_relaxed);
+            const uint64_t qSkipN =
+              tf2::g_qSkipCalls.exchange(0, std::memory_order_relaxed);
+            const uint32_t qSkipAreaN =
+              tf2::g_qSkipAreaN.exchange(0, std::memory_order_relaxed);
+            std::string qSkipAreas;
+            for (uint32_t i = 0; i < qSkipAreaN && i < 32u; ++i)
+              qSkipAreas += str::format((i == 0 ? " qSkipAreas=[" : ","),
+                tf2::g_qSkipAreas[i].load(std::memory_order_relaxed));
+            if (!qSkipAreas.empty())
+              qSkipAreas += "]";
+            // [FaceReject]: the camera-behind-the-portal skip at 0x2EB98F,
+            // by target area. Read faceAreas AGAINST qSkipAreas on this same
+            // line — the same ids in both, on the LOW side only, is the whole
+            // chain: plane crossed -> portal skipped -> no selector -> queue
+            // loop skips the area -> a20 14->9 -> m1 and m2 both halve.
+            const uint64_t faceRej =
+              tf2::g_faceRejectCount.exchange(0, std::memory_order_relaxed);
+            const uint32_t faceAreaN =
+              tf2::g_faceRejectAreaN.exchange(0, std::memory_order_relaxed);
+            std::string faceAreas;
+            for (uint32_t i = 0; i < faceAreaN && i < 32u; ++i)
+              faceAreas += str::format((i == 0 ? " faceAreas=[" : ","),
+                tf2::g_faceRejectAreas[i].load(std::memory_order_relaxed));
+            if (!faceAreas.empty())
+              faceAreas += "]";
+            // [PortalWalk]: the superset — every portal target the flood
+            // iterated. An id in qSkipAreas but ABSENT here was never reached
+            // by any crossing, so no reject is at fault and the loss is a
+            // cascade from whichever source area died first.
+            const uint64_t walkN =
+              tf2::g_portalWalkCount.exchange(0, std::memory_order_relaxed);
+            const uint32_t walkAreaN =
+              tf2::g_portalWalkAreaN.exchange(0, std::memory_order_relaxed);
+            // src>dst, packed src<<16|dst by the drain. Printed as pairs
+            // because the owner of a portal is the whole question now: the
+            // cluster 81/84/92/96/113/141/146/148/152/153/166 moves as one
+            // unit, so exactly one src>dst edge into it should disappear
+            // between the HIGH and LOW states, and that edge names the area to
+            // chase next. src=65535 means the per-area range table did not
+            // cover the portal — a resolution hole, not an area.
+            std::string walkAreas;
+            for (uint32_t i = 0; i < walkAreaN && i < 48u; ++i) {
+              const uint32_t v =
+                tf2::g_portalWalkAreas[i].load(std::memory_order_relaxed);
+              walkAreas += str::format((i == 0 ? " walkPairs=[" : ","),
+                                       (v >> 16), ">", (v & 0xFFFFu));
+            }
+            if (!walkAreas.empty())
+              walkAreas += "]";
+            // [SelWrite]: areas that actually received a selector. THE line to
+            // read against walkPairs — 149 and 124 here in LOW means enqueued
+            // and then abandoned by the forward cursor (ordering, and rewinds=
+            // says whether the engine's own recovery fired at all); absent
+            // means a reject upstream of 0x2EC739 that nothing counts yet.
+            const uint64_t selN =
+              tf2::g_selWriteCount.exchange(0, std::memory_order_relaxed);
+            const uint32_t selAreaN =
+              tf2::g_selWriteAreaN.exchange(0, std::memory_order_relaxed);
+            std::string selAreas;
+            for (uint32_t i = 0; i < selAreaN && i < 48u; ++i)
+              selAreas += str::format((i == 0 ? " selAreas=[" : ","),
+                tf2::g_selWriteAreas[i].load(std::memory_order_relaxed));
+            if (!selAreas.empty())
+              selAreas += "]";
             Logger::warn(str::format(
               "[DispProbe] f=", currentFrame,
               // Labels EVERY frame with the A/B mode so the log can just be
@@ -1533,6 +1696,14 @@ namespace dxvk {
               // line: rising as a20 falls means this is the gate. ed900 sitting
               // flat at ~1.0 never said anything about this.
               " ed900Drop=", tf2::g_ed900DropCount.exchange(0, std::memory_order_relaxed),
+              // [DropAreas]: WHICH areas that -1 dropped. The count above has
+              // read 4.00 flat on BOTH sides of the step and was treated as an
+              // acquittal on exactly that basis. If these ids are
+              // 124/141/148/149/153 on the LOW side and a different four on the
+              // HIGH side, the constant count was concealing the whole defect —
+              // the same count-for-identity substitution that already cost
+              // listLen and the 16-capped seed list.
+              dropAreas,
               " ed900DropInst=", tf2::g_ed900DropInstalled.load(std::memory_order_relaxed),
               // Portals abandoned because the clip produced <3 verts. The only
               // rejects still unpatched on this path, and the suspects for the
@@ -1554,6 +1725,45 @@ namespace dxvk {
               " degenPairInst=",
               tf2::g_degenPairInstalled.load(std::memory_order_relaxed),
               " eb620=", dsEb6,
+              // [QueueProbe]. qStart is LATCHED (last EB620 invocation of the
+              // frame), not summed — it is an index, and summing an index is
+              // meaningless. qStartN/qSkipN are the island call counts and
+              // exist so a silent island failure is visible as 0 calls rather
+              // than as a plausible-looking index.
+              " qStart=", qStart,
+              " qStartN=", qStartN,
+              " qSkipN=", qSkipN,
+              qSkipAreas,
+              " qInst=", (qInst ? 1 : 0),
+              // [FaceReject]. faceRej is the raw skip count; faceAreas are the
+              // target areas those skipped portals led to.
+              " faceRej=", faceRej,
+              faceAreas,
+              " faceInst=",
+              tf2::g_faceRejectInstalled.load(std::memory_order_relaxed),
+              // [PortalWalk]. walkN is the raw portal-iteration count and is
+              // an OUTPUT of how much territory the flood covered — the same
+              // trap faceRej and [JobProbe] calls fall into, so it decides
+              // nothing on its own. walkAreas is the measurement.
+              " walkN=", walkN,
+              walkAreas,
+              // Portals whose target was the no-neighbour sentinel (nAreas+1)
+              // or unresolved. They are excluded from walkAreas so real ids
+              // are not crowded out, but they are counted here so a short id
+              // list is never read as a small walk.
+              " walkOob=", tf2::g_portalWalkOob.load(std::memory_order_relaxed),
+              " walkInst=",
+              tf2::g_portalWalkInstalled.load(std::memory_order_relaxed),
+              // [SelWrite]. selN is the raw store count; selAreas are the
+              // areas enqueued. rewinds is the PER-FRAME DELTA of the
+              // engine's own cursor-rewind counter (dword_1811FBD98):
+              // 4294967295 means the global could not be read, which is not
+              // the same as zero rewinds.
+              " selN=", selN,
+              selAreas,
+              " rewinds=", tf2::g_rewinds.load(std::memory_order_relaxed),
+              " selInst=",
+              tf2::g_selWriteInstalled.load(std::memory_order_relaxed),
               // RAW, undecorated. Compare against camPos on the [PitchProbe]
               // line of the SAME frame: equal (in some frame) => camera origin
               // => sub_1802EAD60 is position-only and stays eliminated.
@@ -1591,14 +1801,20 @@ namespace dxvk {
           {
             std::string seedAreas;
             const uint32_t seedN = tf2::g_areaSeedN.load(std::memory_order_relaxed);
-            for (uint32_t i = 0; i < seedN && i < 16u; ++i)
+            // 48, not 16. listLen is 30 on this map, so the old cap printed 16
+            // of 30 and SILENTLY HID THE OTHER 14 — and "areas 149/124/113/141/
+            // 148/153 are not in the seed list" was read off that truncated
+            // line. Identical defect to the walkAreas one: a capped identity
+            // list manufactures absences. Never cap an identity list below the
+            // length field printed next to it.
+            for (uint32_t i = 0; i < seedN && i < 48u; ++i)
               seedAreas += str::format((i == 0 ? " areas=[" : ","),
                 tf2::g_areaSeedAreas[i].load(std::memory_order_relaxed));
             if (!seedAreas.empty())
               seedAreas += "]";
             std::string liveAreas;
             const uint32_t liveN = tf2::g_areaSeedLiveN.load(std::memory_order_relaxed);
-            for (uint32_t i = 0; i < liveN && i < 16u; ++i)
+            for (uint32_t i = 0; i < liveN && i < 48u; ++i)
               liveAreas += str::format((i == 0 ? " liveAreas=[" : ","),
                 tf2::g_areaSeedLiveAreas[i].load(std::memory_order_relaxed));
             if (!liveAreas.empty())
@@ -1643,7 +1859,7 @@ namespace dxvk {
             tf2::g_dispProbeSlotN.exchange(0, std::memory_order_relaxed);
           if (slotN != 0) {
             std::string areas;
-            const uint32_t shown = slotN < 8u ? slotN : 8u;
+            const uint32_t shown = slotN < 32u ? slotN : 32u;
             for (uint32_t i = 0; i < shown; ++i) {
               areas += str::format(
                 " [", i, "] node=", tf2::g_dispProbeSlotA3[i].load(std::memory_order_relaxed),
@@ -1662,7 +1878,7 @@ namespace dxvk {
               " pitchDeg=", pitchDeg,
               " yawDeg=", yawDeg,
               " n=", slotN,
-              (slotN > 8u ? " (TRUNCATED to 8)" : ""),
+              (slotN > 32u ? " (TRUNCATED to 32)" : ""),
               areas));
           }
 

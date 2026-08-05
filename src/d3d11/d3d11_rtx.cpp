@@ -521,6 +521,36 @@ namespace dxvk { namespace tf2 {
   // NV-DXVK [DegenPair]: joint (r11, r9) histogram of the 0x2EC675 rejects.
   extern std::atomic<uint32_t> g_degenPair[64];
   extern std::atomic<uint32_t> g_degenPairInstalled;
+  // NV-DXVK [QueueProbe]: sub_1802EAD60's queue-start index and the areas the
+  // queue loop skipped for want of a selector. d3d11 drains the islands and
+  // writes these; InstanceManager reads them. Defined in rtx_camera_manager.cpp.
+  extern std::atomic<uint32_t> g_qStart;
+  extern std::atomic<uint64_t> g_qStartCalls;
+  extern std::atomic<uint64_t> g_qSkipCalls;
+  extern std::atomic<uint32_t> g_qSkipAreaN;
+  extern std::atomic<uint32_t> g_qSkipAreas[32];
+  extern std::atomic<uint32_t> g_queueProbeInstalled;
+  // NV-DXVK [FaceReject]: the camera-behind-the-portal-plane skip at 0x2EB98F.
+  extern std::atomic<uint64_t> g_faceRejectCount;
+  extern std::atomic<uint32_t> g_faceRejectAreaN;
+  extern std::atomic<uint32_t> g_faceRejectAreas[32];
+  extern std::atomic<uint32_t> g_faceRejectInstalled;
+  // NV-DXVK [PortalWalk]: every portal iterated, by target area (48 slots --
+  // superset of enqueued + rejected).
+  extern std::atomic<uint64_t> g_portalWalkCount;
+  extern std::atomic<uint32_t> g_portalWalkAreaN;
+  extern std::atomic<uint32_t> g_portalWalkAreas[48];
+  extern std::atomic<uint32_t> g_portalWalkInstalled;
+  extern std::atomic<uint32_t> g_portalWalkOob;
+  // NV-DXVK [SelWrite]: the selector store at 0x2EC739, plus rewind delta.
+  extern std::atomic<uint64_t> g_selWriteCount;
+  extern std::atomic<uint32_t> g_selWriteAreaN;
+  extern std::atomic<uint32_t> g_selWriteAreas[48];
+  extern std::atomic<uint32_t> g_selWriteInstalled;
+  extern std::atomic<uint32_t> g_rewinds;
+  // NV-DXVK [DropAreas]: the identities behind the flat ed900Drop count.
+  extern std::atomic<uint32_t> g_dropAreaN;
+  extern std::atomic<uint32_t> g_dropAreas[48];
   extern std::atomic<uint32_t> g_cullOffAbMode;
   extern std::atomic<float> g_pilotEyeX;
   extern std::atomic<float> g_pilotEyeY;
@@ -39809,6 +39839,17 @@ namespace dxvk {
               dxvk::tf2::g_ed900DropInstalled.store(
                 tf2_decal_hook::Ed900DropProbeInstalled() ? 1u : 0u,
                 std::memory_order_relaxed);
+              // [DropAreas]: identity behind that count. No count drain here —
+              // the counter is the same one DrainEd900DropCount() just read.
+              {
+                uint32_t dropAreas[48] = {};
+                const uint32_t nDrop =
+                  tf2_decal_hook::DrainDropAreas(dropAreas, 48u);
+                for (uint32_t i = 0; i < nDrop; ++i)
+                  dxvk::tf2::g_dropAreas[i].store(dropAreas[i],
+                                                  std::memory_order_relaxed);
+                dxvk::tf2::g_dropAreaN.store(nDrop, std::memory_order_relaxed);
+              }
               // [ClipDegen]: the two <3-vertex rejects, counted separately so
               // it is visible which of the pair fires.
               dxvk::tf2::g_clipDegenA.fetch_add(
@@ -39839,6 +39880,100 @@ namespace dxvk {
                   static_cast<uint32_t>(degenPair[i]), std::memory_order_relaxed);
               dxvk::tf2::g_degenPairInstalled.store(nPair != 0 ? 1u : 0u,
                                                     std::memory_order_relaxed);
+              // [QueueProbe]: the queue cursor and the selector-less skip.
+              // qStart is sub_1802EAD60's RETURN value — the order-list index
+              // the loop starts at — which is ASSIGNED rather than accumulated
+              // because it is an index, not a count. The two call counts and
+              // the skipped-area identities follow the usual accumulate /
+              // assign split.
+              dxvk::tf2::g_queueProbeInstalled.store(
+                tf2_decal_hook::QueueProbeInstalled() ? 1u : 0u,
+                std::memory_order_relaxed);
+              dxvk::tf2::g_qStart.store(tf2_decal_hook::ReadQueueStartIndex(),
+                                        std::memory_order_relaxed);
+              dxvk::tf2::g_qStartCalls.fetch_add(
+                tf2_decal_hook::DrainQStartCount(), std::memory_order_relaxed);
+              dxvk::tf2::g_qSkipCalls.fetch_add(
+                tf2_decal_hook::DrainQSkipCount(), std::memory_order_relaxed);
+              uint32_t qSkipAreas[32] = {};
+              const uint32_t nQSkip =
+                tf2_decal_hook::DrainQSkipAreas(qSkipAreas, 32u);
+              for (uint32_t i = 0; i < nQSkip; ++i)
+                dxvk::tf2::g_qSkipAreas[i].store(qSkipAreas[i],
+                                                 std::memory_order_relaxed);
+              dxvk::tf2::g_qSkipAreaN.store(nQSkip, std::memory_order_relaxed);
+              // [FaceReject]: portals skipped at 0x2EB98F because the camera
+              // is behind the portal plane, by TARGET AREA. This is the reject
+              // the qStart/qSkip pair pointed at -- it sits upstream of every
+              // other counter on this line, which is why they all read zero.
+              dxvk::tf2::g_faceRejectInstalled.store(
+                tf2_decal_hook::FaceRejectProbeInstalled() ? 1u : 0u,
+                std::memory_order_relaxed);
+              dxvk::tf2::g_faceRejectCount.fetch_add(
+                tf2_decal_hook::DrainFaceRejectCount(),
+                std::memory_order_relaxed);
+              uint32_t faceAreas[32] = {};
+              const uint32_t nFace =
+                tf2_decal_hook::DrainFaceRejectAreas(faceAreas, 32u);
+              for (uint32_t i = 0; i < nFace; ++i)
+                dxvk::tf2::g_faceRejectAreas[i].store(faceAreas[i],
+                                                      std::memory_order_relaxed);
+              dxvk::tf2::g_faceRejectAreaN.store(nFace, std::memory_order_relaxed);
+              // [PortalWalk]: every portal iterated, by target area. The
+              // superset that decides whether a selector-less area was
+              // rejected by something uninstrumented or never reached at all.
+              dxvk::tf2::g_portalWalkInstalled.store(
+                tf2_decal_hook::PortalWalkProbeInstalled() ? 1u : 0u,
+                std::memory_order_relaxed);
+              dxvk::tf2::g_portalWalkCount.fetch_add(
+                tf2_decal_hook::DrainPortalWalkCount(),
+                std::memory_order_relaxed);
+              // Pairs, not targets: the target-only list proved the cascade but
+              // could not name the area that owns the cluster entry. Packed
+              // src<<16|dst so one atomic array carries both halves.
+              uint32_t walkSrc[48] = {};
+              uint32_t walkDst[48] = {};
+              uint32_t walkOob = 0;
+              const uint32_t nWalk = tf2_decal_hook::DrainPortalWalkPairs(
+                walkSrc, walkDst, 48u, &walkOob);
+              dxvk::tf2::g_portalWalkOob.store(walkOob, std::memory_order_relaxed);
+              for (uint32_t i = 0; i < nWalk; ++i)
+                dxvk::tf2::g_portalWalkAreas[i].store(
+                  ((walkSrc[i] & 0xFFFFu) << 16) | (walkDst[i] & 0xFFFFu),
+                  std::memory_order_relaxed);
+              dxvk::tf2::g_portalWalkAreaN.store(nWalk, std::memory_order_relaxed);
+              // [SelWrite]: which areas actually got a selector, and whether
+              // the engine's own cursor rewind fired. The rewind global is
+              // cumulative since process start, so publish the per-drain DELTA
+              // -- a cumulative counter on a per-frame line would rise forever
+              // and say nothing about the step being investigated.
+              dxvk::tf2::g_selWriteInstalled.store(
+                tf2_decal_hook::SelWriteProbeInstalled() ? 1u : 0u,
+                std::memory_order_relaxed);
+              dxvk::tf2::g_selWriteCount.fetch_add(
+                tf2_decal_hook::DrainSelWriteCount(), std::memory_order_relaxed);
+              uint32_t selAreas[48] = {};
+              const uint32_t nSel =
+                tf2_decal_hook::DrainSelWriteAreas(selAreas, 48u);
+              for (uint32_t i = 0; i < nSel; ++i)
+                dxvk::tf2::g_selWriteAreas[i].store(selAreas[i],
+                                                    std::memory_order_relaxed);
+              dxvk::tf2::g_selWriteAreaN.store(nSel, std::memory_order_relaxed);
+              {
+                const uint32_t rw = tf2_decal_hook::ReadRewindCount();
+                static uint32_t sPrevRewind = 0;
+                static bool     sHavePrev   = false;
+                uint32_t delta = 0;
+                if (rw != 0xFFFFFFFFu) {
+                  if (sHavePrev && rw >= sPrevRewind)
+                    delta = rw - sPrevRewind;
+                  sPrevRewind = rw;
+                  sHavePrev   = true;
+                } else {
+                  delta = 0xFFFFFFFFu;               // unreadable, not zero
+                }
+                dxvk::tf2::g_rewinds.store(delta, std::memory_order_relaxed);
+              }
             }
           }
 
@@ -41828,10 +41963,12 @@ namespace dxvk {
           }
         }
 
-        // [CullOffAB] PageUp cycles the culling A/B mode. Same Home/End key
-        // cluster as the two toggles above, which is the cluster already known
-        // to reach us (O and Insert were swallowed somewhere). Edge-triggered
-        // identically.
+        // [CullOffAB] F8 cycles the culling A/B mode. Was PageUp (the Home/End
+        // cluster known to reach us after O and Insert were swallowed);
+        // moved to F8 on request. Edge-triggered identically, and F8 is not
+        // bound by the game, so the same "does it reach us" caveat applies —
+        // if a press does nothing, check for the [CullOffAB] log line before
+        // assuming the mode did not change.
         //
         // 0 configured -> 1 area sites off -> 2 all sites off -> back to 0.
         // cullOffUpdate() runs every frame from here and reconciles the applied
@@ -41839,7 +41976,7 @@ namespace dxvk {
         // them live — stand still at the angle you care about and cycle.
         {
           static bool s_cullOffAbKeyLatch = false;
-          const bool keyDown = (GetAsyncKeyState(VK_PRIOR) & 0x8000) != 0;
+          const bool keyDown = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
           const bool keyEdge = keyDown && !s_cullOffAbKeyLatch;
           s_cullOffAbKeyLatch = keyDown;
           if (keyEdge) {

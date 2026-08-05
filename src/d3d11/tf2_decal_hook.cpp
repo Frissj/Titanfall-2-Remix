@@ -42,10 +42,10 @@ namespace dxvk { namespace tf2 {
   extern std::atomic<float> g_dispProbeFc000Z;
   extern std::atomic<float> g_dispProbeFc000W;
   extern std::atomic<uint32_t> g_dispProbeSlotN;
-  extern std::atomic<uint32_t> g_dispProbeSlotA1[8];
-  extern std::atomic<uint32_t> g_dispProbeSlotA2[8];
-  extern std::atomic<uint32_t> g_dispProbeSlotA3[8];
-  extern std::atomic<uint32_t> g_dispProbeSlotRA[8];
+  extern std::atomic<uint32_t> g_dispProbeSlotA1[32];
+  extern std::atomic<uint32_t> g_dispProbeSlotA2[32];
+  extern std::atomic<uint32_t> g_dispProbeSlotA3[32];
+  extern std::atomic<uint32_t> g_dispProbeSlotRA[32];
   extern std::atomic<uint64_t> g_dispProbeEd480Calls;
   extern std::atomic<uint32_t> g_dispProbeEd480N;
   extern std::atomic<uint32_t> g_dispProbeEd480Area[8];
@@ -58,12 +58,12 @@ namespace dxvk { namespace tf2 {
   extern std::atomic<uint32_t> g_areaSeedNAreas;
   extern std::atomic<uint32_t> g_areaSeedListLen;
   extern std::atomic<uint32_t> g_areaSeedN;
-  extern std::atomic<uint32_t> g_areaSeedAreas[16];
+  extern std::atomic<uint32_t> g_areaSeedAreas[48];
   extern std::atomic<uint64_t> g_areaSeedCalls;
   extern std::atomic<uint32_t> g_areaSeedInstalled;
   extern std::atomic<uint32_t> g_areaSeedLive;
   extern std::atomic<uint32_t> g_areaSeedLiveN;
-  extern std::atomic<uint32_t> g_areaSeedLiveAreas[16];
+  extern std::atomic<uint32_t> g_areaSeedLiveAreas[48];
   extern std::atomic<uint32_t> g_areaSeedPending;
   extern std::atomic<uint32_t> g_clipDegenMaxBit;
 
@@ -2001,7 +2001,7 @@ namespace tf2_decal_hook {
       {
         const std::uint32_t s =
           dxvk::tf2::g_dispProbeSlotN.fetch_add(1, std::memory_order_relaxed);
-        if (s < 8u) {
+        if (s < 32u) {
           dxvk::tf2::g_dispProbeSlotA1[s].store(static_cast<std::uint32_t>(a1),
                                                 std::memory_order_relaxed);
           dxvk::tf2::g_dispProbeSlotA2[s].store(static_cast<std::uint32_t>(a2),
@@ -2175,7 +2175,11 @@ namespace tf2_decal_hook {
             if (list[i] == 0xFFFFu)
               continue;
             ++len;
-            if (kept < 16u)
+            // 48 to cover listLen (30 on this map) with headroom. At 16 this
+            // recorded barely half the seed list while printing listLen=30
+            // beside it, which is how the seed set was read as "identical in
+            // both states" — the differing entries were in the 14 never stored.
+            if (kept < 48u)
               dxvk::tf2::g_areaSeedAreas[kept++].store(list[i], std::memory_order_relaxed);
           }
           dxvk::tf2::g_areaSeedListLen.store(len, std::memory_order_relaxed);
@@ -2191,7 +2195,7 @@ namespace tf2_decal_hook {
             if (sel[i] == -1)
               continue;
             ++live;
-            if (liveKept < 16u)
+            if (liveKept < 48u)
               dxvk::tf2::g_areaSeedLiveAreas[liveKept++].store(i, std::memory_order_relaxed);
           }
           dxvk::tf2::g_areaSeedLive.store(live, std::memory_order_relaxed);
@@ -2681,6 +2685,14 @@ namespace tf2_decal_hook {
     constexpr std::size_t kPortalBitsOffset  = 0x100;
     constexpr std::size_t kPortalBitsBytes   = 2048;     // 16384 bits, matches the mask
     constexpr std::uintptr_t kRvaPortalTable = 0x1748D00;  // qword_181748D00
+    // qword_181748CF8 — the PER-AREA portal range table, 8 bytes per area:
+    //   +0  word  portal COUNT   (read at 0x2EC92A as the loop bound)
+    //   +2  word  portal START   (read at 0x2EB934 as the base index)
+    // Portals are therefore contiguous per area, which is what makes a portal
+    // index reverse-resolvable to its OWNING area with no extra instrumentation:
+    // the recorded bit is var_7B8 = portalIdx*3, so portalIdx = bit/3 and the
+    // source is the single area whose [start, start+count) contains it.
+    constexpr std::uintptr_t kRvaAreaPortalRange = 0x1748CF8;
 
     // =======================================================================
     // [DegenPair] — the JOINT (r11, r9) distribution at each degen reject.
@@ -2935,6 +2947,659 @@ namespace tf2_decal_hook {
     volatile std::uint64_t*  s_clipDegenACounter = nullptr;
     volatile std::uint64_t*  s_clipDegenBCounter = nullptr;
 
+    // =======================================================================
+    // [QueueProbe] — THE QUEUE CURSOR AND THE SELECTOR-LESS SKIP.
+    //
+    // WHY. The POSITION sweep (2026-08-05, view locked at pitch -7.81836 /
+    // yaw 175.265, 365 frames, only camPos moving) found a20 stepping 14 -> 9
+    // across a single sharp plane at y ~ -9984, taking m1 3719 -> 1859 and
+    // inst ~10450 -> ~5790 with it. Areas 113, 141, 148, 149, 153 drop as a
+    // block (110/110 frames present above, 0/202 below) and 124 <-> 125 swap.
+    // Every measured gate is CONSTANT across that step: [AreaSeed] listLen=30,
+    // ed900Drop=4.00, allocFail=0, clipDegen=0/0. So nothing that is currently
+    // instrumented is doing it, and the five areas are not being REJECTED --
+    // their portal crossing is never attempted.
+    //
+    // WHAT THE DISASSEMBLY THEN SHOWED, and it is a quantity nobody has ever
+    // logged. sub_1802EAD60 does not only FILL the order list, it RETURNS the
+    // index the queue loop starts at:
+    //     1802eb7e1  call sub_1802EAD60
+    //     1802eb7f7  mov  ebx, eax                          <- ebx = START INDEX
+    //     1802eb860  mov  eax, ebx / inc ebx                <- queue loop head
+    //     1802eb864  movzx ecx, word_1811FE920[rsi+rax*2]   <- walks FORWARD
+    // The loop only ever walks forward from that cursor, so every order-list
+    // slot BELOW it is unreachable no matter what any portal accepts.
+    // [AreaSeed] measured listLen (how many entries EAD60 wrote) and found it
+    // pinned at 30 -- which is why EAD60 was recorded as "eliminated". But
+    // listLen flat does NOT imply the RETURN VALUE is flat, and the return
+    // value is the position-keyed one. Same class of error as CULLING_BIBLE's
+    // withdrawn claim #5, one level further down: an exclusion is only valid
+    // for the QUANTITY it was measured on, not just the axis.
+    //
+    // TWO CAPTURES, because they answer different halves:
+    //   qStart  EAD60's return value. Falls with position => the cursor is the
+    //           gate and the five areas are simply never visited.
+    //   qSkip   areas VISITED by the loop but skipped at 0x2EB884 because their
+    //           selector is still -1, i.e. no portal crossing ever enqueued
+    //           them. Flat qStart + these five in qSkip => the cursor is
+    //           innocent and the loss is in the portal crossings after all.
+    // The two are mutually exclusive explanations and one line separates them.
+    //
+    // Both are hand-built asm islands, NOT C wrappers. sub_1802EB620 does not
+    // decompile, and the [DispProbe] freeze of 2026-08-05 was caused by
+    // wrapping a non-decompiling SIMD function with a guessed signature. An
+    // island commits to no calling convention: it touches memory it owns, one
+    // scratch register it pushes, and flags that are provably dead.
+    constexpr std::uintptr_t kRvaQStart     = 0x2EB7EF;  // or r8,-1 / xor edx,edx
+    constexpr std::uintptr_t kRvaQStartCont = 0x2EB7F5;  // not cl
+    // The `jz loc_1802EC95E` taken when an order-list area has selector == -1.
+    // Retargeted (condition preserved), so the island runs ONLY on the skip.
+    constexpr std::uintptr_t kRvaQSkip      = 0x2EB884;
+    constexpr std::uintptr_t kRvaQSkipTgt   = 0x2EC95E;
+    // Island slots. 0x30 counter (shared convention), 0x38 latched value,
+    // 0x40 area bitmap. 256 bits covers dword_181748D8C = 179 areas with room.
+    constexpr std::size_t    kQValueOffset  = 0x38;
+    constexpr std::size_t    kQAreaBitsOff  = 0x40;
+    constexpr std::size_t    kQAreaBitsSize = 32;   // 256 bits
+    volatile std::uint64_t*  s_qStartCounter = nullptr;
+    volatile std::uint64_t*  s_qSkipCounter  = nullptr;
+    std::uint8_t*            s_qStartPage    = nullptr;
+    std::uint8_t*            s_qSkipPage     = nullptr;
+
+    // =======================================================================
+    // [FaceReject] — client.dll+0x2EB98F, THE CAMERA-BEHIND-THE-PORTAL TEST.
+    //
+    // Measured 2026-08-05: qStart is pinned at 149 (min == max over 259
+    // view-locked frames) so sub_1802EAD60's cursor is NOT the gate, while
+    // areas 92/113/141/148/153 sit in qSkipAreas on 152 of 156 LOW frames
+    // against 4 of 103 HIGH ones. So those areas ARE reached by the queue loop
+    // and no portal crossing ever writes them a selector. This is the reject
+    // that explains it, and it is the FIRST test in the portal body:
+    //
+    //   1802eb956  movaps xmm0, [portal plane]         ; float4
+    //   1802eb965  mulps  xmm0, xmmword_1811FC000      ; x CAMERA ORIGIN
+    //              ...two shufps/addps = horizontal add = plane . camOrigin
+    //   1802eb983  mulss  xmm0, dword_180911100[rax*4] ; x side sign
+    //   1802eb98c  comiss xmm1(0), xmm0
+    //   1802eb98f  jnb    loc_1802EC923                ; dist <= 0 -> SKIP
+    //
+    // dword_180911100 is a two-entry sign table {+1.0f, -1.0f} (the bytes
+    // after it are the string "Draw por..."), so this is a signed plane-side
+    // test on the camera ORIGIN -- a pure function of camera POSITION, and the
+    // only one of the six rejects on this path that reads position rather than
+    // orientation. That is why the whole area layer measured flat across pitch
+    // and yaw and steps hard across a plane in y: a plane-side test IS a sharp
+    // boundary, and the observed one sits at y ~ -9984.
+    //
+    // It is upstream of every reject already instrumented -- the outcode test
+    // (areaPortal), the clip loop (areaClip/areaSkipClip), the <3 rejects
+    // (clipDegen) and the allocator (allocFail) all sit BELOW it -- which is
+    // exactly why all of them read zero while areas still vanish. loc_1802EC923
+    // falls into the loop tail at 0x2EC92A, so the reject means "next portal",
+    // with no allocator call and no selector write.
+    //
+    // COUNTED, NOT PATCHED. This is legitimate portal logic (you may only see
+    // through a portal from its front face), so a patch here is a behaviour
+    // change, not a bug fix, and rtx.conf currently says "Do not add a site
+    // 16". Measure the identities first.
+    //
+    // var_7B8 (the portal bit index, portalIdx*3) is written at 0x2EB93F,
+    // BEFORE this branch, so the existing portal recorder resolves the target
+    // area here exactly as it does at 0x2EC675 -- same rbp displacement, same
+    // qword_181748D00 lookup at drain time.
+    //
+    // !! THE (r11,r9) HISTOGRAM ON THIS PAGE IS MEANINGLESS AND MUST NOT BE
+    // !! READ. InstallBranchPortalRecorder always emits it, but r9d and r11d
+    // !! are not loaded until 0x2EB995/0x2EB9AB -- AFTER this site -- so at
+    // !! 0x2EB98F they hold unrelated leftovers. They are only ever read into
+    // !! the stub's own pushed scratch and clamped, so the histogram is safe
+    // !! but junk. Only the counter and the portal bitmap mean anything here.
+    constexpr std::uintptr_t kRvaFaceReject    = 0x2EB98F;
+    constexpr std::uintptr_t kRvaFaceRejectTgt = 0x2EC923;
+    volatile std::uint64_t*  s_faceRejectCounter = nullptr;
+    std::uint8_t*            s_faceRejectPage    = nullptr;
+
+    // =======================================================================
+    // [PortalWalk] — client.dll+0x2EB93F, EVERY portal the flood iterates.
+    //
+    // WHY, and it is the measurement that should have come first. [FaceReject]
+    // refuted 0x2EB98F: areas 113/141/148 appear in faceAreas ZERO times in
+    // both states while their qSkip goes 7/91 -> 278/281. An area that is
+    // never rejected and never enqueued was never REACHED -- so the portal
+    // leading to it is never walked, and the loss is a CASCADE whose root is
+    // some other area being dropped first. No reject fires anywhere along the
+    // way, which is why six instrumented sites all read zero.
+    //
+    // This records the target of every portal the loop actually walks, which
+    // splits the remaining possibilities cleanly and without another guess:
+    //   target in walkAreas but never enqueued => a seventh reject exists on
+    //     the crossing path and the enumeration is still incomplete.
+    //   target ABSENT from walkAreas           => confirmed cascade; nothing
+    //     rejected it, its source area simply never ran its portal loop. The
+    //     next question is then which source, not which reject.
+    //
+    // SITE. 0x2EB93F is `mov [rbp+0F8h], rcx`, the store of var_7B8 at the top
+    // of the portal body -- before the facing test, before the outcode test,
+    // before the clip. Every portal iteration passes through it exactly once,
+    // and rcx already holds portalIdx*3, so the island needs no frame access
+    // at all: it bts's rcx directly into the same bit table the other two
+    // recorders use, and DrainPortalAreasFromPage resolves it identically.
+    //
+    // The stolen instruction is base+disp only (no rip-relative), so it
+    // replays from the island unchanged.
+    //
+    // FLAGS ARE DEAD HERE, checked rather than assumed: the last writer is
+    // `add eax, ecx` at 0x2EB939 and the next reader is the `jnb` at 0x2EB98F,
+    // which consumes the `comiss` at 0x2EB98C -- no branch in between. The
+    // island's lock inc / and / bts are therefore unobservable.
+    constexpr std::uintptr_t kRvaPortalWalk = 0x2EB93F;
+    volatile std::uint64_t*  s_portalWalkCounter = nullptr;
+    std::uint8_t*            s_portalWalkPage    = nullptr;
+
+    // =======================================================================
+    // [SelWrite] — client.dll+0x2EC739, THE SELECTOR WRITE ITSELF.
+    //
+    // The one measurement that separates the last two possibilities. Pairs
+    // showed 127>149 and 127>124 walked on 109/109 HIGH and 160/160 LOW
+    // frames -- the inbound crossings never stop -- while every OUTBOUND edge
+    // from 149 and 124 closes (108 -> 16). So those two areas stop being
+    // DISPATCHED, not stop being reached. And they are never selector-less
+    // either: qSkipAreas contains neither of them in either state, so the
+    // queue loop does not visit-and-reject them, it never visits them at all.
+    // Every counted reject stays flat across the step (clipDegen 0.00,
+    // allocFail 0.00, ed900Drop 4.00) and faceReject on 149 runs BACKWARDS
+    // (108 HIGH vs 16 LOW). Those facts cannot all hold at once unless either:
+    //
+    //   (1) the selector is never written -- a seventh reject between
+    //       0x2EB93F and 0x2EC739 that none of the six sites cover; or
+    //   (2) the selector IS written and the cursor never comes back for it.
+    //       qStart=149 is a SLOT index (its equality with area id 149 is a
+    //       coincidence that made this harder to see). The loop walks slots
+    //       FORWARD from 149, so an area whose slot is below the cursor is
+    //       never visited -- and never reported selector-less, because being
+    //       reported requires being visited. In HIGH the rewind at
+    //       0x2EC8DA/0x2EC8E2 would be what rescues it.
+    //
+    // The ordering theory was dismissed earlier BECAUSE that rewind exists.
+    // That was an error of the same kind as the rest of this investigation:
+    // the rewind's existence was verified, its FIRING was not. dword_1811FBD98
+    // is incremented on exactly that path and has never been read.
+    //
+    // 149 present here in LOW  => (2): enqueued, then abandoned by the cursor.
+    // 149 absent here in LOW   => (1): back to the disassembly.
+    //
+    // SITE. 0x2EC739 is the store itself:
+    //   42 89 84 92 1C F9 1F 01   mov [rdx+r10*4+11FF91Ch], eax
+    // rdx carries the 0x180000000 image base (lea at 0x2EC71C) and r10 the
+    // TARGET AREA, so the instruction is base+index+disp32 with no
+    // rip-relative component and replays from an island unchanged. Steal is 8,
+    // exactly kIslandMaxSteal.
+    //
+    // Area ids, not portal bits, so this island uses its own 32-byte table at
+    // 0x80 -- clear of the counter at 0x60 and of the portal bit table at
+    // 0x100, neither of which this page uses.
+    // =======================================================================
+    // [DropAreas] — WHICH areas sub_1802ED900 drops, not how many.
+    //
+    // ed900Drop has read 4.00 per frame, constant, in every capture on both
+    // sides of the step, and was treated as exonerated on that basis. That is
+    // the same count-for-identity substitution that already cost this
+    // investigation listLen (30 flat, contents never compared) and the 16-cap
+    // on the seed list. A constant NUMBER of drops says nothing about WHICH
+    // areas are dropped, and only the identity matters here.
+    //
+    // The drop is the one path that fits every measurement at once. 0x2EB8D0
+    // jumps here when ED900 returns -1, which is AFTER the selector is
+    // consumed at 0x2EB88A but BEFORE the dispatch at 0x2EB910 and the portal
+    // loop at 0x2EB915. So a dropped area:
+    //   - was enqueued            => [SelWrite] sees it            (observed)
+    //   - had its selector eaten  => live=0 at exit                (observed)
+    //   - never runs its portals  => no outbound walkPairs edge    (observed)
+    //   - is not selector-less    => absent from qSkipAreas        (observed)
+    //   - leaves nothing pending  => pendExit=0                    (observed)
+    // Nothing else on this path produces all five.
+    //
+    // And it is consistent with the A/B: with the area patches ON more portals
+    // cross, so ED900 builds bigger/more records (alloc 93 vs 40, selN 73 vs
+    // 28) and returns -1 for areas it would otherwise accept. Turning the area
+    // group off restores 124/141/148/149/153 (ran 2/138 -> 15/17).
+    //
+    // The area id is read from var_7C0 rather than rbx: rbx is callee-saved and
+    // should survive the `call sub_1802ED900` at 0x2EB8C5, but "should" is not
+    // a measurement, and the frame slot is written explicitly at 0x2EB87C
+    // (`mov [rbp+0F0h], rcx`, displacement confirmed from the encoding) and is
+    // live across the whole iteration.
+    constexpr std::int32_t   kRbpDispAreaId  = 0xF0;      // var_7C0
+    volatile std::uint64_t*  s_dropAreaCounter = nullptr;
+    std::uint8_t*            s_dropAreaPage    = nullptr;
+
+    constexpr std::uintptr_t kRvaSelWrite     = 0x2EC739;
+    constexpr std::size_t    kSelAreaBitsOff  = 0x80;
+    constexpr std::size_t    kSelAreaBitsSize = 32;         // 256 bits
+    static_assert(kSelAreaBitsOff >= kStubCounterOffset + sizeof(std::uint64_t),
+                  "selector area table overlaps the stub counter");
+    static_assert(kSelAreaBitsOff + kSelAreaBitsSize <= kPortalBitsOffset,
+                  "selector area table overlaps the portal bit table");
+    // dword_1811FBD98 — incremented at 0x2EC8DC on the cursor REWIND path,
+    // i.e. every time an enqueued area's slot was behind the cursor and the
+    // loop had to go back for it. Read directly; no hook needed.
+    constexpr std::uintptr_t kRvaRewindCount  = 0x11FBD98;
+    volatile std::uint64_t*  s_selWriteCounter = nullptr;
+    std::uint8_t*            s_selWritePage    = nullptr;
+
+    // Steal-and-replay island that bts's RCX (masked) into the portal bit
+    // table, for a site that is not a branch.
+    //   +0x00  F0 48 FF 05 <d32>     lock inc [rip -> kStubCounterOffset]
+    //   +0x08  50                    push rax
+    //   +0x09  48 89 C8              mov  rax, rcx
+    //   +0x0C  48 25 FF 3F 00 00     and  rax, 3FFFh
+    //   +0x12  48 0F AB 05 <d32>     bts  [rip -> kPortalBitsOffset], rax
+    //   +0x1A  58                    pop  rax
+    //   +0x1B  <stolen>              (position independent)
+    //   +0x1B+n FF 25 00 00 00 00    jmp  [rip+0]
+    //   +0x21+n <qword> continue
+    // Tail-jmp island that ALSO records an area id read from [rbp+disp32].
+    // Same shape as InstallCounterIslandTailJmp (steal a block ending in an
+    // unconditional `jmp rel32`, replay the head, resolve the jmp to an
+    // absolute), with the bts added.
+    //   +0x00  F0 48 FF 05 <d32>   lock inc [rip -> kStubCounterOffset]
+    //   +0x08  50                  push rax
+    //   +0x09  48 8B 85 <d32>      mov  rax, [rbp+disp32]
+    //   +0x10  48 25 FF 00 00 00   and  rax, 0FFh
+    //   +0x16  48 0F AB 05 <d32>   bts  [rip -> kSelAreaBitsOff], rax
+    //   +0x1E  58                  pop  rax
+    //   +0x1F  <replayed head>
+    //   +....  FF 25 00 00 00 00   jmp  [rip+0]
+    //   +....  <qword> resolved destination
+    bool InstallTailJmpAreaRecorder(const char* tag, std::uintptr_t rva,
+                                    std::size_t stealSize, std::size_t headLen,
+                                    const std::uint8_t* expect,
+                                    std::uintptr_t contRva, std::int32_t rbpDisp,
+                                    volatile std::uint64_t** counterOut,
+                                    std::uint8_t** pageOut) {
+      HMODULE client = GetModuleHandleA("client.dll");
+      if (client == nullptr)
+        return false;
+      auto* base   = reinterpret_cast<std::uint8_t*>(client);
+      auto* target = base + rva;
+
+      if (std::memcmp(target, expect, stealSize) != 0) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] byte mismatch at client.dll+0x", std::hex, rva,
+          std::dec, " - not this build, recorder skipped"));
+        return false;
+      }
+      // Re-derive the stolen jmp's destination and refuse if it moved, exactly
+      // as the plain tail-jmp counter does.
+      std::int32_t curDisp = 0;
+      std::memcpy(&curDisp, expect + headLen + 1, sizeof(curDisp));
+      if (rva + stealSize + curDisp != contRva) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] tail jmp does not land on 0x", std::hex, contRva,
+          std::dec, " - recorder skipped"));
+        return false;
+      }
+
+      std::uint8_t* page = AllocateNearPage(base);
+      if (page == nullptr) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] no page within rel32 range of client.dll"));
+        return false;
+      }
+      std::memset(page, 0xCC, kStubCounterOffset + sizeof(std::uint64_t));
+      std::memset(page + kSelAreaBitsOff, 0, kSelAreaBitsSize);
+
+      std::size_t o = 0;
+      page[o++] = 0xF0; page[o++] = 0x48; page[o++] = 0xFF; page[o++] = 0x05;
+      { const std::int32_t d = static_cast<std::int32_t>(kStubCounterOffset)
+                             - static_cast<std::int32_t>(o + 4);
+        std::memcpy(page + o, &d, 4); o += 4; }
+      page[o++] = 0x50;                                       // push rax
+      page[o++] = 0x48; page[o++] = 0x8B; page[o++] = 0x85;   // mov rax,[rbp+d32]
+      { std::memcpy(page + o, &rbpDisp, 4); o += 4; }
+      page[o++] = 0x48; page[o++] = 0x25;                     // and rax, 0FFh
+      { const std::int32_t m = 0xFF; std::memcpy(page + o, &m, 4); o += 4; }
+      page[o++] = 0x48; page[o++] = 0x0F; page[o++] = 0xAB; page[o++] = 0x05;
+      { const std::int32_t d = static_cast<std::int32_t>(kSelAreaBitsOff)
+                             - static_cast<std::int32_t>(o + 4);
+        std::memcpy(page + o, &d, 4); o += 4; }
+      page[o++] = 0x58;                                       // pop rax
+      std::memcpy(page + o, expect, headLen); o += headLen;   // replay head
+      page[o++] = 0xFF; page[o++] = 0x25;
+      { const std::int32_t z = 0; std::memcpy(page + o, &z, 4); o += 4; }
+      const auto contAddr = reinterpret_cast<std::uint64_t>(base + contRva);
+      std::memcpy(page + o, &contAddr, sizeof(contAddr)); o += 8;
+      if (o > kStubCounterOffset) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] stub is ", o, " bytes and would overrun its counter"));
+        return false;
+      }
+      const std::uint64_t z64 = 0;
+      std::memcpy(page + kStubCounterOffset, &z64, sizeof(z64));
+
+      const std::int64_t rel =
+        static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(page)) -
+        (static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(target)) + 5);
+      if (rel > INT32_MAX || rel < INT32_MIN) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] island out of rel32 range, recorder skipped"));
+        return false;
+      }
+
+      DWORD oldProt = 0;
+      if (!VirtualProtect(target, stealSize, PAGE_EXECUTE_READWRITE, &oldProt)) {
+        dxvk::Logger::warn(dxvk::str::format("[", tag, "] VirtualProtect failed"));
+        return false;
+      }
+      std::uint8_t stub[kIslandMaxSteal];
+      std::memset(stub, 0x90, sizeof(stub));
+      stub[0] = 0xE9;
+      const std::int32_t rel32 = static_cast<std::int32_t>(rel);
+      std::memcpy(stub + 1, &rel32, sizeof(rel32));
+      std::memcpy(target, stub, stealSize);
+      DWORD tmp = 0;
+      VirtualProtect(target, stealSize, oldProt, &tmp);
+      FlushInstructionCache(GetCurrentProcess(), target, stealSize);
+
+      *counterOut = reinterpret_cast<volatile std::uint64_t*>(
+        page + kStubCounterOffset);
+      *pageOut = page;
+      dxvk::Logger::warn(dxvk::str::format(
+        "[", tag, "] RECORDER INSTALLED at client.dll+0x", std::hex, rva,
+        " island=0x", reinterpret_cast<std::uintptr_t>(page),
+        " -> client.dll+0x", contRva, " rbp+0x", rbpDisp, std::dec,
+        " (tail-jmp + dropped-area bitmap)"));
+      return true;
+    }
+
+    // `movRax` is the 3-byte `mov rax, <src>` that copies the register holding
+    // the value to record (48 89 C8 = rcx, 4C 89 D0 = r10). `mask` bounds it so
+    // the bts cannot address outside the table, and (bitsOff, bitsBytes) select
+    // which table on the page it lands in — portal bits at 0x100 for a portal
+    // index, or a 32-byte area table for a raw area id.
+    bool InstallRegBitIsland(const char* tag, std::uintptr_t rva,
+                             std::size_t stealSize, const std::uint8_t* expect,
+                             const std::uint8_t* movRax, std::int32_t mask,
+                             std::size_t bitsOff, std::size_t bitsBytes,
+                             volatile std::uint64_t** counterOut,
+                             std::uint8_t** pageOut) {
+      HMODULE client = GetModuleHandleA("client.dll");
+      if (client == nullptr)
+        return false;
+      auto* base   = reinterpret_cast<std::uint8_t*>(client);
+      auto* target = base + rva;
+
+      if (std::memcmp(target, expect, stealSize) != 0) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] byte mismatch at client.dll+0x", std::hex, rva,
+          std::dec, " - not this build, probe skipped"));
+        return false;
+      }
+
+      std::uint8_t* page = AllocateNearPage(base);
+      if (page == nullptr) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] no page within rel32 range of client.dll"));
+        return false;
+      }
+      std::memset(page, 0xCC, kStubCounterOffset + sizeof(std::uint64_t));
+      std::memset(page + bitsOff, 0, bitsBytes);
+
+      std::size_t o = 0;
+      page[o++] = 0xF0; page[o++] = 0x48; page[o++] = 0xFF; page[o++] = 0x05;
+      { const std::int32_t d = static_cast<std::int32_t>(kStubCounterOffset)
+                             - static_cast<std::int32_t>(o + 4);
+        std::memcpy(page + o, &d, 4); o += 4; }
+      page[o++] = 0x50;                                       // push rax
+      page[o++] = movRax[0]; page[o++] = movRax[1]; page[o++] = movRax[2];
+      page[o++] = 0x48; page[o++] = 0x25;                     // and rax, imm32
+      { std::memcpy(page + o, &mask, 4); o += 4; }
+      page[o++] = 0x48; page[o++] = 0x0F; page[o++] = 0xAB; page[o++] = 0x05;
+      { const std::int32_t d = static_cast<std::int32_t>(bitsOff)
+                             - static_cast<std::int32_t>(o + 4);
+        std::memcpy(page + o, &d, 4); o += 4; }
+      page[o++] = 0x58;                                       // pop rax
+      std::memcpy(page + o, expect, stealSize); o += stealSize;
+      page[o++] = 0xFF; page[o++] = 0x25;
+      { const std::int32_t z = 0; std::memcpy(page + o, &z, 4); o += 4; }
+      const auto contAddr = reinterpret_cast<std::uint64_t>(target + stealSize);
+      std::memcpy(page + o, &contAddr, sizeof(contAddr)); o += 8;
+      if (o > kStubCounterOffset) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] stub is ", o, " bytes, counter sits at 0x",
+          std::hex, kStubCounterOffset, std::dec, " - probe skipped"));
+        return false;
+      }
+      const std::uint64_t z64 = 0;
+      std::memcpy(page + kStubCounterOffset, &z64, sizeof(z64));
+
+      const std::int64_t rel =
+        static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(page)) -
+        (static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(target)) + 5);
+      if (rel > INT32_MAX || rel < INT32_MIN) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] island out of rel32 range, probe skipped"));
+        return false;
+      }
+
+      DWORD oldProt = 0;
+      if (!VirtualProtect(target, stealSize, PAGE_EXECUTE_READWRITE, &oldProt)) {
+        dxvk::Logger::warn(dxvk::str::format("[", tag, "] VirtualProtect failed"));
+        return false;
+      }
+      std::uint8_t stub[kIslandMaxSteal];
+      std::memset(stub, 0x90, sizeof(stub));
+      stub[0] = 0xE9;
+      const std::int32_t rel32 = static_cast<std::int32_t>(rel);
+      std::memcpy(stub + 1, &rel32, sizeof(rel32));
+      std::memcpy(target, stub, stealSize);
+      DWORD tmp = 0;
+      VirtualProtect(target, stealSize, oldProt, &tmp);
+      FlushInstructionCache(GetCurrentProcess(), target, stealSize);
+
+      *counterOut = reinterpret_cast<volatile std::uint64_t*>(
+        page + kStubCounterOffset);
+      *pageOut = page;
+      dxvk::Logger::warn(dxvk::str::format(
+        "[", tag, "] INSTALLED at client.dll+0x", std::hex, rva,
+        " island=0x", reinterpret_cast<std::uintptr_t>(page), std::dec,
+        " (steal+replay, bts rcx = portal bit, every walked portal)"));
+      return true;
+    }
+
+    // Steal-and-replay island that LATCHES EAX into the island page.
+    //   +0x00  F0 48 FF 05 <d32>   lock inc [rip -> +0x30]
+    //   +0x08  89 05 <d32>         mov [rip -> +0x38], eax
+    //   +0x0E  <stolen bytes>
+    //   +0x0E+n FF 25 00 00 00 00  jmp [rip+0]
+    //   +0x14+n <qword> continue address
+    // Flags: the lock inc writes them, but both stolen instructions here write
+    // flags themselves afterwards, so nothing downstream can observe mine.
+    // Registers: EAX is read, never written. No push, no stack use at all.
+    bool InstallEaxLatchIsland(const char* tag, std::uintptr_t rva,
+                               std::size_t stealSize, const std::uint8_t* expect,
+                               volatile std::uint64_t** counterOut,
+                               std::uint8_t** pageOut) {
+      HMODULE client = GetModuleHandleA("client.dll");
+      if (client == nullptr)
+        return false;
+      auto* base   = reinterpret_cast<std::uint8_t*>(client);
+      auto* target = base + rva;
+
+      if (std::memcmp(target, expect, stealSize) != 0) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] byte mismatch at client.dll+0x", std::hex, rva,
+          std::dec, " - not this build, probe skipped"));
+        return false;
+      }
+
+      std::uint8_t* page = AllocateNearPage(base);
+      if (page == nullptr) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] no page within rel32 range of client.dll"));
+        return false;
+      }
+      std::memset(page, 0xCC, 0x48);
+
+      std::size_t o = 0;
+      page[o++] = 0xF0; page[o++] = 0x48; page[o++] = 0xFF; page[o++] = 0x05;
+      { const std::int32_t d = 0x30 - static_cast<std::int32_t>(o + 4);
+        std::memcpy(page + o, &d, 4); o += 4; }                  // o == 0x08
+      page[o++] = 0x89; page[o++] = 0x05;
+      { const std::int32_t d = static_cast<std::int32_t>(kQValueOffset)
+                             - static_cast<std::int32_t>(o + 4);
+        std::memcpy(page + o, &d, 4); o += 4; }                  // o == 0x0E
+      std::memcpy(page + o, expect, stealSize); o += stealSize;
+      page[o++] = 0xFF; page[o++] = 0x25;
+      { const std::int32_t z = 0; std::memcpy(page + o, &z, 4); o += 4; }
+      const auto contAddr = reinterpret_cast<std::uint64_t>(target + stealSize);
+      std::memcpy(page + o, &contAddr, sizeof(contAddr)); o += 8;
+      if (o > 0x30) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] stub is ", o, " bytes and would overrun its counter"));
+        return false;
+      }
+      const std::uint64_t z64 = 0;
+      std::memcpy(page + 0x30, &z64, sizeof(z64));
+      std::memcpy(page + kQValueOffset, &z64, sizeof(z64));
+
+      const std::int64_t rel =
+        static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(page)) -
+        (static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(target)) + 5);
+      if (rel > INT32_MAX || rel < INT32_MIN) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] island out of rel32 range, probe skipped"));
+        return false;
+      }
+
+      DWORD oldProt = 0;
+      if (!VirtualProtect(target, stealSize, PAGE_EXECUTE_READWRITE, &oldProt)) {
+        dxvk::Logger::warn(dxvk::str::format("[", tag, "] VirtualProtect failed"));
+        return false;
+      }
+      std::uint8_t stub[kIslandMaxSteal];
+      std::memset(stub, 0x90, sizeof(stub));
+      stub[0] = 0xE9;
+      const std::int32_t rel32 = static_cast<std::int32_t>(rel);
+      std::memcpy(stub + 1, &rel32, sizeof(rel32));
+      std::memcpy(target, stub, stealSize);
+      DWORD tmp = 0;
+      VirtualProtect(target, stealSize, oldProt, &tmp);
+      FlushInstructionCache(GetCurrentProcess(), target, stealSize);
+
+      *counterOut = reinterpret_cast<volatile std::uint64_t*>(page + 0x30);
+      *pageOut    = page;
+      dxvk::Logger::warn(dxvk::str::format(
+        "[", tag, "] INSTALLED at client.dll+0x", std::hex, rva,
+        " island=0x", reinterpret_cast<std::uintptr_t>(page), std::dec,
+        " (latches eax = sub_1802EAD60's queue start index)"));
+      return true;
+    }
+
+    // Branch recorder that sets one bit per AREA ID held in ECX. Same retarget
+    // trick as InstallBranchPortalRecorder: only the rel32 displacement is
+    // rewritten, so the condition is preserved and the island runs on the taken
+    // path only -- where flags are already dead.
+    //   +0x00  F0 48 FF 05 <d32>      lock inc [rip -> +0x30]
+    //   +0x08  50                     push rax
+    //   +0x09  48 89 C8               mov  rax, rcx
+    //   +0x0C  48 25 FF 00 00 00      and  rax, 0xFF     (bounds the bts)
+    //   +0x12  48 0F AB 05 <d32>      bts  [rip -> +0x40], rax
+    //   +0x1A  58                     pop  rax
+    //   +0x1B  FF 25 00 00 00 00      jmp  [rip+0]
+    //   +0x21  <qword> original branch target
+    bool InstallBranchAreaRecorder(const char* tag, std::uintptr_t rva,
+                                   std::size_t branchSize, std::size_t dispOffset,
+                                   const std::uint8_t* expect,
+                                   std::uintptr_t origTargetRva,
+                                   volatile std::uint64_t** counterOut,
+                                   std::uint8_t** pageOut) {
+      HMODULE client = GetModuleHandleA("client.dll");
+      if (client == nullptr)
+        return false;
+      auto* base   = reinterpret_cast<std::uint8_t*>(client);
+      auto* target = base + rva;
+
+      if (std::memcmp(target, expect, branchSize) != 0) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] byte mismatch at client.dll+0x", std::hex, rva,
+          std::dec, " - not this build, recorder skipped"));
+        return false;
+      }
+      std::int32_t curDisp = 0;
+      std::memcpy(&curDisp, expect + dispOffset, sizeof(curDisp));
+      if (rva + branchSize + curDisp != origTargetRva) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] branch destination is not 0x", std::hex, origTargetRva,
+          std::dec, " - recorder skipped"));
+        return false;
+      }
+
+      std::uint8_t* page = AllocateNearPage(base);
+      if (page == nullptr) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] no page within rel32 range of client.dll"));
+        return false;
+      }
+      std::memset(page, 0xCC, kQAreaBitsOff + kQAreaBitsSize);
+      std::memset(page + kQAreaBitsOff, 0, kQAreaBitsSize);
+
+      std::size_t o = 0;
+      page[o++] = 0xF0; page[o++] = 0x48; page[o++] = 0xFF; page[o++] = 0x05;
+      { const std::int32_t d = 0x30 - static_cast<std::int32_t>(o + 4);
+        std::memcpy(page + o, &d, 4); o += 4; }                   // 0x08
+      page[o++] = 0x50;                                           // push rax
+      page[o++] = 0x48; page[o++] = 0x89; page[o++] = 0xC8;       // mov rax, rcx
+      page[o++] = 0x48; page[o++] = 0x25;
+      { const std::int32_t m = 0xFF; std::memcpy(page + o, &m, 4); o += 4; }
+      page[o++] = 0x48; page[o++] = 0x0F; page[o++] = 0xAB; page[o++] = 0x05;
+      { const std::int32_t d = static_cast<std::int32_t>(kQAreaBitsOff)
+                             - static_cast<std::int32_t>(o + 4);
+        std::memcpy(page + o, &d, 4); o += 4; }                   // 0x1A
+      page[o++] = 0x58;                                           // pop rax
+      page[o++] = 0xFF; page[o++] = 0x25;
+      { const std::int32_t z = 0; std::memcpy(page + o, &z, 4); o += 4; }
+      const auto contAddr = reinterpret_cast<std::uint64_t>(base + origTargetRva);
+      std::memcpy(page + o, &contAddr, sizeof(contAddr)); o += 8;
+      if (o > 0x30) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] stub is ", o, " bytes and would overrun its counter"));
+        return false;
+      }
+      const std::uint64_t z64 = 0;
+      std::memcpy(page + 0x30, &z64, sizeof(z64));
+
+      const std::int64_t rel =
+        static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(page)) -
+        (static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(target)) +
+         static_cast<std::int64_t>(branchSize));
+      if (rel > INT32_MAX || rel < INT32_MIN) {
+        dxvk::Logger::warn(dxvk::str::format(
+          "[", tag, "] stub out of rel32 range, recorder skipped"));
+        return false;
+      }
+
+      DWORD oldProt = 0;
+      if (!VirtualProtect(target + dispOffset, 4, PAGE_EXECUTE_READWRITE, &oldProt)) {
+        dxvk::Logger::warn(dxvk::str::format("[", tag, "] VirtualProtect failed"));
+        return false;
+      }
+      const std::int32_t rel32 = static_cast<std::int32_t>(rel);
+      std::memcpy(target + dispOffset, &rel32, sizeof(rel32));
+      DWORD tmp = 0;
+      VirtualProtect(target + dispOffset, 4, oldProt, &tmp);
+      FlushInstructionCache(GetCurrentProcess(), target, branchSize);
+
+      *counterOut = reinterpret_cast<volatile std::uint64_t*>(page + 0x30);
+      *pageOut    = page;
+      dxvk::Logger::warn(dxvk::str::format(
+        "[", tag, "] RECORDER INSTALLED at client.dll+0x", std::hex, rva,
+        " stub=0x", reinterpret_cast<std::uintptr_t>(page),
+        " -> client.dll+0x", origTargetRva, std::dec,
+        " (branch retarget + selector-less area bitmap from ecx)"));
+      return true;
+    }
+
     bool DoInstallEd900Probe() {
       // sub_1802ED900:  mov rax,rsp / mov [rax+10h],rbx     = 3 + 4 = 7
       static constexpr std::uint8_t kEd900[7] = {
@@ -2976,9 +3641,15 @@ namespace tf2_decal_hook {
         0xE9, 0xDF, 0x0A, 0x00, 0x00,                     // jmp loc_1802EC957
       };
       static_assert(sizeof(kEd900Drop) <= kIslandMaxSteal, "stub buffer");
-      any |= InstallCounterIslandTailJmp("Ed900Drop", kRvaEd900Drop,
-                                         sizeof(kEd900Drop), 2, kEd900Drop,
-                                         kRvaEd900DropCont, &s_ed900DropCounter);
+      // [DropAreas] replaces the plain Ed900Drop counter with the same island
+      // plus the dropped area's IDENTITY. The count alone has read 4.00 flat
+      // in every capture and was taken as an acquittal; which four areas it is
+      // has never been recorded, and that is the whole question.
+      any |= InstallTailJmpAreaRecorder("DropAreas", kRvaEd900Drop,
+                                        sizeof(kEd900Drop), 2, kEd900Drop,
+                                        kRvaEd900DropCont, kRbpDispAreaId,
+                                        &s_dropAreaCounter, &s_dropAreaPage);
+      s_ed900DropCounter = s_dropAreaCounter;   // keep ed900Drop= on the line
 
       // [ClipDegen] A and B. Both are `0F 82 <rel32>` -> loc_1802EC8ED; the
       // installer re-derives the encoded destination from these bytes and
@@ -2999,6 +3670,79 @@ namespace tf2_decal_hook {
       any |= InstallBranchCounter("ClipDegenB", kRvaClipDegenB, 6, 2,
                                   kClipDegenB, kRvaClipDegenTgt,
                                   &s_clipDegenBCounter);
+
+      // [QueueProbe]. qStart latches sub_1802EAD60's return value -- the index
+      // the queue loop starts at, which has never been logged and is the one
+      // position-keyed quantity on this path. Steal is the two instructions at
+      // 0x2EB7EF, both position independent, and EAX (the return value) is
+      // still live there; it is not consumed until `mov ebx, eax` at 0x2EB7F7.
+      //   1802eb7ef  49 83 C8 FF   or  r8, -1
+      //   1802eb7f3  33 D2         xor edx, edx
+      static constexpr std::uint8_t kQStart[6] = {
+        0x49, 0x83, 0xC8, 0xFF,                           // or  r8, 0FFFFFFFFFFFFFFFFh
+        0x33, 0xD2,                                       // xor edx, edx
+      };
+      static_assert(sizeof(kQStart) <= kIslandMaxSteal, "stub buffer");
+      any |= InstallEaxLatchIsland("QStart", kRvaQStart, sizeof(kQStart),
+                                   kQStart, &s_qStartCounter, &s_qStartPage);
+
+      // qSkip records WHICH areas the loop visited and skipped for want of a
+      // selector. ECX holds the area id there (loaded at 0x2EB864, still live
+      // through the `cmp r9d,-1` at 0x2EB880).
+      //   1802eb884  0F 84 D4 10 00 00   jz loc_1802EC95E
+      static constexpr std::uint8_t kQSkip[6] = {
+        0x0F, 0x84, 0xD4, 0x10, 0x00, 0x00,               // jz loc_1802EC95E
+      };
+      any |= InstallBranchAreaRecorder("QSkip", kRvaQSkip, 6, 2, kQSkip,
+                                       kRvaQSkipTgt, &s_qSkipCounter,
+                                       &s_qSkipPage);
+
+      // [FaceReject]. Same recorder as ClipDegenA and the same rbp
+      // displacement, because it resolves the target area from the same
+      // var_7B8 portal bit index -- verified from the encoding at 0x2EC708,
+      // `48 8B 8D F8 00 00 00` = mov rcx,[rbp+0F8h]. var_7B8 is written at
+      // 0x2EB93F, before this branch, so it is already the current portal's.
+      //   1802eb98f  0F 83 8E 0F 00 00   jnb loc_1802EC923
+      // (0x2EB98F + 6 + 0xF8E == 0x2EC923; the installer re-derives that and
+      // declines if the branch ever moves.)
+      static constexpr std::uint8_t kFaceReject[6] = {
+        0x0F, 0x83, 0x8E, 0x0F, 0x00, 0x00,               // jnb loc_1802EC923
+      };
+      any |= InstallBranchPortalRecorder("FaceReject", kRvaFaceReject, 6, 2,
+                                         kFaceReject, kRvaFaceRejectTgt,
+                                         0xF8, &s_faceRejectCounter,
+                                         &s_faceRejectPage);
+
+      // [PortalWalk]: every portal the flood iterates, by target area. The
+      // probe that separates "rejected by something I have not found" from
+      // "never reached at all".
+      //   1802eb93f  48 89 8D F8 00 00 00   mov [rbp+0F8h], rcx
+      static constexpr std::uint8_t kPortalWalk[7] = {
+        0x48, 0x89, 0x8D, 0xF8, 0x00, 0x00, 0x00,         // mov [rbp+0F8h], rcx
+      };
+      static_assert(sizeof(kPortalWalk) <= kIslandMaxSteal, "stub buffer");
+      static constexpr std::uint8_t kMovRaxRcx[3] = { 0x48, 0x89, 0xC8 };
+      any |= InstallRegBitIsland("PortalWalk", kRvaPortalWalk,
+                                 sizeof(kPortalWalk), kPortalWalk,
+                                 kMovRaxRcx,
+                                 static_cast<std::int32_t>(kPortalBitsBytes * 8u - 1u),
+                                 kPortalBitsOffset, kPortalBitsBytes,
+                                 &s_portalWalkCounter, &s_portalWalkPage);
+
+      // [SelWrite]: which areas actually get a selector written. Records r10
+      // (the target area) rather than a portal index, so it uses the 32-byte
+      // area table and a 0xFF mask.
+      //   1802ec739  42 89 84 92 1C F9 1F 01   mov [rdx+r10*4+11FF91Ch], eax
+      static constexpr std::uint8_t kSelWrite[8] = {
+        0x42, 0x89, 0x84, 0x92, 0x1C, 0xF9, 0x1F, 0x01,
+      };
+      static_assert(sizeof(kSelWrite) <= kIslandMaxSteal, "stub buffer");
+      static constexpr std::uint8_t kMovRaxR10[3] = { 0x4C, 0x89, 0xD0 };
+      any |= InstallRegBitIsland("SelWrite", kRvaSelWrite,
+                                 sizeof(kSelWrite), kSelWrite,
+                                 kMovRaxR10, 0xFF,
+                                 kSelAreaBitsOff, kSelAreaBitsSize,
+                                 &s_selWriteCounter, &s_selWritePage);
       return any;
     }
 
@@ -3306,15 +4050,112 @@ namespace tf2_decal_hook {
   // arithmetic applies directly to the bit index. Areas are returned rather
   // than portal indices because the area id is what [AreaDump] and [AreaSeed]
   // are already expressed in — 113/141/148/153 is the group to look for.
-  std::uint32_t DrainClipDegenAreas(std::uint32_t* out, std::uint32_t maxOut) {
-    if (s_clipDegenAPage == nullptr || out == nullptr || maxOut == 0)
+  // [QueueProbe] readers. Both follow the house rule: a zero from a probe that
+  // failed to install is indistinguishable from a zero it measured, so each
+  // exposes an Installed() predicate and the emitter prints it on the line.
+  bool QueueProbeInstalled() {
+    return s_qStartCounter != nullptr && s_qSkipCounter != nullptr;
+  }
+
+  // EAD60's return value, latched (not summed). sub_1802EB620 runs once per
+  // VIEW, so this is the last view's cursor within the frame; read it with
+  // eb620 on the same line, exactly as a20 is.
+  std::uint32_t ReadQueueStartIndex() {
+    if (s_qStartPage == nullptr)
+      return 0xFFFFFFFFu;
+    return *reinterpret_cast<volatile std::uint32_t*>(s_qStartPage + kQValueOffset);
+  }
+
+  std::uint64_t DrainQStartCount() {
+    if (s_qStartCounter == nullptr)
+      return 0;
+    const std::uint64_t v = *s_qStartCounter;
+    *s_qStartCounter = 0;
+    return v;
+  }
+
+  std::uint64_t DrainQSkipCount() {
+    if (s_qSkipCounter == nullptr)
+      return 0;
+    const std::uint64_t v = *s_qSkipCounter;
+    *s_qSkipCounter = 0;
+    return v;
+  }
+
+  // Areas that were in the order list, reached by the cursor, and skipped
+  // because no portal crossing had written them a selector. Read and cleared.
+  // This is the IDENTITY half: if 113/141/148/149/153 appear here, the cursor
+  // is innocent and the loss is in the crossings; if they do not appear at all
+  // the loop never reached them and ReadQueueStartIndex() is the answer.
+  std::uint32_t DrainQSkipAreas(std::uint32_t* out, std::uint32_t maxOut) {
+    if (s_qSkipPage == nullptr || out == nullptr || maxOut == 0)
+      return 0;
+    auto* bits = reinterpret_cast<volatile std::uint64_t*>(s_qSkipPage + kQAreaBitsOff);
+    std::uint32_t n = 0;
+    for (std::uint32_t w = 0; w < kQAreaBitsSize / sizeof(std::uint64_t); ++w) {
+      std::uint64_t v = bits[w];
+      bits[w] = 0;
+      while (v != 0 && n < maxOut) {
+        unsigned long b = 0;
+        _BitScanForward64(&b, v);
+        v &= v - 1;
+        out[n++] = w * 64u + static_cast<std::uint32_t>(b);
+      }
+    }
+    return n;
+  }
+
+  // Shared by [ClipDegen] and [FaceReject]: turn a recorder page's portal-bit
+  // bitmap into neighbour AREA ids, read-and-clear. Factored out when the
+  // second recorder landed so the two cannot drift apart in how they resolve
+  // an area -- the identity is the whole point of both probes, and two copies
+  // of this lookup is two chances to resolve it differently.
+  // `maxBitOut` receives the widest bit index seen, which is the aliasing
+  // guard: near the top of the map the ids on the line are fiction.
+  // DEDUPED BY AREA, AND THE SENTINEL IS FILTERED. The first version emitted
+  // one entry per portal BIT, which made the output useless for the question it
+  // was built to answer:
+  //   walkAreas=[62,63,63,64,65,180,180,180,180,180,180,61,63,74,126,180,...]
+  // Distinct areas there are a handful, but the buffer is 48 and the scan runs
+  // in bit order, so duplicates (two portals to the same neighbour) and ~30
+  // copies of 180 filled it before the scan ever reached the high bits. Every
+  // area behind that point read as ABSENT -- and "absent" is precisely the
+  // verdict [PortalWalk] exists to deliver. A truncated identity list is worse
+  // than none: it manufactures the answer it was asked for.
+  //
+  // 180 is not an area. dword_181748D8C is the area count (179), and the loop
+  // at 0x2EC9D1 indexes nAreas+1, so ids run 0..nAreas with nAreas+1 as the
+  // "no neighbour / outside" terminator. It is counted into `oobOut` rather
+  // than listed, so the line still shows it exists without it drowning the ids
+  // that matter. rtx.conf's warning about "area 180 on a map with 179 areas"
+  // was about bit ALIASING; this is the benign source of the same number, and
+  // maxBit still guards the aliasing case separately.
+  //
+  // Dedupe is by a 256-bit set, so the output is at most one entry per area and
+  // the caller's buffer can no longer bind in practice.
+  //
+  // The area count comes from the EXISTING kRvaAreaCount in the anonymous
+  // namespace above (0x1748D8C, "dword_181748D8C, its bound") -- the same
+  // constant [AreaSeed] already bounds the order-list scan with. A second
+  // definition here was ambiguous at this scope and, worse, would have been a
+  // second place for the RVA to drift.
+  static std::uint32_t DrainPortalAreasFromPage(std::uint8_t* page,
+                                                std::uint32_t* out,
+                                                std::uint32_t maxOut,
+                                                std::uint32_t* maxBitOut,
+                                                std::uint32_t* oobOut) {
+    if (maxBitOut != nullptr)
+      *maxBitOut = 0;
+    if (oobOut != nullptr)
+      *oobOut = 0;
+    if (page == nullptr || out == nullptr || maxOut == 0)
       return 0;
     HMODULE client = GetModuleHandleA("client.dll");
     if (client == nullptr)
       return 0;
 
     auto* bits = reinterpret_cast<volatile std::uint64_t*>(
-      s_clipDegenAPage + kPortalBitsOffset);
+      page + kPortalBitsOffset);
     const auto words =
       static_cast<std::uint32_t>(kPortalBitsBytes / sizeof(std::uint64_t));
 
@@ -3323,7 +4164,16 @@ namespace tf2_decal_hook {
     const std::uint8_t* table =
       WvReadable(pTable, sizeof(void*)) ? *pTable : nullptr;
 
+    // Area count, for the sentinel test. If it cannot be read, nothing is
+    // filtered -- better a noisy list than one silently missing real ids.
+    const auto* pAreaCount = reinterpret_cast<const std::uint32_t*>(
+      reinterpret_cast<std::uint8_t*>(client) + kRvaAreaCount);
+    const std::uint32_t areaCount =
+      WvReadable(pAreaCount, sizeof(std::uint32_t)) ? *pAreaCount : 0xFFFFFFFFu;
+
+    std::uint64_t seen[4] = { 0, 0, 0, 0 };         // 256 areas
     std::uint32_t n = 0;
+    std::uint32_t oob = 0;
     std::uint32_t maxBit = 0;
     for (std::uint32_t w = 0; w < words; ++w) {
       std::uint64_t v = bits[w];
@@ -3335,7 +4185,9 @@ namespace tf2_decal_hook {
         _BitScanReverse64(&hi, v);
         maxBit = w * 64u + static_cast<std::uint32_t>(hi);
       }
-      while (v != 0 && n < maxOut) {
+      // NOTE the bit walk is NOT bounded by maxOut: every bit must be visited
+      // so `oob` and the dedupe stay honest even if the caller's buffer fills.
+      while (v != 0) {
         unsigned long b = 0;
         _BitScanForward64(&b, v);
         v &= v - 1;
@@ -3346,12 +4198,282 @@ namespace tf2_decal_hook {
           if (WvReadable(slot, sizeof(std::uint16_t)))
             area = *reinterpret_cast<const std::uint16_t*>(slot);
         }
-        out[n++] = area;
+        if (area >= areaCount || area >= 256u) {    // sentinel / unresolved
+          ++oob;
+          continue;
+        }
+        const std::uint64_t mask = 1ull << (area & 63u);
+        if ((seen[area >> 6] & mask) != 0)
+          continue;                                 // already listed
+        seen[area >> 6] |= mask;
+        if (n < maxOut)
+          out[n++] = area;
       }
     }
     // Published even when the caller's buffer filled, because the aliasing
     // question is about the WIDEST index seen, not the first sixteen.
+    if (maxBitOut != nullptr)
+      *maxBitOut = maxBit;
+    if (oobOut != nullptr)
+      *oobOut = oob;
+    return n;
+  }
+
+  std::uint32_t DrainClipDegenAreas(std::uint32_t* out, std::uint32_t maxOut) {
+    std::uint32_t maxBit = 0;
+    const std::uint32_t n =
+      DrainPortalAreasFromPage(s_clipDegenAPage, out, maxOut, &maxBit, nullptr);
     dxvk::tf2::g_clipDegenMaxBit.store(maxBit, std::memory_order_relaxed);
+    return n;
+  }
+
+  // [FaceReject] — portals skipped at 0x2EB98F because the camera is behind
+  // the portal plane, by TARGET AREA. Read and cleared.
+  //
+  // READ IT AGAINST qSkipAreas ON THE SAME FRAME. Areas 92/113/141/148/153
+  // appearing here on the LOW side and not on the HIGH side closes the chain:
+  // camera crosses the plane -> this test flips -> the portal to those areas
+  // is skipped -> no selector is written -> the queue loop skips them at
+  // 0x2EB884 -> a20 falls 14 -> 9 -> m1 and m2 both halve.
+  // Absent here while still in qSkipAreas would mean the crossing dies
+  // somewhere else again, and the enumeration missed a seventh reject.
+  bool FaceRejectProbeInstalled() { return s_faceRejectCounter != nullptr; }
+
+  std::uint64_t DrainFaceRejectCount() {
+    if (s_faceRejectCounter == nullptr)
+      return 0;
+    const std::uint64_t v = *s_faceRejectCounter;
+    *s_faceRejectCounter = 0;
+    return v;
+  }
+
+  std::uint32_t DrainFaceRejectAreas(std::uint32_t* out, std::uint32_t maxOut) {
+    return DrainPortalAreasFromPage(s_faceRejectPage, out, maxOut,
+                                    nullptr, nullptr);
+  }
+
+  // [PortalWalk] — the target area of EVERY portal the flood iterated.
+  //
+  // THE DISCRIMINATION, and it needs no threshold: for an area that ends up
+  // selector-less (in qSkipAreas),
+  //   present here  -> the portal WAS walked and something declined to enqueue
+  //                    it, so a reject exists that six instrumented sites do
+  //                    not cover and the enumeration is incomplete.
+  //   absent here   -> nothing rejected it; its source area never ran its
+  //                    portal loop. Confirmed cascade, and the question moves
+  //                    to which source died first.
+  bool PortalWalkProbeInstalled() { return s_portalWalkCounter != nullptr; }
+
+  std::uint64_t DrainPortalWalkCount() {
+    if (s_portalWalkCounter == nullptr)
+      return 0;
+    const std::uint64_t v = *s_portalWalkCounter;
+    *s_portalWalkCounter = 0;
+    return v;
+  }
+
+  // SOURCE -> TARGET pairs for every portal walked, deduped, read and cleared.
+  //
+  // WHY PAIRS. The target-only list settled that 92/113/141/148/153 are never
+  // REACHED (walked 5 of 349 LOW frames against 126 of 134 HIGH) -- so no
+  // reject is at fault and the loss is a cascade. It also showed eleven areas
+  // (81,84,92,96,113,141,146,148,152,153,166) moving with identical counts to
+  // the frame, which is one connected CLUSTER with a single entry, not eleven
+  // independent failures. Targets alone cannot name that entry; the owning
+  // area can.
+  //
+  // NO NEW INSTRUMENTATION. The source is recoverable from the bit already
+  // recorded: portals are contiguous per area in qword_181748CF8 (count at +0,
+  // start at +2), and the bit is portalIdx*3, so the owner is the one area
+  // whose [start, start+count) contains bit/3. Adding a second captured
+  // register to the island would have meant re-verifying flags, scratch and
+  // steal at a site that is already correct and already validated in a
+  // capture. A drain-time lookup over 179 areas costs nothing and cannot
+  // perturb the thing being measured.
+  //
+  // Pairs are deduped, the no-neighbour sentinel is excluded from targets (it
+  // is counted into oobOut), and a source that cannot be resolved is reported
+  // as 0xFFFF rather than dropped, so a hole in the range table is visible
+  // instead of silently thinning the list.
+  // [SelWrite] — areas that actually received a selector at 0x2EC739, read and
+  // cleared. Read against walkPairs and qSkipAreas on the same line:
+  //   149 HERE in LOW  => it is enqueued and the cursor never returns for it;
+  //                       the defect is ordering, and rewinds= says whether
+  //                       the engine's own rewind even fired.
+  //   149 ABSENT in LOW => the crossing is rejected by something upstream of
+  //                       this store that no counter covers yet.
+  // [DropAreas] — WHICH areas sub_1802ED900 dropped, read and cleared.
+  //
+  // NOTE there is deliberately no count drain here. s_dropAreaCounter is the
+  // SAME counter DrainEd900DropCount() already reports as ed900Drop=; adding a
+  // second reader would let whichever drained first zero it and the other read
+  // 0. The count keeps its existing name on the line; this adds only identity.
+  std::uint32_t DrainDropAreas(std::uint32_t* out, std::uint32_t maxOut) {
+    if (s_dropAreaPage == nullptr || out == nullptr || maxOut == 0)
+      return 0;
+    auto* bits = reinterpret_cast<volatile std::uint64_t*>(
+      s_dropAreaPage + kSelAreaBitsOff);
+    std::uint32_t n = 0;
+    for (std::uint32_t w = 0; w < kSelAreaBitsSize / sizeof(std::uint64_t); ++w) {
+      std::uint64_t v = bits[w];
+      bits[w] = 0;
+      while (v != 0 && n < maxOut) {
+        unsigned long b = 0;
+        _BitScanForward64(&b, v);
+        v &= v - 1;
+        out[n++] = w * 64u + static_cast<std::uint32_t>(b);
+      }
+    }
+    return n;
+  }
+
+  bool SelWriteProbeInstalled() { return s_selWriteCounter != nullptr; }
+
+  std::uint64_t DrainSelWriteCount() {
+    if (s_selWriteCounter == nullptr)
+      return 0;
+    const std::uint64_t v = *s_selWriteCounter;
+    *s_selWriteCounter = 0;
+    return v;
+  }
+
+  std::uint32_t DrainSelWriteAreas(std::uint32_t* out, std::uint32_t maxOut) {
+    if (s_selWritePage == nullptr || out == nullptr || maxOut == 0)
+      return 0;
+    auto* bits = reinterpret_cast<volatile std::uint64_t*>(
+      s_selWritePage + kSelAreaBitsOff);
+    std::uint32_t n = 0;
+    for (std::uint32_t w = 0; w < kSelAreaBitsSize / sizeof(std::uint64_t); ++w) {
+      std::uint64_t v = bits[w];
+      bits[w] = 0;
+      while (v != 0 && n < maxOut) {
+        unsigned long b = 0;
+        _BitScanForward64(&b, v);
+        v &= v - 1;
+        out[n++] = w * 64u + static_cast<std::uint32_t>(b);
+      }
+    }
+    return n;
+  }
+
+  // dword_1811FBD98, the engine's own cursor-REWIND counter (incremented at
+  // 0x2EC8DC when an enqueued area's slot was behind the cursor). Free to read,
+  // no hook. This is the number whose EXISTENCE was checked earlier and whose
+  // VALUE never was -- which is why the ordering theory got dropped too soon.
+  // Cumulative since process start; difference it across frames.
+  std::uint32_t ReadRewindCount() {
+    HMODULE client = GetModuleHandleA("client.dll");
+    if (client == nullptr)
+      return 0xFFFFFFFFu;
+    const auto* p = reinterpret_cast<const std::uint32_t*>(
+      reinterpret_cast<std::uint8_t*>(client) + kRvaRewindCount);
+    return WvReadable(p, sizeof(std::uint32_t)) ? *p : 0xFFFFFFFFu;
+  }
+
+  std::uint32_t DrainPortalWalkPairs(std::uint32_t* srcOut,
+                                     std::uint32_t* dstOut,
+                                     std::uint32_t maxOut,
+                                     std::uint32_t* oobOut) {
+    if (oobOut != nullptr)
+      *oobOut = 0;
+    if (s_portalWalkPage == nullptr || srcOut == nullptr || dstOut == nullptr ||
+        maxOut == 0)
+      return 0;
+    HMODULE client = GetModuleHandleA("client.dll");
+    if (client == nullptr)
+      return 0;
+    auto* base = reinterpret_cast<std::uint8_t*>(client);
+
+    const auto* pTable = reinterpret_cast<const std::uint8_t* const*>(
+      base + kRvaPortalTable);
+    const std::uint8_t* table =
+      WvReadable(pTable, sizeof(void*)) ? *pTable : nullptr;
+    const auto* pRange = reinterpret_cast<const std::uint8_t* const*>(
+      base + kRvaAreaPortalRange);
+    const std::uint8_t* range =
+      WvReadable(pRange, sizeof(void*)) ? *pRange : nullptr;
+    const auto* pAreaCount =
+      reinterpret_cast<const std::uint32_t*>(base + kRvaAreaCount);
+    const std::uint32_t areaCount =
+      WvReadable(pAreaCount, sizeof(std::uint32_t)) ? *pAreaCount : 0u;
+
+    // Reverse map portalIdx -> owning area, built once per drain from the same
+    // (count, start) pairs the game itself indexes with.
+    constexpr std::uint32_t kMaxAreas = 256;
+    std::uint16_t start[kMaxAreas] = {};
+    std::uint16_t count[kMaxAreas] = {};
+    const std::uint32_t nAreas =
+      (range != nullptr && areaCount != 0 && areaCount <= kMaxAreas) ? areaCount : 0;
+    for (std::uint32_t a = 0; a < nAreas; ++a) {
+      const void* rec = range + static_cast<std::size_t>(a) * 8u;
+      if (!WvReadable(rec, 4)) {
+        count[a] = 0;
+        continue;
+      }
+      count[a] = *reinterpret_cast<const std::uint16_t*>(rec);
+      start[a] = *(reinterpret_cast<const std::uint16_t*>(rec) + 1);
+    }
+
+    auto* bits = reinterpret_cast<volatile std::uint64_t*>(
+      s_portalWalkPage + kPortalBitsOffset);
+    const auto words =
+      static_cast<std::uint32_t>(kPortalBitsBytes / sizeof(std::uint64_t));
+
+    // Dedupe on the (source, target) pair. 256x256 bits = 8KB is far more than
+    // is needed, so the pair set is kept as a small linear scan over what has
+    // already been emitted -- maxOut is 64 and the real pair count is ~25.
+    std::uint32_t n = 0;
+    std::uint32_t oob = 0;
+    for (std::uint32_t w = 0; w < words; ++w) {
+      std::uint64_t v = bits[w];
+      if (v == 0)
+        continue;
+      bits[w] = 0;                                   // read and clear
+      while (v != 0) {
+        unsigned long b = 0;
+        _BitScanForward64(&b, v);
+        v &= v - 1;
+        const std::uint32_t bit = w * 64u + static_cast<std::uint32_t>(b);
+
+        std::uint32_t dst = 0xFFFFFFFFu;
+        if (table != nullptr) {
+          const void* slot = table + static_cast<std::size_t>(bit) * 4u + 6u;
+          if (WvReadable(slot, sizeof(std::uint16_t)))
+            dst = *reinterpret_cast<const std::uint16_t*>(slot);
+        }
+        if (areaCount != 0 && (dst >= areaCount || dst >= 256u)) {
+          ++oob;                                     // sentinel / unresolved
+          continue;
+        }
+
+        const std::uint32_t portalIdx = bit / 3u;
+        std::uint32_t src = 0xFFFFu;                 // unresolved, still listed
+        for (std::uint32_t a = 0; a < nAreas; ++a) {
+          if (count[a] != 0 && portalIdx >= start[a] &&
+              portalIdx < static_cast<std::uint32_t>(start[a]) + count[a]) {
+            src = a;
+            break;
+          }
+        }
+
+        bool dup = false;
+        for (std::uint32_t i = 0; i < n; ++i) {
+          if (srcOut[i] == src && dstOut[i] == dst) {
+            dup = true;
+            break;
+          }
+        }
+        if (dup)
+          continue;
+        if (n < maxOut) {
+          srcOut[n] = src;
+          dstOut[n] = dst;
+          ++n;
+        }
+      }
+    }
+    if (oobOut != nullptr)
+      *oobOut = oob;
     return n;
   }
 

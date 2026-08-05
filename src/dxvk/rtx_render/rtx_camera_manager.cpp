@@ -333,14 +333,21 @@ namespace dxvk { namespace tf2 {
   // "what is different about the three that vanish", answerable from data
   // instead of from another inference about the disassembly.
   //
-  // Bounded by construction: at most 8 slots per frame, written by the hook,
+  // Bounded by construction: at most 32 slots per frame, written by the hook,
   // drained by the frame loop. No throttle logic, no unbounded log growth, and
   // no risk of a job thread logging (which would perturb what is measured).
-  // slotN is the TRUE count and may exceed 8 — compare it against a20.
+  // slotN is the TRUE count and may exceed 32 — compare it against a20.
+  //
+  // RAISED 8 -> 32 on 2026-08-05. The cap was sized when a20 was 2-5 areas. The
+  // POSITION sweep (view locked at pitch -7.81836 / yaw 175.265, 365 frames,
+  // only camPos moving) puts a20 at 14 on one side of y = -10000 and 9 on the
+  // other, so the 8-slot window truncated exactly the frames that mattered and
+  // the 5 areas that drop could not be named — the one thing this probe exists
+  // to do. 32 covers the observed 14 with headroom; slotN still reports truth.
   std::atomic<uint32_t> g_dispProbeSlotN{ 0 };
-  std::atomic<uint32_t> g_dispProbeSlotA1[8];
-  std::atomic<uint32_t> g_dispProbeSlotA2[8];
-  std::atomic<uint32_t> g_dispProbeSlotA3[8];
+  std::atomic<uint32_t> g_dispProbeSlotA1[32];
+  std::atomic<uint32_t> g_dispProbeSlotA2[32];
+  std::atomic<uint32_t> g_dispProbeSlotA3[32];
   // NV-DXVK: the client.dll RVA that CALLED sub_1802E8A20, per slot.
   //
   // THIS IS THE FIELD THAT EXPLAINS FIVE FAILED HYPOTHESES. sub_1802E8A20 has
@@ -358,7 +365,66 @@ namespace dxvk { namespace tf2 {
   // Both facts held simultaneously; the error was assuming one caller.
   // Raw RVA, no classification — CULLING_BIBLE 10.2, log the value before
   // deriving anything from it.
-  std::atomic<uint32_t> g_dispProbeSlotRA[8];
+  std::atomic<uint32_t> g_dispProbeSlotRA[32];
+
+  // NV-DXVK [QueueProbe] — the queue CURSOR and the selector-less skip.
+  //
+  // Defined HERE, in libdxvk, for the same link reason as every other counter
+  // on the [DispProbe] line: the islands live in d3d11/tf2_decal_hook.cpp, but
+  // the emitter is InstanceManager::garbageCollection in libdxvk.a, and
+  // dxgi.dll links libdxvk.a WITHOUT the d3d11 objects. libdxvk therefore
+  // cannot call into tf2_decal_hook at all — d3d11 drains the islands on its
+  // own frame boundary and pushes the values down here. Calling the drain
+  // functions directly from the emitter costs five LNK2019s.
+  //
+  // g_qStart is ASSIGNED, not accumulated: it is an order-list INDEX (the
+  // value sub_1802EAD60 returns and the queue loop starts at), and summing an
+  // index would be meaningless. The call counts are accumulated as usual so a
+  // frame-boundary skew between producer and consumer loses nothing.
+  std::atomic<uint32_t> g_qStart{ 0xFFFFFFFFu };
+  std::atomic<uint64_t> g_qStartCalls{ 0 };
+  std::atomic<uint64_t> g_qSkipCalls{ 0 };
+  std::atomic<uint32_t> g_qSkipAreaN{ 0 };
+  std::atomic<uint32_t> g_qSkipAreas[32];
+  std::atomic<uint32_t> g_queueProbeInstalled{ 0 };
+
+  // NV-DXVK [FaceReject] — client.dll+0x2EB98F, portals skipped because the
+  // camera is behind the portal plane, counted and keyed by target area.
+  // Same link-boundary reason as the g_q* block above.
+  std::atomic<uint64_t> g_faceRejectCount{ 0 };
+  std::atomic<uint32_t> g_faceRejectAreaN{ 0 };
+  std::atomic<uint32_t> g_faceRejectAreas[32];
+  std::atomic<uint32_t> g_faceRejectInstalled{ 0 };
+
+  // NV-DXVK [PortalWalk] — client.dll+0x2EB93F, the target area of every
+  // portal the flood iterates, before any reject. 48 slots rather than 32:
+  // this is the SUPERSET of every enqueued and every rejected target, so it
+  // is the widest list on the line and truncating it would silently turn a
+  // "present" into an "absent" — the exact inversion the probe exists to
+  // decide.
+  std::atomic<uint64_t> g_portalWalkCount{ 0 };
+  std::atomic<uint32_t> g_portalWalkAreaN{ 0 };
+  std::atomic<uint32_t> g_portalWalkAreas[48];
+  std::atomic<uint32_t> g_portalWalkInstalled{ 0 };
+  // Portals whose target was the no-neighbour sentinel or did not resolve.
+  // Kept visible so a short walkAreas list is never mistaken for a small walk.
+  std::atomic<uint32_t> g_portalWalkOob{ 0 };
+
+  // NV-DXVK [SelWrite] — client.dll+0x2EC739, areas that actually received a
+  // selector, plus the engine's own cursor-rewind counter (dword_1811FBD98).
+  // g_rewinds is a DELTA computed on the d3d11 side; the raw global is
+  // cumulative since process start.
+  std::atomic<uint64_t> g_selWriteCount{ 0 };
+  std::atomic<uint32_t> g_selWriteAreaN{ 0 };
+  std::atomic<uint32_t> g_selWriteAreas[48];
+  std::atomic<uint32_t> g_selWriteInstalled{ 0 };
+  std::atomic<uint32_t> g_rewinds{ 0 };
+
+  // NV-DXVK [DropAreas] — WHICH areas sub_1802ED900 dropped at 0x2EB8D0.
+  // ed900Drop (the count) has read 4.00 flat in every capture and was treated
+  // as an acquittal on that basis; the identity of those four was never taken.
+  std::atomic<uint32_t> g_dropAreaN{ 0 };
+  std::atomic<uint32_t> g_dropAreas[48];
 
   // NV-DXVK [AreaSeed] — sub_1802EAD60's ORDER LIST, measured from outside it.
   //
@@ -404,7 +470,7 @@ namespace dxvk { namespace tf2 {
   std::atomic<uint32_t> g_areaSeedNAreas{ 0 };   // dword_181748D8C, the buffer bound
   std::atomic<uint32_t> g_areaSeedListLen{ 0 };  // entries EAD60 actually wrote
   std::atomic<uint32_t> g_areaSeedN{ 0 };        // recorded ids; may exceed 16
-  std::atomic<uint32_t> g_areaSeedAreas[16];
+  std::atomic<uint32_t> g_areaSeedAreas[48];
   std::atomic<uint64_t> g_areaSeedCalls{ 0 };    // EF090 invocations this frame
   std::atomic<uint32_t> g_areaSeedInstalled{ 0 };
 
@@ -429,7 +495,7 @@ namespace dxvk { namespace tf2 {
   // pending should be 0 at exit; a non-zero value means the loop abandoned work.
   std::atomic<uint32_t> g_areaSeedLive{ 0 };
   std::atomic<uint32_t> g_areaSeedLiveN{ 0 };
-  std::atomic<uint32_t> g_areaSeedLiveAreas[16];
+  std::atomic<uint32_t> g_areaSeedLiveAreas[48];
   std::atomic<uint32_t> g_areaSeedPending{ 0 };
 
   // NV-DXVK [Ed900Drop] — areas dropped by sub_1802ED900's -1 at 0x2EB8D0.
