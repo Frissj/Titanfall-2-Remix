@@ -1043,6 +1043,41 @@ namespace dxvk {
     // sequential, prefetcher-friendly stream lets the per-instance reads hit
     // cached memory. Reused (capacity retained) across draws.
     std::vector<uint8_t>                 m_t31ReadCache;
+    // NV-DXVK [T31Cache]: validity key for m_t31ReadCache. The copy above was
+    // unconditional -- it re-read the WHOLE mapped t31 buffer on every
+    // instanced draw. Measured: 236 MB/window over 27711 calls (8.5 KB each,
+    // 554 calls/frame, 4.72 MB/frame), which is 91% of all frame-thread
+    // write-combined traffic and the single hottest leaf in our code
+    // ([Perf.WcCopy] d3d11+0x33707b -> SubmitInstancedDraw).
+    //
+    // All three fields must match or we re-copy:
+    //   SrcBuf  the D3D11Buffer identity. Compared ONLY -- never dereferenced,
+    //           because the Com<ID3D11Resource> that produced it is released at
+    //           the end of the resolve block (same contract as
+    //           m_cachedInstBufPtr).
+    //   MapPtr  the slice address, which changes on Map(WRITE_DISCARD).
+    //   MapGen  D3D11Buffer::GetMapGeneration(), which ALSO changes on
+    //           Map(WRITE_NO_OVERWRITE) -- the in-place rewrite that MapPtr
+    //           alone cannot see. Without this the cache would serve stale
+    //           per-instance transforms; see the note on GetMapGeneration().
+    // SrcBuf == nullptr is the empty state and can never match a real fill.
+    //
+    // The generation is read BEFORE the bytes, never after: stamping a newer
+    // generation onto older bytes is the one ordering that could serve stale
+    // data, and reading it first can only ever cause a redundant re-copy.
+    //
+    // SCOPE: this covers the immediate context, which is the only thread that
+    // reaches SubmitInstancedDraw here ([Perf.SdThreads] count=1). A DEFERRED
+    // context maps buffers via AllocSlice() without touching m_mapped, so a
+    // deferred writer would leave GetMappedSlice() -- and therefore t31Data
+    // itself, cache or no cache -- pointing at the previous slice. That is a
+    // pre-existing property of this read path, not something the key adds, and
+    // bumping the generation there would re-copy the same stale slice rather
+    // than fix it. If t31 ever moves to a deferred context, the read at the
+    // resolve site is what has to change.
+    const void*                          m_t31CacheSrcBuf = nullptr;
+    const void*                          m_t31CacheMapPtr = nullptr;
+    uint64_t                             m_t31CacheMapGen = 0ull;
     // NV-DXVK [CbStage]: staging buffer for the mapped (write-combined)
     // CBufCommonPerCamera read in the BSP fanout path. c_cameraOrigin and the
     // c_cameraRelativeToClip VP rows are read a scalar at a time out of WC

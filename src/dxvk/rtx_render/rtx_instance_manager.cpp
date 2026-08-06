@@ -773,7 +773,27 @@ namespace dxvk {
       // in the frame by AccelManager and gating on them emitted nothing at all.
       // hidden/frustum/mask/surfIdx are logged as FIELDS so the on-screen subset
       // can be selected offline without dropping objects at capture time.
-      {
+      //
+      // NV-DXVK [perf] 2026-08-06: gated on tagDenied. [MapWrite] is in
+      // log.cpp's built-in denylist (log.cpp:444, "360/frame, one line per
+      // instance per frame"), so emitMsg discards this line - but str::format
+      // still BUILT it first: ~300 characters, 6 floats and ~16 hex/integer
+      // conversions plus the allocation, once per instance per frame, on
+      // dxvk-cs, the thread [ThreadCensus] measures at ~98% of one core and
+      // [Perf.CsSplit] at 98.7 ms of a ~100 ms frame.
+      //
+      // [Perf.FmtSite] attributed 4,249,584 of the process's 4,325,700
+      // float->text conversions per 5s window to THIS ONE CALL - 98.6%. The
+      // output was bounded; the work never was. Third occurrence of §5.3 in
+      // the CPU handoff.
+      //
+      // tagDenied is called per-hit rather than cached in a static bool on
+      // purpose: the tag index is built lazily on the first filtered message,
+      // so an early cached read would latch "not denied" for the whole session,
+      // and RTX_D3D11_DIAG=1 has to be able to disable the filter at runtime.
+      // The probe is a bucketed prefix compare - orders of magnitude below the
+      // string build it replaces.
+      if (!Logger::tagDenied("[MapWrite]")) {
         Logger::info(str::format(
           "[MapWrite] f=", m_frameLastUpdated,
           " hidden=", (censusHidden() ? 1 : 0),
@@ -821,7 +841,9 @@ namespace dxvk {
       mapWriteAccount(/*isInsert*/ true, static_cast<uint32_t>(m_linkedBlas->getSpatialMap().size()));
 
       // See the move() site: ungated census, visibility logged as fields.
-      {
+      // NV-DXVK [perf] 2026-08-06: tagDenied gate, same reasoning as the move()
+      // site - the tag is denylisted, so this string was built and thrown away.
+      if (!Logger::tagDenied("[MapWrite]")) {
         Logger::info(str::format(
           "[MapWrite] f=", m_frameLastUpdated,
           " hidden=", (censusHidden() ? 1 : 0),
@@ -4955,11 +4977,29 @@ namespace dxvk {
     // and whether they even have a vertex-normal buffer (if not, the shading normal
     // is the geometric/face normal and negating normalInstanceToWorld is a no-op).
     if (svFlip) {
-      static std::mutex sFnMu;
-      static std::unordered_set<XXH64_hash_t> sFnLog;
+      // NV-DXVK [perf] 2026-08-06: this took a process-global mutex and did an
+      // unordered_set insert for EVERY sub-view instance, EVERY frame, purely
+      // to decide whether to emit a line that only ever fires once per VS hash.
+      // The output was one-shot; the work was per-instance-per-frame, on
+      // dxvk-cs - the thread [ThreadCensus] measures at ~96 ms of a ~99 ms
+      // frame. Same defect as the [DrawName] probe in §5.3 of the CPU handoff:
+      // bound the WORK, not just the output.
+      //
+      // A thread-local set fronts the shared one. Steady state (the hash has
+      // been seen by this thread before) is one hash lookup and no lock at all.
+      // The shared set stays the authority for "first globally", so the line is
+      // still emitted exactly once across all threads rather than once per
+      // thread - the thread-local set only ever suppresses work, never grants
+      // permission to log.
       const XXH64_hash_t vsFn = drawCall.getTransformData().vertexShaderHash;
+      static thread_local std::unordered_set<XXH64_hash_t> tFnSeen;
       bool firstFn = false;
-      { std::lock_guard<std::mutex> g(sFnMu); firstFn = sFnLog.insert(vsFn).second; }
+      if (tFnSeen.insert(vsFn).second) {
+        static std::mutex sFnMu;
+        static std::unordered_set<XXH64_hash_t> sFnLog;
+        std::lock_guard<std::mutex> g(sFnMu);
+        firstFn = sFnLog.insert(vsFn).second;
+      }
       if (firstFn) {
         Logger::info(str::format(
           "[FlipNormalDiag] vsXxh=0x", std::hex, uint64_t(vsFn), std::dec,

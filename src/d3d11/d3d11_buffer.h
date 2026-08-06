@@ -120,6 +120,7 @@ namespace dxvk {
       // it is immune to the slice-address recycling that mapPtr comparison
       // would suffer when allocSlice() hands back a freed allocation.
       m_contentGen.fetch_add(1, std::memory_order_release);
+      NoteMapForWrite();
       return m_mapped;
     }
 
@@ -128,6 +129,29 @@ namespace dxvk {
     // discard, which is also a valid cache key.
     uint64_t GetContentGeneration() const {
       return m_contentGen.load(std::memory_order_acquire);
+    }
+
+    // NV-DXVK [T31Cache]: a SECOND generation, deliberately separate from
+    // m_contentGen. m_contentGen moves only in DiscardSlice(), i.e. only when
+    // the slice is RENAMED. Map(D3D11_MAP_WRITE_NO_OVERWRITE) does not rename:
+    // it hands the game back the existing mapPtr and the game writes in place
+    // (d3d11_context_imm.cpp MapBuffer). So for a NO_OVERWRITE writer, neither
+    // mapPtr nor m_contentGen ever changes, and anything that caches the bytes
+    // keyed on those two would serve pre-write data for the rest of the
+    // buffer's life -- a silently wrong transform, not a crash.
+    //
+    // Why not just widen m_contentGen: its existing consumers ([CamCache] and
+    // InvalidateMaxIdxCache) are tuned around rename-only invalidation, and
+    // bumping them on every NO_OVERWRITE map would change their hit rates as a
+    // side effect of an unrelated fix. This one is strictly more conservative
+    // (it moves on renames AND in-place maps) and only new consumers opt in.
+    uint64_t GetMapGeneration() const {
+      return m_mapGen.load(std::memory_order_acquire);
+    }
+
+    // Call on every path that opens a CPU write window onto the mapped bytes.
+    void NoteMapForWrite() {
+      m_mapGen.fetch_add(1, std::memory_order_release);
     }
 
     DxvkBufferSliceHandle GetMappedSlice() const {
@@ -170,6 +194,9 @@ namespace dxvk {
     // Atomic because the immediate context writes it (on Map(DISCARD)) while
     // deferred-context threads recording draws read it for cache keying.
     std::atomic<uint64_t>         m_contentGen { 0ull };
+    // NV-DXVK [T31Cache]: monotonic map generation -- bumped in DiscardSlice()
+    // AND on Map(WRITE_NO_OVERWRITE). See GetMapGeneration().
+    std::atomic<uint64_t>         m_mapGen     { 0ull };
 
     // NV-DXVK TF2: persistent eviction priority. Source/Titanfall sets HIGH
     // on streaming targets, then later checks Get to verify residency. The

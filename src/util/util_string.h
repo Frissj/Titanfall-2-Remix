@@ -26,6 +26,10 @@
 #include <cstring>
 #include <memory>
 #include <string>
+
+// NV-DXVK [Perf.FmtSite]: call-site attribution for the float branch of
+// appendOne below. Self-contained and Win32-guarded internally.
+#include "util_fmt_diag.h"
 #include <string_view>
 #include <sstream>
 #include <type_traits>
@@ -225,6 +229,26 @@ namespace dxvk::str {
   template<typename... Args>
   std::string format(const Args&... args) {
     detail::FormatSink sink;
+
+    // NV-DXVK [Perf.FmtSite]: name the CALL SITE, and note it HERE rather than
+    // in appendOne. The first version of this probe sat in appendOne's float
+    // branch, and _ReturnAddress() there resolved to formatInto<float,char[2],
+    // ...> - appendOne had been inlined into the recursive formatInto, so the
+    // probe named its own caller inside this header instead of the diagnostic
+    // that issued the format. Six sites, ~4.7M calls/window, and not one of
+    // them identifiable.
+    //
+    // format() is the outermost frame, so its return address is the real
+    // caller. The float count is folded in at compile time, which also means
+    // the whole probe compiles away for the (many) format() calls that pass no
+    // floats at all - strictly cheaper than the per-float version it replaces.
+#ifdef _WIN32
+    constexpr uint32_t kFloatArgs = (0u + ... + uint32_t(
+      std::is_same_v<std::decay_t<Args>, float> ||
+      std::is_same_v<std::decay_t<Args>, double>));
+    if constexpr (kFloatArgs != 0u)
+      fmt_diag::noteFloat(_ReturnAddress(), kFloatArgs);
+#endif
 
     // Long diagnostic lines are the ones that reallocate repeatedly; short
     // fragments (the `str::format(" t", slot, "=", size)` pieces built inside

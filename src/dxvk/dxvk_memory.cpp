@@ -536,10 +536,22 @@ DxvkMemory::DxvkMemory() { }
   }
   
   //// NV-DXVK start: Free unused memory
-  void DxvkMemoryAllocator::freeUnusedChunks() {
+  uint32_t DxvkMemoryAllocator::freeUnusedChunks(uint32_t maxChunksToFree) {
+    const bool unlimited = (maxChunksToFree == 0);
+    uint32_t freed = 0;
+
     for (auto& heap : m_memHeaps) {
-      freeEmptyChunks(&heap);
+      if (!unlimited && freed >= maxChunksToFree)
+        break;
+
+      // Hand each heap only the REMAINING budget, so the bound is across the
+      // whole call and not per heap -- otherwise a budget of 1 could still free
+      // one chunk from every heap in the same frame.
+      const uint32_t remaining = unlimited ? 0u : (maxChunksToFree - freed);
+      freed += freeEmptyChunks(&heap, remaining);
     }
+
+    return freed;
   }
   //// NV-DXVK end
 
@@ -854,11 +866,22 @@ DxvkMemory::DxvkMemory() { }
   }
 
 
-  void DxvkMemoryAllocator::freeEmptyChunks(
-    const DxvkMemoryHeap*       heap) {
+  uint32_t DxvkMemoryAllocator::freeEmptyChunks(
+    const DxvkMemoryHeap*       heap,
+          uint32_t              maxChunksToFree) {
+    // NV-DXVK: 0 == unlimited, which is what both allocation-pressure call
+    // sites get from the default argument -- their behaviour is byte-identical
+    // to before. A non-zero budget caps how many chunks one call may release so
+    // the vkFreeMemory cost can be spread across frames instead of spiking.
+    const bool unlimited = (maxChunksToFree == 0);
+    uint32_t freed = 0;
+
     for (uint32_t i = 0; i < m_memProps.memoryTypeCount; i++) {
+      if (!unlimited && freed >= maxChunksToFree)
+        break;
+
       DxvkMemoryType* type = &m_memTypes[i];
-      
+
       if (type->heap != heap)
         continue;
 
@@ -868,9 +891,20 @@ DxvkMemory::DxvkMemory() { }
 
       type->chunks.erase(
         std::remove_if(type->chunks.begin(), type->chunks.end(),
-          [] (const Rc<DxvkMemoryChunk>& chunk) { return chunk->isEmpty(); }),
+          [&] (const Rc<DxvkMemoryChunk>& chunk) {
+            if (!chunk->isEmpty())
+              return false;
+            // Budget exhausted: leave the remaining empty chunks in place for a
+            // later call rather than dropping them all now.
+            if (!unlimited && freed >= maxChunksToFree)
+              return false;
+            ++freed;
+            return true;
+          }),
         type->chunks.end());
     }
+
+    return freed;
   }
 
 }

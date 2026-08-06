@@ -615,6 +615,35 @@ namespace dxvk {
     RTX_OPTION("rtx", uint32_t, captureSourceGeometryWarmFrames, 3, "How many consecutive frames a newly-seen draw keeps being captured by rtx.captureSourceGeometry.\n"
                "Engine re-batches create a new BlasEntry on TWO consecutive frames (paired dedup-misses observed via [MtnDedup]), so the window must cover at least the first 2 sightings; 3 adds one frame of slack. Larger values waste copy bandwidth on draws that will not re-bake.");
 
+    // NV-DXVK [Perf.ChunkTrim] (2026-08-06): automatic release of EMPTY DXVK
+    // allocator chunks. See SceneManager::manageTextureVram.
+    RTX_OPTION("rtx", bool, autoFreeUnusedChunks, true,
+               "Automatically release DXVK allocator chunks that hold no live suballocations, instead of only ever doing so when the UI's force-free button is pressed.\n"
+               "WHY THIS EXISTS. DxvkMemoryAllocator is a high-water-mark allocator: it grows chunks on demand and only gives one back under two conditions, neither of which fires in normal play.\n"
+               "  1. Allocation pressure. tryAllocFromType calls freeEmptyChunks, but only behind shouldFreeEmptyChunks (dxvk_memory.cpp:857), which is 'totalAllocated + thisAllocation > budget'. That is a LAST-DITCH reclaim at the edge of the heap budget -- by the time it fires you are already in the degraded regime it was supposed to prevent. It never trims a merely wasteful footprint.\n"
+               "  2. An explicit user action. freeUnusedChunks is otherwise reached only through SceneManager::manageTextureVram's two m_forceFree* atomics, both set from the Remix UI.\n"
+               "So on a session where nobody presses the button and the heap never quite saturates, the high-water mark is never given back. That is the mechanism behind 'VRAM climbs and never comes back down'.\n"
+               "MEASURED 2026-08-06 on the BT mission, steady state, [Perf.MemCat]: heap0(VRAM) alloc=7569MB used=5313MB slack=2255MB -- 30% of every byte taken from the driver was sitting in chunks with nothing suballocated in them. That was the single largest line item in an 8 GB footprint, larger than the game's textures (appTex=2329MB) and larger than the acceleration structures (rtxAccel=2229MB).\n"
+               "This does NOT add a new call site or a new failure mode: it sets the SAME freeUnused flag the force path sets, at the SAME point in the frame (SceneManager::onFrameEnd), so everything that was already true of the manual trim is still true of this one. It only changes WHEN it fires.\n"
+               "Set false to restore stock behaviour (trim only on explicit request).");
+    RTX_OPTION("rtx", uint32_t, autoFreeUnusedChunksSlackMB, 512,
+               "Slack (allocated minus suballocated, per heap) at or above which rtx.autoFreeUnusedChunks trims, in MB. The largest single heap's slack is what is tested, not the sum.\n"
+               "Raise it to trim less often and tolerate more headroom; lower it to keep the footprint tighter at the cost of more frequent trims. Note that empty chunks are the ONLY thing recoverable -- slack sitting inside partially-used chunks is fragmentation and no threshold reaches it, which is why a trim can legitimately recover far less than the slack figure that triggered it.");
+    RTX_OPTION("rtx", uint32_t, autoFreeUnusedChunksMaxPerTrim, 1,
+               "Maximum allocator chunks released per automatic trim. THIS IS THE KNOB THAT KEEPS THE TRIM INVISIBLE, and it is why the automatic path cannot hitch the way an unbounded free can.\n"
+               "A chunk is 320 MB device-local / 128 MB otherwise (dxvk_options.cpp), and releasing one is a vkFreeMemory of that whole allocation. Freeing every empty chunk at once is therefore a multi-hundred-MB-to-multi-GB burst of driver work on a single frame -- acceptable at a load boundary, a visible stutter mid-gameplay. At 1 chunk per trim the cost per frame is one vkFreeMemory and the footprint still drains completely, just over several seconds instead of instantly: the measured 2255 MB of VRAM slack is about 7 chunks, so it clears in ~7 trims.\n"
+               "The manual force-free path is unaffected and stays unbounded -- it is an explicit user action at a moment of their choosing, which is exactly when paying the whole cost at once is correct.\n"
+               "Raise it to drain faster if you can absorb the cost; there is no reason to lower it below 1.");
+    RTX_OPTION("rtx", uint32_t, autoFreeUnusedChunksRetryDeltaMB, 128,
+               "How much slack must GROW, in MB, before retrying after an automatic trim that freed nothing.\n"
+               "Slack over the threshold does not imply anything is recoverable: only entirely-empty chunks can be released, and slack inside partially-used chunks is fragmentation no trim reaches. MEASURED 2026-08-06: 7 productive trims recovered 1360 MB, then 50 consecutive trims freed 0 chunks each while slack sat at ~1900 MB -- fifty heap walks taking every per-memory-type lock to accomplish nothing.\n"
+               "Growth is the exact retry condition, not a heuristic: a chunk can only become newly empty if allocated rose (new chunks) or used fell (suballocations released), and slack = allocated - used rises in both cases. Falling slack means more allocation, which cannot empty a chunk. So if slack has not grown since a null trim, there is provably nothing new to find.\n"
+               "Default is one 128 MB non-device-local chunk. The explicit force-free path ignores this entirely -- a user request is never suppressed by a previous null result.");
+    RTX_OPTION("rtx", uint32_t, autoFreeUnusedChunksCooldownMs, 1000,
+               "Minimum milliseconds between automatic trims. Paired with rtx.autoFreeUnusedChunksMaxPerTrim, this sets the drain RATE: at the defaults, one 320 MB chunk per second.\n"
+               "It also stops the policy thrashing. Once the empty chunks are gone the slack that remains is fragmentation inside partially-used chunks, which no trim can reach, so re-testing every frame would walk the heaps forever to recover nothing.\n"
+               "Every trim logs [Perf.ChunkTrim] with chunks= and recovered= -- tune against that line, not against a guess.");
+
     RTX_OPTION_ENV("rtx", bool, enableAlwaysCalculateAABB, false, "RTX_ALWAYS_CALCULATE_AABB", "Calculate an Axis Aligned Bounding Box for every draw call.\n This may improve instance tracking across frames for skinned and vertex shaded calls.");
 
     // Camera
@@ -875,6 +904,34 @@ namespace dxvk {
                "A/B proved independent of every cull site. RVA buckets resolve directly in the\n"
                "client.dll/engine.dll IDBs (IDB addr = 0x180000000 + RVA). ~0.2% overhead on\n"
                "the sampled thread; turn off once the gap is attributed.");
+    RTX_OPTION("rtx", bool, perfThreadCensus, false,
+               "DIAGNOSTIC: [ThreadCensus] — per-thread CPU census for the WHOLE process,\n"
+               "logged every 5s as ms-of-CPU per second of wall (100% = one core saturated).\n"
+               "Built 2026-08-06 for the question rtx.perfGapSampler structurally cannot answer:\n"
+               "the presenting thread is BLOCKED 66.6ms of a 102.3ms frame ([Perf.Busy]), the\n"
+               "wait is NOT a DXVK condvar ([Perf.CondWait] <=0.13ms/frame) and only\n"
+               "materialsystem_dx11.dll / tier0.dll import SleepConditionVariableSRW — so it is\n"
+               "asleep on the ENGINE's condvar, and the sampler only ever watches g_presentTid.\n"
+               "Read busySum first: with a ~102ms frame, a LOW busySum means nothing is computing\n"
+               "and the frame is paced by a wait chain or a throttle (stop hunting expensive\n"
+               "code); one thread near 100% means that thread is the critical path and the\n"
+               "sampler should be pointed at it. Uses QueryThreadCycleTime, whose deltas are\n"
+               "EXACT rather than sampled, so it polls at 250ms and never suspends a thread —\n"
+               "none of the SuspendThread hazards that make perfGapSampler intrusive apply.");
+    RTX_OPTION("rtx", std::string, perfGapSamplerThread, "",
+               "DIAGNOSTIC: which thread rtx.perfGapSampler samples. EMPTY (default) = the\n"
+               "present thread, i.e. the original behaviour. Otherwise the name set via\n"
+               "SetThreadDescription, matched case-insensitively as a substring — \"dxvk-cs\"\n"
+               "for the command-stream thread. Re-resolved every 2s, so it survives the\n"
+               "thread being created after the sampler starts, and thread ids changing\n"
+               "between runs.\n"
+               "Point it here when [ThreadCensus] finds a saturated thread: on 2026-08-06\n"
+               "dxvk-cs measured 96.97% of one core on a 98.8ms frame — it IS the frame time,\n"
+               "with the present thread blocked 61ms and the GPU idle 76ms downstream of it.\n"
+               "NOTE the histogram reads differently for a BUSY target than for a blocked one:\n"
+               "the syscallCallers/APPcallers lines only populate when the target is parked in\n"
+               "a syscall, so for a running thread they go sparse and the per-RVA 'top' line is\n"
+               "the signal. That line names OUR code directly — resolve it against d3d11.pdb.");
 
     // NV-DXVK [NsysAuto]: unattended Nsight Systems capture, same shape as
     // rtx.perfAutoSweep - arm it in rtx.conf, launch, walk away.

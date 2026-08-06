@@ -446,12 +446,21 @@ namespace dxvk {
 
     // NV-DXVK start: Free unused memory
     /**
-     * \brief Free's any chunks from memory that 
+     * \brief Free's any chunks from memory that
      *   are completely unused.
-     *   This call may be expensive, it should
-     *   be used very sparingly.
+     *
+     *   Each chunk released is one vkFreeMemory of a full chunk (320 MB
+     *   device-local / 128 MB otherwise by default, dxvk_options.cpp), so an
+     *   unbounded call can drop several hundred MB to multiple GB in a single
+     *   frame -- fine at a load boundary, a visible hitch mid-gameplay.
+     *
+     * \param [in] maxChunksToFree Upper bound on chunks released by this call.
+     *   0 means unlimited (the original behaviour, used by the allocation-
+     *   pressure paths and the explicit force-free UI action). Pass a small
+     *   budget to spread the work across frames instead of paying it at once.
+     * \returns Number of chunks actually released.
      */
-    void freeUnusedChunks();
+    uint32_t freeUnusedChunks(uint32_t maxChunksToFree = 0);
     // NV-DXVK end
 
   private:
@@ -513,8 +522,12 @@ namespace dxvk {
       const DxvkMemoryHeap*       heap,
             VkDeviceSize          allocationSize) const;
 
-    void freeEmptyChunks(
-      const DxvkMemoryHeap*       heap);
+    // NV-DXVK: maxChunksToFree == 0 means unlimited, which is what the two
+    // allocation-pressure call sites pass (implicitly, via the default) so
+    // their behaviour is unchanged. Returns the number of chunks released.
+    uint32_t freeEmptyChunks(
+      const DxvkMemoryHeap*       heap,
+            uint32_t              maxChunksToFree = 0);
 
   };
   

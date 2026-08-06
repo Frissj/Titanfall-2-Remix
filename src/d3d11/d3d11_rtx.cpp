@@ -16,6 +16,10 @@
 // report emitted next to [Perf.Busy]. Included explicitly rather than relied
 // on transitively through thread.h.
 #include "../util/util_cond_diag.h"
+// NV-DXVK [Perf.FmtSite]: fmt_diag::drain for the float-formatting call-site
+// report emitted next to [Perf.WcCopy]. Reaches here transitively through
+// util_string.h, but included explicitly like util_cond_diag.h above.
+#include "../util/util_fmt_diag.h"
 #include "../dxbc/dxbc_util.h"
 #include "../dxbc/dxbc_common.h"
 // NV-DXVK [SubViewSkyTexDump]: AssetExporter::dumpImageToFile is called
@@ -761,6 +765,27 @@ static SunFieldLocs memoSunLocs(const CommonShaderT* common) {
 std::atomic<uint64_t> g_instBufCacheHits   { 0 };
 std::atomic<uint64_t> g_instBufCacheMisses { 0 };
 std::atomic<uint64_t> g_instBufCacheBytes  { 0 };
+
+// NV-DXVK [Perf.T31Cache]: does keying the t31 bulk copy actually pay?
+// The whole premise is that the 554 instanced draws per frame read ONE t31
+// buffer that the game rewrites once per frame -- exactly the pattern
+// m_instBufCache already measures at 100% hits on the sibling instance buffer.
+// That is a hypothesis about TF2's upload cadence, not a proof, so it gets
+// counted rather than assumed: if the game genuinely rewrites t31 between
+// draws the cache misses every time, bytesSaved reads 0, and the change is a
+// no-op (one pointer compare) rather than a regression. hits/misses answer
+// "how often", bytesSaved/bytesCopied answer "how much WC traffic went away".
+std::atomic<uint64_t> g_t31CacheHits       { 0 };
+std::atomic<uint64_t> g_t31CacheMisses     { 0 };
+std::atomic<uint64_t> g_t31CacheBytesSaved { 0 };
+std::atomic<uint64_t> g_t31CacheBytesCopied{ 0 };
+
+// NV-DXVK [T31Cache]: kill switch, as a compile-time constant next to the code
+// it affects rather than an env var, per the convention the other three perf
+// switches follow. Set to false to restore the unconditional per-draw copy;
+// the counters keep working either way, so a suspected stale-transform bug can
+// be tested against the old behaviour in one rebuild without unpicking the key.
+constexpr bool kEnableT31ReadCache = true;
 
 // NV-DXVK [Perf.BonePath]: which of the three bone-buffer read attempts wins.
 // The map half of prep costs 15-26 us/call and three separate guesses at its
@@ -5352,8 +5377,163 @@ namespace dxvk {
   //  - Sample cost on the target is two kernel transitions (~microseconds)
   //    every 2 ms: ~0.2% overhead, far under the noise floor.
   // ============================================================
+  // NV-DXVK [CpuCalib]: forward declaration. The definition sits next to the
+  // [Perf.SdThreads] stall math that first needed it (~line 8404); the census
+  // below needs the same measured rate to turn cycles into milliseconds, and
+  // this TU defines it later.
+  static int64_t getCalibratedCyclesPerUs();
+
+  // ============================================================
+  // [ThreadCensus] - per-thread busy/blocked census for the WHOLE process.
+  //
+  // WHY (2026-08-06). [Perf.Busy] puts the presenting thread at 66.6 ms
+  // BLOCKED of a 102.3 ms frame. [Perf.CondWait], which times the wait from
+  // inside the wait, rules out every DXVK condition variable (<=0.13 ms/frame
+  // across three builds). Only materialsystem_dx11.dll and tier0.dll import
+  // SleepConditionVariableSRW (verified from their import tables). So the
+  // frame thread is asleep on the ENGINE's condvar, waiting for engine
+  // threads - and [GapSampler] only ever targets g_presentTid, so the other
+  // side of that wait has never been measured.
+  //
+  // This deliberately answers a NARROWER question than a RIP histogram, and
+  // one that has to come first: during those 66 ms, is any thread RUNNING?
+  //   something pegged -> that thread is the critical path, and the sampler
+  //                       should be pointed at it next
+  //   nothing running  -> nobody is computing, so the frame is paced by a
+  //                       wait chain or a throttle, and hunting for expensive
+  //                       code anywhere is the wrong search entirely
+  // Those two answers send the next session in opposite directions, which is
+  // why this is worth its own instrument rather than another histogram.
+  //
+  // WHY CYCLES, NOT SAMPLES. QueryThreadCycleTime returns a CUMULATIVE
+  // per-thread cycle count and needs no suspension, no stack walk and no
+  // unwind data - it is a handle read. Deltas across a poll interval are
+  // therefore EXACT rather than sampled: a thread that ran 3 ms in the
+  // interval reports 3 ms whether we polled once or a thousand times. That is
+  // why this can poll at 250 ms where the RIP sampler needs 2 ms, and why it
+  // can cover every thread in the process at a cost that does not grow with
+  // accuracy.
+  //
+  // SAFETY. Nothing here suspends a thread, so none of the SuspendThread
+  // rules governing the sampler below apply. The only calls made against a
+  // foreign thread are QueryThreadCycleTime, GetThreadDescription and
+  // NtQueryInformationThread(ThreadQuerySetWin32StartAddress) - all read-only
+  // and none of which block the target. Both of the latter two are resolved
+  // by GetProcAddress and simply skipped if absent, so this cannot fail to
+  // build or run on a machine that lacks them.
+  //
+  // UNITS: ms of CPU per SECOND of wall, per thread. Frame-count free, so the
+  // sampler thread needs no access to the frame counter; 1000 ms/s is exactly
+  // one core saturated.
+  // ============================================================
   namespace {
     std::atomic<bool> g_gapSamplerStarted { false };
+
+    constexpr uint32_t kCensusMaxThreads  = 192;
+    constexpr uint64_t kCensusPollMs      = 250;
+    // ThreadQuerySetWin32StartAddress. Names the DLL that OWNS a thread, which
+    // is what distinguishes an engine worker from one of ours when the engine
+    // has not set a thread description.
+    constexpr ULONG    kThreadStartAddrInfo = 9;
+
+    struct CensusThread {
+      uint32_t  tid       = 0;
+      HANDLE    h         = nullptr;
+      uint64_t  lastCyc   = 0;
+      uint64_t  accCyc    = 0;
+      bool      haveLast  = false;
+      // Sweep mark for the re-enumeration below. A real field rather than a
+      // spare bit in tid: nothing documents the top bit of a Windows thread id
+      // as free, and a census that silently dropped a thread would be
+      // indistinguishable from one that found it idle - the exact confusion
+      // this instrument exists to avoid.
+      bool      alive     = false;
+      uintptr_t startAddr = 0;
+      char      name[40]  = {};
+    };
+
+    using PFN_GetThreadDescription = HRESULT (WINAPI*)(HANDLE, PWSTR*);
+    using PFN_NtQueryInfoThread    = LONG (NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+
+    // Resolved once on the sampler thread, never on a hot path.
+    PFN_GetThreadDescription censusGetThreadDesc() {
+      static const PFN_GetThreadDescription s_fn = []() -> PFN_GetThreadDescription {
+        if (HMODULE k = GetModuleHandleA("kernel32.dll"))
+          return reinterpret_cast<PFN_GetThreadDescription>(
+            reinterpret_cast<void*>(GetProcAddress(k, "GetThreadDescription")));
+        return nullptr;
+      }();
+      return s_fn;
+    }
+
+    // NV-DXVK [GapSampler]: resolve a thread by the name it registered with
+    // SetThreadDescription (util_env.cpp setThreadName uses exactly that, which
+    // is why "dxvk-cs" shows up in [ThreadCensus]). Substring, case-insensitive.
+    //
+    // BY NAME, NOT BY TID, on purpose: thread ids change every run, so a tid in
+    // rtx.conf would silently sample an unrelated thread - or nothing - the next
+    // time the game starts, and a RIP histogram of the wrong thread looks
+    // exactly like a RIP histogram of the right one.
+    //
+    // Returns 0 if no thread matches, which the caller treats as "fall back to
+    // the present thread" rather than "sample nothing": a typo'd name should
+    // degrade to the old behaviour, and the target is printed on the
+    // [GapSampler] line so a mismatch is visible rather than silent.
+    uint32_t censusFindThreadByName(const char* want) {
+      if (want == nullptr || want[0] == '\0')
+        return 0;
+      auto fnDesc = censusGetThreadDesc();
+      if (fnDesc == nullptr)
+        return 0;
+
+      uint32_t   found  = 0;
+      const DWORD ownPid = GetCurrentProcessId();
+      HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+      if (snap == INVALID_HANDLE_VALUE)
+        return 0;
+
+      THREADENTRY32 te = {};
+      te.dwSize = sizeof(te);
+      if (Thread32First(snap, &te)) {
+        do {
+          if (te.th32OwnerProcessID != ownPid)
+            continue;
+          HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+          if (h == nullptr)
+            continue;
+          PWSTR desc = nullptr;
+          if (SUCCEEDED(fnDesc(h, &desc)) && desc != nullptr) {
+            char nm[64] = {};
+            for (uint32_t i = 0; i < 63 && desc[i] != L'\0'; ++i)
+              nm[i] = char(desc[i] & 0x7F);
+            LocalFree(desc);
+            // Case-insensitive substring, so "dxvk-cs" matches whatever
+            // decoration a future DXVK might add around it.
+            const size_t nl = strlen(nm), wl = strlen(want);
+            if (wl != 0 && nl >= wl) {
+              for (size_t s = 0; s + wl <= nl; ++s) {
+                if (::_strnicmp(nm + s, want, wl) == 0) { found = te.th32ThreadID; break; }
+              }
+            }
+          }
+          CloseHandle(h);
+          if (found != 0)
+            break;
+        } while (Thread32Next(snap, &te));
+      }
+      CloseHandle(snap);
+      return found;
+    }
+
+    PFN_NtQueryInfoThread censusNtQueryInfoThread() {
+      static const PFN_NtQueryInfoThread s_fn = []() -> PFN_NtQueryInfoThread {
+        if (HMODULE n = GetModuleHandleA("ntdll.dll"))
+          return reinterpret_cast<PFN_NtQueryInfoThread>(
+            reinterpret_cast<void*>(GetProcAddress(n, "NtQueryInformationThread")));
+        return nullptr;
+      }();
+      return s_fn;
+    }
 
     void gapSamplerThread() {
       struct GapMod { uintptr_t base, end; char name[48]; };
@@ -5368,15 +5548,144 @@ namespace dxvk {
       HANDLE   hTarget = nullptr;
       uint32_t hTargetTid = 0;
 
+      // [GapSampler] target resolution state. samplerNamedTid == 0 means "no
+      // named target resolved", which the sampler reads as "use the present
+      // thread" - the behaviour this instrument shipped with.
+      uint32_t samplerNamedTid      = 0;
+      uint64_t samplerTargetMs      = 0;
+      char     samplerTargetName[64] = {};
+
+      // [ThreadCensus] state. Owned entirely by this thread; no other thread
+      // reads or writes it, so none of it needs synchronisation.
+      std::vector<CensusThread> census;
+      uint64_t censusLastPollMs  = 0;
+      uint64_t censusLastEnumMs  = 0;
+      uint64_t censusWindowMs    = GetTickCount64();
+
       for (;;) {
         ::Sleep(2);
-        if (!RtxOptions::perfGapSampler()) {
+        const bool sampOn   = RtxOptions::perfGapSampler();
+        const bool censusOn = RtxOptions::perfThreadCensus();
+        if (!sampOn && !censusOn) {
           ::Sleep(250);
           continue;
         }
-        const uint32_t tid = vanish_diag::g_presentTid.load(std::memory_order_relaxed);
+        const uint64_t tickMs = GetTickCount64();
+
+        // ---- [ThreadCensus] poll. No suspension; cycle deltas are exact. ----
+        if (censusOn && tickMs - censusLastPollMs >= kCensusPollMs) {
+          censusLastPollMs = tickMs;
+
+          // Re-enumerate periodically: engine workers come and go, and a dead
+          // tid whose handle still opens would otherwise keep reporting its
+          // final delta forever. Threads created between enumerations are
+          // simply picked up late; their first poll seeds lastCyc and
+          // contributes nothing, which is why haveLast exists.
+          if (census.empty() || tickMs - censusLastEnumMs > 2000) {
+            censusLastEnumMs = tickMs;
+            for (auto& t : census)
+              t.alive = false;                  // cleared here, set by the sweep
+
+            HANDLE tsnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if (tsnap != INVALID_HANDLE_VALUE) {
+              THREADENTRY32 te = {};
+              te.dwSize = sizeof(te);
+              const DWORD ownPid = GetCurrentProcessId();
+              const DWORD selfTid = GetCurrentThreadId();
+              if (Thread32First(tsnap, &te)) {
+                do {
+                  if (te.th32OwnerProcessID != ownPid)
+                    continue;
+                  if (te.th32ThreadID == selfTid)
+                    continue;               // never census the sampler itself
+                  bool found = false;
+                  for (auto& t : census) {
+                    if (t.tid == te.th32ThreadID) {
+                      t.alive = true;
+                      found = true;
+                      break;
+                    }
+                  }
+                  if (found || census.size() >= kCensusMaxThreads)
+                    continue;
+
+                  CensusThread nt = {};
+                  nt.tid   = te.th32ThreadID;
+                  nt.alive = true;
+                  // LIMITED_INFORMATION is enough for QueryThreadCycleTime and
+                  // GetThreadDescription and is always grantable within our own
+                  // process; the start address needs the wider right, so try it
+                  // first and fall back rather than losing the thread entirely.
+                  nt.h = OpenThread(THREAD_QUERY_INFORMATION, FALSE, nt.tid);
+                  const bool wide = nt.h != nullptr;
+                  if (nt.h == nullptr)
+                    nt.h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, nt.tid);
+                  if (nt.h == nullptr)
+                    continue;
+
+                  if (auto fnDesc = censusGetThreadDesc()) {
+                    PWSTR desc = nullptr;
+                    if (SUCCEEDED(fnDesc(nt.h, &desc)) && desc != nullptr) {
+                      for (uint32_t i = 0; i < 39 && desc[i] != L'\0'; ++i)
+                        nt.name[i] = char(desc[i] & 0x7F);
+                      LocalFree(desc);
+                    }
+                  }
+                  if (wide) {
+                    if (auto fnQ = censusNtQueryInfoThread()) {
+                      PVOID sa = nullptr;
+                      if (fnQ(nt.h, kThreadStartAddrInfo, &sa, sizeof(sa), nullptr) >= 0)
+                        nt.startAddr = uintptr_t(sa);
+                    }
+                  }
+                  census.push_back(nt);
+                } while (Thread32Next(tsnap, &te));
+              }
+              CloseHandle(tsnap);
+            }
+
+            // Drop threads that did not survive the sweep.
+            for (size_t i = census.size(); i-- > 0; ) {
+              if (!census[i].alive) {
+                if (census[i].h != nullptr)
+                  CloseHandle(census[i].h);
+                census.erase(census.begin() + ptrdiff_t(i));
+              }
+            }
+          }
+
+          for (auto& t : census) {
+            uint64_t c = 0;
+            if (t.h == nullptr || !QueryThreadCycleTime(t.h, &c))
+              continue;
+            if (t.haveLast && c >= t.lastCyc)
+              t.accCyc += c - t.lastCyc;
+            t.lastCyc  = c;
+            t.haveLast = true;
+          }
+        }
+
+        // Re-resolve the sampler's target every 2s: the named thread may not
+        // exist yet when the sampler starts (dxvk-cs is created with the
+        // device), and it must not be cached across a device recreate.
+        if (sampOn && tickMs - samplerTargetMs >= 2000) {
+          samplerTargetMs = tickMs;
+          const std::string want = RtxOptions::perfGapSamplerThread();
+          samplerNamedTid = want.empty() ? 0u : censusFindThreadByName(want.c_str());
+          for (uint32_t i = 0; i < 63 && i < want.size(); ++i)
+            samplerTargetName[i] = want[i];
+          samplerTargetName[std::min<size_t>(63, want.size())] = '\0';
+        }
+
+        if (sampOn) do {
+        // A named target that resolved wins; otherwise fall back to the present
+        // thread, which is both the original behaviour and the safe answer for
+        // a name that matched nothing.
+        const uint32_t tid = samplerNamedTid != 0
+          ? samplerNamedTid
+          : vanish_diag::g_presentTid.load(std::memory_order_relaxed);
         if (tid == 0 || tid == uint32_t(GetCurrentThreadId()))
-          continue;
+          break;
         if (tid != hTargetTid) {
           if (hTarget != nullptr)
             CloseHandle(hTarget);
@@ -5384,7 +5693,7 @@ namespace dxvk {
           hTargetTid = tid;
         }
         if (hTarget == nullptr)
-          continue;
+          break;
 
         // --- suspended window: context capture ONLY ---
         uintptr_t rip = 0, rsp = 0;
@@ -5469,6 +5778,7 @@ namespace dxvk {
             }
           }
         }
+        } while (false);   // end of the sampOn block
 
         const uint64_t nowMs = GetTickCount64();
         if (gapMods.empty() || nowMs - lastModsMs > 10000) {
@@ -5493,8 +5803,12 @@ namespace dxvk {
           }
         }
 
-        if (nowMs - lastFlushMs >= 5000 && !gapRips.empty()) {
+        // The census emits even when the RIP sampler collected nothing (it is
+        // valid to run the census alone), so the flush can no longer require a
+        // non-empty gapRips - the sampler line guards on that itself below.
+        if (nowMs - lastFlushMs >= 5000 && (!gapRips.empty() || censusOn)) {
           lastFlushMs = nowMs;
+          if (!gapRips.empty()) {
           // Aggregate per module and per 16-byte RVA bucket. 2026-08-06: was
           // 256, which was too coarse at the top hit — ntdll's syscall stubs
           // are 16 bytes apart, so a 256-byte bucket merged ~16 DIFFERENT
@@ -5545,7 +5859,16 @@ namespace dxvk {
           std::sort(callers2.begin(), callers2.end(), [](auto& a, auto& b) { return a.second > b.second; });
 
           std::ostringstream line;
-          line << "[GapSampler] samples=" << gapRips.size() << " unknown=" << unknown << " mods:";
+          // Name the TARGET on every line. Without it a histogram of dxvk-cs is
+          // indistinguishable from one of the present thread, and the whole
+          // point of retargeting is that they answer different questions.
+          line << "[GapSampler] target="
+               << (samplerNamedTid != 0
+                     ? str::format(samplerTargetName, "(tid=", samplerNamedTid, ")")
+                     : (samplerTargetName[0] != '\0'
+                          ? str::format(samplerTargetName, "(NOT FOUND -> present)")
+                          : std::string("present")))
+               << " samples=" << gapRips.size() << " unknown=" << unknown << " mods:";
           for (size_t i = 0; i < mods.size() && i < 8; ++i)
             line << " " << mods[i].first << "=" << (mods[i].second * 100u) / uint32_t(gapRips.size()) << "%";
           line << " | top:";
@@ -5561,6 +5884,82 @@ namespace dxvk {
           gapRips.clear();
           gapCallers.clear();
           gapCallers2.clear();
+          }   // end of the "sampler had samples" block
+
+          // ---- [ThreadCensus] ----
+          // Read busySum FIRST and read it against the frame time. It is the
+          // total CPU the whole process actually executed, as a percentage of
+          // ONE core. If the frame is ~102 ms and busySum is small, then no
+          // thread is computing during the block and the frame is paced by a
+          // wait chain or a throttle - in which case looking for expensive
+          // code, anywhere, is the wrong search. If instead one thread sits
+          // near 100%, that thread is the critical path and the RIP sampler
+          // should be pointed at it next.
+          if (censusOn && !census.empty()) {
+            const uint64_t winMs = (nowMs > censusWindowMs) ? (nowMs - censusWindowMs) : 1u;
+            censusWindowMs = nowMs;
+            const int64_t cyPerUs = getCalibratedCyclesPerUs();
+            const double  winUs   = double(winMs) * 1000.0;
+
+            struct CensusRow { const CensusThread* t; uint64_t cyc; };
+            std::vector<CensusRow> rows;
+            rows.reserve(census.size());
+            uint64_t totalCyc = 0;
+            for (auto& t : census) {
+              rows.push_back(CensusRow { &t, t.accCyc });
+              totalCyc += t.accCyc;
+              t.accCyc = 0;                 // per-window, like every other counter here
+            }
+            std::sort(rows.begin(), rows.end(),
+              [](const CensusRow& a, const CensusRow& b) { return a.cyc > b.cyc; });
+
+            auto pctOf = [cyPerUs, winUs](uint64_t cyc) -> double {
+              return (cyPerUs > 0 && winUs > 0.0)
+                ? (double(cyc) / double(cyPerUs)) * 100.0 / winUs
+                : 0.0;
+            };
+
+            uint32_t active = 0;
+            for (const auto& r : rows) {
+              if (pctOf(r.cyc) >= 5.0)
+                ++active;
+            }
+
+            const uint32_t presentTid =
+              vanish_diag::g_presentTid.load(std::memory_order_relaxed);
+
+            std::ostringstream cl;
+            cl << "[ThreadCensus] window=" << winMs << "ms threads=" << census.size()
+               << " active(>=5%)=" << active
+               << " busySum=" << pctOf(totalCyc) << "%core | top:";
+            for (size_t i = 0; i < rows.size() && i < 14; ++i) {
+              const double pct = pctOf(rows[i].cyc);
+              if (pct < 0.1 && i >= 4)
+                break;                      // stop once the tail is all idle
+              const CensusThread* t    = rows[i].t;
+              const uint32_t      rtid = t->tid;
+              // Name the thread by its description if the engine set one
+              // (tier0 does), else by the module that OWNS it - which is the
+              // distinction that matters here: an engine worker vs one of ours.
+              std::string who;
+              if (t->name[0] != '\0') {
+                who = t->name;
+              } else if (t->startAddr != 0) {
+                const GapMod* hit = nullptr;
+                for (const auto& m : gapMods) {
+                  if (t->startAddr >= m.base && t->startAddr < m.end) { hit = &m; break; }
+                }
+                who = hit
+                  ? str::format(hit->name, "+0x", std::hex, uintptr_t(t->startAddr - hit->base), std::dec)
+                  : std::string("?");
+              } else {
+                who = "?";
+              }
+              cl << " " << rtid << "[" << who << "]"
+                 << (rtid == presentTid ? "(PRESENT)" : "") << "=" << pct << "%";
+            }
+            Logger::warn(cl.str());
+          }
         }
       }
     }
@@ -5572,7 +5971,11 @@ namespace dxvk {
     // [GapSampler] lazy start — one detached thread for the process lifetime,
     // created the first time the option reads true so a False conf costs
     // nothing, not even the thread.
-    if (RtxOptions::perfGapSampler() && !g_gapSamplerStarted.exchange(true)) {
+    // [ThreadCensus] shares that thread (it needs the same module snapshot and
+    // the same 5s flush cadence), so either option is enough to start it; the
+    // loop then re-reads both every tick and does only the work it is asked for.
+    if ((RtxOptions::perfGapSampler() || RtxOptions::perfThreadCensus())
+        && !g_gapSamplerStarted.exchange(true)) {
       std::thread(gapSamplerThread).detach();
     }
     // [VQProbe] per-frame VirtualQuery census — names the guard responsible
@@ -8077,9 +8480,19 @@ namespace dxvk {
   // When off, markSub returns before touching the clock AND before advancing
   // tStg, so pf_setup and preFilters go back to reporting their whole spans
   // and the sub-buckets read 0 â€” that 0 means "not measured", not "free".
+  //
+  // NV-DXVK [perf] 2026-08-06 (v2 handoff Â§3c): DEFAULT FLIPPED ON for the
+  // bisection run that names the contents of bt_extractXf / tail_emit /
+  // pf_setup in one pass. The env var still wins in both directions, so
+  // RTX_D3D11_SUBMARK=0 turns the splits back off without a rebuild once the
+  // bisect has landed â€” flip this default back to false at that point, since
+  // the ~0.33 us/draw these cost is larger than several of the buckets they
+  // report.
   static const bool s_submitDrawSubMarkers = []() {
     const char* v = std::getenv("RTX_D3D11_SUBMARK");
-    return v != nullptr && v[0] == '1';
+    if (v == nullptr || v[0] == '\0')
+      return true;          // default ON
+    return v[0] != '0';     // RTX_D3D11_SUBMARK=0 disables, no rebuild needed
   }();
   static thread_local int64_t s_perfPfsGuardAcc   = 0, s_perfPfsGuardMax   = 0;
   static thread_local int64_t s_perfPfsStudioAcc  = 0, s_perfPfsStudioMax  = 0;
@@ -9056,11 +9469,20 @@ namespace dxvk {
           // It's DYNAMIC (MAP_WRITE_DISCARD) so we use GetMappedSlice().
           const uint8_t* t31Data = nullptr;
           size_t t31Len = 0;
+          // NV-DXVK [T31Cache]: identity + map generation of the buffer behind
+          // t31Data, captured HERE because `res` (and with it the guarantee
+          // that t31Buf is alive) dies at the end of this block. t31SrcBuf is
+          // kept for pointer comparison only and is never dereferenced again;
+          // t31SrcGen must therefore be read now, while the Com ref is held.
+          const void* t31SrcBuf = nullptr;
+          uint64_t    t31SrcGen = 0ull;
           {
             Com<ID3D11Resource> res;
             boneSrv->GetResource(&res);
             auto* t31Buf = static_cast<D3D11Buffer*>(res.ptr());
             if (t31Buf) {
+              t31SrcBuf = t31Buf;
+              t31SrcGen = t31Buf->GetMapGeneration();
               auto mapped = t31Buf->GetMappedSlice();
               if (mapped.mapPtr && mapped.length > 0) {
                 t31Data = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
@@ -10102,18 +10524,52 @@ namespace dxvk {
             const uint8_t* t31Read = t31Data;
             size_t         t31ReadLen = t31Len;
             if (t31Data != nullptr && t31Len > 0) {
-              m_t31ReadCache.resize(t31Len);
-              // NV-DXVK [Perf.InstDraw] 2026-07-27: was std::memcpy. The source is
-              // the MAPPED t31 buffer â€” write-combined per the m_t31ReadCache decl
-              // in d3d11_rtx.h â€” and plain memcpy reads WC with ordinary loads at
-              // ~300 MB/s effective (see memcpyFromWC at the top of this file).
-              // movntdqa fills a whole line-fill buffer per transaction instead.
-              // Same bytes either way, so the "no visual change" note above still
-              // holds. Precedent: the per-draw index snapshot went from ~64 ms/frame
-              // to 219 us/window on this exact substitution.
-              // This copy sits INSIDE the loop timer (tLoop0 opens above it), so
-              // the win lands in [Perf.InstDraw] loop_ms, NOT prep_ms.
-              memcpyFromWC(m_t31ReadCache.data(), t31Data, t31Len);
+              // NV-DXVK [T31Cache] 2026-08-06: the copy below is correct but was
+              // unconditional, and this function runs 554 times a frame against
+              // what is almost always the SAME buffer contents. Re-reading the
+              // whole thing each time cost 4.72 MB/frame of write-combined
+              // traffic -- 91% of all frame-thread WC bytes and, per
+              // [GapSampler], the hottest leaf in our code at ~10% of frame-
+              // thread samples. The comment below explains why ONE copy is
+              // needed; nothing ever justified 554 of them.
+              //
+              // The key must catch both ways the bytes can change under us:
+              // Map(WRITE_DISCARD) renames the slice (MapPtr moves) and
+              // Map(WRITE_NO_OVERWRITE) writes in place (only MapGen moves).
+              // Getting this wrong is a stale per-instance transform, which
+              // looks like geometry in the wrong place, not a crash -- so it
+              // is keyed on all three and re-copies whenever any of them
+              // differs. Length is checked via the cache's own size so a
+              // resize can never leave us reading past the fill.
+              const bool t31CacheHit =
+                     kEnableT31ReadCache
+                  && m_t31CacheSrcBuf == t31SrcBuf
+                  && m_t31CacheMapPtr == t31Data
+                  && m_t31CacheMapGen == t31SrcGen
+                  && m_t31ReadCache.size() == t31Len;
+
+              if (t31CacheHit) {
+                g_t31CacheHits.fetch_add(1, std::memory_order_relaxed);
+                g_t31CacheBytesSaved.fetch_add(t31Len, std::memory_order_relaxed);
+              } else {
+                m_t31ReadCache.resize(t31Len);
+                // NV-DXVK [Perf.InstDraw] 2026-07-27: was std::memcpy. The source is
+                // the MAPPED t31 buffer â€” write-combined per the m_t31ReadCache decl
+                // in d3d11_rtx.h â€” and plain memcpy reads WC with ordinary loads at
+                // ~300 MB/s effective (see memcpyFromWC at the top of this file).
+                // movntdqa fills a whole line-fill buffer per transaction instead.
+                // Same bytes either way, so the "no visual change" note above still
+                // holds. Precedent: the per-draw index snapshot went from ~64 ms/frame
+                // to 219 us/window on this exact substitution.
+                // This copy sits INSIDE the loop timer (tLoop0 opens above it), so
+                // the win lands in [Perf.InstDraw] loop_ms, NOT prep_ms.
+                memcpyFromWC(m_t31ReadCache.data(), t31Data, t31Len);
+                m_t31CacheSrcBuf = t31SrcBuf;
+                m_t31CacheMapPtr = t31Data;
+                m_t31CacheMapGen = t31SrcGen;
+                g_t31CacheMisses.fetch_add(1, std::memory_order_relaxed);
+                g_t31CacheBytesCopied.fetch_add(t31Len, std::memory_order_relaxed);
+              }
               t31Read = m_t31ReadCache.data();
               t31ReadLen = t31Len;
             }
@@ -43330,6 +43786,88 @@ namespace dxvk {
                 "/", (memInfo.heaps[i].memoryBudget >> 20), "MB");
             }
             Logger::warn(str::format("[Perf.VidMem]", heaps));
+
+            // NV-DXVK [Perf.MemCat] (2026-08-06): WHICH CATEGORY owns the VRAM.
+            // [Perf.VidMem] above is the driver's per-heap total -- it says the
+            // number is 8 GB but never says what is in it, so every session so
+            // far has had to guess. DxvkMemoryStats has tracked eight categories
+            // per heap since forever (dxvk_memory.h:38) and NOTHING has ever read
+            // them out. This is that readout. Same 5s window, same gate, printed
+            // on the next line so the two are always paired in the log.
+            //
+            // WHY IT IS NEEDED, and what it settles on the first line it prints:
+            // the scene's whole resident set appears in ONE 5s window at level
+            // load ([Perf.Block] scene: instances 0 -> 15,477, textures 0 ->
+            // 1,236) and then sits flat forever (+8 MB over the following 25s).
+            // So the open question is NOT "what leaks per frame" -- nothing does
+            // -- it is "why is the one-time set ~5.8 GB". Read appTex first:
+            //   appTex ~= the whole number  => the memory is the GAME'S OWN
+            //     textures, it is legitimate, and the lever is budget/streaming,
+            //     not a retention bug. 1,236 textures at ~4.7 MB each is 5.8 GB,
+            //     which is ordinary for 2048^2 BC7 with a full mip chain.
+            //   appTex small, something else large => that category is the bug,
+            //     and this line names it instead of costing another session.
+            //
+            // AND IT EXPLAINS [Perf.TexBudget] residentMB=3, which has been read
+            // as "the texture manager holds 3 MB" and treated as impossible.
+            // It is not impossible and it is not wrong: rtx_texture_manager.cpp:84
+            // sums usedByCategory(RTXMaterialTexture) ONLY -- Remix REPLACEMENT
+            // materials, of which TF2 has essentially none. Every texture the
+            // game itself creates is tagged AppTexture at d3d11_texture.cpp:214
+            // and is invisible to that probe by construction. The instrument was
+            // never measuring the thing it was being read as measuring.
+            //
+            // slack = allocated - used, i.e. driver chunks held minus what is
+            // actually suballocated in them. Large slack with small used means
+            // chunk fragmentation and freeUnusedChunks() is the lever; small
+            // slack means the categories below are the real content.
+            //
+            // Deltas are vs the PREVIOUS window and print only when non-zero, so
+            // a steady scene stays a short line and any genuine growth is visible
+            // without diffing timestamps by hand.
+            //
+            // Cost: 10 relaxed atomic loads per heap once per 5s. No locks, no
+            // Vulkan calls, no thread suspension -- safe to leave on permanently,
+            // unlike the gap sampler.
+            {
+              using Cat = DxvkMemoryStats::Category;
+              static const char* const kCatName[Cat::Count] = {
+                "", "appBuf", "appTex", "rtxGeo", "rtxBuf",
+                "rtxAccel", "rtxOmm", "rtxTex", "rtxRT",
+              };
+              static uint64_t s_prevCat[VK_MAX_MEMORY_HEAPS][Cat::Count] = {};
+              static bool     s_prevCatValid = false;
+
+              for (uint32_t i = 0; i < memInfo.heapCount; ++i) {
+                const DxvkMemoryStats st = m_context->m_device->getMemoryStats(i);
+                const uint64_t allocated = st.totalAllocated();
+                const uint64_t used      = st.totalUsed();
+                const uint64_t slack     = (allocated > used) ? (allocated - used) : 0ull;
+                const bool devLocal =
+                  (memInfo.heaps[i].heapFlags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+
+                std::string cats;
+                for (uint32_t c = Cat::First; c <= Cat::Last; ++c) {
+                  const uint64_t cur = st.usedByCategory(static_cast<Cat>(c));
+                  cats += str::format(" ", kCatName[c], "=", (cur >> 20));
+                  if (s_prevCatValid) {
+                    const int64_t dBytes =
+                      static_cast<int64_t>(cur) - static_cast<int64_t>(s_prevCat[i][c]);
+                    const int64_t dMb = dBytes / (1 << 20);
+                    if (dMb != 0)
+                      cats += str::format("(", (dMb > 0 ? "+" : ""), dMb, ")");
+                  }
+                  s_prevCat[i][c] = cur;
+                }
+
+                Logger::warn(str::format(
+                  "[Perf.MemCat] heap", i, devLocal ? "(VRAM)" : "(SYS)",
+                  " alloc=", (allocated >> 20), "MB",
+                  " used=",  (used      >> 20), "MB",
+                  " slack=", (slack     >> 20), "MB |", cats));
+              }
+              s_prevCatValid = true;
+            }
           }
 
           // NV-DXVK [perf]: frame-time accounting hole. With the coverage
@@ -45960,6 +46498,66 @@ namespace dxvk {
                 t_wcSites[i] = WcSite {};
             }
 
+            // NV-DXVK [Perf.FmtSite]: who converts floats to text, and where.
+            // Unlike [Perf.WcCopy] above this is POOLED ACROSS THREADS, because
+            // the thread in question is dxvk-cs while this drain runs on the
+            // frame thread - a thread_local table would report the wrong
+            // thread's sites and look exactly like a correct empty result.
+            // Read byThread first: if the calls are not on the CS thread, the
+            // [GapSampler] hit that motivated this was something else.
+            {
+              const uint64_t base = reinterpret_cast<uint64_t>(GetModuleHandleA("d3d11.dll"));
+              uint64_t size = 0;
+              if (base) {
+                const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+                if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+                  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+                  if (nt->Signature == IMAGE_NT_SIGNATURE)
+                    size = nt->OptionalHeader.SizeOfImage;
+                }
+              }
+
+              static fmt_diag::FmtSnapshot snaps[512];
+              const uint32_t fn = fmt_diag::drain(snaps, 512u);
+              if (fn != 0) {
+                std::vector<uint32_t> ord(fn);
+                for (uint32_t i = 0; i < fn; ++i)
+                  ord[i] = i;
+                std::sort(ord.begin(), ord.end(), [](uint32_t a, uint32_t b) {
+                  return snaps[a].calls > snaps[b].calls;
+                });
+
+                uint64_t totCalls = 0;
+                for (uint32_t i = 0; i < fn; ++i)
+                  totCalls += snaps[i].calls;
+
+                // Per-thread totals, deduped by tid (drain emits one row per
+                // (tid, site), and `total` repeats the thread's whole count).
+                std::string byThread;
+                std::unordered_set<uint32_t> seenTid;
+                for (uint32_t i = 0; i < fn; ++i) {
+                  if (!seenTid.insert(snaps[ord[i]].tid).second)
+                    continue;
+                  if (seenTid.size() > 5)
+                    break;
+                  byThread += str::format(" ", snaps[ord[i]].tid, "=", snaps[ord[i]].total);
+                }
+
+                std::string fs = str::format(
+                  "[Perf.FmtSite] float->text this window: total=", totCalls,
+                  " calls | byThread:", byThread, " | top:");
+                for (uint32_t i = 0; i < fn && i < 6; ++i) {
+                  const auto& s3 = snaps[ord[i]];
+                  const uint64_t a = reinterpret_cast<uint64_t>(s3.ret);
+                  fs += (size && a >= base && a < base + size)
+                    ? str::format(" d3d11+0x", std::hex, (a - base), std::dec)
+                    : str::format(" ?@0x", std::hex, a, std::dec);
+                  fs += str::format("=", s3.calls, "(tid ", s3.tid, ")");
+                }
+                Logger::info(fs);
+              }
+            }
+
             // The other single-entry cache, this one INSIDE the expensive half.
             // A low hitPct here with a large MB/window means the fanout cycles
             // between instance buffers and we re-copy each one every call â€”
@@ -45977,6 +46575,31 @@ namespace dxvk {
               double(ib) / (1024.0 * 1024.0),
               im ? double(ib) / 1024.0 / double(im) : 0.0);
             Logger::info(ibBuf);
+
+            // NV-DXVK [Perf.T31Cache]: the keyed bulk copy that used to run
+            // unconditionally. savedMB is the write-combined traffic removed
+            // this window; compare it against the d3d11+0x33707b entry on the
+            // [Perf.WcCopy] line above, which is the same copy measured from
+            // the callee side -- that entry should fall by savedMB and the
+            // window total with it. A hitPct near 0 with a large copiedMB is
+            // the refutation: it means the game really does rewrite t31
+            // between draws and the buffer must be re-read every call.
+            const uint64_t th = g_t31CacheHits.exchange(0, std::memory_order_relaxed);
+            const uint64_t tm = g_t31CacheMisses.exchange(0, std::memory_order_relaxed);
+            const uint64_t ts = g_t31CacheBytesSaved.exchange(0, std::memory_order_relaxed);
+            const uint64_t tc = g_t31CacheBytesCopied.exchange(0, std::memory_order_relaxed);
+            const uint64_t tt = th + tm;
+            char tcBuf[288];
+            std::snprintf(tcBuf, sizeof(tcBuf),
+              "[Perf.T31Cache] hits=%llu misses=%llu hitPct=%.1f"
+              " savedMB=%.2f copiedMB=%.2f avgCopy_KB=%.1f enabled=%d",
+              (unsigned long long) th, (unsigned long long) tm,
+              tt ? 100.0 * double(th) / double(tt) : 0.0,
+              double(ts) / (1024.0 * 1024.0),
+              double(tc) / (1024.0 * 1024.0),
+              tm ? double(tc) / 1024.0 / double(tm) : 0.0,
+              kEnableT31ReadCache ? 1 : 0);
+            Logger::info(tcBuf);
 
             // NV-DXVK [Perf.BonePath]: the map chain itself â€” the residue of the
             // map half after three refuted guesses. direct= means mapPtr(0) hit

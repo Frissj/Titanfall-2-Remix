@@ -7,8 +7,50 @@
 
 #include "../tracy/TracyC.h"
 
+// NV-DXVK [Perf.CsSplit]: per-chunk execution timing on the CS thread.
+// str::format reaches here transitively through dxvk_context.h, but this file
+// has never used it before - included explicitly so the report does not depend
+// on someone else's include graph.
+#include <chrono>
+#include <algorithm>
+#include "../util/util_string.h"
+#include "../util/log/log.h"
+
 namespace dxvk {
-  
+
+  // NV-DXVK [Perf.CsSplit] 2026-08-06: is dxvk-cs's time ONE fat pass or a
+  // million small ones? That distinction decides whether it can be threaded.
+  //
+  // [ThreadCensus] measures dxvk-cs at 95-98% of one core on a ~100 ms frame:
+  // it IS the frame time, with the game thread blocked ~60 ms and the GPU idle
+  // ~76 ms behind it. But "move it to the worker pool" is only possible for
+  // some of that work:
+  //   - Vulkan command recording is serial by construction (one VkCommandBuffer,
+  //     D3D11-ordered state and draws). It cannot be spread across cores.
+  //   - Remix's scene processing (instance manager, accel manager, spatial map,
+  //     hashing) is data-parallel in principle - 16k mostly independent
+  //     instances - and the d3d11-geometry pool that would run it already
+  //     exists and idles at ~1.4%.
+  // The two are indistinguishable in the [GapSampler] histogram because it is
+  // flat (top bucket 1.9%, top eight under 9%).
+  //
+  // WHY PER-CHUNK, and not a timer around executeAll vs the rest of the loop:
+  // threadFunc's only work IS executeAll, so that split would read ~100%/0% and
+  // answer nothing. The shape of the per-chunk DISTRIBUTION does answer it:
+  //   one chunk/frame at tens of ms -> a big serial Remix pass rides in a
+  //     single command; that is the parallelizable case and the fat bucket
+  //     names how much is on the table
+  //   ~1400 chunks/frame at microseconds each -> the cost is command replay
+  //     spread over the whole stream; nothing to hand to a pool, and the answer
+  //     to "can we multithread this" is no
+  // A frame is ~1364 chunks, so one clock pair per chunk is ~2700 steady_clock
+  // reads (~41 ns each, measured) = ~0.11 ms/frame against a 96 ms thread:
+  // ~0.1%, and it is measuring the thread that decides the frame rate.
+  //
+  // Compile-time constant next to the code it affects, per the convention the
+  // other perf switches in this project follow.
+  static constexpr bool kEnableCsSplit = true;
+
   DxvkCsChunk::DxvkCsChunk() {
     
   }
@@ -170,6 +212,18 @@ namespace dxvk {
 
     DxvkCsChunkRef chunk;
 
+    // [Perf.CsSplit] state. Thread-local by construction - only this thread
+    // touches it - so no synchronisation and no atomics on the hot path.
+    // Buckets are decade-spaced in microseconds; `fat` deliberately starts at
+    // 1 ms because that is the scale at which a bucket could hold a whole
+    // scene-processing pass rather than a run of draw commands.
+    constexpr uint32_t kCsBuckets = 5;   // <10us, <100us, <1ms, <10ms, >=10ms
+    uint64_t csBucketNs[kCsBuckets] = {};
+    uint64_t csBucketN [kCsBuckets] = {};
+    uint64_t csTotalNs = 0, csChunks = 0, csMaxNs = 0, csIdleNs = 0;
+    auto     csLastReport = std::chrono::steady_clock::now();
+    auto     csWaitStart  = csLastReport;
+
     try {
       while (!m_stopped.load()) {
         { 
@@ -197,7 +251,67 @@ namespace dxvk {
         
         if (chunk) {
           m_context->addStatCtr(DxvkStatCounter::CsChunkCount, 1);
-          chunk->executeAll(m_context.ptr());
+
+          if constexpr (kEnableCsSplit) {
+            const auto t0 = std::chrono::steady_clock::now();
+            // Everything between leaving the lock above and here is queue
+            // bookkeeping and the condvar wait; billing it as idle keeps
+            // "busy" comparable with [ThreadCensus]'s cycle-based number.
+            csIdleNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+              t0 - csWaitStart).count());
+
+            chunk->executeAll(m_context.ptr());
+
+            const auto t1 = std::chrono::steady_clock::now();
+            csWaitStart = t1;
+            const uint64_t dNs = uint64_t(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+            csTotalNs += dNs;
+            ++csChunks;
+            if (dNs > csMaxNs)
+              csMaxNs = dNs;
+
+            const uint64_t dUs = dNs / 1000ull;
+            const uint32_t b = dUs < 10ull      ? 0u
+                             : dUs < 100ull     ? 1u
+                             : dUs < 1000ull    ? 2u
+                             : dUs < 10000ull   ? 3u
+                                                : 4u;
+            csBucketNs[b] += dNs;
+            csBucketN [b] += 1;
+
+            // Report on the same 5s cadence as [ThreadCensus]/[GapSampler] so
+            // the three lines describe the same window and can be read together.
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                  t1 - csLastReport).count() >= 5000) {
+              const double winMs = double(std::chrono::duration_cast<
+                std::chrono::milliseconds>(t1 - csLastReport).count());
+              csLastReport = t1;
+
+              static constexpr const char* kBucketNames[kCsBuckets] = {
+                "<10us", "<100us", "<1ms", "<10ms", ">=10ms"
+              };
+              std::string line = str::format(
+                "[Perf.CsSplit] window=", winMs, "ms chunks=", csChunks,
+                " execMs=", double(csTotalNs) / 1e6,
+                " idleMs=", double(csIdleNs) / 1e6,
+                " busyPct=", winMs > 0.0 ? (double(csTotalNs) / 1e6) * 100.0 / winMs : 0.0,
+                " maxChunkMs=", double(csMaxNs) / 1e6, " | byDuration:");
+              for (uint32_t i = 0; i < kCsBuckets; ++i) {
+                line += str::format(" ", kBucketNames[i], "=",
+                  double(csBucketNs[i]) / 1e6, "ms/", csBucketN[i]);
+              }
+              Logger::warn(line);
+
+              for (uint32_t i = 0; i < kCsBuckets; ++i) {
+                csBucketNs[i] = 0;
+                csBucketN[i]  = 0;
+              }
+              csTotalNs = csChunks = csMaxNs = csIdleNs = 0;
+            }
+          } else {
+            chunk->executeAll(m_context.ptr());
+          }
         }
       }
     } catch (const DxvkError& e) {

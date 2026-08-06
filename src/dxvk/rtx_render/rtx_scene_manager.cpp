@@ -5223,9 +5223,141 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [Perf.ChunkTrim] (2026-08-06): the automatic trigger this call has
+    // never had. Until now freeUnusedChunks() was reachable ONLY through the two
+    // m_forceFree* atomics above, both of which are manual UI actions -- so on a
+    // normal play session the allocator's high-water mark was never given back,
+    // which is precisely why VRAM was observed to climb and never recover.
+    //
+    // MEASURED, [Perf.MemCat], BT mission steady state:
+    //   heap0(VRAM) alloc=7569MB used=5313MB slack=2255MB
+    // 30% of everything taken from the driver held in chunks with nothing
+    // suballocated in them -- a bigger line item than the game's own textures
+    // (appTex=2329MB) or the acceleration structures (rtxAccel=2229MB).
+    //
+    // SAFETY IS INHERITED, NOT ASSUMED: this sets the SAME freeUnused flag the
+    // force path sets, so the trim still happens at the same point in the frame
+    // (SceneManager::onFrameEnd), on the same thread, through the same call.
+    // Nothing about the trim changes -- only when it is asked for.
+    //
+    // Tested against the LARGEST heap's slack rather than the sum, so a big
+    // VRAM heap cannot be masked by a small tidy system heap.
+    bool         autoTrim      = false;
+    VkDeviceSize autoTrimSlack = 0;
+
+    if (!freeUnused && RtxOptions::autoFreeUnusedChunks()) {
+      DxvkMemoryAllocator& memoryManager = m_device->getCommon()->memoryManager();
+      const uint32_t heapCount = memoryManager.getMemoryProperties().memoryHeapCount;
+
+      VkDeviceSize worstSlack = 0;
+      for (uint32_t i = 0; i < heapCount; ++i) {
+        const DxvkMemoryStats stats = m_device->getMemoryStats(i);
+        const VkDeviceSize allocated = stats.totalAllocated();
+        const VkDeviceSize used      = stats.totalUsed();
+
+        if (allocated > used)
+          worstSlack = std::max(worstSlack, allocated - used);
+      }
+
+      const VkDeviceSize slackThreshold =
+        VkDeviceSize(RtxOptions::autoFreeUnusedChunksSlackMB()) << 20;
+
+      // BACK-OFF AFTER A FRUITLESS TRIM. Slack over the threshold does NOT mean
+      // there is anything to recover: only entirely-empty chunks can be freed,
+      // and slack sitting inside partially-used chunks is fragmentation that no
+      // trim reaches. MEASURED 2026-08-06: after 7 productive trims recovered
+      // 1360 MB, the next 50 consecutive trims freed 0 chunks each while slack
+      // sat at ~1900 MB -- fifty heap walks, each taking every per-memory-type
+      // lock, to accomplish nothing. Without this the policy retries forever.
+      //
+      // The retry condition is slack GROWTH, and that is exact rather than a
+      // heuristic. A chunk can only become newly empty if either allocated rose
+      // (new chunks exist) or used fell (suballocations were released), and
+      // slack = allocated - used rises in both cases. Slack falling means used
+      // rose, i.e. more allocation, which cannot empty a chunk. So if slack has
+      // not grown since a trim that found nothing, there is provably nothing
+      // new to find.
+      const VkDeviceSize retryDelta =
+        VkDeviceSize(RtxOptions::autoFreeUnusedChunksRetryDeltaMB()) << 20;
+      const bool worthRetrying =
+        (m_fruitlessTrimSlack == 0) || (worstSlack > m_fruitlessTrimSlack + retryDelta);
+
+      if (worstSlack >= slackThreshold && worthRetrying) {
+        const auto now = std::chrono::steady_clock::now();
+        const bool neverTrimmed =
+          m_lastChunkTrimTime == std::chrono::steady_clock::time_point::min();
+        const int64_t sinceMs = neverTrimmed ? 0 :
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - m_lastChunkTrimTime).count();
+
+        if (neverTrimmed || sinceMs >= int64_t(RtxOptions::autoFreeUnusedChunksCooldownMs())) {
+          m_lastChunkTrimTime = now;
+          freeUnused    = true;
+          autoTrim      = true;
+          autoTrimSlack = worstSlack;
+        }
+      }
+    }
+
     if (freeUnused) {
       // DXVK doesnt free chunks for us by default (its high water mark) so force release some memory back to the system here.
-      m_device->getCommon()->memoryManager().freeUnusedChunks();
+
+      // NV-DXVK [Perf.ChunkTrim]: report what the trim actually RECOVERED, not
+      // what triggered it. Only genuinely empty chunks can be released; slack
+      // inside a partially-used chunk is fragmentation and no policy reaches it,
+      // so recovered is expected to be well under the slack that fired this.
+      // Tune rtx.autoFreeUnusedChunksSlackMB against this line, not a guess.
+      DxvkMemoryAllocator& memoryManager = m_device->getCommon()->memoryManager();
+      const uint32_t heapCount = memoryManager.getMemoryProperties().memoryHeapCount;
+
+      VkDeviceSize beforeAllocated = 0;
+      VkDeviceSize beforeUsed      = 0;
+      for (uint32_t i = 0; i < heapCount; ++i) {
+        const DxvkMemoryStats stats = m_device->getMemoryStats(i);
+        beforeAllocated += stats.totalAllocated();
+        beforeUsed      += stats.totalUsed();
+      }
+
+      // THE AUTOMATIC PATH IS BUDGETED, THE MANUAL ONE IS NOT, and the
+      // difference is deliberate. A chunk is 320 MB device-local and releasing
+      // it is a vkFreeMemory of the whole allocation, so freeing every empty
+      // chunk at once is a multi-GB burst of driver work on one frame. That is
+      // fine when the USER asked for it at a moment of their choosing, and it
+      // is a visible stutter when a background policy decides mid-firefight.
+      // So: forced -> 0 (unlimited, unchanged behaviour); auto -> a small
+      // per-trim budget, which still drains the heap fully, just spread over
+      // seconds. 2255 MB of slack is ~7 chunks, i.e. ~7 seconds at the default
+      // 1 chunk/second, with one vkFreeMemory on each of those frames.
+      const uint32_t trimBudget =
+        autoTrim ? RtxOptions::autoFreeUnusedChunksMaxPerTrim() : 0u;
+
+      const uint32_t chunksFreed = memoryManager.freeUnusedChunks(trimBudget);
+
+      VkDeviceSize afterAllocated = 0;
+      for (uint32_t i = 0; i < heapCount; ++i)
+        afterAllocated += m_device->getMemoryStats(i).totalAllocated();
+
+      const VkDeviceSize recovered =
+        (beforeAllocated > afterAllocated) ? (beforeAllocated - afterAllocated) : 0;
+
+      // Arm or clear the back-off described above. A trim that freed nothing
+      // records the slack level it gave up at, so the policy stays quiet until
+      // slack grows past it; a productive trim clears the record, because more
+      // chunks may now be reachable and the next attempt should be allowed.
+      // Only the automatic path participates -- an explicit force-free is a
+      // user decision and must never be suppressed by a previous null result.
+      if (autoTrim)
+        m_fruitlessTrimSlack = (chunksFreed == 0) ? autoTrimSlack : 0;
+
+      Logger::warn(str::format(
+        "[Perf.ChunkTrim] trigger=", (autoTrim ? "auto" : "forced"),
+        " budget=", trimBudget, (trimBudget == 0 ? "(unlimited)" : ""),
+        " chunks=", chunksFreed,
+        " allocated=", (beforeAllocated >> 20), "->", (afterAllocated >> 20), "MB",
+        " recovered=", (recovered >> 20), "MB",
+        " used=", (beforeUsed >> 20), "MB",
+        " slack=", ((beforeAllocated > beforeUsed) ? ((beforeAllocated - beforeUsed) >> 20) : 0), "MB",
+        (autoTrim && chunksFreed == 0) ? " -> backing off until slack grows" : ""));
     }
   }
 

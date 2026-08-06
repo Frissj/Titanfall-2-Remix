@@ -1099,6 +1099,13 @@ namespace dxvk {
     } else if (likely(MapType == D3D11_MAP_WRITE_NO_OVERWRITE)) {
       // Put this on a fast path without any extra checks since it's
       // a somewhat desired method to partially update large buffers
+      // NV-DXVK [T31Cache]: this path hands back the EXISTING slice and the
+      // game writes into it in place, so neither mapPtr nor the DiscardSlice
+      // content generation moves. Anything caching these bytes needs a signal
+      // that they may have changed; that is what m_mapGen is. One relaxed
+      // atomic increment on a path that is about to have the game memcpy into
+      // write-combined memory.
+      pResource->NoteMapForWrite();
       DxvkBufferSliceHandle physSlice = pResource->GetMappedSlice();
       pMappedResource->pData      = physSlice.mapPtr;
       pMappedResource->RowPitch   = bufferSize;

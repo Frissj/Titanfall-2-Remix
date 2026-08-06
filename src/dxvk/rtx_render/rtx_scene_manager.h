@@ -21,6 +21,7 @@
 */
 #pragma once
 
+#include <chrono>
 #include <deque>
 #include <mutex>
 #include <vector>
@@ -499,6 +500,22 @@ private:
 
   std::atomic_bool m_forceFreeTextureMemory = false;
   std::atomic_bool m_forceFreeUnusedDxvkAllocatorChunks = false;
+
+  // NV-DXVK [Perf.ChunkTrim] (2026-08-06): when the automatic empty-chunk trim
+  // last ran, for rtx.autoFreeUnusedChunksCooldownMs. Only ever touched from
+  // SceneManager::manageTextureVram on the frame-end thread, so it needs no
+  // synchronisation -- unlike the two force atomics above, which are set from
+  // the UI thread. time_point::min() means "never trimmed", which makes the
+  // first qualifying frame fire immediately rather than waiting out a cooldown
+  // measured from process start.
+  std::chrono::steady_clock::time_point m_lastChunkTrimTime =
+    std::chrono::steady_clock::time_point::min();
+
+  // NV-DXVK [Perf.ChunkTrim]: slack level at which an automatic trim last found
+  // NOTHING to free, or 0 when the last one was productive. Suppresses further
+  // attempts until slack grows past it -- see the back-off reasoning in
+  // SceneManager::manageTextureVram. Same thread as m_lastChunkTrimTime.
+  VkDeviceSize m_fruitlessTrimSlack = 0;
 
   // NV-DXVK: latest captured engine c_gameTime — see setEngineGameTime
   // comment above. Default 0 → before any draw of the screen-space
