@@ -378,6 +378,7 @@ namespace dxvk {
       // measure can be split at this call. Separate from nowNs above, which is
       // relative to this function's own epoch.
       vanish_diag::g_presentEnterNs.store(vanish_diag::steadyNowNs(), std::memory_order_relaxed);
+      vanish_diag::g_presentTid.store(uint32_t(GetCurrentThreadId()), std::memory_order_relaxed);
 
       const uint64_t prevEnd = s_lastPresentEndNs.load(std::memory_order_relaxed);
       if (prevEnd != 0ull && nowNs > prevEnd) {

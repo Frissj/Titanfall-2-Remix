@@ -168,6 +168,10 @@ namespace dxvk { namespace vanish_diag {
   // swapchain and the entry-point hooks share one time base.
   extern std::atomic<uint64_t> g_presentEnterNs;
   extern std::atomic<uint64_t> g_presentExitNs;
+  // NV-DXVK [GapSampler]: the thread that calls Present — the one whose
+  // post-present CPU gap ([Perf.Boundary] postMs) needs naming. Written by
+  // the swapchain on every Present, read by the sampler thread.
+  extern std::atomic<uint32_t> g_presentTid;
   extern std::atomic<uint64_t> g_boundaryPreNs;
   extern std::atomic<uint64_t> g_boundaryPostNs;
   extern std::atomic<uint64_t> g_boundaryPreMaxNs;

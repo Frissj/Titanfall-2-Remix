@@ -570,23 +570,30 @@ namespace dxvk {
 
   // NV-DXVK [MapGate]: why is the SpatialMap never written?
   //
-  // [MapWrite] logs ZERO lines across an entire run, from either write site,
-  // while [InstReap]/[FindSim]/[MtnDedup] in this same file log normally and
-  // the tag is not on the denylist. Both write sites sit inside
-  // `if (!m_isCreatedByRenderer)`, and the [MapWrite] call is inside that block
-  // too - so zero lines cannot distinguish:
-  //     (a) these functions are never called for these instances, from
-  //     (b) they are called and m_isCreatedByRenderer is always true.
-  // Those are different bugs in different places, and guessing between them is
-  // what this probe exists to avoid.
+  // *** RESOLVED 2026-08-06, and the premise was FALSE. [MapWrite] logged zero
+  // *** lines because the tag IS on a denylist - the HARDCODED emitMsg prefix
+  // *** filter in log.cpp (~line 424, silenced 2026-07-30 for the MeshTrace
+  // *** runs at 360 lines/frame), not the rtx.conf one this comment checked.
+  // *** The reference_log_filter rule exists for exactly this: when a log that
+  // *** must fire logs nothing, check log.cpp's built-in array FIRST.
+  // *** The writes themselves DO land: [InstReap] samples mapSz=1..8+ at reap
+  // *** time, and the 00:48 2026-08-06 run measures only ~49 reaps/frame
+  // *** against ~19,000 live instances (0.3%/frame churn). The "58% replaced
+  // *** every frame" era below described an earlier build, or a VS-local
+  // *** subset, and is NOT the current state. The per-frame write counters on
+  // *** the [MapGate] line (mapWrMove/mapWrInsert/mapSzMax, added with this
+  // *** note) prove it from the write side without re-enabling the flood.
+  // *** The [FindSim]/[MtnDedup] spatialMapSize=0 reads are per-BlasEntry:
+  // *** those VSes' lookups hit freshly (re)created BlasEntries whose maps are
+  // *** empty by construction - a different, narrower question than "is the
+  // *** map ever written".
   //
-  // Consequences of the map staying empty, all measured: getNearestData has
-  // zero candidates on 100% of 17402 lookups (spatialMapSize=0, every rejection
-  // counter 0), nearest matching hits 0.00%, 93% of reaps carry propId=0x0 so
-  // exact matching cannot cover for it, every draw therefore builds a NEW
-  // instance, the old one is never touched, age reaches exactly 1.00 and
-  // keepN=1 reaps it - ~31 fresh instance ids per frame, and 58% of a stable
-  // population replaced every frame.
+  // Original premise, kept for the record (numbers are from that older build):
+  // both write sites sit inside `if (!m_isCreatedByRenderer)`, and zero lines
+  // could not distinguish (a) never called from (b) always renderer-created.
+  // Consequences measured then: getNearestData zero candidates on 100% of
+  // 17402 lookups, nearest matching 0.00%, 93% of reaps propId=0x0, ~31 fresh
+  // instance ids per frame, 58% of a stable population replaced every frame.
   //
   // COUNTERS, not per-call lines: these functions run per instance per frame
   // (hundreds), and the log is already 127 MB. One summary line per frame
@@ -611,6 +618,20 @@ namespace dxvk {
     std::atomic<uint32_t> s_mgTpRenderer  { 0u };
     std::atomic<uint32_t> s_mgNullBlas    { 0u };
     std::atomic<uint32_t> s_mgUnsetFrame  { 0u };
+    // Write-side proof, counters not per-call lines (the per-call form is the
+    // denylisted [MapWrite] flood): how many SpatialMap move()/insert() calls
+    // actually executed this frame, and the largest map they landed in.
+    std::atomic<uint32_t> s_mgWrMove      { 0u };
+    std::atomic<uint32_t> s_mgWrInsert    { 0u };
+    std::atomic<uint32_t> s_mgWrMapSzMax  { 0u };
+
+    void mapWriteAccount(bool isInsert, uint32_t mapSzAfter) {
+      (isInsert ? s_mgWrInsert : s_mgWrMove).fetch_add(1u, std::memory_order_relaxed);
+      uint32_t seen = s_mgWrMapSzMax.load(std::memory_order_relaxed);
+      while (mapSzAfter > seen &&
+             !s_mgWrMapSzMax.compare_exchange_weak(seen, mapSzAfter, std::memory_order_relaxed)) {
+      }
+    }
 
     void mapGateAccount(uint32_t frame, bool isTeleport, bool isRenderer, bool blasNull) {
       // kInvalidFrameIndex IS UINT32_MAX - the same value used as the "no frame
@@ -630,6 +651,9 @@ namespace dxvk {
           const uint32_t tpR  = s_mgTpRenderer.exchange(0u);
           const uint32_t nb   = s_mgNullBlas.exchange(0u);
           const uint32_t uf   = s_mgUnsetFrame.exchange(0u);
+          const uint32_t wrM  = s_mgWrMove.exchange(0u);
+          const uint32_t wrI  = s_mgWrInsert.exchange(0u);
+          const uint32_t wrSz = s_mgWrMapSzMax.exchange(0u);
           if (observed != kInvalidFrameIndex) {
             Logger::info(str::format(
               "[MapGate] f=", observed,
@@ -639,7 +663,10 @@ namespace dxvk {
               " tpIsRenderer=", tpR,
               " nullBlas=", nb,
               " unsetFrame=", uf,
-              " mapWritesExpected=", (otc - otcR) + (tp - tpR)));
+              " mapWritesExpected=", (otc - otcR) + (tp - tpR),
+              " mapWrMove=", wrM,
+              " mapWrInsert=", wrI,
+              " mapSzMax=", wrSz));
           }
         }
       } else {
@@ -735,6 +762,9 @@ namespace dxvk {
       const XXH64_hash_t oldKey = m_spatialCacheHash;
       m_spatialCacheHash = m_linkedBlas->getSpatialMap().move(
           m_spatialCacheHash, newPos, firstInstanceObjectToWorld, this, m_stablePropId);
+      // NV-DXVK [MapGate] write-side proof; [MapWrite] below is denylisted in
+      // log.cpp so the counter is the only signal that survives to the log.
+      mapWriteAccount(/*isInsert*/ false, static_cast<uint32_t>(m_linkedBlas->getSpatialMap().size()));
 
       // UNGATED per-frame census: one line per instance per frame. No VS gate
       // (every VS gate in this investigation was a blind spot -- it only saw
@@ -787,6 +817,8 @@ namespace dxvk {
       // cache key is available for an exact join against [MapDump2].
       m_spatialCacheHash = m_linkedBlas->getSpatialMap().insert(
           centroid, firstInstanceObjectToWorld, this, m_stablePropId);
+      // NV-DXVK [MapGate] write-side proof; see the move() site.
+      mapWriteAccount(/*isInsert*/ true, static_cast<uint32_t>(m_linkedBlas->getSpatialMap().size()));
 
       // See the move() site: ungated census, visibility logged as fields.
       {
@@ -2577,7 +2609,14 @@ namespace dxvk {
         //     dropped/rekeyed them (churn) — look upstream of GC.
         // pos= identifies dome (|pos| huge, reprojected) vs deck (~y=-10860).
         // Gameplay-gated; 24 detail lines/frame ([GcExit] keeps the totals).
-        if (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+        // NV-DXVK 2026-08-06: tagDenied gate — 46 lines/frame in the 00:48
+        // capture, and the gather below (map size, material hash, world pos)
+        // is wasted when the denylist drops the line. The churn MAGNITUDE now
+        // lives on [MapGate]'s per-frame counters ([GcExit] also keeps totals
+        // but is itself denylisted by default), so denying the detail lines
+        // loses identity only, not the measurement.
+        if (!Logger::tagDenied("[InstReap]")
+            && tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
           // UNCAPPED. This was 24/frame and it SATURATED on every single frame
           // of the 2026-07-29 capture — 24 reaps/frame, unbroken — so the
           // number in the log was the cap reporting itself, not the scene, and
@@ -3419,7 +3458,10 @@ namespace dxvk {
         // high-churn VSes (0x2859d250 / 0x28d6baea / 0x292b6ba0) that draw
         // hundreds of times per frame, any budget burns out early and blinds
         // the rest of the run. Same failure as [InstReap]'s 24/frame cap.
-        {
+        // NV-DXVK 2026-08-06: tagDenied gate — this site alone was 136
+        // lines/frame (00:48 capture) and the whole gather+format below is
+        // wasted when the denylist would drop the line anyway.
+        if (!Logger::tagDenied("[MtnDedup]")) {
           // Centroid is what the SpatialMap actually keys/cells on, and it is
           // NOT o2w.T — log both so a divergence is visible directly.
           const Vector3 mdCentroid =
@@ -4095,8 +4137,14 @@ namespace dxvk {
     // Hardcoded hash kept so the original 2904d2 capture still reproduces;
     // rtx.findSimilarProbeVsHashes aims the same probe at anything else
     // (e.g. the tree-billboard VS) without a rebuild.
-    const bool isProbeVS = (vsHashProbe == 0x2904d2163ef31a17ull)
-                        || lookupHash(RtxOptions::findSimilarProbeVsHashes(), vsHashProbe);
+    // NV-DXVK 2026-08-06: tagDenied gates — [FindSim] was 46 lines/frame in
+    // the 00:48 capture. Gating the flag rather than each emit covers every
+    // [FindSim]/[FindSimMtn] site in this function at once; the throttle
+    // counters simply stop advancing while denied, which is the same state a
+    // fresh run starts in.
+    const bool isProbeVS = !Logger::tagDenied("[FindSim]")
+                        && ((vsHashProbe == 0x2904d2163ef31a17ull)
+                         || lookupHash(RtxOptions::findSimilarProbeVsHashes(), vsHashProbe));
     // NV-DXVK [FindSimMtn]: the s2s "two views" black-sky root. The reprojected
     // 3D-skybox terrain VS 0x29146e1d places 14 panels every frame in both
     // views (MtnPlace=14, all reproject gates PASS), but only 13 survive to the
@@ -4107,7 +4155,8 @@ namespace dxvk {
     // extra collapses are propId collisions (engine reused a stablePropId for
     // distinct panels) or distance merges (panels fall within the dedup radius
     // after reproject). Own counters so it captures full frames of all 14.
-    const bool isMtnProbe = (vsHashProbe == 0x29146e1dd50b0314ull);
+    const bool isMtnProbe = !Logger::tagDenied("[FindSimMtn]")
+                         && (vsHashProbe == 0x29146e1dd50b0314ull);
 
     // Search the BLAS for an instance matching ours
     {

@@ -1164,25 +1164,67 @@ namespace dxvk {
     // block, its timestamps, and the flush after the loop all fall away.
     const bool geomDiagOn = RtxOptions::logGeomDiag();
 
-    // NV-DXVK [SceneCull]: Remix-side radius + frustum culling — the replacement
-    // for the engine culls that d3d11_rtx.cpp's [CullOff] patches switch off.
+    // NV-DXVK [SceneCull]: Remix-side culling — the replacement for the engine
+    // culls that d3d11_rtx.cpp's [CullOff] patches switch off.
     // See the RtxOptions::SceneCull comment for why the cull lives here (BLAS is
     // kept, only the TLAS instance goes away) and what it does and does not save.
     //
+    // RESTRUCTURED 2026-08-06 to the RT_CULLING_2026-08-05.md §1A shape: a UNION
+    // OF KEEPS, not a set of rejects. An instance is kept if ANY enabled keep
+    // covers it, and culled only when every keep misses:
+    //   frustum keep  — case #1, directly visible (margin-widened, as before)
+    //   radius keep   — case #3, reflections/GI near the camera (position-only)
+    //   light keep    — case #2, shadow casters: the CSM trick — extrude the
+    //                   visible bounds toward each light, keep what falls inside
+    // A bug in any keep term over-keeps (perf), it cannot make an occluder
+    // vanish. The old form (radius reject OR frustum reject) could: the frustum
+    // REJECT was direction-keyed and dropped off-screen shadow casters, which is
+    // §1's unsound class. frustumCullBehindCamera is obsolete in this shape —
+    // "behind the camera" is simply "not covered by the frustum keep", and
+    // whether it survives is the other keeps' decision.
+    //
     // Everything is hoisted out of the per-instance loop: option reads, the
-    // camera matrices, and the world-to-projection product. The per-instance work
-    // is then 8 corner transforms and a clip-space outcode AND, only for
-    // instances that reach the mask check.
+    // camera matrices, the world-to-projection product, and the per-light
+    // swept volumes. The per-instance work is 8 corner transforms + outcode,
+    // and the light segment tests only for instances no other keep covered.
+    //
+    // The "visible bounds" feeding the light extrusion is the camera-centered
+    // cube of half-extent visibleRange — a strict superset of the capped view
+    // frustum, so conservative in the safe direction, and deliberately
+    // rotation-INVARIANT (the keep set only moves with position, §1's rule).
+    // Tightening it to true frustum corners is a later refinement; it needs the
+    // projection handedness verified first, and the cost of not doing it is
+    // only perf.
     struct SceneCullCtx {
       bool  enabled = false;
       bool  radiusOn = false;
       bool  frustumOn = false;
-      bool  cullBehind = false;
+      bool  lightOn = false;
       float radiusSq = 0.0f;
       float sideScale = 1.0f;       // 1 + frustumMargin, widens L/R/T/B
       Vector3 camPos { 0.0f, 0.0f, 0.0f };
       Matrix4 worldToProj;
-      uint32_t tested = 0, byRadius = 0, byFrustum = 0;
+      // One entry per light: a segment [a,b] plus a pad radius. The capsule
+      // (segment swept by pad) contains the convex hull of the visible-bounds
+      // cube and the light — for a distant light, of the cube swept along the
+      // light axis. Instance test = segment vs instance AABB expanded by pad.
+      struct LightSeg { Vector3 a, b; float pad; };
+      std::vector<LightSeg> lightSegs;
+      // True when the light keep must cover EVERYTHING: no lights are known
+      // this frame or last, so "which off-screen geometry can shadow the
+      // visible region" cannot be answered, and the only safe answer is all
+      // of it. Without this, an empty light table silently degrades the
+      // union to frustum-only — the exact direction-keyed cull §1 bans, and
+      // the 2026-08-06 BT vanish.
+      bool lightAllKeep = false;
+      // §2.2 solid-angle reject — the ONE magnitude-based reject in the §1A
+      // formula, applied to the kept set. Never orientation-derived.
+      bool solidAngleOn = false;
+      float solidAngleMinSq = 0.0f;        // (radians)^2, compared against extent^2/dist^2
+      float lightExemptDistSq = 0.0f;      // near-light exemption for the reject
+      std::vector<Vector3> lightPoints;    // positioned lights only, for the exemption
+      uint32_t tested = 0, culled = 0, culledSmall = 0;
+      uint32_t keptFrustum = 0, keptRadius = 0, keptLight = 0, keptSkinned = 0;
     } sceneCull;
     if (RtxOptions::SceneCull::enable()) {
       const RtCamera& scCam = cameraManager.getMainCamera();
@@ -1194,13 +1236,99 @@ namespace dxvk {
         sceneCull.radiusOn   = (scRadius > 0.0f);
         sceneCull.radiusSq   = scRadius * scRadius;
         sceneCull.frustumOn  = RtxOptions::SceneCull::frustumEnable();
-        sceneCull.cullBehind = RtxOptions::SceneCull::frustumCullBehindCamera();
+        sceneCull.lightOn    = RtxOptions::SceneCull::lightInfluenceEnable();
         sceneCull.sideScale  = 1.0f + std::max(0.0f, RtxOptions::SceneCull::frustumMargin());
         sceneCull.camPos     = scCam.getPosition();
         sceneCull.worldToProj = Matrix4(scCam.getViewToProjection() * scCam.getWorldToView());
-        sceneCull.enabled    = sceneCull.radiusOn || sceneCull.frustumOn;
+        if (sceneCull.lightOn) {
+          float visR = RtxOptions::SceneCull::visibleRange();
+          if (visR <= 0.0f)
+            visR = (scRadius > 0.0f) ? scRadius : 50000.0f;
+          // Half-diagonal of the visible-bounds cube: the capsule pad that makes
+          // the segment sweep contain the cube sweep.
+          const float visPad = 1.7320508f * visR;
+          const float sunLen = std::max(visR, RtxOptions::SceneCull::lightInfluenceSunLength());
+          // Live table, no snapshot, no lag. m_lights is filled by addLight()
+          // during draw submission, which precedes this, so an empty table
+          // here is REAL emptiness, not ordering: measured 2026-08-06,
+          // [EngineLights.census] resident=0 active=0 on every frame of the
+          // BT mission — TF2 lights that map entirely with the sky/dome
+          // environment, which never enters the light table.
+          const auto& scLights =
+            ctx->getCommonObjects()->getSceneManager().getLightManager().getLightTable();
+          sceneCull.lightSegs.reserve(scLights.size());
+          for (const auto& [scHash, scLight] : scLights) {
+            if (scLight.getType() == RtLightType::Distant) {
+              // Direction sign convention unverified against the shader side, so
+              // sweep BOTH ways along the axis. Wrong-signing a one-way sweep
+              // would cull real sun occluders — recreating the original leak —
+              // while both ways only over-keeps. Tighten only with the
+              // convention proven.
+              const Vector3 scDir = scLight.getDirection();
+              sceneCull.lightSegs.push_back({ sceneCull.camPos - scDir * sunLen,
+                                              sceneCull.camPos + scDir * sunLen, visPad });
+            } else {
+              // Position-carrying lights (Sphere/Rect/Disk/Cylinder). Only the
+              // sphere exposes a radius; the areal lights' physical extents are
+              // negligible against visPad.
+              const float scLr = (scLight.getType() == RtLightType::Sphere)
+                ? scLight.getSphereLight().getRadius() : 0.0f;
+              sceneCull.lightSegs.push_back({ sceneCull.camPos, scLight.getPosition(), visPad + scLr });
+              sceneCull.lightPoints.push_back(scLight.getPosition());
+            }
+          }
+          // No lights in the table => the scene is lit by the sky/dome
+          // environment, and dome light arrives from EVERY direction — no
+          // extrusion can bound its occluders, so the only sound light keep
+          // is everything (RT_CULLING doc §2.1's sun case, amplified). The
+          // perf lever on such maps is the solid-angle reject below, not
+          // this term.
+          if (sceneCull.lightSegs.empty()) {
+            sceneCull.lightAllKeep = true;
+            static bool s_scWarnedNoLights = false;
+            if (!s_scWarnedNoLights) {
+              s_scWarnedNoLights = true;
+              Logger::warn("[SceneCull] light table empty (sky/dome-lit scene) — "
+                           "light keep covers everything; solid-angle is the active cull");
+            }
+          }
+        }
+        // §2.2 solid-angle: magnitude, not orientation, so it is sound by §1's
+        // rule and it is the term that actually culls on sky/dome-lit maps
+        // where the light keep must cover everything.
+        const float scSaMin = RtxOptions::SceneCull::solidAngleMin();
+        sceneCull.solidAngleOn = RtxOptions::SceneCull::solidAngleCull() && scSaMin > 0.0f;
+        sceneCull.solidAngleMinSq = scSaMin * scSaMin;
+        const float scSaEx = RtxOptions::SceneCull::solidAngleLightExemptRadius();
+        sceneCull.lightExemptDistSq = scSaEx * scSaEx;
+        // No keep enabled would make the union empty and cull the whole scene;
+        // treat it as disabled instead. The solid-angle reject rides along only
+        // when at least one keep term is on (it prunes the KEPT set).
+        sceneCull.enabled = sceneCull.radiusOn || sceneCull.frustumOn || sceneCull.lightOn;
       }
     }
+    // Segment [a,b] vs AABB [lo,hi] expanded by pad: standard slab test.
+    // Conservative on degenerate axes (d ~ 0 inside the slab passes).
+    const auto sceneCullSegHitsBox = [](const Vector3& a, const Vector3& b, float pad,
+                                        const Vector3& lo, const Vector3& hi) -> bool {
+      float t0 = 0.0f, t1 = 1.0f;
+      for (int ax = 0; ax < 3; ++ax) {
+        const float sLo = lo[ax] - pad, sHi = hi[ax] + pad;
+        const float d = b[ax] - a[ax];
+        if (std::abs(d) < 1e-6f) {
+          if (a[ax] < sLo || a[ax] > sHi)
+            return false;
+          continue;
+        }
+        float ta = (sLo - a[ax]) / d, tb = (sHi - a[ax]) / d;
+        if (ta > tb) std::swap(ta, tb);
+        t0 = std::max(t0, ta);
+        t1 = std::min(t1, tb);
+        if (t0 > t1)
+          return false;
+      }
+      return true;
+    };
 
     markMrg(mrg_setup);
     for (RtInstance* instance : sortedInstances) {
@@ -1471,13 +1599,33 @@ namespace dxvk {
                 if (clip.y < -lim) oc |= 0x04u;
                 if (clip.y >  lim) oc |= 0x08u;
               }
-              if (sceneCull.cullBehind && clip.z < 0.0f) oc |= 0x10u;
+              // Behind-near bit, unconditional now: as a KEEP, "in the frustum"
+              // must exclude boxes wholly behind the camera, or the frustum term
+              // would cover everything behind you and the union would never
+              // narrow. (The old reject-mode option frustumCullBehindCamera is
+              // obsolete: behind-camera geometry is kept exactly when the radius
+              // or light keep covers it, which is the §1A-correct answer.)
+              if (clip.z < 0.0f) oc |= 0x10u;
               scOutcodeAnd &= oc;
             }
           }
 
-          bool scCulled = false;
-          if (sceneCull.radiusOn) {
+          // Union of keeps: kept the moment any term covers the instance, culled
+          // only if every enabled term missed. Ordered cheapest-first; the light
+          // segments only run for instances frustum and radius both missed.
+          bool scKept = false;
+          // Frustum-kept means ON SCREEN (within margin): never subject to the
+          // solid-angle reject below — a visible object popping out is a
+          // guaranteed artifact however small it is, while an off-screen
+          // occluder's absence is bounded by the quadratic solid-angle
+          // argument (see the reject).
+          bool scFrustumKept = false;
+          if (sceneCull.frustumOn && scOutcodeAnd == 0u) {
+            scKept = true;
+            scFrustumKept = true;
+            ++sceneCull.keptFrustum;
+          }
+          if (!scKept && sceneCull.radiusOn) {
             // Squared distance from the camera to the closest point of the world
             // box: zero while the camera is inside it, so large objects survive
             // until they are fully outside the sphere.
@@ -1485,17 +1633,97 @@ namespace dxvk {
             const float dy = std::max(0.0f, std::max(scLo.y - sceneCull.camPos.y, sceneCull.camPos.y - scHi.y));
             const float dz = std::max(0.0f, std::max(scLo.z - sceneCull.camPos.z, sceneCull.camPos.z - scHi.z));
             const float d2 = dx * dx + dy * dy + dz * dz;
-            if (std::isfinite(d2) && d2 > sceneCull.radiusSq) {
-              scCulled = true;
-              ++sceneCull.byRadius;
+            // Non-finite box => keep, never cull on garbage.
+            if (!std::isfinite(d2) || d2 <= sceneCull.radiusSq) {
+              scKept = true;
+              ++sceneCull.keptRadius;
             }
           }
-          if (!scCulled && sceneCull.frustumOn && scOutcodeAnd != 0u) {
-            scCulled = true;
-            ++sceneCull.byFrustum;
+          if (!scKept && sceneCull.lightOn) {
+            if (sceneCull.lightAllKeep) {
+              // No lights known — the fail-safe: light keep covers everything.
+              scKept = true;
+              ++sceneCull.keptLight;
+            } else {
+              for (const auto& seg : sceneCull.lightSegs) {
+                if (sceneCullSegHitsBox(seg.a, seg.b, seg.pad, scLo, scHi)) {
+                  scKept = true;
+                  ++sceneCull.keptLight;
+                  break;
+                }
+              }
+            }
           }
-          if (scCulled) {
+          // SKINNED EXEMPTION (2026-08-06, the BT vanish): every keep above
+          // reasons from the world-space bounding box, and for skinned
+          // geometry that box bounds the PRE-SKIN vertices — the bones place
+          // the drawn surface somewhere else entirely, so the box is not
+          // where the character is. The cull's premise fails, so the verdict
+          // is void: never cull skinned instances. (The corner math above
+          // still ran — skinned instances are a small population and gating
+          // the decision, not the arithmetic, keeps this diff readable.)
+          const auto& scSkinData = scBlas->input.getSkinningState();
+          const bool scSkinned = (scSkinData.numBones > 0)
+            || (scBlas->input.getGeometryData().numBonesPerVertex > 0);
+          if (scSkinned) {
+            if (!scKept)
+              ++sceneCull.keptSkinned;   // only count ones the keeps would have culled
+          } else if (!scKept) {
             instance->getVkInstance().mask = 0;
+            ++sceneCull.culled;
+          } else if (sceneCull.solidAngleOn && !scFrustumKept) {
+            // §2.2 — the one magnitude reject, applied to the kept OFF-SCREEN
+            // set only. WHY OFF-SCREEN CAN BE CULLED AGGRESSIVELY (the far-
+            // field occluder bound, 2026-08-06): under dome/environment light
+            // an occluder changes a receiver's illumination in proportion to
+            // the SOLID ANGLE it subtends from the receiver — quadratic in
+            // angular size, so a 5-pixel-wide occluder blocks ~0.001% of the
+            // hemisphere. And strong occlusion is LOCAL: only surfaces within
+            // a few multiples of the occluder's own size are significantly
+            // darkened, and those surfaces project to roughly the same few
+            // pixels the occluder itself would. So camera-based angular size
+            // bounds the ON-SCREEN ERROR of culling it — the same bounded-
+            // error reasoning Lightcuts applies to light clusters. Mirrors are
+            // covered (a reflection images the occluder at a comparable
+            // angular scale), point-light penumbra magnification is the
+            // near-light exemption below, and skinned boxes never get here.
+            // KNOWN LIMIT, deliberate: many sub-threshold occluders can
+            // aggregate (a forest each tree below threshold). Instances are
+            // draw batches with combined AABBs, which blunts this; if an
+            // aggregate shadow visibly vanishes, lower solidAngleMin.
+            //
+            // Apparent angular size ≈ longest world-box axis / distance to the
+            // box's closest point. Both terms err toward keeping: longest axis
+            // because bounding spheres lie about long thin things (doc §2.2's
+            // cables/railings caveat), closest-point distance because it
+            // maximises apparent size.
+            const float scMaxExtent = std::max(scHi.x - scLo.x,
+                                      std::max(scHi.y - scLo.y, scHi.z - scLo.z));
+            const float sdx = std::max(0.0f, std::max(scLo.x - sceneCull.camPos.x, sceneCull.camPos.x - scHi.x));
+            const float sdy = std::max(0.0f, std::max(scLo.y - sceneCull.camPos.y, sceneCull.camPos.y - scHi.y));
+            const float sdz = std::max(0.0f, std::max(scLo.z - sceneCull.camPos.z, sceneCull.camPos.z - scHi.z));
+            const float scDistSq = sdx * sdx + sdy * sdy + sdz * sdz;
+            if (std::isfinite(scDistSq) && scDistSq > 0.0f && std::isfinite(scMaxExtent)
+                && scMaxExtent * scMaxExtent < sceneCull.solidAngleMinSq * scDistSq) {
+              // Doc §2.2 caveat: a small object next to a light casts a large
+              // shadow — exempt anything near a positioned light. (Distant/
+              // dome light needs no exemption: it magnifies nothing, a small
+              // occluder's shadow stays small.)
+              bool scNearLight = false;
+              for (const Vector3& lp : sceneCull.lightPoints) {
+                const float lx = std::max(0.0f, std::max(scLo.x - lp.x, lp.x - scHi.x));
+                const float ly = std::max(0.0f, std::max(scLo.y - lp.y, lp.y - scHi.y));
+                const float lz = std::max(0.0f, std::max(scLo.z - lp.z, lp.z - scHi.z));
+                if (lx * lx + ly * ly + lz * lz <= sceneCull.lightExemptDistSq) {
+                  scNearLight = true;
+                  break;
+                }
+              }
+              if (!scNearLight) {
+                instance->getVkInstance().mask = 0;
+                ++sceneCull.culledSmall;
+              }
+            }
           }
         }
       }
@@ -1794,10 +2022,11 @@ namespace dxvk {
     markMrg(mrg_loop);
 
     // NV-DXVK [SceneCull]: one line per second while enabled. `tested` is the set
-    // that reached the cull (mask != 0, valid box); kept = tested - radius -
-    // frustum is what still enters the TLAS. If kept never moves as the camera
-    // turns, the frustum rule is not firing (check that the engine culls really
-    // are off — with them on there is nothing off-screen left to cull).
+    // that reached the cull (mask != 0, valid box). The kept* fields are which
+    // KEEP term covered the instance FIRST (frustum before radius before light,
+    // so keptLight counts instances only the light extrusion saved). culled is
+    // what left the TLAS. keptLight is the number to watch when tuning
+    // visibleRange/sunLength — it is the §2.3 term earning its keep.
     if (sceneCull.enabled && RtxOptions::SceneCull::logStats()) {
       static auto s_lastSceneCullLog = std::chrono::steady_clock::now();
       const auto now = std::chrono::steady_clock::now();
@@ -1805,9 +2034,14 @@ namespace dxvk {
         s_lastSceneCullLog = now;
         Logger::warn(str::format("[SceneCull] f=", m_device->getCurrentFrameId(),
           " tested=", sceneCull.tested,
-          " culledRadius=", sceneCull.byRadius,
-          " culledFrustum=", sceneCull.byFrustum,
-          " kept=", (sceneCull.tested - sceneCull.byRadius - sceneCull.byFrustum),
+          " keptFrustum=", sceneCull.keptFrustum,
+          " keptRadius=", sceneCull.keptRadius,
+          " keptLight=", sceneCull.keptLight,
+          " keptSkinned=", sceneCull.keptSkinned,
+          " culled=", sceneCull.culled,
+          " culledSmall=", sceneCull.culledSmall,
+          " lights=", sceneCull.lightSegs.size(),
+          " lightAllKeep=", (sceneCull.lightAllKeep ? 1 : 0),
           " radius=", RtxOptions::SceneCull::radius(),
           " margin=", RtxOptions::SceneCull::frustumMargin()));
       }

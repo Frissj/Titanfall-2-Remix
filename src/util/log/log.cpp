@@ -345,6 +345,26 @@ namespace dxvk {
     return s_enabled;
   }
 
+  // NV-DXVK: see log.h. The same bucketed prefix probe emitMsg runs, minus the
+  // mutex and the emit. The `tag` argument must be the exact start of the
+  // message (prefix semantics are identical to emitMsg's, so a deny entry
+  // longer than `tag` cannot match — pass the full tag including ']').
+  bool Logger::tagDenied(const char* tag) {
+    if (d3d11DiagEnabled())
+      return false;                       // diag mode disables the filter wholesale
+    const TagIndex* tagIndex = g_tagIndex.load(std::memory_order_acquire);
+    if (tagIndex == nullptr || tag == nullptr)
+      return false;                       // index not built yet: emitMsg decides
+    const size_t len = std::strlen(tag);
+    if (len < 2)
+      return false;
+    for (const auto& entry : tagIndex->buckets[static_cast<unsigned char>(tag[1])]) {
+      if (len >= entry.len && std::memcmp(tag, entry.text, entry.len) == 0)
+        return true;
+    }
+    return false;
+  }
+
   void Logger::emitMsg(LogLevel level, const std::string& message) {
     // NV-DXVK: drop high-volume diagnostic tags unless RTX_D3D11_DIAG=1.
     // These tags fire at per-draw rates (1000s/sec in TF2 main menu) and

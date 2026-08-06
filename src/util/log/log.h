@@ -98,6 +98,19 @@ namespace dxvk {
     // list in log.cpp.
     static void setDenyTags(const std::string& spec);
 
+    // NV-DXVK: would emitMsg drop a message starting with this tag? For hot
+    // call sites, so str::format never runs for a line the denylist would
+    // discard anyway:
+    //   if (!Logger::tagDenied("[MtnDedup]")) Logger::info(str::format(...));
+    // Uses the same published tag index as emitMsg (a handful of memcmps).
+    // Returns false while the index is not built yet (before the first
+    // info/warn emit) — the line then goes through emitMsg's own filter, so
+    // the answer is never wrong, only occasionally pessimistic about cost.
+    // Denylist changes via setDenyTags are picked up on the next call, same
+    // as emitMsg itself. Deliberately NOT gated on d3d11DiagEnabled() here:
+    // RTX_D3D11_DIAG=1 clears the denylist, which this reflects naturally.
+    static bool tagDenied(const char* tag);
+
     // NV-DXVK: force the log file to disk. Intended for the
     // UnhandledExceptionFilter path where the process is about to die and
     // the OS won't run ofstream destructors. Acquires the same mutex as

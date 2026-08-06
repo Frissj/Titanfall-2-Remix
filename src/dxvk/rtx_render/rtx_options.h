@@ -867,6 +867,14 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, perfAutoSweepExitOnFinish, true,
                "When rtx.perfAutoSweep completes, flush the log and terminate the "
                "process. Only ever fires if perfAutoSweep was explicitly enabled.");
+    RTX_OPTION("rtx", bool, perfGapSampler, false,
+               "DIAGNOSTIC: [GapSampler] — sample the game's present thread's RIP every ~2ms\n"
+               "(suspend/read/resume) and log a per-module + per-RVA-bucket histogram every 5s.\n"
+               "Built 2026-08-06 to name the ~70ms/frame of game CPU that sits AFTER Present\n"
+               "and BEFORE the next D3D11 call ([Perf.Boundary] postMs), which the F8 CullOffAB\n"
+               "A/B proved independent of every cull site. RVA buckets resolve directly in the\n"
+               "client.dll/engine.dll IDBs (IDB addr = 0x180000000 + RVA). ~0.2% overhead on\n"
+               "the sampled thread; turn off once the gap is attributed.");
 
     // NV-DXVK [NsysAuto]: unattended Nsight Systems capture, same shape as
     // rtx.perfAutoSweep - arm it in rtx.conf, launch, walk away.
@@ -1816,28 +1824,88 @@ namespace dxvk {
     struct SceneCull {
       friend class ImGUI;
       friend class RtxOptions;
+      // RESTRUCTURED 2026-08-06 to RT_CULLING_2026-08-05.md's §1A shape: a UNION
+      // OF KEEPS with no direction-keyed reject. An instance is kept if ANY
+      // enabled keep covers it (frustum = directly visible, radius = near-camera
+      // reflections/GI, lightInfluence = shadow casters), and culled only when
+      // every keep misses. A bug in a keep term over-keeps (perf); it cannot
+      // make an occluder vanish. The pre-2026-08-06 form was reject-based and
+      // its frustum reject was §1-unsound (dropped off-screen shadow casters).
       RTX_OPTION("rtx.sceneCull", bool, enable, false,
-                 "Master switch for Remix-side radius/frustum culling of ray-traced instances.\n"
+                 "Master switch for Remix-side culling of ray-traced instances, structured as a\n"
+                 "union of keeps: an instance is kept if the frustum keep, the radius keep, or the\n"
+                 "light-influence keep covers it, and culled only when every enabled keep misses.\n"
                  "Culls by zeroing the instance mask in mergeInstancesIntoBlas, which keeps the BLAS\n"
                  "and geometry resident (no rebuild when the object returns) but removes the instance\n"
-                 "from the TLAS. Intended to replace the engine culling disabled by rtx.cullOff.*.");
+                 "from the TLAS. Intended to replace the engine culling disabled by rtx.cullOff.*.\n"
+                 "If no keep term is enabled the cull is inert (nothing is removed), never cull-all.");
       RTX_OPTION("rtx.sceneCull", float, radius, 0.0f,
-                 "Cull instances whose world-space bounding box is entirely farther than this many\n"
-                 "world units from the main camera. 0 disables the radius cull. Measured from the\n"
-                 "closest point of the box, so large objects survive until fully outside the sphere.");
-      RTX_OPTION("rtx.sceneCull", bool, frustumEnable, false,
-                 "Cull instances whose world-space bounding box lies entirely outside the main\n"
-                 "camera frustum. Removes off-screen shadow casters and reflection/GI contributors —\n"
-                 "widen frustumMargin, or prefer the radius cull, if that shows.");
+                 "KEEP term: instances whose world-space bounding box comes within this many world\n"
+                 "units of the main camera are kept, in every direction — this is what preserves\n"
+                 "behind-the-camera geometry for mirrors and GI. 0 disables the term. Measured to\n"
+                 "the closest point of the box, so the camera being inside a large box keeps it.");
+      RTX_OPTION("rtx.sceneCull", bool, frustumEnable, true,
+                 "KEEP term: instances whose world-space bounding box touches the (margin-widened)\n"
+                 "main camera frustum are kept — case #1, directly visible. No longer a reject: an\n"
+                 "instance outside the frustum survives if the radius or light-influence keep covers\n"
+                 "it. Boxes wholly behind the near plane do not count as touching.");
       RTX_OPTION("rtx.sceneCull", float, frustumMargin, 0.25f,
                  "Fractional widening of the left/right/top/bottom frustum planes for the frustum\n"
-                 "cull, e.g. 0.25 keeps anything within 125% of the screen extents. Costs a little\n"
-                 "scope, buys back most edge-of-screen shadow and reflection contributors.");
+                 "keep, e.g. 0.25 keeps anything within 125% of the screen extents.");
       RTX_OPTION("rtx.sceneCull", bool, frustumCullBehindCamera, false,
-                 "Also reject instances entirely behind the camera near plane. Off by default: geometry\n"
-                 "behind the camera is exactly what mirrors and indirect lighting need.");
+                 "OBSOLETE since the 2026-08-06 keep-union restructure; no longer read. Behind-camera\n"
+                 "geometry is kept exactly when the radius or light-influence keep covers it.");
+      RTX_OPTION("rtx.sceneCull", bool, lightInfluenceEnable, true,
+                 "KEEP term (RT_CULLING doc §2.3): keep off-screen instances that can intercept light\n"
+                 "headed for the visible region — shadow casters, case #2, and the ONLY sound answer\n"
+                 "for the sun. Per light, the visible-bounds volume is extruded toward the light (the\n"
+                 "cascaded-shadow-map trick) and instances inside the extrusion are kept: for a\n"
+                 "distant/sun light the sweep runs lightInfluenceSunLength along BOTH senses of the\n"
+                 "light axis (sign convention deliberately unverified — one-way with the wrong sign\n"
+                 "would cull real sun occluders and recreate the light leak; both ways only\n"
+                 "over-keeps), for positioned lights the sweep runs camera-to-light. The visible\n"
+                 "bounds are the camera-centered cube of half-extent visibleRange — a superset of\n"
+                 "the capped frustum and rotation-invariant, so the keep set only moves with\n"
+                 "position. Every approximation errs toward keeping; this term cannot hide geometry,\n"
+                 "only spend performance. Watch keptLight on [SceneCull] logStats.");
+      RTX_OPTION("rtx.sceneCull", float, visibleRange, 0.0f,
+                 "Half-extent, in world units, of the camera-centered cube standing in for 'the\n"
+                 "visible region' in the light-influence keep. 0 = use rtx.sceneCull.radius, or\n"
+                 "50000 if that is also unset. Smaller = tighter extrusions = more culled; must\n"
+                 "still cover the far geometry you can actually see.");
+      RTX_OPTION("rtx.sceneCull", float, lightInfluenceSunLength, 100000.0f,
+                 "Sweep length, in world units, of the visible-bounds extrusion along a distant\n"
+                 "(sun) light's axis, applied in both senses. Clamped up to visibleRange. Too short\n"
+                 "culls far sun occluders (mountain shadows vanish); too long only costs perf.");
+      RTX_OPTION("rtx.sceneCull", bool, solidAngleCull, true,
+                 "REJECT term, the only one (RT_CULLING doc §2.2, far-field occluder bound): cull\n"
+                 "kept OFF-SCREEN instances whose apparent angular size — longest world-box axis\n"
+                 "over distance to the box — is below solidAngleMin. On-screen (frustum-kept)\n"
+                 "instances are never rejected, so nothing visible can pop. Sound because dome/sky\n"
+                 "occlusion scales with the SOLID ANGLE an occluder subtends (quadratic in angular\n"
+                 "size) and strong occlusion is local to the occluder, so the on-screen error of\n"
+                 "culling it is bounded by a small multiple of its own angular size — this is what\n"
+                 "actually culls on sky/dome-lit maps (e.g. TF2's BT mission: light table empty,\n"
+                 "light keep covers everything). Skinned instances are exempt (their box does not\n"
+                 "bound the drawn surface), and so is anything within solidAngleLightExemptRadius\n"
+                 "of a positioned light (penumbra magnification: a small occluder near a light\n"
+                 "casts a large shadow). Known limit: many sub-threshold occluders can aggregate;\n"
+                 "draw-batch AABBs blunt this, and the fix for a visibly missing aggregate shadow\n"
+                 "is lowering solidAngleMin.");
+      RTX_OPTION("rtx.sceneCull", float, solidAngleMin, 0.01f,
+                 "Apparent-size threshold for the off-screen solid-angle reject, in radians. 0.01\n"
+                 "is ~5 pixels at 1080p/90FOV; as an off-screen occluder that is ~0.001% of the\n"
+                 "hemisphere's light, well under perception. An object 10,000 units away is culled\n"
+                 "only if its longest axis is under ~100 units. Raise for more culling, lower if\n"
+                 "an aggregate shadow (forest, fence line) visibly thins; 0 disables the reject.");
+      RTX_OPTION("rtx.sceneCull", float, solidAngleLightExemptRadius, 1000.0f,
+                 "Solid-angle reject exemption: keep any instance whose box is within this many\n"
+                 "world units of a positioned (non-distant) light, however small it looks — near a\n"
+                 "light, a small occluder throws a large shadow.");
       RTX_OPTION("rtx.sceneCull", bool, logStats, false,
-                 "Log one [SceneCull] line per second: instances tested, and how many each rule culled.");
+                 "Log one [SceneCull] line per second: instances tested, which keep term covered\n"
+                 "them first (keptFrustum/keptRadius/keptLight/keptSkinned), how many the keep\n"
+                 "union culled (culled), and how many the solid-angle reject removed (culledSmall).");
     };
 
     // Resolve Options

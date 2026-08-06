@@ -29,6 +29,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <smmintrin.h>  // NV-DXVK [WC staging]: _mm_stream_load_si128 (SSE4.1)
+#include <tlhelp32.h>   // NV-DXVK [GapSampler]: module snapshot for RIP resolution
+#include <thread>       // NV-DXVK [GapSampler]: the sampler thread
 
 // NV-DXVK [WC staging]: copy FROM write-combined (WC) mapped GPU memory into
 // cached system memory. Plain memcpy reads WC with ordinary loads â€” every
@@ -1443,15 +1445,119 @@ namespace dxvk {
   volatile uint64_t* g_studioVcallCounter = nullptr;   // in trampoline page; inc'd by stub asm
   std::atomic<uint64_t> g_studioConsumerCount{ 0u };
 
+  // ============================================================
+  // [VQProbe] — who is calling VirtualQuery?
+  //
+  // 2026-08-06: [GapSampler] at 16-byte resolution put 58-70% of the present
+  // thread's samples on ONE address — ntdll+0x1604c0 = ZwQueryVirtualMemory
+  // +0x10, i.e. the `syscall` inside the VirtualQuery stub. VirtualQuery is a
+  // full kernel transition that walks the VAD tree under the process address-
+  // space lock; at tens of thousands of calls per frame it dominates the
+  // frame, and it is CPU-busy time, which is why [Perf.Busy] reads 97% and
+  // no D3D11-side timer sees it.
+  //
+  // RIP alone cannot name the CALLER (that needs a stack walk we will not do
+  // from a sampling thread), so count at every guard we own. One relaxed
+  // increment per call, flushed once per frame — cheap enough to leave in.
+  // Read the [VQProbe] line: the site with tens of thousands per frame is
+  // the one to cache or hoist.
+  // ============================================================
+  namespace vqprobe {
+    enum Site : uint32_t {
+      kStudioReadable = 0, kStudioExecutable, kDecalEngineRead, kDecalCvar,
+      kWvReadable, kDecalIsReadable, kSiteCount
+    };
+    static const char* const kNames[kSiteCount] = {
+      "studioMemReadable", "studioMemExecutable", "decalEngineRead",
+      "decalCvarFloat", "wvReadable", "decalIsReadable"
+    };
+    std::atomic<uint32_t> g_counts[kSiteCount] = {};
+    inline void hit(Site s) { g_counts[s].fetch_add(1u, std::memory_order_relaxed); }
+
+    // 2026-08-06 round 2. The first census read 929 calls/frame from our
+    // guards while [GapSampler] put ~55 ms/frame in the VirtualQuery syscall
+    // — 60 us per call, which is absurd for a VAD lookup UNLESS the calls are
+    // blocking on the process address-space lock, or the syscall has a
+    // different caller entirely. Counting calls cannot separate those, so
+    // measure the two things that can:
+    //   g_vqSyscalls — calls that actually reached VirtualQuery (cache MISS),
+    //                  vs the `hit` counters above which count entries.
+    //   g_vqNanos    — wall time inside those syscalls. If this reads ~55 ms
+    //                  per frame, our guard is the cost (and is being
+    //                  lock-stalled); if it reads ~1 ms, the syscall belongs
+    //                  to someone else and GapSampler's caller histogram
+    //                  ([RSP] at the syscall) names them.
+    std::atomic<uint32_t> g_vqSyscalls { 0 };
+    std::atomic<uint64_t> g_vqNanos { 0 };
+
+    // Called once per frame from cullOffUpdate (EndFrame).
+    inline void flushPerFrame() {
+      if (!RtxOptions::perfGapSampler())
+        return;                                   // rides the same diagnostic flag
+      uint32_t v[kSiteCount]; uint32_t total = 0;
+      for (uint32_t i = 0; i < kSiteCount; ++i) {
+        v[i] = g_counts[i].exchange(0u, std::memory_order_relaxed);
+        total += v[i];
+      }
+      static uint32_t s_frames = 0;
+      static uint32_t s_acc[kSiteCount] = {};
+      static uint32_t s_accTotal = 0;
+      for (uint32_t i = 0; i < kSiteCount; ++i) s_acc[i] += v[i];
+      s_accTotal += total;
+      if (++s_frames < 60u)
+        return;                                   // one line per ~60 frames
+      const uint32_t sysN  = g_vqSyscalls.exchange(0u, std::memory_order_relaxed);
+      const uint64_t sysNs = g_vqNanos.exchange(0ull, std::memory_order_relaxed);
+      std::ostringstream os;
+      os << "[VQProbe] frames=" << s_frames << " vqPerFrame=" << (s_accTotal / s_frames)
+         << " syscallsPerFrame=" << (sysN / s_frames)
+         << " syscallUsPerFrame=" << (sysNs / 1000ull / s_frames)
+         << " usPerSyscall=" << (sysN ? (sysNs / 1000.0 / sysN) : 0.0) << " |";
+      for (uint32_t i = 0; i < kSiteCount; ++i)
+        os << " " << kNames[i] << "=" << (s_acc[i] / s_frames);
+      Logger::warn(os.str());
+      s_frames = 0; s_accTotal = 0;
+      for (uint32_t i = 0; i < kSiteCount; ++i) s_acc[i] = 0;
+    }
+  }
+
   // Return true iff [p, p+n) is entirely committed + readable (and not a
   // guard page). VirtualQuery-based guard â€” used before dereferencing an
   // engine pointer so a rotted offset / freed object can't fault us (the
   // session history is full of device-loss crashes from unchecked reads).
+  // NV-DXVK [VQProbe]: instrumented — see the block above; VirtualQuery is a
+  // syscall and this guard is called from per-draw paths.
   static bool studioMemReadable(const void* p, size_t n) {
+    vqprobe::hit(vqprobe::kStudioReadable);
+    // NV-DXVK [perf] 2026-08-06: single-entry region cache. VirtualQuery is a
+    // SYSCALL (ntdll!ZwQueryVirtualMemory — the [GapSampler] top hit at
+    // 58-70% of the present thread), and this guard has 109 call sites, many
+    // of them inside per-renderable loops that re-query the SAME committed
+    // region thousands of times per frame. A VirtualQuery returns the whole
+    // enclosing region, so one result answers every subsequent query inside
+    // it; remembering the last region turns a run of queries over one object
+    // (or one heap block) into a pointer compare.
+    //
+    // SAFETY: this can only go stale by becoming OPTIMISTIC if a region is
+    // decommitted between calls — the same window the un-cached form already
+    // has (query, then deref). It is refreshed on every miss, holds one
+    // region only, and is thread_local so no lock and no cross-thread view.
+    // Kept deliberately dumb: no map, no eviction policy, no size growth.
+    struct VqRegion { uintptr_t start, end; bool readable; };
+    static thread_local VqRegion t_last { 0, 0, false };
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(p);
+    if (p != nullptr && addr >= t_last.start && (addr + n) <= t_last.end)
+      return t_last.readable;
     if (p == nullptr)
       return false;
     MEMORY_BASIC_INFORMATION mbi = {};
-    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0)
+    // [VQProbe] timed syscall — see g_vqNanos.
+    const auto vqT0 = std::chrono::steady_clock::now();
+    const SIZE_T vqRet = VirtualQuery(p, &mbi, sizeof(mbi));
+    vqprobe::g_vqNanos.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - vqT0).count()), std::memory_order_relaxed);
+    vqprobe::g_vqSyscalls.fetch_add(1u, std::memory_order_relaxed);
+    if (vqRet == 0)
       return false;
     if (mbi.State != MEM_COMMIT)
       return false;
@@ -1465,6 +1571,11 @@ namespace dxvk {
     const uintptr_t a     = reinterpret_cast<uintptr_t>(p);
     const uintptr_t start = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
     const uintptr_t end   = start + mbi.RegionSize;
+    // Publish the region for the cache above. Only committed+readable regions
+    // are cached: every early return before this point is a REJECT, and
+    // caching a reject would have to prove the whole span shares one region,
+    // which it has not.
+    t_last = { start, end, true };
     return a >= start && (a + n) <= end;
   }
 
@@ -1473,6 +1584,7 @@ namespace dxvk {
   // pointer (e.g. slot 8 of a freed/recycled or non-IClientRenderable object)
   // would otherwise `call` into .data and fault av=exec.
   static bool studioMemExecutable(const void* p) {
+    vqprobe::hit(vqprobe::kStudioExecutable);
     if (p == nullptr)
       return false;
     MEMORY_BASIC_INFORMATION mbi = {};
@@ -4773,9 +4885,256 @@ namespace dxvk {
     }
   }
 
+  // ============================================================
+  // [GapSampler] — RIP-histogram sampling profiler for the game's present
+  // thread.
+  //
+  // WHY (2026-08-06): [Perf.Boundary]/[Perf.Gap] measure ~70 ms/frame of game
+  // CPU AFTER Present exit and BEFORE the next D3D11 call, and the F8
+  // [CullOffAB] A/B proved it INDEPENDENT of every cull site (abMode 0/1/2
+  // all ~120 ms frames, afterQueryEnd ~70 ms in 6 chunks). No D3D11-side
+  // timer can see into that gap — the thread is outside our layer — so
+  // sample it: suspend the present thread every ~2 ms, read RIP, resume,
+  // histogram by module+RVA. RVAs resolve directly in the client/engine IDBs
+  // (preferred base 0x180000000: IDB addr = base + RVA).
+  //
+  // SAFETY RULES, each load-bearing:
+  //  - NOTHING is allocated, formatted, or logged between Suspend and Resume.
+  //    The suspended thread may hold the CRT heap lock or the logger mutex;
+  //    touching either from here would deadlock the game. The only work in
+  //    the suspended window is GetThreadContext into a stack CONTEXT.
+  //  - The module snapshot (Toolhelp) is refreshed OUTSIDE the suspend, on
+  //    this thread, at most every 10 s. client.dll can unload on quit — a
+  //    stale snapshot mislabels at worst one flush window.
+  //  - Sample cost on the target is two kernel transitions (~microseconds)
+  //    every 2 ms: ~0.2% overhead, far under the noise floor.
+  // ============================================================
+  namespace {
+    std::atomic<bool> g_gapSamplerStarted { false };
+
+    void gapSamplerThread() {
+      struct GapMod { uintptr_t base, end; char name[48]; };
+      std::vector<GapMod>    gapMods;
+      std::vector<uintptr_t> gapRips;
+      std::vector<uintptr_t> gapCallers;    // [RSP] — the syscall stub's caller
+      std::vector<uintptr_t> gapCallers2;   // one frame further — the real caller
+      gapRips.reserve(8192);
+      gapCallers.reserve(8192);
+      gapCallers2.reserve(8192);
+      uint64_t lastFlushMs = GetTickCount64(), lastModsMs = 0;
+      HANDLE   hTarget = nullptr;
+      uint32_t hTargetTid = 0;
+
+      for (;;) {
+        ::Sleep(2);
+        if (!RtxOptions::perfGapSampler()) {
+          ::Sleep(250);
+          continue;
+        }
+        const uint32_t tid = vanish_diag::g_presentTid.load(std::memory_order_relaxed);
+        if (tid == 0 || tid == uint32_t(GetCurrentThreadId()))
+          continue;
+        if (tid != hTargetTid) {
+          if (hTarget != nullptr)
+            CloseHandle(hTarget);
+          hTarget = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, tid);
+          hTargetTid = tid;
+        }
+        if (hTarget == nullptr)
+          continue;
+
+        // --- suspended window: context capture ONLY ---
+        uintptr_t rip = 0, rsp = 0;
+        if (SuspendThread(hTarget) != DWORD(-1)) {
+          CONTEXT ctx = {};
+          ctx.ContextFlags = CONTEXT_CONTROL;   // includes Rip and Rsp
+          if (GetThreadContext(hTarget, &ctx)) {
+            rip = uintptr_t(ctx.Rip);
+            rsp = uintptr_t(ctx.Rsp);
+          }
+          ResumeThread(hTarget);
+        }
+        // --- end suspended window ---
+        if (rip != 0 && gapRips.size() < 65536)
+          gapRips.push_back(rip);
+
+        // CALLER of a syscall. A Windows x64 syscall stub is
+        //   mov r10,rcx / mov eax,SSN / test / jne / syscall / ret
+        // and it never touches RSP, so while the thread is inside the
+        // syscall [RSP] still holds the RETURN ADDRESS into whoever called
+        // the stub — one 8-byte read names them, with no stack walk and no
+        // unwind data. Detect "in a stub" by pattern rather than by address:
+        // the two bytes at RIP-2 are 0F 05 (syscall) for the post-syscall
+        // RIP, which is where a sampled in-kernel thread parks.
+        // Read AFTER Resume: the memory is our own process and the frame is
+        // still live (the syscall has not returned), so this needs no lock
+        // and nothing is done inside the suspended window.
+        if (rip > 2 && rsp != 0 && gapCallers.size() < 65536) {
+          const uint8_t* pc = reinterpret_cast<const uint8_t*>(rip - 2);
+          if (!IsBadReadPtr(pc, 2) && pc[0] == 0x0F && pc[1] == 0x05) {
+            const uintptr_t* sp = reinterpret_cast<const uintptr_t*>(rsp);
+            if (!IsBadReadPtr(sp, sizeof(uintptr_t)))
+              gapCallers.push_back(*sp);
+            // ONE FRAME FURTHER. [RSP] only names the stub's caller, which is
+            // always the Win32 wrapper (KERNELBASE!VirtualQuery+0x30 was 94%
+            // of samples) — that identifies the API, not the code paying for
+            // it. The wrapper's own return address is somewhere in its frame,
+            // so scan the next 64 stack slots and take the first value that
+            // maps into a module OTHER than ntdll/KERNELBASE: that is the
+            // application code that called VirtualQuery. Heuristic by nature
+            // (a stale pointer in a dead slot can alias), but over thousands
+            // of samples the real caller dominates the histogram, and every
+            // read is a plain load from our own live stack — no unwind data,
+            // no lock, nothing inside the suspended window.
+            for (uint32_t s = 1; s <= 64; ++s) {
+              const uintptr_t* slot = reinterpret_cast<const uintptr_t*>(rsp + s * sizeof(uintptr_t));
+              if (IsBadReadPtr(slot, sizeof(uintptr_t)))
+                break;
+              const uintptr_t v = *slot;
+              if (v < 0x10000)
+                continue;
+              const GapMod* m = nullptr;
+              for (const auto& mm : gapMods) {
+                if (v >= mm.base && v < mm.end) { m = &mm; break; }
+              }
+              if (m == nullptr)
+                continue;
+              if (::_stricmp(m->name, "ntdll.dll") == 0 || ::_stricmp(m->name, "KERNELBASE.dll") == 0)
+                continue;                       // still inside the wrapper chain
+              // MUST look like a RETURN address, i.e. be immediately preceded
+              // by a call. Without this the scan reports whatever stale
+              // pointer sits in a dead stack slot: the first run of this probe
+              // put 75% on client.dll+0x1748000, which is not code at all —
+              // it is the portal-table DATA region (qword_181748CF8 lives
+              // there) and is page-aligned, the giveaway. Accept only the
+              // three call encodings that can precede a return address:
+              //   E8 rel32            -> 5 bytes back
+              //   FF 15 disp32        -> 6 bytes back (call [rip+d])
+              //   FF D0..D7 / 41 FF D*-> 2-3 bytes back (call reg)
+              const uint8_t* r = reinterpret_cast<const uint8_t*>(v);
+              if (IsBadReadPtr(r - 8, 8))
+                continue;
+              const bool isRet =
+                   (r[-5] == 0xE8)
+                || (r[-6] == 0xFF && r[-5] == 0x15)
+                || (r[-2] == 0xFF && (r[-1] & 0xF8) == 0xD0)
+                || (r[-3] == 0x41 && r[-2] == 0xFF && (r[-1] & 0xF8) == 0xD0);
+              if (!isRet)
+                continue;
+              gapCallers2.push_back(v);
+              break;
+            }
+          }
+        }
+
+        const uint64_t nowMs = GetTickCount64();
+        if (gapMods.empty() || nowMs - lastModsMs > 10000) {
+          lastModsMs = nowMs;
+          gapMods.clear();
+          HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
+          if (snap != INVALID_HANDLE_VALUE) {
+            MODULEENTRY32W me = {};
+            me.dwSize = sizeof(me);
+            if (Module32FirstW(snap, &me)) {
+              do {
+                GapMod m = {};
+                m.base = uintptr_t(me.modBaseAddr);
+                m.end  = m.base + me.modBaseSize;
+                // narrow the wide module name, ASCII-only is fine for DLLs
+                for (uint32_t i = 0; i < 47 && me.szModule[i] != L'\0'; ++i)
+                  m.name[i] = char(me.szModule[i] & 0x7F);
+                gapMods.push_back(m);
+              } while (Module32NextW(snap, &me));
+            }
+            CloseHandle(snap);
+          }
+        }
+
+        if (nowMs - lastFlushMs >= 5000 && !gapRips.empty()) {
+          lastFlushMs = nowMs;
+          // Aggregate per module and per 16-byte RVA bucket. 2026-08-06: was
+          // 256, which was too coarse at the top hit — ntdll's syscall stubs
+          // are 16 bytes apart, so a 256-byte bucket merged ~16 DIFFERENT
+          // syscalls into one line (the 69% bucket at ntdll+0x160400 spans
+          // ZwCreateKey..NtOpenProcess and cannot name which). 16 bytes names
+          // the stub exactly; resolve against the module's export table
+          // (nearest export at or below the RVA).
+          std::unordered_map<std::string, uint32_t> perMod;
+          std::unordered_map<std::string, uint32_t> perBucket;
+          uint32_t unknown = 0;
+          for (const uintptr_t r : gapRips) {
+            const GapMod* hit = nullptr;
+            for (const auto& m : gapMods) {
+              if (r >= m.base && r < m.end) { hit = &m; break; }
+            }
+            if (hit == nullptr) { ++unknown; continue; }
+            perMod[hit->name] += 1;
+            perBucket[str::format(hit->name, "+0x", std::hex, uintptr_t(r - hit->base) & ~uintptr_t(0xF))] += 1;
+          }
+          std::vector<std::pair<std::string, uint32_t>> mods(perMod.begin(), perMod.end());
+          std::sort(mods.begin(), mods.end(), [](auto& a, auto& b) { return a.second > b.second; });
+          std::vector<std::pair<std::string, uint32_t>> buckets(perBucket.begin(), perBucket.end());
+          std::sort(buckets.begin(), buckets.end(), [](auto& a, auto& b) { return a.second > b.second; });
+
+          // Syscall CALLERS — the line that names who is making the call.
+          std::unordered_map<std::string, uint32_t> perCaller;
+          for (const uintptr_t r : gapCallers) {
+            const GapMod* hit = nullptr;
+            for (const auto& m : gapMods) {
+              if (r >= m.base && r < m.end) { hit = &m; break; }
+            }
+            perCaller[hit ? str::format(hit->name, "+0x", std::hex, uintptr_t(r - hit->base) & ~uintptr_t(0xF))
+                          : std::string("<unmapped>")] += 1;
+          }
+          std::vector<std::pair<std::string, uint32_t>> callers(perCaller.begin(), perCaller.end());
+          std::sort(callers.begin(), callers.end(), [](auto& a, auto& b) { return a.second > b.second; });
+
+          std::unordered_map<std::string, uint32_t> perCaller2;
+          for (const uintptr_t r : gapCallers2) {
+            const GapMod* hit = nullptr;
+            for (const auto& m : gapMods) {
+              if (r >= m.base && r < m.end) { hit = &m; break; }
+            }
+            perCaller2[hit ? str::format(hit->name, "+0x", std::hex, uintptr_t(r - hit->base) & ~uintptr_t(0xF))
+                           : std::string("<unmapped>")] += 1;
+          }
+          std::vector<std::pair<std::string, uint32_t>> callers2(perCaller2.begin(), perCaller2.end());
+          std::sort(callers2.begin(), callers2.end(), [](auto& a, auto& b) { return a.second > b.second; });
+
+          std::ostringstream line;
+          line << "[GapSampler] samples=" << gapRips.size() << " unknown=" << unknown << " mods:";
+          for (size_t i = 0; i < mods.size() && i < 8; ++i)
+            line << " " << mods[i].first << "=" << (mods[i].second * 100u) / uint32_t(gapRips.size()) << "%";
+          line << " | top:";
+          for (size_t i = 0; i < buckets.size() && i < 8; ++i)
+            line << " " << buckets[i].first << "=" << buckets[i].second;
+          line << " | syscallCallers(n=" << gapCallers.size() << "):";
+          for (size_t i = 0; i < callers.size() && i < 5; ++i)
+            line << " " << callers[i].first << "=" << callers[i].second;
+          line << " | APPcallers(n=" << gapCallers2.size() << "):";
+          for (size_t i = 0; i < callers2.size() && i < 10; ++i)
+            line << " " << callers2[i].first << "=" << callers2[i].second;
+          Logger::warn(line.str());
+          gapRips.clear();
+          gapCallers.clear();
+          gapCallers2.clear();
+        }
+      }
+    }
+  }
+
   // Called once per frame from EndFrame. Reconciles the live patch state with the
   // options, so any flag can be flipped at runtime and the engine code follows.
   static void cullOffUpdate() {
+    // [GapSampler] lazy start — one detached thread for the process lifetime,
+    // created the first time the option reads true so a False conf costs
+    // nothing, not even the thread.
+    if (RtxOptions::perfGapSampler() && !g_gapSamplerStarted.exchange(true)) {
+      std::thread(gapSamplerThread).detach();
+    }
+    // [VQProbe] per-frame VirtualQuery census — names the guard responsible
+    // for the ZwQueryVirtualMemory syscall the sampler found.
+    vqprobe::flushPerFrame();
     // [CullOffAB] runtime override, cycled by PageUp. 2 = restore everything,
     // 1 = restore only the area-layer sites. See g_cullOffAbMode for why this
     // is a patch toggle rather than a diff against rtx.cullOff.pvs.

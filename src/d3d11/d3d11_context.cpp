@@ -160,6 +160,7 @@ namespace dxvk {
     thread_local uint32_t t_lastQueryEndType = 0;
     std::atomic<uint64_t> g_presentEnterNs { 0 };
     std::atomic<uint64_t> g_presentExitNs { 0 };
+    std::atomic<uint32_t> g_presentTid { 0 };
     std::atomic<uint64_t> g_boundaryPreNs { 0 };
     std::atomic<uint64_t> g_boundaryPostNs { 0 };
     std::atomic<uint64_t> g_boundaryPreMaxNs { 0 };

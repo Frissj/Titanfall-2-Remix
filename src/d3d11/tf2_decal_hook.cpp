@@ -594,7 +594,12 @@ namespace tf2_decal_hook {
     //   4. bucket-id mismatch ending a run early
     // So the measurement is: props CLAIMED by the entry ranges vs props that
     // actually clear the distance limit. A gap is the prepass dropping them.
-    constexpr bool kLogPrepassCensus   = true;
+    // OFF 2026-08-06, with the rest of the cull diagnostics. This census walks
+    // every prepass entity and every prop record it claims — ~6,600 records
+    // per frame in the measured capture (claimed=6429) — plus three
+    // ReadEngineCvarFloat calls, and emits one line per frame for an
+    // investigation that is not currently open. Flip to true to bring it back.
+    constexpr bool kLogPrepassCensus   = false;
     constexpr int  kPrepassMaxLines    = 4000;
     // ConVar object RVAs (value float at +0x58, int at +0x5C; see tf2_engine_cvars).
     constexpr std::uintptr_t kRvaCvPrepassDist    = 0x13B87470;
@@ -985,17 +990,43 @@ namespace tf2_decal_hook {
     // position-dependent copied (the alloca_probe call at +23 is far outside).
     constexpr std::size_t kWvPrologueSize = 5;
 
+    // NV-DXVK [perf] 2026-08-06: THE frame-time bug, found by [GapSampler] +
+    // its validated APP-caller histogram. VirtualQuery is a SYSCALL
+    // (ntdll!ZwQueryVirtualMemory), and this guard is called from inside the
+    // per-frame area/portal walks below (179 areas x their portals, e.g. the
+    // slot loops at ~4198/~4441 and the header reads at ~4165/~4390) —
+    // thousands of calls per frame. Measured: ~70% of the present thread's
+    // samples parked in that one syscall, ~50 ms of a ~110 ms frame, and it
+    // inflated EVERY VirtualQuery in the process to ~14.5 us via address-space
+    // lock contention (a VAD lookup is normally ~1 us).
+    //
+    // Fix is the same single-entry region cache studioMemReadable uses: a
+    // VirtualQuery returns the WHOLE enclosing region, and every one of these
+    // reads targets client.dll's data segment — one region answers them all,
+    // so a run of thousands collapses to one syscall.
+    //
+    // SAFETY: identical to the other cache. It can only go optimistic if a
+    // region is decommitted between calls, which is the same window the
+    // uncached form already had between its query and the deref that follows.
+    // Only committed+readable regions are cached, never rejects; refreshed on
+    // every miss; thread_local, so no lock and no cross-thread view.
     bool WvReadable(const void* p, std::size_t len) {
       if (p == nullptr)
         return false;
+      struct WvRegion { std::uintptr_t start, end; };
+      static thread_local WvRegion t_last { 0, 0 };
+      const auto addr = reinterpret_cast<std::uintptr_t>(p);
+      if (addr >= t_last.start && (addr + len) <= t_last.end)
+        return true;
       MEMORY_BASIC_INFORMATION mbi = {};
       if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT)
         return false;
       if ((mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0)
         return false;
-      const auto start = reinterpret_cast<std::uintptr_t>(p);
-      const auto end = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-      return start + len <= end;
+      const auto start = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
+      const auto end = start + mbi.RegionSize;
+      t_last = { start, end };
+      return addr + len <= end;
     }
 
     inline std::uint32_t WvPopcount64(std::uint64_t v) {
@@ -4561,9 +4592,16 @@ namespace tf2_engine_cvars {
     };
 
     // True iff [p, p+len) is committed and readable.
+    // NV-DXVK [perf] 2026-08-06: same single-entry region cache as WvReadable
+    // above — see that comment for the measurement and the safety argument.
     bool IsReadable(const void* p, std::size_t len) {
       if (p == nullptr)
         return false;
+      struct IrRegion { std::uintptr_t start, end; };
+      static thread_local IrRegion t_last { 0, 0 };
+      const auto addrIr = reinterpret_cast<std::uintptr_t>(p);
+      if (addrIr >= t_last.start && (addrIr + len) <= t_last.end)
+        return true;
       MEMORY_BASIC_INFORMATION mbi = {};
       if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0)
         return false;
@@ -4575,6 +4613,7 @@ namespace tf2_engine_cvars {
       const auto start = reinterpret_cast<std::uintptr_t>(p);
       const auto regionEnd =
         reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+      t_last = { reinterpret_cast<std::uintptr_t>(mbi.BaseAddress), regionEnd };
       return start + len <= regionEnd;
     }
 
