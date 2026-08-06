@@ -16,7 +16,12 @@
 namespace dxvk {
   
   D3D11CommonShader:: D3D11CommonShader() { }
-  D3D11CommonShader::~D3D11CommonShader() { }
+  D3D11CommonShader::~D3D11CommonShader() {
+    // NV-DXVK [RdefCache]: invalidate every shader-pointer-keyed RDEF memo.
+    // See g_shaderEpoch in d3d11_shader.h - this is what makes a raw
+    // D3D11CommonShader* safe to use as a memo key across a map change.
+    g_shaderEpoch.fetch_add(1u, std::memory_order_relaxed);
+  }
   
   
   D3D11CommonShader::D3D11CommonShader(

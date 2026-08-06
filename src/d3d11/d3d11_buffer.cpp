@@ -5,8 +5,21 @@
 
 #include "../dxvk/dxvk_data.h"
 
+#ifndef RTX_D3D11_CACHED_DYNAMIC_INDEX_BUFFERS
+// NV-DXVK [perf/CachedDynamicIB] 2026-08-06: allocate DYNAMIC INDEX buffers in
+// HOST_CACHED (system) memory instead of write-combined BAR memory, because
+// Remix reads their contents back on the CPU every frame. On by default.
+//
+// SET THIS TO false to restore stock DXVK behaviour (DEVICE_LOCAL|HOST_VISIBLE,
+// write-combined). That is the A/B for this change — see the long rationale at
+// the DYNAMIC case in GetMemoryFlags(), and measure with [Perf.CullVtx]
+// reduce_MBps (CPU read side) against [Perf.GpuPass] (GPU side), since this
+// trades GPU-side locality for CPU-side read speed.
+#define RTX_D3D11_CACHED_DYNAMIC_INDEX_BUFFERS true
+#endif
+
 namespace dxvk {
-  
+
   D3D11Buffer::D3D11Buffer(
           D3D11Device*                pDevice,
     const D3D11_BUFFER_DESC*          pDesc)
@@ -231,6 +244,49 @@ namespace dxvk {
 
         if (m_desc.BindFlags)
           memoryFlags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+        // NV-DXVK [perf/CachedDynamicIB] 2026-08-06: DYNAMIC INDEX buffers are
+        // read back by the CPU every frame, so give them CACHED memory.
+        //
+        // Remix is not a plain translation layer here: SubmitDraw scans the
+        // index range of every draw to compute a tight max-index for the
+        // object-space AABB producer (see the needsMeshBoundingBox tombstone in
+        // d3d11_rtx.cpp). That is ~600k indices / ~1.2 MB per frame READ BACK
+        // from a buffer D3D11 assumes is write-only.
+        //
+        // With DEVICE_LOCAL|HOST_VISIBLE those reads come from BAR memory, which
+        // is write-combined: uncached, ~300 MB/s. [Perf.CullVtx] measured
+        // exactly that — reduce_MBps 280-365 with acquire_ms ~1.5, i.e. the cost
+        // is the reads themselves and the scan is already at the hardware limit.
+        // Tuning the loop cannot beat the memory type; a 2->8 cache-line unroll
+        // was tried and came back 21% WORSE (tombstoned in maxIndexFromWC).
+        //
+        // This is the same substitution DXVK already makes one case up: for
+        // D3D11_CPU_ACCESS_READ on DEFAULT buffers it adds HOST_CACHED and
+        // clears DEVICE_LOCAL. The situation is the same — CPU reads back — the
+        // difference is only that D3D11 never told us, because the readback is
+        // Remix's, not the application's.
+        //
+        // THE TRADE, explicitly: clearing DEVICE_LOCAL moves the buffer to
+        // system RAM, so the GPU reaches it over PCIe. In Remix that is weaker
+        // than it looks — index data is copied into RT geometry buffers for BLAS
+        // builds rather than fetched per-draw by a rasterizer — but it is not
+        // free, and the game's Map(WRITE_DISCARD) writes also become cached
+        // rather than write-combining. Both are GPU/write-side costs traded for
+        // a CPU read-side win, so it must be MEASURED, not assumed:
+        //   [Perf.CullVtx] reduce_MBps  should leave ~300 for multiple GB/s
+        //   [Perf.SubmitDraw] bt_cullVtx should fall from ~4.3 ms/frame
+        //   [Perf.GpuPass]              watch for any rise in the RT passes
+        // Set RTX_D3D11_CACHED_DYNAMIC_INDEX_BUFFERS to false to A/B it.
+        //
+        // Scoped to INDEX buffers alone on purpose: vertex and constant buffers
+        // are not scanned per draw, so they keep write-combining, which is the
+        // right choice for a write-only streaming buffer.
+        if (RTX_D3D11_CACHED_DYNAMIC_INDEX_BUFFERS
+         && (m_desc.BindFlags & D3D11_BIND_INDEX_BUFFER)) {
+          memoryFlags |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+          memoryFlags &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        }
         break;
       
       case D3D11_USAGE_STAGING:

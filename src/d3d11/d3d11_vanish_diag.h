@@ -86,7 +86,42 @@ namespace dxvk { namespace vanish_diag {
   // needs no windows.h in this header.
   extern thread_local bool t_isFrameThread;
 
+  // NV-DXVK [perf] 2026-08-06: per-call accumulation is THREAD-LOCAL and
+  // non-atomic; the atomics are touched once per 5 s window instead of once
+  // per call.
+  //
+  // WHY. Everything below the `if (!timed) return` in ScopedCall runs only on
+  // the frame thread, so the atomics were never actually being used for
+  // cross-thread accumulation there - they were paying `lock xadd` (~18 ns
+  // each, more when the line is shared with the worker threads that bump
+  // g_counts) purely out of habit. Five of them per call, against ~302,000
+  // GetData polls per frame ([Perf.Query]: 12.69 M polls per 5 s window,
+  // 99.998% not-ready), is ~27 ms per frame of lock-prefixed traffic to
+  // maintain counters that are read three times a minute.
+  //
+  // Plain thread-local adds are ~1 ns and need no synchronisation because a
+  // thread cannot race with itself. The globals stay atomic because the
+  // DRAIN still crosses threads and g_counts is still bumped by every thread.
+  //
+  // KNOWN LIMIT: if the frame thread changes identity, whatever the previous
+  // thread had accumulated but not yet flushed is lost. That is one window of
+  // one thread's diagnostic counters at a swap that happens ~never, and the
+  // alternative (a registry of per-thread blocks, as [Perf.SdThreads] uses)
+  // buys nothing here.
+  inline thread_local uint64_t t_accTimeNs[CALL_COUNT]    = {};
+  inline thread_local uint64_t t_accTimeCalls[CALL_COUNT] = {};
+  inline thread_local uint64_t t_accGapNs[CALL_COUNT]     = {};
+  inline thread_local uint64_t t_accGapCount[CALL_COUNT]  = {};
+  inline thread_local uint64_t t_accGapMaxNs              = 0;
+  inline thread_local int      t_accGapMaxCall            = 0;
+
+  // Fold this thread's accumulators into the shared atomics. Called at the top
+  // of both drains; the second call is a no-op because the locals are zeroed.
+  // Defined below, once the [Perf.Gap] globals it touches have been declared.
+  inline void flushDiagLocals();
+
   inline void drainTimes(uint64_t outNs[CALL_COUNT], uint64_t outCalls[CALL_COUNT]) {
+    flushDiagLocals();
     for (int i = 0; i < CALL_COUNT; ++i) {
       outNs[i]    = g_timeNs[i].exchange(0, std::memory_order_relaxed);
       outCalls[i] = g_timeCalls[i].exchange(0, std::memory_order_relaxed);
@@ -190,8 +225,35 @@ namespace dxvk { namespace vanish_diag {
   extern thread_local int  t_lastCallId;
   extern thread_local int  t_depth;
 
+  // Definition of the flush forward-declared above, now that g_gapNsByCall /
+  // g_gapCountByCall / g_gapMaxNs / g_gapMaxCall are in scope.
+  inline void flushDiagLocals() {
+    for (int i = 0; i < CALL_COUNT; ++i) {
+      if (t_accTimeNs[i] || t_accTimeCalls[i]) {
+        g_timeNs[i].fetch_add(t_accTimeNs[i], std::memory_order_relaxed);
+        g_timeCalls[i].fetch_add(t_accTimeCalls[i], std::memory_order_relaxed);
+        t_accTimeNs[i] = t_accTimeCalls[i] = 0;
+      }
+      if (t_accGapNs[i] || t_accGapCount[i]) {
+        g_gapNsByCall[i].fetch_add(t_accGapNs[i], std::memory_order_relaxed);
+        g_gapCountByCall[i].fetch_add(t_accGapCount[i], std::memory_order_relaxed);
+        t_accGapNs[i] = t_accGapCount[i] = 0;
+      }
+    }
+    if (t_accGapMaxNs != 0) {
+      uint64_t prev = g_gapMaxNs.load(std::memory_order_relaxed);
+      while (t_accGapMaxNs > prev
+          && !g_gapMaxNs.compare_exchange_weak(prev, t_accGapMaxNs,
+               std::memory_order_relaxed)) { }
+      if (t_accGapMaxNs >= prev)
+        g_gapMaxCall.store(t_accGapMaxCall, std::memory_order_relaxed);
+      t_accGapMaxNs = 0;
+    }
+  }
+
   inline void drainGaps(uint64_t outNs[CALL_COUNT], uint64_t outCounts[CALL_COUNT],
                         uint64_t& outMaxNs, int& outMaxCall) {
+    flushDiagLocals();
     for (int i = 0; i < CALL_COUNT; ++i) {
       outNs[i]     = g_gapNsByCall[i].exchange(0, std::memory_order_relaxed);
       outCounts[i] = g_gapCountByCall[i].exchange(0, std::memory_order_relaxed);
@@ -214,23 +276,50 @@ namespace dxvk { namespace vanish_diag {
       if (!timed)
         return;
 
+      // ONE clock read serves BOTH the gap close and the body start.
+      //
+      // NV-DXVK [perf] 2026-08-06: this deliberately reverses the earlier
+      // ordering decision, and the reason is that the call rate changed by two
+      // orders of magnitude. That decision took a SECOND clock read here so the
+      // gap atomics below would not be charged to the entry point's body time,
+      // and it was correct when the note was written: ~6000 timed calls/frame,
+      // where an extra read is invisible and the misattribution was measurable.
+      //
+      // It is now wrong. [Perf.Query] measures 12.69 MILLION GetData polls per
+      // 5 s window - ~302,000 per frame on ~6 query objects, 99.998% not-ready,
+      // i.e. the engine spinning on one EVENT query while the GPU works. Every
+      // one of those pays this constructor. steady_clock::now() is QPC, ~41 ns
+      // on this machine, so the extra read alone is ~12 ms PER FRAME to avoid
+      // charging ~20 ns of relaxed atomics to the body. [GapSampler] confirms
+      // it from the other side: ntdll!RtlQueryPerformanceCounter is 620+37+30
+      // of 1891 frame-thread samples, ~36% of the thread, and this header is
+      // the caller.
+      //
+      // The trade, stated plainly: we stop paying 41 ns of real frame time and
+      // accept that the gap bookkeeping now lands inside the measured body, so
+      // [Perf.Entry] reads slightly HIGH and [Perf.Gap] slightly LOW against
+      // older logs. That error used to be the cost of five atomic RMWs; the
+      // same change that made this worth doing also moved those to thread-local
+      // adds (see flushDiagLocals), so what actually leaks into the body now is
+      // a handful of plain increments - single-digit ns, well under the ~41 ns
+      // this saves. The original objection is answered, not merely accepted.
+      //
+      // Two reads per call is the floor for measuring body and gap at all;
+      // going below it needs a cheaper clock (rdtsc) or sampling, not a
+      // reordering.
+      const auto tEnter = std::chrono::steady_clock::now();
+
       // [Perf.Gap]: close the interval opened by the previous call's exit. Only
       // at depth 0 - a nested entry point would otherwise report the enclosing
       // call's body as a gap.
-      //
-      // Ordering is load-bearing: this bookkeeping runs BEFORE t0 is taken, so
-      // the atomics below are not charged to the entry point's body time. The
-      // first version of this took t0 first and inflated [Perf.Entry] from
-      // 1.6 ms to 7.8 ms per frame - ~6000 gap computations charged to the
-      // calls they were measuring. The extra clock read is far cheaper than the
-      // atomics it excludes, and is only paid at depth 0.
       if (t_depth == 0 && t_haveLastExit) {
-        const auto tEnter = std::chrono::steady_clock::now();
         const uint64_t gapNs = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
           tEnter - t_lastExit).count());
 
-        g_gapNsByCall[t_lastCallId].fetch_add(gapNs, std::memory_order_relaxed);
-        g_gapCountByCall[t_lastCallId].fetch_add(1, std::memory_order_relaxed);
+        // Thread-local: see flushDiagLocals. These were `lock xadd` on every
+        // one of ~302,000 polls per frame.
+        t_accGapNs[t_lastCallId]    += gapNs;
+        t_accGapCount[t_lastCallId] += 1;
 
         // Split the QueryEnd bucket by query type - see the comment on
         // g_gapNsByQueryType. Only QueryEnd needs this; the other call ids are
@@ -279,15 +368,16 @@ namespace dxvk { namespace vanish_diag {
           }
         }
 
-        uint64_t prevMax = g_gapMaxNs.load(std::memory_order_relaxed);
-        while (gapNs > prevMax
-            && !g_gapMaxNs.compare_exchange_weak(prevMax, gapNs, std::memory_order_relaxed)) { }
-        if (gapNs >= prevMax)
-          g_gapMaxCall.store(t_lastCallId, std::memory_order_relaxed);
+        // Thread-local max, folded into the shared one at drain time. Was an
+        // atomic load plus a CAS loop per call.
+        if (gapNs > t_accGapMaxNs) {
+          t_accGapMaxNs   = gapNs;
+          t_accGapMaxCall = t_lastCallId;
+        }
       }
 
       ++t_depth;
-      t0 = std::chrono::steady_clock::now();
+      t0 = tEnter;   // reused - see the note above
     }
 
     ~ScopedCall() {
@@ -296,8 +386,9 @@ namespace dxvk { namespace vanish_diag {
 
       const auto t1 = std::chrono::steady_clock::now();
       const auto dNs = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-      g_timeNs[id].fetch_add(uint64_t(dNs), std::memory_order_relaxed);
-      g_timeCalls[id].fetch_add(1, std::memory_order_relaxed);
+      // Thread-local: see flushDiagLocals.
+      t_accTimeNs[id]    += uint64_t(dNs);
+      t_accTimeCalls[id] += 1;
 
       // Open the next interval. Again depth 0 only, and reusing t1 rather than
       // taking a second reading - this path runs ~6000 times per frame and the

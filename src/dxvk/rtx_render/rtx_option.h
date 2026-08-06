@@ -32,6 +32,7 @@
 #include <optional>
 #include <initializer_list>
 #include <utility>
+#include <chrono>
 
 #include "../util/config/config.h"
 #include "../util/xxHash/xxhash.h"
@@ -50,9 +51,115 @@ class RtxOptionManager;
 #define RTX_OPTION_DEBUG_LOGGING false
 #endif
 
+#ifndef RTX_OPTION_NOLOCK_POD_READS
+// NV-DXVK [OptNoLock] 2026-08-06: read POD option values (bool / int / float /
+// integrals / enums) WITHOUT taking the global RtxOption mutex. On by default.
+//
+// SET THIS TO false to route every option read back through the mutex — that is
+// the A/B for this optimisation, and the one switch to flip if an option value
+// is ever suspected of being read stale or torn. Container-valued options
+// (fast_unordered_set / string / vector) always take the lock regardless of
+// this setting; see RtxOption::kPodInlineValue for why the split is safe.
+//
+// Measured motivation: [Perf.OptRead] found 75,591 option reads per frame on
+// the frame thread alone (~54 per draw) at 88 ns per acquisition = 6.7 ms/frame,
+// and that is a lower bound because worker threads were not counted.
+#define RTX_OPTION_NOLOCK_POD_READS true
+#endif
+
+#ifndef RTX_OPTION_READ_DIAG
+// NV-DXVK [Perf.OptRead] 2026-08-06: count option reads and sample the mutex
+// acquisition cost, emitted as [Perf.OptRead] once per perf window. On by
+// default — this is what verifies RTX_OPTION_NOLOCK_POD_READS above is actually
+// working (fastPct should be ~100 and estLockMsPerFrame ~0).
+//
+// SET THIS TO false once the numbers are settled: it costs one thread-local
+// increment per read (~0.07 ms/frame at the measured 75k reads/frame) plus two
+// clock reads per 1024 locked reads.
+#define RTX_OPTION_READ_DIAG true
+#endif
+
 namespace dxvk {
   class DxvkDevice;
-  
+
+  // ============================================================
+  // NV-DXVK [Perf.OptRead] 2026-08-06: how much does reading an RtxOption cost?
+  //
+  // EVERY option read — including a plain bool — goes through
+  // RtxOption<T>::getValue(), which takes ONE process-global std::mutex
+  // (RtxOptionImpl::getUpdateMutex()). The per-draw paths in d3d11_rtx.cpp read
+  // options constantly, from the frame thread and the worker threads at once,
+  // so this is a single serialization point under a workload of ~1500 draws per
+  // frame. That makes it the only candidate that fits the shape of the CPU
+  // profile after the big single-item wins were taken: SubmitDraw's cost is now
+  // spread thinly across ~68 rows, none dominant, which is what a per-call tax
+  // paid inside every row looks like.
+  //
+  // MEASURED, not assumed — this started as a hypothesis and the numbers came
+  // back: 75,591 reads/frame on the frame thread alone (~54 per draw), 88 ns
+  // per acquisition, 6.7 ms/frame, and that is a LOWER bound because worker
+  // threads are not counted. 88 ns is ~4x an uncontended SRWLOCK, so the
+  // threads are genuinely queueing on each other. RTX_OPTION_NOLOCK_POD_READS
+  // is the fix that followed; these counters stay to prove it holds.
+  //   total/perFrame — reads on THIS thread (the frame thread, since the log
+  //                    emits from EndFrame on the same thread as SubmitDraw).
+  //   locked vs fast — mutex path vs lock-free POD path. Container options are
+  //                    still locked by design, so `locked` never reaches zero;
+  //                    it quantifies the residual and says whether hoisting
+  //                    those specific per-draw set reads is worth doing next.
+  //   avgLockNs      — 1-in-1024 sample of the acquisition only, scaled up.
+  //
+  // Cost when enabled: one increment per read, plus two clock reads on 1 call
+  // in 1024 (~0.08 ns/call amortised). Switched at COMPILE time via
+  // RTX_OPTION_READ_DIAG at the top of this file, so when it is off nothing is
+  // emitted at all — no branch, no counter. Deliberately not an env var: a
+  // getenv here would cost far more than the thing being measured, and a
+  // function-local static would put a thread-safe-static guard check on the
+  // hottest read in the process (the hang lesson from util_cond_diag).
+  static constexpr bool g_optReadDiag = RTX_OPTION_READ_DIAG;
+  inline thread_local uint64_t t_optReadCount   = 0;   // LOCKED reads on this thread
+  inline thread_local uint64_t t_optReadFast    = 0;   // lock-free POD reads
+  inline thread_local uint64_t t_optReadSamples = 0;   // sampled acquisitions
+  inline thread_local uint64_t t_optReadNs      = 0;   // ns inside those acquisitions
+  static constexpr uint64_t kOptReadSampleMask  = 1023ull;
+
+  // ============================================================
+  // NV-DXVK [OptNoLock] 2026-08-06: lock-free reads for POD options.
+  //
+  // [Perf.OptRead] measured 75,591 option reads per frame on the frame thread
+  // alone (~54 per draw), at 88 ns per mutex acquisition = 6.7 ms/frame, a
+  // LOWER bound since worker threads are not counted. 88 ns is ~4x an
+  // uncontended SRWLOCK, i.e. the threads are genuinely queueing on each other.
+  // That single global mutex is why SubmitDraw's cost is spread thinly across
+  // ~68 rows with nothing dominant: it is a tax inside every row.
+  //
+  // WHY POD ONLY. The mutex protects a reader holding a `const T&` from a
+  // concurrent resolveValue()/setImmediately() mutating the pointee. For
+  // fast_unordered_set, std::string or std::vector that is a real race with a
+  // real crash (rehash / reallocation under the reader), so those KEEP the
+  // lock, unconditionally. POD options are different in kind:
+  //   - the value lives INLINE in the 8-byte GenericValue union, not behind a
+  //     pointer (see getResolvedValuePtr's is_pod_v overload), so the address
+  //     is a fixed member offset that is stable for the option's lifetime —
+  //     the returned reference can never dangle, whatever a writer does;
+  //   - the write is a single naturally-aligned store of <= 8 bytes, and the
+  //     read is a single naturally-aligned load of the same, so no reader can
+  //     ever observe a half-written value. It sees the old value or the new
+  //     one, which is exactly the guarantee the locked path gave (options
+  //     change between frames, and no caller can tell WHICH side of an
+  //     option-change edit it landed on anyway).
+  // This is the same read getValueNoLock() has always performed; it is now
+  // reachable without holding the mutex, for the types where that is sound.
+  //
+  // NOT a blanket "drop the lock": writes still take it, every non-POD read
+  // still takes it, and the fast path is a compile-time `if constexpr` so
+  // container options cannot accidentally reach it.
+  //
+  // The A/B switch is RTX_OPTION_NOLOCK_POD_READS at the top of this file.
+  // Being compile-time rather than runtime means that when it is off the fast
+  // path is not merely skipped but not emitted at all — there is no residual
+  // branch on the hottest read in the process.
+
   // RtxOption refers to a serializable option, which can be of a basic type (i.e. int) or a class type (i.e. vector hash value)
   // On initialization, it retrieves a value from a Config object and add itself to a global list so that all options can be serialized 
   // into a file when requested.
@@ -621,27 +728,71 @@ namespace dxvk {
       }
     }
 
+    // True when T's resolved value is stored inline in the GenericValue union
+    // and is therefore a single aligned load. Everything else (containers,
+    // strings, the Vector types that are held by pointer) is excluded, so the
+    // lock-free path below is unreachable for them at compile time.
+    // Verified against the actual types: Vector2/3/4 all declare a
+    // user-provided constexpr default ctor, so they are NOT pod and stay on the
+    // pointer+lock path. This selects bool / int / float / integrals / enums —
+    // exactly the set the per-draw call sites read.
+    // Disabled when RTX_OPTION_DEBUG_LOGGING is on, because that build wants
+    // the dirty-value warning in the locked path below and must not skip it,
+    // and by RTX_OPTION_NOLOCK_POD_READS=false, the A/B switch for this change.
+    static constexpr bool kPodInlineValue =
+      std::is_pod_v<T> && sizeof(T) <= sizeof(GenericValue)
+      && !RTX_OPTION_DEBUG_LOGGING
+      && RTX_OPTION_NOLOCK_POD_READS;
+
     const T& getValue() const {
-      std::lock_guard<std::mutex> lock(RtxOptionImpl::getUpdateMutex());
-      // NV-DXVK: Do not assert here. Static initializers in this DLL may reach an
-      // RtxOption before DxvkInstance::DxvkInstance() has had a chance to invoke
-      // RtxOptions::Create(), which would trip the assert during DLL_PROCESS_ATTACH
-      // and abort the host process. The resolved value pointer has already been
-      // populated from the default layer during the RtxOption constructor, so
-      // returning it pre-init just yields the code-defined default.
-#if RTX_OPTION_DEBUG_LOGGING
-      // Print out a warning whenever a dirty value is accessed.
-      if (isDirty()) {
-        GenericValueWrapper freshValue(type);
-        const_cast<RtxOption*>(this)->resolveValue(freshValue.data);
-        if (!isEqual(m_resolvedValue, freshValue.data)) {
-          Logger::warn(str::format("RtxOption retrieved a dirty value: ", getFullName().c_str(),
-              " has cached value: ", genericValueToString(m_resolvedValue),
-              " but would resolve to: ", genericValueToString(freshValue.data)));
+      // [OptNoLock] POD fast path — see the rationale above the switch.
+      // if constexpr / else, not a plain early return: with an early return the
+      // locked path below would still be COMPILED for POD types and MSVC would
+      // flag it unreachable. This way only one of the two bodies is emitted per
+      // instantiation, and flipping RTX_OPTION_NOLOCK_POD_READS swaps them
+      // wholesale with no residual branch either way.
+      if constexpr (kPodInlineValue) {
+        if (g_optReadDiag) {
+          ++t_optReadFast;
         }
-      }
+        return *getResolvedValuePtr<T>();
+      } else {
+        // [Perf.OptRead] — see the counters above. Short-circuits to a single
+        // predictable branch when disabled; times ONLY the lock acquisition, so
+        // the number is the contention cost and not the pointer deref.
+        const bool optSample =
+          g_optReadDiag && ((++t_optReadCount & kOptReadSampleMask) == 0ull);
+        std::chrono::steady_clock::time_point optT0;
+        if (optSample) {
+          optT0 = std::chrono::steady_clock::now();
+        }
+        std::lock_guard<std::mutex> lock(RtxOptionImpl::getUpdateMutex());
+        if (optSample) {
+          t_optReadNs += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - optT0).count());
+          ++t_optReadSamples;
+        }
+        // NV-DXVK: Do not assert here. Static initializers in this DLL may reach an
+        // RtxOption before DxvkInstance::DxvkInstance() has had a chance to invoke
+        // RtxOptions::Create(), which would trip the assert during DLL_PROCESS_ATTACH
+        // and abort the host process. The resolved value pointer has already been
+        // populated from the default layer during the RtxOption constructor, so
+        // returning it pre-init just yields the code-defined default.
+#if RTX_OPTION_DEBUG_LOGGING
+        // Print out a warning whenever a dirty value is accessed.
+        if (isDirty()) {
+          GenericValueWrapper freshValue(type);
+          const_cast<RtxOption*>(this)->resolveValue(freshValue.data);
+          if (!isEqual(m_resolvedValue, freshValue.data)) {
+            Logger::warn(str::format("RtxOption retrieved a dirty value: ", getFullName().c_str(),
+                " has cached value: ", genericValueToString(m_resolvedValue),
+                " but would resolve to: ", genericValueToString(freshValue.data)));
+          }
+        }
 #endif
-      return *getResolvedValuePtr<T>();
+        return *getResolvedValuePtr<T>();
+      }
     }
 
     template <typename U, std::enable_if_t<std::is_same_v<U, T>, bool> = true>

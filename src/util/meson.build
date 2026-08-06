@@ -54,6 +54,8 @@ util_src = files([
   'util_watchdog.h',
 
   'util_globaltime.h',
+
+  'util_cond_diag.h',
 ])
 
 util_lib = static_library('util', util_src,

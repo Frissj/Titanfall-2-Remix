@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -38,6 +39,23 @@ namespace dxvk {
     // fieldName -> {offset, size}
     std::unordered_map<std::string, D3D11CbufferField> fields;
   };
+
+  // NV-DXVK [RdefCache]: liveness epoch for shader-pointer-keyed memos.
+  //
+  // The RDEF lookup memos in d3d11_rtx.cpp key on a raw D3D11CommonShader*
+  // because it is the only thing available per draw that is free to compare.
+  // A raw pointer is NOT a stable identity across a map change: the shaders
+  // for the old map are destroyed and the allocator can hand the same address
+  // back for a shader of the new map, at which point a memo would answer with
+  // the previous shader's cbuffer offsets - silently wrong field reads, the
+  // same class of bug the D3DReflect rebuild in populateFieldUsage exists to
+  // prevent.
+  //
+  // Bumped in ~D3D11CommonShader, so ANY shader dying invalidates every memo.
+  // That is deliberately coarse: shader destruction happens on map load, not
+  // in the draw loop, so the cost is a full re-resolve a handful of times per
+  // session, and the guard cannot be defeated by allocation reuse.
+  inline std::atomic<uint64_t> g_shaderEpoch { 0 };
 
   /**
    * \brief Common shader object
@@ -117,14 +135,23 @@ namespace dxvk {
       return false;
     }
     // Convenience: return {slot, offset, size} for a field, or std::nullopt.
-    struct CBFieldLoc { uint32_t slot, offset, size; };
+    // NV-DXVK 2026-08-06: `used` carries D3D_SVF_USED through to callers.
+    // It was previously dropped here, so every FindCBField caller had to make
+    // a SECOND string-keyed lookup via ReadsCBField to learn whether the value
+    // it just read is one the shader actually consumes — and in practice most
+    // callers simply did not, which is the exact trap ReadsCBField's comment
+    // below warns about. Carrying it costs one byte in a struct that is
+    // already memoized by value (see memoCBFieldLoc), so the flag rides along
+    // for free wherever the location is cached.
+    struct CBFieldLoc { uint32_t slot, offset, size; bool used; };
     std::optional<CBFieldLoc> FindCBField(const std::string& cbName,
                                           const std::string& fieldName) const {
       auto cb = FindCBuffer(cbName);
       if (!cb) return std::nullopt;
       auto it = cb->fields.find(fieldName);
       if (it == cb->fields.end()) return std::nullopt;
-      return CBFieldLoc{ cb->bindSlot, it->second.offset, it->second.size };
+      return CBFieldLoc{ cb->bindSlot, it->second.offset, it->second.size,
+                         it->second.used };
     }
     // NV-DXVK: RDEF diagnostic — list all cbuffer names the shader declares,
     // plus their bind slot. Used to identify merged-bucket VS variants where

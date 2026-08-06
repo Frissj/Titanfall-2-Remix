@@ -30,6 +30,7 @@
 #include <utility>
 
 #include "util_error.h"
+#include "util_cond_diag.h"
 
 #include "./com/com_include.h"
 
@@ -272,6 +273,12 @@ namespace dxvk {
 
     void wait(std::unique_lock<dxvk::mutex>& lock) {
       auto srw = lock.mutex()->native_handle();
+      // NV-DXVK [Perf.CondWait]: this is the single chokepoint every DXVK
+      // condvar wait funnels through (the predicate overload below loops on
+      // it), so timing it here attributes the frame thread's ~70 ms/frame
+      // block to a DXVK site or rules DXVK out entirely. See util_cond_diag.h
+      // for why the [GapSampler] APPcaller line could not answer this.
+      cond_diag::ScopedWait waitScope;
       SleepConditionVariableSRW(&m_cond, srw, INFINITE, 0);
     }
 
@@ -304,6 +311,9 @@ namespace dxvk {
       auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout);
       auto srw = lock.mutex()->native_handle();
 
+      // NV-DXVK [Perf.CondWait]: timed too, so a timed wait cannot hide from
+      // the accounting the untimed one above is subject to.
+      cond_diag::ScopedWait waitScope;
       return SleepConditionVariableSRW(&m_cond, srw, ms.count(), 0)
         ? std::cv_status::no_timeout
         : std::cv_status::timeout;

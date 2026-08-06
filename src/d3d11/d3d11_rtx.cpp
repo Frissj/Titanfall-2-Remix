@@ -2,6 +2,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>   // NV-DXVK [Perf.WcCopy]: getenv/strtol for the kill switch
 #include <string>
 
 #include "d3d11_vanish_diag.h"
@@ -11,6 +12,10 @@
 #include <sstream>
 #include "../util/config/config.h"
 #include "../util/util_env.h"
+// NV-DXVK [Perf.CondWait]: cond_diag::drain for the per-thread condvar-block
+// report emitted next to [Perf.Busy]. Included explicitly rather than relied
+// on transitively through thread.h.
+#include "../util/util_cond_diag.h"
 #include "../dxbc/dxbc_util.h"
 #include "../dxbc/dxbc_common.h"
 // NV-DXVK [SubViewSkyTexDump]: AssetExporter::dumpImageToFile is called
@@ -29,6 +34,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <smmintrin.h>  // NV-DXVK [WC staging]: _mm_stream_load_si128 (SSE4.1)
+#include <intrin.h>     // NV-DXVK [Perf.WcCopy]: _ReturnAddress for call-site attribution
 #include <tlhelp32.h>   // NV-DXVK [GapSampler]: module snapshot for RIP resolution
 #include <thread>       // NV-DXVK [GapSampler]: the sampler thread
 
@@ -42,7 +48,79 @@
 // movntdqa requires 16-byte-ALIGNED source addresses, so the unaligned head
 // and tail fall back to memcpy; destination alignment is irrelevant
 // (_mm_storeu_si128). Only the SOURCE being WC matters â€” dst is normal heap.
+// NV-DXVK [Perf.WcCopy] 2026-08-06: WHICH caller owns the WC-copy time?
+//
+// [GapSampler] puts 163-190 of ~1890 frame-thread samples (~10%, ~11 ms/frame)
+// in memcpyFromWC's streaming loop, making it the hottest leaf in our code -
+// but a leaf RIP names the callee, never the caller, and this function has a
+// dozen call sites (index snapshots, bone palettes, cb staging, t31 instance
+// buffers, sky snapshots). Reading the code did not settle which one dominates,
+// and guessing has been wrong three times this session, so measure it.
+//
+// _ReturnAddress() is a single register read and this function is already
+// moving bulk memory, so the accounting is free relative to what it measures.
+// Direct-mapped, thread-local, no atomics on the hot path.
+//
+// LIMIT: if a call site gets memcpyFromWC inlined, _ReturnAddress() reports the
+// enclosing function instead. The PDB shows the out-of-line body exists (that
+// is the symbol the sampler names), so most sites report correctly, but treat
+// the attribution as "which region", not a proof of a single line. Resolve the
+// RVAs against public/bin/d3d11.pdb the usual way.
+namespace {
+  constexpr size_t kWcSiteEntries = 128;
+  constexpr size_t kWcSiteProbe   = 4;
+  struct WcSite { const void* ret = nullptr; uint64_t calls = 0; uint64_t bytes = 0; };
+  thread_local WcSite t_wcSites[kWcSiteEntries] {};
+
+  // Runtime kill switch, so this can be ruled out of a hang or a slowdown with
+  // a launch-arg instead of a rebuild. Resolved at load time, NOT lazily:
+  // getenv takes a CRT lock and memcpyFromWC runs on threads that hold DXVK
+  // locks, so a first-use getenv here could invert lock order (see the
+  // deadlock note in util_cond_diag.h - that mistake has already cost one
+  // hang). Zero-initialised to false until dynamic init runs, which only ever
+  // means "not counting yet".
+  inline bool readWcDiagEnv() {
+    const char* v = std::getenv("RTX_WCCOPY_DIAG");
+    return (v == nullptr || v[0] == '\0') ? true : (std::strtol(v, nullptr, 10) != 0);
+  }
+  const bool g_wcDiagEnabled = readWcDiagEnv();
+
+  // Bucketing detail that matters for the ANSWER, not just for tidiness: call
+  // sites are return addresses inside one function's callers, so they cluster
+  // in a narrow RVA range and hash to neighbouring slots. A plain direct-mapped
+  // table would let two real sites land together and repeatedly evict each
+  // other, and both would then under-report - silently corrupting the exact
+  // measurement this exists to make. So: 128 slots, probe 4, and when all four
+  // are taken evict the SMALLEST rather than whatever we landed on, which keeps
+  // the heavy hitters (the only ones being ranked) stable.
+  inline void wcNote(const void* ret, size_t len) {
+    if (!g_wcDiagEnabled)
+      return;
+    const uintptr_t h    = reinterpret_cast<uintptr_t>(ret);
+    const size_t    home = size_t((h ^ (h >> 7)) & (kWcSiteEntries - 1u));
+
+    size_t victim    = home;
+    uint64_t leastBy = ~0ull;
+
+    for (size_t k = 0; k < kWcSiteProbe; ++k) {
+      WcSite& c = t_wcSites[(home + k) & (kWcSiteEntries - 1u)];
+      if (c.ret == ret) { c.calls += 1; c.bytes += len; return; }
+      if (c.ret == nullptr) {
+        c.ret = ret; c.calls = 1; c.bytes = len; return;
+      }
+      if (c.bytes < leastBy) { leastBy = c.bytes; victim = (home + k) & (kWcSiteEntries - 1u); }
+    }
+
+    WcSite& e = t_wcSites[victim];
+    e.ret   = ret;
+    e.calls = 1;
+    e.bytes = len;
+  }
+}
+
 static void memcpyFromWC(void* dst, const void* src, size_t len) {
+  wcNote(_ReturnAddress(), len);
+
   uint8_t* d = static_cast<uint8_t*>(dst);
   const uint8_t* s = static_cast<const uint8_t*>(src);
 
@@ -149,6 +227,32 @@ static uint32_t maxIndexFromWC(const void* src, uint32_t count, uint32_t idxStri
   // serial chain through a 1-cycle-throughput / multi-cycle-latency vmax.
   // Issuing two lines and reducing into two independent accumulators fixes
   // both; they merge once at the end. Still exact, still one pass.
+  // NV-DXVK TOMBSTONE [perf] 2026-08-06: tried WIDENING this from 128 bytes
+  // (2 cache lines, 2 accumulators) to 512 bytes (8 lines, 4 accumulators) on
+  // the theory that the loop was LATENCY-bound — 5.9 KB per scan is 92 lines,
+  // 2 lines per iteration is ~46 dependent round trips, and the core has ~10-12
+  // line-fill buffers, so it looked like 5 of every 6 were sitting idle.
+  //
+  // REFUTED BY MEASUREMENT. Normalised per index (the window's index count rose
+  // 26.8M -> 30.4M, so the raw ms are not comparable):
+  //     128B/2-line:  139.6 ms / 26.76M idx = 5.22 ns/index
+  //     512B/8-line:  192.5 ms / 30.42M idx = 6.33 ns/index   (21% WORSE)
+  // reduce_MBps fell 365 -> 280-301 in the same direction.
+  //
+  // Two things this proves, both worth keeping:
+  //  1. The loop was NOT starved of memory-level parallelism. The out-of-order
+  //     engine already runs ahead across 128-byte iterations and extracts more
+  //     lines-in-flight than the unroll factor suggests, so adding unroll bought
+  //     nothing.
+  //  2. 32 live __m128i against 16 XMM registers spills, and the spill traffic
+  //     is pure added cost once (1) means there is no latency to hide. The
+  //     earlier 1->2 widening helped because it went from genuinely serial to
+  //     parallel; 2->8 was past the knee.
+  //
+  // Do NOT re-attempt by unrolling further. If this scan is attacked again the
+  // targets are the ones outside this loop: the ~20% cache miss rate driven by
+  // TF2's per-frame Map(DISCARD) renames, or removing the consumer entirely
+  // (GPU-side AABB — see the needsMeshBoundingBox tombstone at the call site).
   const uint32_t perIter = 128u / idxStride;  // 64 indices (u16) or 32 (u32)
   if ((count - i) >= perIter) {
     __m128i accA = _mm_setzero_si128();
@@ -347,6 +451,19 @@ static auto memoCamOriginLoc(const CommonShaderT* common)
   static thread_local const void* s_keys[kRdefMemoWays] = {};
   static thread_local LocT        s_vals[kRdefMemoWays] {};
   static thread_local size_t      s_next = 0;
+  static thread_local uint64_t    s_epoch = 0;
+  // NV-DXVK [RdefCache] 2026-08-06: epoch guard. This memo keyed on a raw
+  // shader pointer with no liveness check, so a map change that recycled a
+  // D3D11CommonShader allocation could return the DEAD shader's c_cameraOrigin
+  // offset for a live one. Latent since the memo was added; see g_shaderEpoch.
+  // Qualified: these memo helpers live at global scope (the file's first
+  // `namespace dxvk` opens much further down), so the name would not resolve.
+  const uint64_t epochNow = dxvk::g_shaderEpoch.load(std::memory_order_relaxed);
+  if (epochNow != s_epoch) {
+    for (size_t i = 0; i < kRdefMemoWays; ++i)
+      s_keys[i] = nullptr;
+    s_epoch = epochNow;
+  }
   const void* key = static_cast<const void*>(common);
   for (size_t i = 0; i < kRdefMemoWays; ++i) {
     if (s_keys[i] == key) {
@@ -360,6 +477,281 @@ static auto memoCamOriginLoc(const CommonShaderT* common)
   s_vals[s_next] = loc;
   s_next = (s_next + 1u) % kRdefMemoWays;
   return loc;
+}
+
+// NV-DXVK [CbFieldMemo] 2026-08-06: (shader, cbuffer, field) memo for the
+// per-draw RDEF field lookups. Introduced for the EngineSunCapture path and
+// since adopted by CaptureSkyProbeCubeFromCb, which had the same raw-lookup
+// defect - hence the general name.
+//
+// WHY. CaptureEngineSunFromCb has a once-per-frame success latch, but it arms
+// ONLY after every read succeeds. Its three early-outs (!gotDir || !gotColor,
+// magSq < 1e-6, colMag < 1e-3) return without arming it, and that is
+// deliberate - a draw that cannot see the fields must not suppress a later
+// draw that can, which is what preserves "latch even on the depth pre-pass".
+// The consequence is that every draw BEFORE the first success - nearly all
+// ~1200 of them, since most shaders never declare CBufCommonPerCamera - runs
+// the full ~20-lookup gauntlet and fails. [GapSampler] measured 18% of the
+// frame thread in exactly those lines (d3d11_rtx.cpp:35565/35567/35635), and
+// FindCBField takes const std::string&, so each of those lookups
+// heap-allocates a temp string and hashes two maps (see the C++20 TODO on
+// D3D11CommonShader). This makes the retry ~free instead of removing it.
+//
+// Cannot reuse memoCamOriginLoc: its table is keyed on the shader ALONE
+// because the field name is a constant of that memo. Here the name varies
+// across c_sunDir, c_sunColor, c_skyColor, c_fogColorFactor,
+// c_sunHighlightSize, c_maxLightingValue, c_envMapLightScale,
+// c_forceExposure and c_fogParams, so the key must be the tuple.
+//
+// Names are keyed by literal POINTER, never by string compare - that is the
+// whole point, since a string compare is what we are removing. Every call
+// site passes the same literal every time so its address is stable; two
+// unmerged literals with equal text simply occupy two entries, which is
+// correct and only slightly less dense.
+//
+// WHAT IS CACHED, PRECISELY: the {slot, offset, size} LOCATION reflection
+// reports for a field. That is a property of the compiled shader and fixed
+// for its lifetime. NOT the value. The sun/sky/fog values are per-MAP
+// constants and are still re-read from the mapped cbuffer on every capture,
+// so a map change republishes new values on the next frame's capture exactly
+// as before - this memo cannot freeze them.
+//
+// NEGATIVES ARE CACHED TOO, and that is most of the win: "this shader does
+// not declare c_sunDir" is the answer for almost every draw, and it is
+// currently the most expensive answer to recompute.
+//
+// Direct-mapped rather than the 8-way scan above: the working set here is
+// (shaders in flight x ~9 fields x 2 stages), too big for a linear scan that
+// runs 20 times per draw. A collision costs one re-resolve, never a wrong
+// answer, because both key halves are compared on hit.
+std::atomic<uint64_t> g_cbFieldMemoHits   { 0 };
+std::atomic<uint64_t> g_cbFieldMemoMisses { 0 };
+
+static constexpr size_t kCBFieldMemoEntries = 256;   // power of two
+
+template<typename CommonShaderT>
+static auto memoCBFieldLoc(const CommonShaderT* common,
+                            const char* cbName,
+                            const char* fieldName)
+    -> decltype(common->FindCBField("", "")) {
+  using LocT = decltype(common->FindCBField("", ""));
+  struct Entry {
+    const void* shader = nullptr;
+    const char* cb     = nullptr;
+    const char* field  = nullptr;
+    LocT        val    {};
+  };
+  static thread_local Entry    s_tab[kCBFieldMemoEntries] {};
+  static thread_local uint64_t s_epoch = 0;
+
+  // Qualified: these memo helpers live at global scope (the file's first
+  // `namespace dxvk` opens much further down), so the name would not resolve.
+  const uint64_t epochNow = dxvk::g_shaderEpoch.load(std::memory_order_relaxed);
+  if (epochNow != s_epoch) {
+    for (size_t i = 0; i < kCBFieldMemoEntries; ++i)
+      s_tab[i].shader = nullptr;
+    s_epoch = epochNow;
+  }
+
+  const uintptr_t hs = reinterpret_cast<uintptr_t>(common)    >> 4;
+  const uintptr_t hf = reinterpret_cast<uintptr_t>(fieldName) >> 2;
+  Entry& e = s_tab[(hs * 0x9E3779B97F4A7C15ull ^ hf) & (kCBFieldMemoEntries - 1u)];
+
+  if (e.shader == static_cast<const void*>(common)
+   && e.cb     == cbName
+   && e.field  == fieldName) {
+    g_cbFieldMemoHits.fetch_add(1, std::memory_order_relaxed);
+    return e.val;
+  }
+
+  g_cbFieldMemoMisses.fetch_add(1, std::memory_order_relaxed);
+  LocT loc  = common->FindCBField(cbName, fieldName);
+  e.shader  = common;
+  e.cb      = cbName;
+  e.field   = fieldName;
+  e.val     = loc;
+  return loc;
+}
+
+// NV-DXVK [ResSlotMemo] 2026-08-06: the FindResourceSlot twin of
+// memoCBFieldLoc above. Same key shape (shader + literal name POINTER, never a
+// string compare), same epoch guard, same direct-mapped table, same reason:
+// FindResourceSlot takes `const std::string&`, so every call from a per-draw
+// path heap-allocates a temp string and hashes the resource map.
+//
+// Its own table rather than a shared one with memoCBFieldLoc, because the
+// value types differ (uint32_t slot vs a {slot,offset,size} location) and
+// folding them would only halve the effective density of each.
+//
+// Same "location not value" rule applies: a resource's bind slot is a property
+// of the compiled shader and fixed for its lifetime. The RESOURCE bound to that
+// slot changes constantly and is still read live at every use site.
+std::atomic<uint64_t> g_resSlotMemoHits   { 0 };
+std::atomic<uint64_t> g_resSlotMemoMisses { 0 };
+
+// NV-DXVK [EngineSun.why] 2026-08-06: CaptureEngineSunFromCb has NEVER
+// published, in this session's log or any previous one — zero [EngineSun.
+// publish] lines — while still costing 1.27 ms/frame (tc_sun_ns), because its
+// once-per-frame latch arms only on success and it never succeeds. So it
+// re-runs the full gauntlet on all ~1500 draws of every frame, forever, to
+// produce nothing. The atmosphere has consequently never received engine sun
+// data at all.
+//
+// Which of the seven early-outs fires has never been measured, and the
+// candidates need completely different fixes: a field the shaders do not
+// declare is a naming problem (rtx.atmosphere.dumpEngineSunCBFields), a null
+// mapPtr is the device-local-cbuffer problem this codebase has hit repeatedly,
+// and a zero magSq/colMag is a "we are reading the wrong draw" problem. One
+// relaxed increment per draw on a path already costing 0.85 us/draw settles it
+// in a single run instead of a guess.
+enum SunWhy : uint32_t {
+  kSunPublished = 0,  // reached publishEngineSunCapture
+  kSunNoLoc,          // field not declared / bad slot / size < 12
+  kSunNoCb,           // cb.buffer == nullptr
+  kSunNoMap,          // GetMappedSlice().mapPtr == nullptr (device-local?)
+  kSunRange,          // base + 12 > ByteWidth
+  kSunNonFinite,      // NaN/Inf in the three floats
+  kSunMagSq,          // direction is zero-length (depth/shadow pass pushes zeros)
+  kSunColMag,         // colour is black
+  kSunUnused,         // field declared but fxc marked it [unused] on this shader
+  kSunWhyCount
+};
+std::atomic<uint64_t> g_sunWhy[kSunWhyCount] {};
+
+static constexpr size_t kResSlotMemoEntries = 128;   // power of two
+
+template<typename CommonShaderT>
+static uint32_t memoResourceSlot(const CommonShaderT* common, const char* resName) {
+  struct Entry {
+    const void* shader = nullptr;
+    const char* name   = nullptr;
+    uint32_t    slot   = UINT32_MAX;
+  };
+  static thread_local Entry    s_tab[kResSlotMemoEntries] {};
+  static thread_local uint64_t s_epoch = 0;
+
+  // Qualified: these memo helpers live at global scope (the file's first
+  // `namespace dxvk` opens much further down), so the name would not resolve.
+  const uint64_t epochNow = dxvk::g_shaderEpoch.load(std::memory_order_relaxed);
+  if (epochNow != s_epoch) {
+    for (size_t i = 0; i < kResSlotMemoEntries; ++i)
+      s_tab[i].shader = nullptr;
+    s_epoch = epochNow;
+  }
+
+  const uintptr_t hs = reinterpret_cast<uintptr_t>(common)  >> 4;
+  const uintptr_t hn = reinterpret_cast<uintptr_t>(resName) >> 2;
+  Entry& e = s_tab[(hs * 0x9E3779B97F4A7C15ull ^ hn) & (kResSlotMemoEntries - 1u)];
+
+  if (e.shader == static_cast<const void*>(common) && e.name == resName) {
+    g_resSlotMemoHits.fetch_add(1, std::memory_order_relaxed);
+    return e.slot;
+  }
+
+  g_resSlotMemoMisses.fetch_add(1, std::memory_order_relaxed);
+  const uint32_t slot = common->FindResourceSlot(resName);
+  e.shader = common;
+  e.name   = resName;
+  e.slot   = slot;
+  return slot;
+}
+
+// NV-DXVK [SunLocMemo] 2026-08-06: resolve the ENTIRE sun read for a shader in
+// one memo probe.
+//
+// The per-draw path used to call memoCBFieldLoc FOUR times (c_sunDir and
+// c_sunColor, each tried on VS then PS) and then GetMappedSlice up to four
+// times. But [EngineSun.zero] confirmed what the layout already implied: both
+// fields live in the SAME cbuffer (CBufCommonPerCamera, dirSlot=2 colSlot=2),
+// so one slot resolution and ONE mapped pointer serve both reads.
+//
+// This collapses that to a single 8-way probe returning both offsets plus a
+// viability verdict, and lets a shader that cannot supply the sun bail before
+// touching a constant buffer at all. Viability is the full test — both fields
+// declared, >= 12 bytes, a legal slot, the same slot, and both marked
+// D3D_SVF_USED — so a caller that gets viable==true needs no further checks
+// beyond the buffer binding itself.
+//
+// Same epoch guard and same "location not value" rule as memoCBFieldLoc: the
+// offsets are properties of the compiled shader, the VALUES are still read
+// fresh from the mapped cbuffer on every capture.
+struct SunFieldLocs {
+  uint32_t slot      = UINT32_MAX;
+  uint32_t dirOffset = 0;
+  uint32_t colOffset = 0;
+  bool     viable    = false;
+  // Carried so the reject path can say WHY without a second, uncached
+  // FindCBField — that lookup would run on the majority of draws (the
+  // non-viable ones) and hand back the per-draw string-keyed cost this memo
+  // exists to remove.
+  bool     declared  = false;   // both fields present in RDEF, whatever their used flag
+};
+
+// DIRECT-MAPPED, 256 entries — NOT the 8-way scan used by memoModelInstSlot.
+//
+// NV-DXVK 2026-08-06: this was 8-way on its first version and it REGRESSED the
+// sun path from 4.51 to 8.64 ms/frame. [Perf.PrepSplit] named it exactly:
+// rdefMemo misses went 8,118 -> 36,046 per window while cbMemo (the 256-entry
+// direct-mapped table this replaced) fell from 90,648 hits at 98.7% to nothing.
+// Every miss here costs TWO string-keyed FindCBField calls, each of which
+// heap-allocates a temp std::string and hashes two maps, so ~28k extra misses
+// per window is ~56k extra RDEF lookups.
+//
+// The cause is the one memoCBFieldLoc's own comment already gives for choosing
+// direct-mapped over the 8-way scan: TF2 keeps far more than eight shaders in
+// flight, so an 8-entry round-robin table thrashes. The key here is the shader
+// ALONE (the field names are constants of this memo), which is a smaller key
+// space than memoCBFieldLoc's (shader x field) — 256 entries is ample.
+//
+// Counters are the cbField pair on purpose: this call replaced memoCBFieldLoc
+// on the sun path, so cbMemo's hitPct stays directly comparable to the 98.7%
+// baseline it used to report.
+template<typename CommonShaderT>
+static SunFieldLocs memoSunLocs(const CommonShaderT* common) {
+  struct Entry {
+    const void*  shader = nullptr;
+    SunFieldLocs val    {};
+  };
+  static thread_local Entry    s_tab[kCBFieldMemoEntries] {};
+  static thread_local uint64_t s_epoch = 0;
+
+  if (common == nullptr) {
+    return SunFieldLocs {};
+  }
+
+  const uint64_t epochNow = dxvk::g_shaderEpoch.load(std::memory_order_relaxed);
+  if (epochNow != s_epoch) {
+    for (size_t i = 0; i < kCBFieldMemoEntries; ++i)
+      s_tab[i].shader = nullptr;
+    s_epoch = epochNow;
+  }
+
+  const uintptr_t hs = reinterpret_cast<uintptr_t>(common) >> 4;
+  Entry& e = s_tab[(hs * 0x9E3779B97F4A7C15ull >> 32) & (kCBFieldMemoEntries - 1u)];
+  if (e.shader == static_cast<const void*>(common)) {
+    g_cbFieldMemoHits.fetch_add(1, std::memory_order_relaxed);
+    return e.val;
+  }
+  g_cbFieldMemoMisses.fetch_add(1, std::memory_order_relaxed);
+
+  SunFieldLocs out;
+  const auto dirLoc = common->FindCBField("CBufCommonPerCamera", "c_sunDir");
+  const auto colLoc = common->FindCBField("CBufCommonPerCamera", "c_sunColor");
+  out.declared = dirLoc.has_value() && colLoc.has_value();
+  if (dirLoc.has_value() && colLoc.has_value()
+      && dirLoc->size >= 12 && colLoc->size >= 12
+      && dirLoc->slot == colLoc->slot
+      && dirLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
+      && dirLoc->used && colLoc->used) {
+    out.slot      = dirLoc->slot;
+    out.dirOffset = dirLoc->offset;
+    out.colOffset = colLoc->offset;
+    out.viable    = true;
+  }
+
+  e.shader = common;
+  e.val    = out;
+  return out;
 }
 
 // NV-DXVK [Perf.InstBufCache]: same question for m_instBufCache, the other
@@ -1490,8 +1882,21 @@ namespace dxvk {
     std::atomic<uint32_t> g_vqSyscalls { 0 };
     std::atomic<uint64_t> g_vqNanos { 0 };
 
+    // NV-DXVK [perf/VQCache] 2026-08-06: bumped once per frame from the same
+    // EndFrame site that calls flushPerFrame(). studioMemReadable's region
+    // cache clears on a change, which bounds how stale a cached region can be
+    // to ONE FRAME. The previous single-entry cache had no bound at all: a
+    // caller that kept hitting could ride a region result for the whole
+    // session. This is the epoch, not the frame id, precisely so the cache
+    // does not need to reach the device (it is a free function used from
+    // worker threads that have no DxvkDevice in scope).
+    std::atomic<uint32_t> g_vqEpoch { 0 };
+
     // Called once per frame from cullOffUpdate (EndFrame).
     inline void flushPerFrame() {
+      // Bump BEFORE the perfGapSampler early-out below: the region cache's
+      // staleness bound must hold whether or not the census is being logged.
+      g_vqEpoch.fetch_add(1u, std::memory_order_relaxed);
       if (!RtxOptions::perfGapSampler())
         return;                                   // rides the same diagnostic flag
       uint32_t v[kSiteCount]; uint32_t total = 0;
@@ -1529,27 +1934,62 @@ namespace dxvk {
   // syscall and this guard is called from per-draw paths.
   static bool studioMemReadable(const void* p, size_t n) {
     vqprobe::hit(vqprobe::kStudioReadable);
-    // NV-DXVK [perf] 2026-08-06: single-entry region cache. VirtualQuery is a
+    // NV-DXVK [perf] 2026-08-06: N-way region cache. VirtualQuery is a
     // SYSCALL (ntdll!ZwQueryVirtualMemory — the [GapSampler] top hit at
     // 58-70% of the present thread), and this guard has 109 call sites, many
     // of them inside per-renderable loops that re-query the SAME committed
     // region thousands of times per frame. A VirtualQuery returns the whole
     // enclosing region, so one result answers every subsequent query inside
-    // it; remembering the last region turns a run of queries over one object
-    // (or one heap block) into a pointer compare.
+    // it; remembering regions turns a run of queries over one object (or one
+    // heap block) into a pointer compare.
     //
-    // SAFETY: this can only go stale by becoming OPTIMISTIC if a region is
-    // decommitted between calls — the same window the un-cached form already
-    // has (query, then deref). It is refreshed on every miss, holds one
-    // region only, and is thread_local so no lock and no cross-thread view.
-    // Kept deliberately dumb: no map, no eviction policy, no size growth.
-    struct VqRegion { uintptr_t start, end; bool readable; };
-    static thread_local VqRegion t_last { 0, 0, false };
-    const uintptr_t addr = reinterpret_cast<uintptr_t>(p);
-    if (p != nullptr && addr >= t_last.start && (addr + n) <= t_last.end)
-      return t_last.readable;
+    // WHY N-WAY AND NOT ONE ENTRY. The original cache held a single region,
+    // which gives a 0% hit rate to any caller that ALTERNATES between two
+    // regions — and studioReadMaterialName does that by construction: it
+    // guards matPtr (engine object heap), then guards the name pointer read
+    // out of it (string heap). Every call evicted the other's entry, so both
+    // queries missed, every time. [VQProbe] measured the result directly:
+    // 978 guard calls/frame, 384 of them reaching the syscall, 15.2 us per
+    // syscall (not the ~1 us a VAD lookup costs — these block on the process
+    // address-space lock, which the game's own streaming holds constantly) =
+    // 5.86 ms/frame, ~15% of our whole CPU budget. Eight ways covers the
+    // handful of distinct regions any one call site alternates across.
+    //
+    // SAFETY: a cached region can only go stale by becoming OPTIMISTIC if it
+    // is decommitted between calls — the same window the un-cached form
+    // already has (query, then deref). The table is thread_local (no lock, no
+    // cross-thread view) and is CLEARED EVERY FRAME via vqprobe::g_vqEpoch,
+    // which makes this strictly safer than the single-entry version it
+    // replaces: that one was refreshed only on a miss, so a caller that kept
+    // hitting could ride one region result indefinitely. Now nothing survives
+    // a frame boundary.
+    struct VqRegion { uintptr_t start, end; };
+    static constexpr size_t kVqWays = 8;
+    static thread_local VqRegion t_regions[kVqWays] {};
+    static thread_local size_t   t_nextWay = 0;
+    static thread_local uint32_t t_vqEpoch = UINT32_MAX;
+
     if (p == nullptr)
       return false;
+
+    const uint32_t vqEpochNow = vqprobe::g_vqEpoch.load(std::memory_order_relaxed);
+    if (vqEpochNow != t_vqEpoch) {
+      for (size_t i = 0; i < kVqWays; ++i)
+        t_regions[i] = { 0, 0 };
+      t_vqEpoch  = vqEpochNow;
+      t_nextWay  = 0;
+    }
+
+    // Only committed+readable regions are ever stored (see the publish below),
+    // so a containment hit IS the readable answer — there is no cached-reject
+    // case to distinguish. Empty ways are {0,0} and can never contain a span
+    // of non-zero length, so they need no separate validity flag.
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(p);
+    for (size_t i = 0; i < kVqWays; ++i) {
+      if (addr >= t_regions[i].start && (addr + n) <= t_regions[i].end)
+        return true;
+    }
+
     MEMORY_BASIC_INFORMATION mbi = {};
     // [VQProbe] timed syscall — see g_vqNanos.
     const auto vqT0 = std::chrono::steady_clock::now();
@@ -1574,8 +2014,11 @@ namespace dxvk {
     // Publish the region for the cache above. Only committed+readable regions
     // are cached: every early return before this point is a REJECT, and
     // caching a reject would have to prove the whole span shares one region,
-    // which it has not.
-    t_last = { start, end, true };
+    // which it has not. Round-robin replacement — no recency policy, because
+    // the working set here is a handful of long-lived regions per call site
+    // and anything smarter would cost more than the compare it saves.
+    t_regions[t_nextWay] = { start, end };
+    t_nextWay = (t_nextWay + 1u) % kVqWays;
     return a >= start && (a + n) <= end;
   }
 
@@ -7763,6 +8206,19 @@ namespace dxvk {
   // Remainder (viewport fallback tail) stays in xt_srcFb.
   static thread_local int64_t s_perfXtSfCamAcc = 0, s_perfXtSfCamMax = 0;
   static thread_local int64_t s_perfXtSfO2wAcc = 0, s_perfXtSfO2wMax = 0;
+  // NV-DXVK [perf] 2026-08-06: sf_o2w sub-split. sf_o2w is 1.516 ms/frame —
+  // 32% of bt_extractXf and its single largest leaf — but it spans ~530 lines
+  // covering two unrelated transform sources, so the number names no culprit.
+  //   o2w_ilf  — input-layout semantic facts + t31 eligibility (memoIlFacts)
+  //   o2w_t31  — instanced path: g_modelInst RDEF slot, SRV resolve,
+  //              GetMappedSlice, and the 48-byte memcpyFromWC per draw
+  //   sf_o2w   — REMAINDER: the legacy t30 bone path
+  // The t31 block is the one that touches write-combined memory every draw, so
+  // if o2w_t31 dominates the cost is the WC read and the fix is caching the
+  // per-instance entry; if the remainder dominates it is the bone path and the
+  // WC read is a red herring. Gated on RTX_D3D11_SUBMARK like the other splits.
+  static thread_local int64_t s_perfO2wIlfAcc = 0, s_perfO2wIlfMax = 0;
+  static thread_local int64_t s_perfO2wT31Acc = 0, s_perfO2wT31Max = 0;
   // xt_w2v split: view-matrix scan, Z-up detect, camera smoothing, world matrix
   static thread_local int64_t s_perfXtW2vScanAcc     = 0, s_perfXtW2vScanMax     = 0;
   // NV-DXVK: w2v_scan (view-matrix discovery) split â€” w2vsCached = path-5 cached
@@ -8009,6 +8465,23 @@ namespace dxvk {
   static thread_local int64_t s_perfTeCensusAcc  = 0, s_perfTeCensusMax  = 0;
   static thread_local int64_t s_perfTePropIdAcc  = 0, s_perfTePropIdMax  = 0;
   static thread_local int64_t s_perfTeTraceAcc   = 0, s_perfTeTraceMax   = 0;
+  // NV-DXVK [perf] 2026-08-06: tail_emit is the largest row in SubmitDraw
+  // (4.38 ms/frame) but its four te_* children only account for 1.85 of it and
+  // emitCs_ns reads 0 — so ~2.5 ms/frame, the biggest single unexplained block
+  // left, sits in the span between the te_trace mark and the EmitCs hand-off.
+  // Cut it the same way pf_setup was cut, rather than theorising:
+  //   te_memoDup  MemoCeiling + DupPass probes (both option-gated, expect ~0 —
+  //               if this is NOT ~0 the gates are not doing what they claim)
+  //   te_phase2   capturePhase2 block
+  //   te_srcGeo   captureSourceGeometry — the s2s source-bake capture, the one
+  //               block in here that does real per-draw copying
+  //   tail_emit   REMAINDER: the move-capture + batch-arena/EmitCs hand-off
+  // markSub not markStg: three more clock reads per draw is ~0.17 ms/frame on
+  // the very path being measured, which is larger than some of the buckets.
+  // RTX_D3D11_SUBMARK=1 turns these on together with the pfs_/pff_ splits.
+  static thread_local int64_t s_perfTeMemoDupAcc = 0, s_perfTeMemoDupMax = 0;
+  static thread_local int64_t s_perfTePhase2Acc  = 0, s_perfTePhase2Max  = 0;
+  static thread_local int64_t s_perfTeSrcGeoAcc  = 0, s_perfTeSrcGeoMax  = 0;
 
   bool D3D11Rtx::OnDraw(UINT vertexCount, UINT startVertex) {
     ++m_rawDrawCount;
@@ -11160,6 +11633,23 @@ namespace dxvk {
       tXt = now;
     };
 
+    // NV-DXVK [perf] 2026-08-06: markXtSub — markXt for OPTIONAL subdivisions,
+    // same contract as markSub in SubmitDraw. Returns before touching the clock
+    // AND before advancing tXt, so with it off the parent bucket is unchanged
+    // and the sub-buckets read 0 (meaning "not measured", not "free").
+    //
+    // Gated because bt_extractXf is already cut 21 ways and its children sum to
+    // 4.53 of its 4.70 ms/frame — there is no unattributed block left to find,
+    // so any further split is bisection scaffolding for a specific question
+    // rather than a permanent stage. Two unconditional clock reads per draw
+    // would be ~0.12 ms/frame, which is larger than several of the leaves.
+    // Shares RTX_D3D11_SUBMARK with the pf_setup and tail_emit splits.
+    auto markXtSub = [&tXt, &markXt](int64_t& acc, int64_t& max) {
+      if (!s_submitDrawSubMarkers)
+        return;
+      markXt(acc, max);
+    };
+
     // NV-DXVK: Reset per-call.  Will be set to true below only if no real
     // perspective matrix is found in any cbuffer and the viewport fallback
     // block ends up running.  SubmitDraw reads this immediately after the
@@ -13494,6 +13984,7 @@ namespace dxvk {
           sfInstSemSlot       = ilf.instSemSlot;
           sfInstSemByteOffset = ilf.instSemByteOffset;
         }
+        markXtSub(s_perfO2wIlfAcc, s_perfO2wIlfMax);  // [o2w_ilf] IlFacts + eligibility
         bool gotBoneTransform = false;
         {
           // Heavy diagnostic logging: tag every step so we can see exactly
@@ -13793,6 +14284,7 @@ namespace dxvk {
             }
           }
         }
+        markXtSub(s_perfO2wT31Acc, s_perfO2wT31Max);  // [o2w_t31] instanced path incl. WC entry read
 
         // Legacy t30 bone path â€” only used when the t31 path above didn't
         // produce a transform (skinned characters / non-BSP draws).
@@ -20905,12 +21397,32 @@ namespace dxvk {
           m_curStudioName[sizeof(m_curStudioName) - 1] = '\0';
           if (m_curStudioName[0]) m_curStudioNameWhy = 0;  // resolved
 
-          if (hideWidow && m_curDrawIsWidow)
+          // NV-DXVK [widow-gate braces] 2026-08-06: these two `if`s had NO
+          // braces, so each guarded only its `m_meshTraceCp = __LINE__;` and
+          // the `return;` beneath it ran UNCONDITIONALLY. Any draw that got
+          // here — i.e. any studiorender model draw, whenever ANY of
+          // hide/isolate/detect/dumpNames/pickActive was on — was dropped from
+          // raytracing regardless of whether it was the Widow. The second `if`
+          // was unreachable dead code, which is what proves braces were meant:
+          // an unconditional return after the first one can never fall through
+          // to an isolate test.
+          //
+          // Dormant in this config for two independent reasons (both of which
+          // can change): pickActive is false because rtx.logSurfaceCoverage is
+          // off, and g_curStudioMaterialSlot is null because
+          // tf2patches::kEnableEnginePatches is compile-time false. The moment
+          // the engine patches go back on — which the conf notes plan for —
+          // flipping tf2DetectWidow or the pick tool would have made every
+          // studio model vanish, in a session whose open bug is studio models
+          // vanishing.
+          if (hideWidow && m_curDrawIsWidow) {
             m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
             return;   // hide the Widow by engine model name
-          if (isolateWidow && !m_curDrawIsWidow)
+          }
+          if (isolateWidow && !m_curDrawIsWidow) {
             m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
             return;   // isolate: drop every other studiorender model
+          }
         }
       }
     }
@@ -30958,13 +31470,35 @@ namespace dxvk {
       // vbPtr/ibPtr are printed so the log can also say whether the engine
       // gives these draws a per-slot buffer identity (stable pointers per
       // batch) that could upgrade class identity to slot identity later.
+      // NV-DXVK [perf/DrawNameGate] 2026-08-06: everything below is bounded to
+      // 256 emitted lines, but it used to pay its FULL cost on every probe-VS
+      // draw forever — and with rtx.findSimilarProbeVsHashes aimed at 0x292b
+      // (the shared sky/hull VS) that is most of the frame's ~1500 draws. The
+      // expensive parts are studioReadMaterialName (two VirtualQuery-guarded
+      // reads = the 5.86 ms/frame [VQProbe] found) and a formatted std::string
+      // + global mutex + string hash per draw.
+      //
+      // Two fast-outs, both output-EQUIVALENT (neither can suppress a line the
+      // old code would have emitted):
+      //   1. sDnFull — once 256 distinct keys are in, `sDnSeen.size() < 256`
+      //      is false forever, so no further line can ever be emitted and the
+      //      whole block is dead weight. Latch it and skip.
+      //   2. t_dnSeenLocal — a thread-local set of key hashes this thread has
+      //      already pushed into sDnSeen. A repeat is a guaranteed
+      //      insert(...).second == false, i.e. the old code did all the work
+      //      to reach `dnFirst = false`. Skipping it changes nothing but cost.
+      //      Keyed on (vs, matPtr, vbPtr) — the integer triple, resolvable
+      //      WITHOUT reading the material name, which is the whole point.
+      //
+      // The name is still part of the global key (a recycled matPtr under a
+      // new name must produce a new line — that is the pointer-churn finding
+      // this probe exists to make), so a local miss still does the full,
+      // exact, name-inclusive path. Local misses are bounded by the number of
+      // distinct triples, which the log shows is ~150 for a session.
+      static std::atomic<bool> sDnFull { false };
       if (isOptProbeVs
+          && !sDnFull.load(std::memory_order_relaxed)
           && dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
-        char dnName[64] = {};
-        if (t_matsysMatPtr != 0) {
-          const char* dnm = studioReadMaterialName(t_matsysMatPtr);
-          if (dnm != nullptr) { const size_t dn = ::strnlen(dnm, 63); std::memcpy(dnName, dnm, dn); }
-        }
         static std::mutex sDnMu;
         static std::unordered_set<std::string> sDnSeen;
         const auto& dnIa = m_context->m_state.ia;
@@ -30972,32 +31506,53 @@ namespace dxvk {
           ? reinterpret_cast<uint64_t>(dnIa.vertexBuffers[0].buffer.ptr()) : 0ull;
         const uint64_t dnIbPtr = (dnIa.indexBuffer.buffer != nullptr)
           ? reinterpret_cast<uint64_t>(dnIa.indexBuffer.buffer.ptr()) : 0ull;
-        // matPtr AND vbPtr are part of the key ON PURPOSE:
-        //  - if the engine's IMaterial* for one material name is unstable
-        //    (pointer churn), the cap fills with same-name-different-ptr
-        //    lines — exactly the finding that would disqualify
-        //    engineMaterialPtr as identity;
-        //  - the number of distinct vbPtr per (vs, material) says whether
-        //    each batch slot keeps its own stable buffer object (per-slot
-        //    identity upgrade possible) or all slots share one dynamic
-        //    buffer (class identity is the ceiling).
-        const std::string dnKey = str::format("0x", std::hex, vsXxhRt, "|", t_matsysMatPtr, "|", dnVbPtr, std::dec, "|",
-                                              (dnName[0] ? dnName : "(none)"));
-        bool dnFirst = false;
-        {
-          std::lock_guard<std::mutex> lkDn(sDnMu);
-          if (sDnSeen.size() < 256 && sDnSeen.insert(dnKey).second) dnFirst = true;
-        }
-        if (dnFirst) {
-          Logger::info(str::format(
-            "[DrawName] vs=0x", std::hex, vsXxhRt, std::dec,
-            " mat=", (dnName[0] ? dnName : "(none)"),
-            " matPtr=0x", std::hex, t_matsysMatPtr,
-            " vbPtr=0x", dnVbPtr,
-            " ibPtr=0x", dnIbPtr, std::dec,
-            " idxCount=", dcs.geometryData.indexCount,
-            " vtxCount=", dcs.geometryData.vertexCount,
-            " id=", dcs.drawCallID));
+
+        // Cheap integer identity for the triple, mixed with the same constant
+        // the other memos in this file use. Collisions only lose a log line
+        // that would have been a duplicate in ~all cases, and cost nothing.
+        uint64_t dnLocalKey = vsXxhRt * 0x9E3779B97F4A7C15ull;
+        dnLocalKey ^= (t_matsysMatPtr + 0x165667B19E3779F9ull);
+        dnLocalKey *= 0x9E3779B97F4A7C15ull;
+        dnLocalKey ^= (dnVbPtr + 0x27D4EB2F165667C5ull);
+        static thread_local std::unordered_set<uint64_t> t_dnSeenLocal;
+        // Insert eagerly: a NEW triple runs the full path once, and every
+        // repeat of it thereafter is a hit that costs one hash lookup.
+        if (t_dnSeenLocal.insert(dnLocalKey).second) {
+          char dnName[64] = {};
+          if (t_matsysMatPtr != 0) {
+            const char* dnm = studioReadMaterialName(t_matsysMatPtr);
+            if (dnm != nullptr) { const size_t dn = ::strnlen(dnm, 63); std::memcpy(dnName, dnm, dn); }
+          }
+          // matPtr AND vbPtr are part of the key ON PURPOSE:
+          //  - if the engine's IMaterial* for one material name is unstable
+          //    (pointer churn), the cap fills with same-name-different-ptr
+          //    lines — exactly the finding that would disqualify
+          //    engineMaterialPtr as identity;
+          //  - the number of distinct vbPtr per (vs, material) says whether
+          //    each batch slot keeps its own stable buffer object (per-slot
+          //    identity upgrade possible) or all slots share one dynamic
+          //    buffer (class identity is the ceiling).
+          const std::string dnKey = str::format("0x", std::hex, vsXxhRt, "|", t_matsysMatPtr, "|", dnVbPtr, std::dec, "|",
+                                                (dnName[0] ? dnName : "(none)"));
+          bool dnFirst = false;
+          {
+            std::lock_guard<std::mutex> lkDn(sDnMu);
+            if (sDnSeen.size() < 256 && sDnSeen.insert(dnKey).second) dnFirst = true;
+            // Latch the cap under the same lock that owns the size, so the
+            // fast-out above can never race ahead of the last emitted line.
+            if (sDnSeen.size() >= 256) sDnFull.store(true, std::memory_order_relaxed);
+          }
+          if (dnFirst) {
+            Logger::info(str::format(
+              "[DrawName] vs=0x", std::hex, vsXxhRt, std::dec,
+              " mat=", (dnName[0] ? dnName : "(none)"),
+              " matPtr=0x", std::hex, t_matsysMatPtr,
+              " vbPtr=0x", dnVbPtr,
+              " ibPtr=0x", dnIbPtr, std::dec,
+              " idxCount=", dcs.geometryData.indexCount,
+              " vtxCount=", dcs.geometryData.vertexCount,
+              " id=", dcs.drawCallID));
+          }
         }
       }
       const bool isMtnPlaceVs =
@@ -31019,21 +31574,45 @@ namespace dxvk {
         // draw of each shader.
         static std::mutex sRtMu;
         static uint32_t sRtCaptureFrame = UINT32_MAX;
+        // NV-DXVK [perf/MtnPlaceGate] 2026-08-06: sRtCaptureFrame is latched to
+        // exactly one frame, so once that frame is BEHIND us this probe can
+        // never log again from the latch path — yet it still took the global
+        // mutex on every probe-VS draw, forever. Publish the latched frame to a
+        // relaxed atomic and answer from that; the mutex is now only taken
+        // while the latch is still open (a handful of frames at startup).
+        // Reading a stale value is harmless: it can only be UINT32_MAX one
+        // frame longer than necessary, which re-takes the lock, which is the
+        // slow path we are leaving intact anyway.
+        static std::atomic<uint32_t> sRtCaptureFramePub { UINT32_MAX };
         bool logRt = false;
         {
-          std::lock_guard<std::mutex> lkRt(sRtMu);
-          if (sRtCaptureFrame == UINT32_MAX && g_engineSkyMainAnchorValid != 0u) {
-            sRtCaptureFrame = frameRt;
+          const uint32_t pubFrame = sRtCaptureFramePub.load(std::memory_order_relaxed);
+          if (pubFrame == UINT32_MAX) {
+            std::lock_guard<std::mutex> lkRt(sRtMu);
+            if (sRtCaptureFrame == UINT32_MAX && g_engineSkyMainAnchorValid != 0u) {
+              sRtCaptureFrame = frameRt;
+              sRtCaptureFramePub.store(frameRt, std::memory_order_relaxed);
+            }
+            logRt = (sRtCaptureFrame != UINT32_MAX && frameRt == sRtCaptureFrame);
+          } else {
+            logRt = (frameRt == pubFrame);
           }
-          logRt = (sRtCaptureFrame != UINT32_MAX && frameRt == sRtCaptureFrame);
         }
         // The single-frame latch above is right for the mountain-row snapshot
         // it was built for, but useless for an option-driven probe: the whole
         // question there is whether inSubView FLIPS between frames, which one
         // frame cannot show. Give those their own across-frame budget.
-        if (!logRt && isOptProbeVs) {
-          static std::atomic<uint32_t> sOptRtN { 0 };
-          logRt = (sOptRtN.fetch_add(1, std::memory_order_relaxed) < 512u);
+        //
+        // The budget is spent after 512 lines, but fetch_add kept running on
+        // every draw past that — an unconditional lock xadd on a line shared
+        // with every other probe-VS draw. Latch the exhaustion in a relaxed
+        // load so the common (spent) case is a plain read.
+        static std::atomic<uint32_t> sOptRtN { 0 };
+        static std::atomic<bool>     sOptRtSpent { false };
+        if (!logRt && isOptProbeVs && !sOptRtSpent.load(std::memory_order_relaxed)) {
+          const uint32_t n = sOptRtN.fetch_add(1, std::memory_order_relaxed);
+          logRt = (n < 512u);
+          if (n >= 512u) sOptRtSpent.store(true, std::memory_order_relaxed);
         }
         if (logRt) {
           const auto& T = dcs.transformData;
@@ -33189,6 +33768,8 @@ namespace dxvk {
       }
     }
 
+    markSub(s_perfTeMemoDupAcc, s_perfTeMemoDupMax);  // [te_memoDup] MemoCeiling + DupPass probes
+
     // ================================================================
     // NV-DXVK [Phase2]: GPU-driven-injection per-draw capture.
     // ================================================================
@@ -33314,6 +33895,8 @@ namespace dxvk {
     // onto the filled captures (see rtx_context.cpp), so the bake cannot tear.
     // Only draws predicted to (re)bake are captured — see the predictor note
     // in d3d11_rtx.h. Full rationale: RasterGeometry::GeometryCapture.
+    markSub(s_perfTePhase2Acc, s_perfTePhase2Max);  // [te_phase2] capturePhase2 block
+
     if (RtxOptions::captureSourceGeometry()) {
       RasterGeometry& cgeo = dcs.geometryData;
       // Skinned draws are excluded: they re-bake every frame on boneHash
@@ -33678,6 +34261,8 @@ namespace dxvk {
         }
       }
     }
+
+    markSub(s_perfTeSrcGeoAcc, s_perfTeSrcGeoMax);  // [te_srcGeo] captureSourceGeometry
 
     // NV-DXVK PERF: move-capture dcs instead of copying it. DrawCallState holds
     // the geometry's Rc<DxvkBuffer> set (position/index/texcoord/color/bone) plus
@@ -35542,45 +36127,255 @@ namespace dxvk {
     // Both fields exist on every shader that binds CBufCommonPerCamera
     // (cb2). We read whichever stage exposes them - VS preferred so the
     // values latch even when only the depth pre-pass is bound.
+    // [EngineSun.why] records WHICH gate rejected, so the per-window histogram
+    // can name the reason this capture has never once succeeded. Last writer
+    // wins: the reads are tried VS-then-PS, so this ends up holding the reason
+    // the final attempt failed, which is the one that mattered.
+    uint32_t sunWhy = kSunNoLoc;
     auto readSunVec3 = [&](const D3D11CommonShader* common,
                            const auto& cbs,
                            const char* fieldName,
                            Vector3& out) -> bool {
-      if (!common) return false;
-      auto loc = common->FindCBField("CBufCommonPerCamera", fieldName);
+      if (!common) { sunWhy = kSunNoLoc; return false; }
+      // [SunMemo]: location only - the value below is still read fresh from
+      // the mapped cbuffer every capture, so per-map sun/sky/fog changes
+      // still republish. See memoCBFieldLoc.
+      auto loc = memoCBFieldLoc(common, "CBufCommonPerCamera", fieldName);
       if (!loc.has_value() || loc->size < 12
           || loc->slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+        sunWhy = kSunNoLoc;
+        return false;
+      }
+      // NV-DXVK [EngineSun D3D_SVF_USED] 2026-08-06: require that the shader
+      // we are reading from ACTUALLY CONSUMES the field.
+      //
+      // [EngineSun.zero] measured dirUsed=0 colUsed=0 on the shader this
+      // capture had been reading from every draw: it consumes NEITHER field.
+      // RDEF lists every DECLARED field regardless of usage, so the location
+      // resolved fine and the read "succeeded" — c_sunDir even returned a
+      // clean unit vector (0.379294, 0.340452, 0.860365), magnitude 0.99997,
+      // which is why the magSq gate never once fired and the failure looked
+      // like a colour-only problem. It was not: BOTH values came from a
+      // shader that never reads them, so neither was authoritative and the
+      // zero colour is simply what those bytes hold.
+      //
+      // This is the same defect D3D11CommonShader::ReadsCBField was written
+      // for (see its comment, and the FS_7a6e4c5725a53e07 c_uv1RotScale case
+      // that destroyed character UVs). FindCBField dropped the flag, so this
+      // caller could not see it; CBFieldLoc now carries it.
+      //
+      // Consequence to expect: if NO bound shader ever reads these fields,
+      // this capture correctly stops publishing and [EngineSun.why] reads
+      // unused=100%. That is the ANSWER, not a regression — it means TF2's
+      // sun colour must be sourced from wherever it is actually consumed, and
+      // it is strictly better than publishing a value we cannot trust. It also
+      // makes the reject cheap: it lands before GetMappedSlice and the
+      // write-combined reads, which is most of tc_sun's per-draw cost.
+      if (!loc->used) {
+        sunWhy = kSunUnused;
         return false;
       }
       const auto& cb = cbs[loc->slot];
-      if (cb.buffer == nullptr) return false;
+      if (cb.buffer == nullptr) { sunWhy = kSunNoCb; return false; }
       const auto map = cb.buffer->GetMappedSlice();
       const uint8_t* p = reinterpret_cast<const uint8_t*>(map.mapPtr);
-      if (p == nullptr) return false;
+      if (p == nullptr) { sunWhy = kSunNoMap; return false; }
       const size_t base = static_cast<size_t>(cb.constantOffset) * 16 + loc->offset;
-      if (base + 12 > cb.buffer->Desc()->ByteWidth) return false;
+      if (base + 12 > cb.buffer->Desc()->ByteWidth) { sunWhy = kSunRange; return false; }
       const float* fp = reinterpret_cast<const float*>(p + base);
       if (!std::isfinite(fp[0]) || !std::isfinite(fp[1]) || !std::isfinite(fp[2])) {
+        sunWhy = kSunNonFinite;
         return false;
       }
       out = Vector3 { fp[0], fp[1], fp[2] };
       return true;
     };
 
+    // NV-DXVK [SunLocMemo] 2026-08-06: single-probe read of BOTH fields.
+    //
+    // This replaced four memoCBFieldLoc probes and up to four GetMappedSlice
+    // calls per draw. c_sunDir and c_sunColor live in the same cbuffer — the
+    // [EngineSun.zero] capture confirmed dirSlot=2 colSlot=2 — so one slot
+    // resolution and ONE mapped pointer serve both reads, and memoSunLocs
+    // folds declared/size/slot/D3D_SVF_USED into one cached verdict.
+    //
+    // A shader that cannot supply the sun (the overwhelming majority) now costs
+    // exactly one 8-way memo hit and returns before touching a constant buffer.
+    // The reads for a viable shader are two 12-byte loads off one pointer
+    // instead of two independent map-and-read sequences.
+    //
+    // VS is still preferred over PS so the values latch even when only the
+    // depth pre-pass is bound — same precedence as the four-call version, just
+    // resolved per stage instead of per field. Both fields must come from the
+    // SAME stage now, which is a correctness improvement: the old code could
+    // pair a direction read from the VS with a colour read from the PS, i.e.
+    // two different cbuffers, and call the result one coherent sun.
     Vector3 dir{}, color{};
-    bool gotDir = readSunVec3(vsCommon, m_context->m_state.vs.constantBuffers,
-                              "c_sunDir", dir);
-    if (!gotDir) {
-      gotDir = readSunVec3(psCommon, m_context->m_state.ps.constantBuffers,
-                           "c_sunDir", dir);
+    bool dirFromVs = false, colFromVs = false;
+    bool gotSun = false;
+
+    auto readSunPair = [&](const D3D11CommonShader* common,
+                           const auto& cbs, bool isVs) -> bool {
+      const SunFieldLocs locs = memoSunLocs(common);
+      if (!locs.viable) {
+        // Distinguish "field absent" from "present but fxc marked it unused" —
+        // completely different fixes — using the flag the memo already carries,
+        // so this costs nothing beyond the probe we have already done.
+        sunWhy = locs.declared ? kSunUnused : kSunNoLoc;
+        return false;
+      }
+      const auto& cb = cbs[locs.slot];
+      if (cb.buffer == nullptr) { sunWhy = kSunNoCb; return false; }
+      const auto map = cb.buffer->GetMappedSlice();
+      const uint8_t* p = reinterpret_cast<const uint8_t*>(map.mapPtr);
+      if (p == nullptr) { sunWhy = kSunNoMap; return false; }
+      const size_t cbBase   = static_cast<size_t>(cb.constantOffset) * 16;
+      const size_t dirBase  = cbBase + locs.dirOffset;
+      const size_t colBase  = cbBase + locs.colOffset;
+      const uint32_t byteWidth = cb.buffer->Desc()->ByteWidth;
+      if (dirBase + 12 > byteWidth || colBase + 12 > byteWidth) {
+        sunWhy = kSunRange;
+        return false;
+      }
+      const float* fd = reinterpret_cast<const float*>(p + dirBase);
+      const float* fc = reinterpret_cast<const float*>(p + colBase);
+      if (!std::isfinite(fd[0]) || !std::isfinite(fd[1]) || !std::isfinite(fd[2])
+       || !std::isfinite(fc[0]) || !std::isfinite(fc[1]) || !std::isfinite(fc[2])) {
+        sunWhy = kSunNonFinite;
+        return false;
+      }
+      dir   = Vector3 { fd[0], fd[1], fd[2] };
+      color = Vector3 { fc[0], fc[1], fc[2] };
+      dirFromVs = colFromVs = isVs;
+      return true;
+    };
+
+    gotSun = readSunPair(vsCommon, m_context->m_state.vs.constantBuffers, true);
+    if (!gotSun) {
+      gotSun = readSunPair(psCommon, m_context->m_state.ps.constantBuffers, false);
     }
-    bool gotColor = readSunVec3(vsCommon, m_context->m_state.vs.constantBuffers,
-                                "c_sunColor", color);
-    if (!gotColor) {
-      gotColor = readSunVec3(psCommon, m_context->m_state.ps.constantBuffers,
-                             "c_sunColor", color);
+    if (!gotSun) {
+      g_sunWhy[sunWhy].fetch_add(1, std::memory_order_relaxed);
+      return false;
     }
-    if (!gotDir || !gotColor) {
+
+    // NV-DXVK [SunLatch] 2026-08-06: arm the once-per-frame latch HERE, on an
+    // AUTHORITATIVE READ — not on a successful publish at the tail.
+    //
+    // This is the structural cost of this function, and it is much larger than
+    // the per-draw work. The latch used to arm only after the content checks
+    // (magSq / colMag) passed, so a frame in which the cbuffer legitimately
+    // holds a zero sun colour NEVER armed it, and all ~870 draws/frame that
+    // reach this point re-did the whole gauntlet — memo probe, GetMappedSlice,
+    // two write-combined 12-byte reads — to arrive at the same answer 870 times.
+    // [EngineSun.why] shows exactly that shape: colMag=44644 per window with
+    // published=0.
+    //
+    // WHY THIS IS CORRECT AND NOT A "GIVE UP AFTER N TRIES" HEURISTIC. The
+    // retry existed because a draw that CANNOT SEE the fields must not suppress
+    // a later draw that can. That distinction is now made precisely, one step
+    // earlier, by memoSunLocs' viability verdict (declared + sized + same slot +
+    // D3D_SVF_USED) plus the bound/mapped checks. Reaching this line means a
+    // shader that genuinely CONSUMES both fields handed us finite values out of
+    // its live cbuffer — that is not a failed attempt, it is THE answer for this
+    // frame. The values are per-MAP constants, so every other draw this frame
+    // reading the same cbuffer necessarily agrees; asking 869 more times cannot
+    // change it.
+    //
+    // The content checks below therefore now decide whether to PUBLISH, which
+    // is what they were always for, rather than whether to RETRY, which they
+    // were never suited to.
+    //
+    // EXPOSURE, stated: the first authoritative read of a frame wins. If that
+    // draw's cbuffer holds invalid content, this frame publishes nothing and the
+    // next frame tries again — self-correcting, because the capture re-runs
+    // every frame and a one-frame delay in a per-map constant is invisible. The
+    // [EngineSun.why] histogram makes it observable if it ever happens: a frame
+    // that latches on bad content still increments magSq or colMag.
+    s_sunCapturedFrame.store(sunFrameNow, std::memory_order_relaxed);
+
+    // NV-DXVK [perf] 2026-08-06: the two validity rejections below are
+    // HOISTED from the tail of this function.
+    //
+    // They used to run only after every remaining field had been read, and
+    // those fields live in mapped WRITE-COMBINED cbuffer memory - uncached
+    // reads at roughly 300 MB/s, which is what this function's header comment
+    // means by "a dozen small reads of mapped cbuffer memory". The draws that
+    // fail here are the COMMON case, not the rare one: TF2's depth-only and
+    // shadow-cascade passes DECLARE CBufCommonPerCamera but push zeros into
+    // it (see the c_sunColor note below), so they reached the tail having
+    // already paid for c_skyColor, c_fogColorFactor, three floats,
+    // c_forceExposure and the 32-byte c_fogParams blob - then threw it away.
+    // Because the once-per-frame latch arms only on SUCCESS, that repeated on
+    // every draw until a good one latched. [GapSampler] put 18% of the frame
+    // thread in exactly those read lines.
+    //
+    // This is a pure reordering. Both paths return false without publishing
+    // and without side effects - everything between here and the tail only
+    // writes function-local values - so no caller can distinguish the two
+    // orders, and the retry-until-success behaviour the latch depends on is
+    // untouched.
+
+    // Reject zero-direction draws (uninitialised cbuffer state on certain
+    // pre-game-load passes). Magnitude should be ~1.0 in steady state.
+    const float magSq = dir.x*dir.x + dir.y*dir.y + dir.z*dir.z;
+    if (magSq < 1e-6f) {
+      g_sunWhy[kSunMagSq].fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+
+    // Reject zero-colour reads. Some shader stages declare c_sunColor
+    // in RDEF but TF2 doesn't push the value for those passes
+    // (depth-only, shadow cascade, pre-game-load). Capturing zero and
+    // propagating it into Hillaire's sun illuminance blacks out all
+    // atmospheric scattering and breaks the path tracer downstream.
+    // Wait for a draw whose cbuffer actually has the sun colour.
+    const float colMag = color.x + color.y + color.z;
+    if (colMag < 1e-3f) {
+      g_sunWhy[kSunColMag].fetch_add(1, std::memory_order_relaxed);
+      // NV-DXVK [EngineSun.zero] 2026-08-06: [EngineSun.why] came back
+      // colMag=100%, every other gate 0 — including magSq, which is tested
+      // FIRST. So c_sunDir reads a valid non-zero direction on every draw while
+      // c_sunColor reads black on every draw. That kills the "depth/shadow
+      // passes push zeros" explanation this function assumes (those would zero
+      // BOTH and trip magSq), and it kills "wrong field names" (noLoc=0).
+      //
+      // The remaining candidate has a precedent in this tree: D3D11CommonShader
+      // documents that RDEF lists every DECLARED field regardless of usage, and
+      // that reading a field fxc marked [unused] picks up whatever is in the
+      // buffer (see the FS_7a6e4c5725a53e07 c_uv1RotScale case). FindCBField
+      // returns only {slot,offset,size} and DROPS that flag; ReadsCBField is
+      // the accessor that keeps it. If c_sunColor is declared-but-unused on
+      // these shaders, TF2 never uploads it and the bytes are legitimately
+      // zero — in which case the fix is to find the shader that DOES read it,
+      // not to keep sampling this one.
+      //
+      // One line per distinct VS, hard-capped, gameplay-gated. Prints the USED
+      // flags beside the values so the answer is unambiguous either way.
+      static std::atomic<uint32_t> sZeroN { 0 };
+      if (sZeroN.load(std::memory_order_relaxed) < 12u
+          && dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+        const D3D11CommonShader* dirSh = dirFromVs ? vsCommon : psCommon;
+        const D3D11CommonShader* colSh = colFromVs ? vsCommon : psCommon;
+        // Explicit type, not auto: the ternary's other arm is std::nullopt_t,
+        // and naming the optional keeps the common type unambiguous.
+        std::optional<D3D11CommonShader::CBFieldLoc> dirLoc, colLoc;
+        if (dirSh) dirLoc = dirSh->FindCBField("CBufCommonPerCamera", "c_sunDir");
+        if (colSh) colLoc = colSh->FindCBField("CBufCommonPerCamera", "c_sunColor");
+        sZeroN.fetch_add(1, std::memory_order_relaxed);
+        Logger::info(str::format(
+          "[EngineSun.zero]",
+          " dirStage=",  (dirFromVs ? "VS" : "PS"),
+          " colStage=",  (colFromVs ? "VS" : "PS"),
+          " dirUsed=",   (dirSh && dirSh->ReadsCBField("CBufCommonPerCamera", "c_sunDir")   ? 1 : 0),
+          " colUsed=",   (colSh && colSh->ReadsCBField("CBufCommonPerCamera", "c_sunColor") ? 1 : 0),
+          " dir=(", dir.x, ",", dir.y, ",", dir.z, ")",
+          " col=(", color.x, ",", color.y, ",", color.z, ")",
+          " dirOff=",  (dirLoc.has_value() ? int(dirLoc->offset) : -1),
+          " dirSlot=", (dirLoc.has_value() ? int(dirLoc->slot)   : -1),
+          " colOff=",  (colLoc.has_value() ? int(colLoc->offset) : -1),
+          " colSlot=", (colLoc.has_value() ? int(colLoc->slot)   : -1)));
+      }
       return false;
     }
 
@@ -35615,7 +36410,7 @@ namespace dxvk {
                             const char* fieldName,
                             float& out) -> bool {
       if (!common) return false;
-      auto loc = common->FindCBField("CBufCommonPerCamera", fieldName);
+      auto loc = memoCBFieldLoc(common, "CBufCommonPerCamera", fieldName);
       if (!loc.has_value() || loc->size < 4
           || loc->slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
         return false;
@@ -35671,7 +36466,7 @@ namespace dxvk {
     auto readFogBlob = [&](const D3D11CommonShader* common,
                            const auto& cbs) -> bool {
       if (!common) return false;
-      auto loc = common->FindCBField("CBufCommonPerCamera", "c_fogParams");
+      auto loc = memoCBFieldLoc(common, "CBufCommonPerCamera", "c_fogParams");
       if (!loc.has_value() || loc->size < 32
           || loc->slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
         return false;
@@ -35697,23 +36492,9 @@ namespace dxvk {
       readFogBlob(psCommon, m_context->m_state.ps.constantBuffers);
     }
 
-    // Reject zero-direction draws (uninitialised cbuffer state on certain
-    // pre-game-load passes). Magnitude should be ~1.0 in steady state.
-    const float magSq = dir.x*dir.x + dir.y*dir.y + dir.z*dir.z;
-    if (magSq < 1e-6f) {
-      return false;
-    }
-
-    // Reject zero-colour reads. Some shader stages declare c_sunColor
-    // in RDEF but TF2 doesn't push the value for those passes
-    // (depth-only, shadow cascade, pre-game-load). Capturing zero and
-    // propagating it into Hillaire's sun illuminance blacks out all
-    // atmospheric scattering and breaks the path tracer downstream.
-    // Wait for a draw whose cbuffer actually has the sun colour.
-    const float colMag = color.x + color.y + color.z;
-    if (colMag < 1e-3f) {
-      return false;
-    }
+    // (magSq / colMag rejections were here; hoisted to directly after the
+    // c_sunDir + c_sunColor reads above so a rejected draw stops before the
+    // remaining write-combined cbuffer reads. See the note at the hoist.)
 
     EngineSunSnapshot snap;
     snap.worldDirection   = dir;
@@ -35728,10 +36509,13 @@ namespace dxvk {
     std::memcpy(snap.fogParam1, fogParam1, 16);
     snap.frameId          = m_context->m_device->getCurrentFrameId();
     snap.valid            = true;
+    g_sunWhy[kSunPublished].fetch_add(1, std::memory_order_relaxed);
     publishEngineSunCapture(snap);
 
-    // NV-DXVK [perf, tail_capture]: arm the once-per-frame latch (see top
-    // of function) â€” later draws this frame skip the whole capture.
+    // NV-DXVK [SunLatch]: already armed at the authoritative-read point above,
+    // which is the earliest place the answer for this frame is known. Kept as a
+    // harmless idempotent store so the publish path still reads as self-contained
+    // if the arming point is ever moved back.
     s_sunCapturedFrame.store(sunFrameNow, std::memory_order_relaxed);
 
     // Throttled confirmation log. Includes ALL captured fields so each
@@ -35964,14 +36748,20 @@ namespace dxvk {
                      ? m_context->m_state.vs.shader->GetCommonShader() : nullptr;
     if (vsCommon == nullptr) return false;
 
-    auto matLoc = vsCommon->FindCBField("CBufCommonPerCamera",
-                                        "c_cameraRelativeToClip");
+    // NV-DXVK [CbFieldMemo]: these were raw FindCBField calls on a per-draw
+    // path - the same defect fixed in the EngineSunCapture helpers. Each raw
+    // call heap-allocates a temp std::string and hashes two maps (see the
+    // C++20 TODO on D3D11CommonShader), and this runs for every sky and
+    // sub-view draw. Locations only; the cbuffer values below are still read
+    // fresh every call.
+    auto matLoc = memoCBFieldLoc(vsCommon, "CBufCommonPerCamera",
+                                 "c_cameraRelativeToClip");
     if (!matLoc.has_value() || matLoc->size < 64
         || matLoc->slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
       return false;
     }
-    auto orgLoc = vsCommon->FindCBField("CBufCommonPerCamera",
-                                        "c_cameraOrigin");
+    auto orgLoc = memoCBFieldLoc(vsCommon, "CBufCommonPerCamera",
+                                 "c_cameraOrigin");
     if (!orgLoc.has_value() || orgLoc->size < 12
         || orgLoc->slot != matLoc->slot) {
       return false;
@@ -35997,7 +36787,13 @@ namespace dxvk {
 
     // Snapshot full cb2 contents â€” used by RtxContext when it
     // discard-allocates fresh cb2 slices for each cube face.
-    std::memcpy(cap.cb2Snapshot, p + base, snapBytes);
+    //
+    // NV-DXVK [perf]: memcpyFromWC, not std::memcpy. `p` is the MAPPED cbuffer
+    // slice, which is write-combined - plain memcpy reads it with ordinary
+    // loads at ~300 MB/s effective, one uncached transaction per load (see
+    // memcpyFromWC at the top of this file). Up to kSnapshotMax = 1 KB per sky
+    // or sub-view draw. Same bytes either way.
+    memcpyFromWC(cap.cb2Snapshot, p + base, snapBytes);
 
     // Decode the matrix and origin for direct CPU use.
     const float* fpMat = reinterpret_cast<const float*>(p + base + matLoc->offset);
@@ -36088,12 +36884,35 @@ namespace dxvk {
       return false;
     }
 
+    // NV-DXVK [perf/LightsDumpLatch] 2026-08-06: sLastFrame is stored only on
+    // the SUCCESS path far below, so if any early-out fires every frame the
+    // throttle never arms and everything above that early-out runs on EVERY
+    // DRAW, forever. That is what happens here: the log shows exactly one
+    // [EngineLights.dump] line for the whole session (the buffer-ptr latch)
+    // and never a dump, i.e. the mirror-not-populated return below is taken
+    // every time. This is the SAME defect shape as the EngineSunCapture latch
+    // fixed last session — "arms only on success" — and rtx.lights.
+    // dumpEngineLightsBuffer defaults to TRUE, so it is on in a stock config.
+    //
+    // Fixed with a per-FRAME hopeless latch rather than by arming sLastFrame:
+    // g_lightBufferMirrorPopulated is a frame-wide condition, so once one draw
+    // has found it empty no other draw this frame can succeed either. Arming
+    // sLastFrame instead would have burned the whole cadence window and
+    // delayed the first real dump by up to N frames; this leaves the cadence
+    // semantics exactly as they were.
+    static std::atomic<uint64_t> sHopelessFrame { UINT64_MAX };
+    if (sHopelessFrame.load(std::memory_order_relaxed) == curFrame) {
+      return false;
+    }
+
     auto psPtr = m_context->m_state.ps.shader.ptr();
     const D3D11CommonShader* psCommon = (psPtr != nullptr) ? psPtr->GetCommonShader() : nullptr;
     if (!psCommon) return false;
 
-    // Find the SRV slot s_globalLights binds to via RDEF.
-    const uint32_t slot = psCommon->FindResourceSlot("s_globalLights");
+    // Find the SRV slot s_globalLights binds to via RDEF. Memoized: this is a
+    // per-draw path and FindResourceSlot is string-keyed (temp std::string +
+    // map hash per call). The slot is a property of the compiled shader.
+    const uint32_t slot = memoResourceSlot(psCommon, "s_globalLights");
     if (slot == UINT32_MAX) return false;
     if (slot >= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) return false;
 
@@ -36136,6 +36955,10 @@ namespace dxvk {
       std::lock_guard<std::mutex> lk(tf2::g_lightBufferMirrorMutex);
       if (!tf2::g_lightBufferMirrorPopulated
           || tf2::g_lightBufferMirror.size() < viewOff + viewLen) {
+        // Frame-wide condition — see the sHopelessFrame comment at the top.
+        // Latch it so the remaining draws of this frame stop short of the
+        // RDEF lookup, the SRV/buffer-view chain and this very mutex.
+        sHopelessFrame.store(curFrame, std::memory_order_relaxed);
         return false;
       }
       // Copy out under the lock so we can dump without holding it.
@@ -42607,6 +43430,95 @@ namespace dxvk {
             }
           }
 
+          // NV-DXVK [Perf.CondWait]: split [Perf.Busy]'s blockedMs by thread
+          // and name the DXVK condvar site responsible for it.
+          //
+          // Read this line TOGETHER with [Perf.Busy]. The present thread's
+          // blockedMs is ~70 of a ~121 ms frame and [GapSampler] says that
+          // block is a SleepConditionVariableSRW wait. dxvk::condition_variable
+          // is the only thing in d3d11.dll that calls that API, so:
+          //   present tid appears here with msPerFrame ~= blockedMs  -> ours,
+          //     and stack: names the site to fix.
+          //   present tid absent or ~0                               -> the
+          //     wait belongs to materialsystem_dx11/tier0 (both import the
+          //     same API), i.e. engine-internal, and no DXVK-side change
+          //     addresses it. That is a real answer, not a null result.
+          //
+          // Frames are printed as d3d11+0xRVA only. Every frame of interest is
+          // in d3d11.dll by construction, and the RVA resolves against
+          // public/bin/d3d11.pdb (dbghelp loads it: SymLoadModuleEx at base
+          // 0x180000000, SymFromAddr + SymGetLineFromAddr64 give
+          // function+offset and file:line).
+          {
+            cond_diag::Snapshot snap[24];
+            const uint32_t nSnap = cond_diag::drain(snap, 24);
+            const double   fDiv  = double(s_frameTimeSamples ? s_frameTimeSamples : 1);
+
+            const uint64_t d3d11Base = reinterpret_cast<uint64_t>(GetModuleHandleA("d3d11.dll"));
+            const uint32_t curTid    = GetCurrentThreadId();
+
+            // Real image size from the PE header, NOT an open-ended "above
+            // base" test. ntdll loads ABOVE d3d11 in this process
+            // (d3d11@0x7ffb9b2c0000, ntdll@0x7ffc...), so an unbounded
+            // comparison would relabel every ntdll frame as d3d11+0x<huge>.
+            // Same trap [Perf.SyncSite]'s SyncDiagModuleSize exists to avoid.
+            uint64_t d3d11Size = 0;
+            if (d3d11Base) {
+              const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(d3d11Base);
+              if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+                const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+                  d3d11Base + dos->e_lfanew);
+                if (nt->Signature == IMAGE_NT_SIGNATURE)
+                  d3d11Size = nt->OptionalHeader.SizeOfImage;
+              }
+            }
+
+            // Stacks are invariant per thread, so print each one once.
+            static uint32_t s_loggedTids[24] = {};
+            static uint32_t s_loggedCount    = 0;
+
+            for (uint32_t i = 0; i < nSnap; ++i) {
+              const cond_diag::Snapshot& s = snap[i];
+              if (s.waitCount == 0)
+                continue;
+
+              const double msPerFrame = double(s.waitNs) / 1.0e6 / fDiv;
+
+              // Idle worker threads park on their condvar all window and
+              // would bury the one line that matters. Only threads costing
+              // real time in a frame, plus the frame thread itself (whose
+              // ZERO is the informative result), are worth a line.
+              if (msPerFrame < 1.0 && s.tid != curTid)
+                continue;
+
+              bool alreadyLogged = false;
+              for (uint32_t k = 0; k < s_loggedCount; ++k)
+                alreadyLogged |= (s_loggedTids[k] == s.tid);
+
+              std::string stack;
+              if (!alreadyLogged && s.nFrames != 0) {
+                if (s_loggedCount < 24)
+                  s_loggedTids[s_loggedCount++] = s.tid;
+                for (uint16_t k = 0; k < s.nFrames; ++k) {
+                  const uint64_t a = reinterpret_cast<uint64_t>(s.frames[k]);
+                  if (!stack.empty())
+                    stack += " | ";
+                  stack += (d3d11Size && a >= d3d11Base && a < d3d11Base + d3d11Size)
+                    ? str::format("d3d11+0x", std::hex, (a - d3d11Base), std::dec)
+                    : str::format("?@0x",     std::hex, a,               std::dec);
+                }
+              }
+
+              Logger::warn(str::format(
+                "[Perf.CondWait] tid=", s.tid,
+                (s.tid == curTid ? " (frame thread)" : ""),
+                " msPerFrame=", msPerFrame,
+                " waits=", s.waitCount,
+                " maxMs=", double(s.maxNs) / 1.0e6,
+                (stack.empty() ? "" : str::format(" stack: ", stack))));
+            }
+          }
+
           // NV-DXVK [perf]: where inside the wrapper that time goes, if it is
           // inside the wrapper at all. Only the IMMEDIATE context is timed â€”
           // that is the thread [Perf.Busy] measures. Deferred contexts run on
@@ -44687,6 +45599,8 @@ namespace dxvk {
                                  " xsf_se2cb2=",     s_perfXtXsfSe2Cb2Acc,
                                  " sf_cam=",         s_perfXtSfCamAcc,
                                  " sf_o2w=",         s_perfXtSfO2wAcc,
+                                 " o2w_ilf=",        s_perfO2wIlfAcc,
+                                 " o2w_t31=",        s_perfO2wT31Acc,
                                  " xt_srcFb=",       s_perfXtSrcFallbackAcc,
                                  " w2v_scan=",       s_perfXtW2vScanAcc,
                                  " w2vs_cached=",    s_perfXtW2vsCachedAcc,
@@ -44743,6 +45657,9 @@ namespace dxvk {
                                  " te_census=",      s_perfTeCensusAcc,
                                  " te_propId=",      s_perfTePropIdAcc,
                                  " te_trace=",       s_perfTeTraceAcc,
+                                 " te_memoDup=",     s_perfTeMemoDupAcc,
+                                 " te_phase2=",      s_perfTePhase2Acc,
+                                 " te_srcGeo=",      s_perfTeSrcGeoAcc,
                                  " tail_emit=",      s_perfSubmitDrawStageTailEmitAcc,
                                  " emitCs_ns=",      s_perfSubmitDrawStageEmitCsAccNs,
                                  " tail=",           s_perfSubmitDrawStageTailAcc,
@@ -44891,17 +45808,157 @@ namespace dxvk {
             const uint64_t mh = g_rdefMemoHits.exchange(0, std::memory_order_relaxed);
             const uint64_t mm = g_rdefMemoMisses.exchange(0, std::memory_order_relaxed);
             const uint64_t mt = mh + mm;
-            char pbBuf[288];
+            // NV-DXVK [CbFieldMemo]: kept as its own counter pair rather than
+            // folded into rdefMemo above. They measure different caches at very
+            // different call rates (~20/draw vs ~1/draw), and merging them would
+            // swamp the rdefMemo hitPct this line already exists to watch.
+            const uint64_t sh = g_cbFieldMemoHits.exchange(0, std::memory_order_relaxed);
+            const uint64_t sm = g_cbFieldMemoMisses.exchange(0, std::memory_order_relaxed);
+            const uint64_t st = sh + sm;
+            // NV-DXVK [ResSlotMemo]: same treatment for the FindResourceSlot
+            // memo. Its own pair for the same reason cbMemo has one — and this
+            // one doubles as the check that the lights path really stopped
+            // running per draw: `resMemo` total collapsing to near zero is what
+            // the sHopelessFrame latch is supposed to produce.
+            const uint64_t rh = g_resSlotMemoHits.exchange(0, std::memory_order_relaxed);
+            const uint64_t rm = g_resSlotMemoMisses.exchange(0, std::memory_order_relaxed);
+            const uint64_t rt = rh + rm;
+            char pbBuf[640];   // +resMemo: 416 was already close to the old max
             std::snprintf(pbBuf, sizeof(pbBuf),
               "[Perf.PrepSplit] resolve_ms=%.2f map_ms=%.2f resolvePerCall_us=%.2f"
-              " mapPerCall_us=%.2f | rdefMemo hits=%llu misses=%llu hitPct=%.1f",
+              " mapPerCall_us=%.2f | rdefMemo hits=%llu misses=%llu hitPct=%.1f"
+              " | cbMemo hits=%llu misses=%llu hitPct=%.1f"
+              " | resMemo hits=%llu misses=%llu hitPct=%.1f",
               double(s_perfInstPrepResNsAcc) / 1e6,
               double(s_perfInstPrepNsAcc) / 1e6,
               s_perfInstCount ? double(s_perfInstPrepResNsAcc) / 1e3 / double(s_perfInstCount) : 0.0,
               s_perfInstCount ? double(s_perfInstPrepNsAcc) / 1e3 / double(s_perfInstCount) : 0.0,
               (unsigned long long) mh, (unsigned long long) mm,
-              mt ? 100.0 * double(mh) / double(mt) : 0.0);
+              mt ? 100.0 * double(mh) / double(mt) : 0.0,
+              (unsigned long long) sh, (unsigned long long) sm,
+              st ? 100.0 * double(sh) / double(st) : 0.0,
+              (unsigned long long) rh, (unsigned long long) rm,
+              rt ? 100.0 * double(rh) / double(rt) : 0.0);
             Logger::info(pbBuf);
+
+            // NV-DXVK [Perf.OptRead]: is the process-global RtxOption mutex a
+            // real per-draw tax? See the counters in rtx_option.h. These are
+            // thread_locals and this emit runs on the SAME thread as SubmitDraw,
+            // so the numbers describe the FRAME THREAD only — worker threads
+            // read options too and are not counted here, which means estLockMs
+            // is a LOWER BOUND on the whole-process cost, never an upper one.
+            // estLockMs scales the 1-in-1024 sample back up to all reads.
+            {
+              const uint64_t orReads   = t_optReadCount;
+              const uint64_t orFast    = t_optReadFast;
+              const uint64_t orSamples = t_optReadSamples;
+              const uint64_t orNs      = t_optReadNs;
+              t_optReadCount = 0; t_optReadFast = 0;
+              t_optReadSamples = 0; t_optReadNs = 0;
+              if (orReads + orFast > 0) {
+                // locked = still going through the global mutex (non-POD, or
+                // RTX_OPT_NOLOCK=0). fast = the lock-free POD path.
+                // estLockMsPerFrame is now the residual cost: with the POD path
+                // live it should collapse toward zero, and `fast` should carry
+                // essentially all of the ~75k reads/frame measured before.
+                const double avgLockNs = orSamples ? double(orNs) / double(orSamples) : 0.0;
+                const double estLockMs = avgLockNs * double(orReads) / 1.0e6;
+                const uint64_t orTotal = orReads + orFast;
+                char orBuf[320];
+                std::snprintf(orBuf, sizeof(orBuf),
+                  "[Perf.OptRead] frameThread total=%llu perFrame=%llu"
+                  " locked=%llu fast=%llu fastPct=%.1f samples=%llu"
+                  " avgLockNs=%.1f estLockMsPerFrame=%.3f",
+                  (unsigned long long) orTotal,
+                  (unsigned long long) (sFramesInWindow ? orTotal / sFramesInWindow : 0ull),
+                  (unsigned long long) orReads,
+                  (unsigned long long) orFast,
+                  orTotal ? 100.0 * double(orFast) / double(orTotal) : 0.0,
+                  (unsigned long long) orSamples,
+                  avgLockNs,
+                  sFramesInWindow ? estLockMs / double(sFramesInWindow) : 0.0);
+                Logger::info(orBuf);
+              }
+            }
+
+            // NV-DXVK [EngineSun.why]: name the gate that has stopped
+            // CaptureEngineSunFromCb from EVER publishing. published>0 means it
+            // started working; otherwise the dominant bucket is the fix to make:
+            //   noLoc     shaders do not declare c_sunDir/c_sunColor at all
+            //             -> wrong field names, use rtx.atmosphere.dumpEngineSunCBFields
+            //   noMap     cbuffer is device-local, mapPtr is null
+            //             -> read it the way the hull path does, not via mapPtr
+            //   magSq/colMag  fields exist but every draw we look at pushes zeros
+            //             -> we are sampling the wrong draws, not the wrong field
+            {
+              static constexpr const char* kSunWhyNames[kSunWhyCount] = {
+                "published", "noLoc", "noCb", "noMap", "range", "nonFinite",
+                "magSq", "colMag", "unused"
+              };
+              std::string sunLine = "[EngineSun.why]";
+              uint64_t sunTotal = 0;
+              for (uint32_t i = 0; i < kSunWhyCount; ++i) {
+                const uint64_t v = g_sunWhy[i].exchange(0, std::memory_order_relaxed);
+                sunTotal += v;
+                sunLine += std::string(" ") + kSunWhyNames[i] + "=" + std::to_string(v);
+              }
+              if (sunTotal > 0)
+                Logger::info(sunLine);
+            }
+
+            // NV-DXVK [Perf.WcCopy]: name the write-combined-copy call sites.
+            // See wcNote / memcpyFromWC. Top 5 by bytes, then reset.
+            //
+            // Frame-thread table only - copies made on the CS or worker threads
+            // accumulate in their own thread_local and are not reported here.
+            // That is deliberate: the ~11 ms this exists to explain is on the
+            // frame thread ([GapSampler] samples it, [Perf.SdStall] bills it).
+            {
+              const uint64_t base = reinterpret_cast<uint64_t>(GetModuleHandleA("d3d11.dll"));
+              uint64_t size = 0;
+              if (base) {
+                const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+                if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+                  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+                  if (nt->Signature == IMAGE_NT_SIGNATURE)
+                    size = nt->OptionalHeader.SizeOfImage;
+                }
+              }
+
+              size_t order[kWcSiteEntries];
+              size_t n = 0;
+              for (size_t i = 0; i < kWcSiteEntries; ++i) {
+                if (t_wcSites[i].calls != 0)
+                  order[n++] = i;
+              }
+              std::sort(order, order + n, [](size_t a, size_t b) {
+                return t_wcSites[a].bytes > t_wcSites[b].bytes;
+              });
+
+              if (n != 0) {
+                std::string wc = "[Perf.WcCopy] frame-thread WC copies this window:";
+                uint64_t totBytes = 0, totCalls = 0;
+                for (size_t i = 0; i < n; ++i) {
+                  totBytes += t_wcSites[order[i]].bytes;
+                  totCalls += t_wcSites[order[i]].calls;
+                }
+                wc += str::format(" total=", double(totBytes) / (1024.0 * 1024.0),
+                                  "MB/", totCalls, "calls |");
+                for (size_t i = 0; i < n && i < 5; ++i) {
+                  const WcSite& s2 = t_wcSites[order[i]];
+                  const uint64_t a = reinterpret_cast<uint64_t>(s2.ret);
+                  wc += (size && a >= base && a < base + size)
+                    ? str::format(" d3d11+0x", std::hex, (a - base), std::dec)
+                    : str::format(" ?@0x", std::hex, a, std::dec);
+                  wc += str::format("=", double(s2.bytes) / (1024.0 * 1024.0),
+                                    "MB/", s2.calls);
+                }
+                Logger::info(wc);
+              }
+
+              for (size_t i = 0; i < kWcSiteEntries; ++i)
+                t_wcSites[i] = WcSite {};
+            }
 
             // The other single-entry cache, this one INSIDE the expensive half.
             // A low hitPct here with a large MB/window means the fanout cycles
@@ -45087,6 +46144,8 @@ namespace dxvk {
                                  " xsf_se2cb2=",     s_perfXtXsfSe2Cb2Max,
                                  " sf_cam=",         s_perfXtSfCamMax,
                                  " sf_o2w=",         s_perfXtSfO2wMax,
+                                 " o2w_ilf=",        s_perfO2wIlfMax,
+                                 " o2w_t31=",        s_perfO2wT31Max,
                                  " xt_srcFb=",       s_perfXtSrcFallbackMax,
                                  " w2v_scan=",       s_perfXtW2vScanMax,
                                  " w2vs_cached=",    s_perfXtW2vsCachedMax,
@@ -45134,6 +46193,9 @@ namespace dxvk {
                                  " te_census=",      s_perfTeCensusMax,
                                  " te_propId=",      s_perfTePropIdMax,
                                  " te_trace=",       s_perfTeTraceMax,
+                                 " te_memoDup=",     s_perfTeMemoDupMax,
+                                 " te_phase2=",      s_perfTePhase2Max,
+                                 " te_srcGeo=",      s_perfTeSrcGeoMax,
                                  " tail_emit=",      s_perfSubmitDrawStageTailEmitMax,
                                  " emitCs_ns=",      s_perfSubmitDrawStageEmitCsMaxNs,
                                  " tail=",           s_perfSubmitDrawStageTailMax));
@@ -45188,6 +46250,8 @@ namespace dxvk {
         s_perfXtSrcFallbackAcc                = 0; s_perfXtSrcFallbackMax                = 0;
         s_perfXtSfCamAcc                      = 0; s_perfXtSfCamMax                      = 0;
         s_perfXtSfO2wAcc                      = 0; s_perfXtSfO2wMax                      = 0;
+        s_perfO2wIlfAcc                       = 0; s_perfO2wIlfMax                       = 0;
+        s_perfO2wT31Acc                       = 0; s_perfO2wT31Max                       = 0;
         s_perfXtXsfUiOrthoAcc                 = 0; s_perfXtXsfUiOrthoMax                 = 0;
         s_perfXtXsfSe2Cb2Acc                  = 0; s_perfXtXsfSe2Cb2Max                  = 0;
         s_perfXtW2vScanAcc                    = 0; s_perfXtW2vScanMax                    = 0;
@@ -45238,6 +46302,9 @@ namespace dxvk {
         s_perfTeCensusAcc                     = 0; s_perfTeCensusMax                     = 0;
         s_perfTePropIdAcc                     = 0; s_perfTePropIdMax                     = 0;
         s_perfTeTraceAcc                      = 0; s_perfTeTraceMax                      = 0;
+        s_perfTeMemoDupAcc                    = 0; s_perfTeMemoDupMax                    = 0;
+        s_perfTePhase2Acc                     = 0; s_perfTePhase2Max                     = 0;
+        s_perfTeSrcGeoAcc                     = 0; s_perfTeSrcGeoMax                     = 0;
         s_perfSubmitDrawStageEmitCsAccNs      = 0; s_perfSubmitDrawStageEmitCsMaxNs      = 0;
         s_perfSubmitDrawStageTailEmitAcc      = 0; s_perfSubmitDrawStageTailEmitMax      = 0;
       }
