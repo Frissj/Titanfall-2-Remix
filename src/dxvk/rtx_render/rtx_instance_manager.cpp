@@ -3405,10 +3405,106 @@ namespace dxvk {
     st.basisStable  += basisStable;
   }
 
+  // NV-DXVK [Perf.SceneObj]: stage timer for processSceneObjectImpl.
+  //
+  // WHY HERE. The chain is measured end to end and every link agrees:
+  //   [Perf.Busy]        frame 73.6 ms
+  //   [Perf.CsSplit]     dxvk-cs exec 73.3 ms = 99.6%   -> dxvk-cs IS the frame
+  //   [Perf.CsCmd]       commitGeometryToRT 54 ms/f, 1119 calls @ 48.5us
+  //   [CommitRT]         submitMs 49, finalizeMs 0      -> computing, not stalled
+  //   [Perf.SubmitState] process 36us/draw (80%), material 8us (18%)
+  //   [ProcDCS]          instMs 32, geomMs 4            -> the instance half
+  // That leaves InstanceManager::processSceneObject at ~32 ms/frame, 29us/draw
+  // -- 44% of the whole frame, and the deepest leaf anything has reached.
+  //
+  // WHAT THE STAGES DECIDE:
+  //   find    findSimilarInstance -- the dedup search (SpatialMap lookup,
+  //           nearest-neighbour stage, material compare). If this dominates,
+  //           the fix is the dedup key, not the instance work; note that
+  //           [FindSim]/suppressStablePropIdVsHashes already established the
+  //           propId round-robins with period 3 for some shaders, forcing
+  //           100% of those lookups into the nearest-neighbour stage.
+  //   mid     the decision logic and the pile of per-draw diagnostics between
+  //           the search and the instance work ([MtnDedup] et al).
+  //   add     addInstance -- only on a dedup miss. addedPct says how often.
+  //   update  updateInstance -- transform/surface/material write. Expected to
+  //           dominate on a steady scene where nearly every draw dedups.
+  //
+  // COST: 4 clock reads per call (~205 ns), ~0.23 ms/frame at 1119 draws.
+  // Gated off by default via rtx.perfSceneObjSplit.
+  namespace {
+    struct SceneObjSplitGuard {
+      using clk = std::chrono::steady_clock;
+
+      bool            on;
+      clk::time_point t0, tFind, tMid, tAdd;
+      bool            hasFind = false, hasMid = false, hasAdd = false;
+      bool            added   = false;
+
+      explicit SceneObjSplitGuard(bool enabled)
+      : on(enabled) {
+        if (on)
+          t0 = clk::now();
+      }
+
+      void markFind()   { if (on) { tFind = clk::now(); hasFind = true; } }
+      void markMid()    { if (on) { tMid  = clk::now(); hasMid  = true; } }
+      void markAdd()    { if (on) { tAdd  = clk::now(); hasAdd  = true; } }
+      void noteAdded()  { added = true; }
+      void markUpdate() { /* end of scope; the destructor stamps it */ }
+
+      static int64_t ns(clk::time_point a, clk::time_point b) {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count();
+      }
+
+      ~SceneObjSplitGuard() {
+        if (!on)
+          return;
+
+        const auto tEnd = clk::now();
+
+        static thread_local int64_t  sFind = 0, sMid = 0, sAdd = 0, sUpd = 0;
+        static thread_local uint64_t sCalls = 0, sAdds = 0;
+        static thread_local clk::time_point sLastLog{};
+        static thread_local bool sInit = false;
+        if (!sInit) { sLastLog = t0; sInit = true; }
+
+        sFind += ns(t0, hasFind ? tFind : tEnd);
+        if (hasFind) sMid += ns(tFind, hasMid ? tMid : tEnd);
+        if (hasMid)  sAdd += ns(tMid,  hasAdd ? tAdd : tEnd);
+        if (hasAdd)  sUpd += ns(tAdd,  tEnd);
+        ++sCalls;
+        if (added) ++sAdds;
+
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(tEnd - sLastLog).count() >= 3000) {
+          const int64_t c = sCalls ? int64_t(sCalls) : 1;
+          const int64_t tot = sFind + sMid + sAdd + sUpd;
+          Logger::info(str::format(
+            "[Perf.SceneObj] calls=", sCalls,
+            " addedPct=", (sCalls ? (sAdds * 100 / sCalls) : 0),
+            " avgUsPerCall=", (tot / 1000 / c),
+            " | find=", (sFind / 1000 / c), "us",
+            " mid=", (sMid / 1000 / c), "us",
+            " add=", (sAdd / 1000 / c), "us",
+            " update=", (sUpd / 1000 / c), "us",
+            " | pct find=", (tot ? (sFind * 100 / tot) : 0),
+            " mid=", (tot ? (sMid * 100 / tot) : 0),
+            " add=", (tot ? (sAdd * 100 / tot) : 0),
+            " update=", (tot ? (sUpd * 100 / tot) : 0)));
+          sFind = sMid = sAdd = sUpd = 0;
+          sCalls = sAdds = 0;
+          sLastLog = tEnd;
+        }
+      }
+    };
+  }
+
   RtInstance* InstanceManager::processSceneObjectImpl(
     const CameraManager& cameraManager, const RayPortalManager& rayPortalManager,
     BlasEntry& blas, const DrawCallState& drawCall, MaterialData& materialData, RtInstance* existingInstance,
     DrawCallCache* drawCallCache, const FanoutSplit* split) {
+
+    SceneObjSplitGuard psoSplit(RtxOptions::perfSceneObjSplit());
 
     // If the RtInstance represents multiple instances, use the full transform of the first copy for the spatial map.
     // this prevents a bad de-duplication when the same replacement asset is used in multiple GeomPointInstancer prims.
@@ -3442,6 +3538,8 @@ namespace dxvk {
         : nullptr;
       currentInstance = findSimilarInstance(blas, materialData, firstInstanceObjectToWorld, drawCall.cameraType, rayPortalManager, lookupStablePropId, drawCallCache, prevO2W);
     }
+
+    psoSplit.markFind();   // NV-DXVK [Perf.SceneObj]: end of `find`
 
     // NV-DXVK [SubView phantom check]: per-VS-per-frame counters of
     // "found similar existing instance" vs "created new". If sub-view
@@ -3884,12 +3982,19 @@ namespace dxvk {
       }
     }
 
+    psoSplit.markMid();   // NV-DXVK [Perf.SceneObj]: end of `mid`
+
     if (currentInstance == nullptr) {
       // No existing match - so need to create one
       currentInstance = addInstance(blas);
+      psoSplit.noteAdded();
     }
 
+    psoSplit.markAdd();   // NV-DXVK [Perf.SceneObj]: end of `add`
+
     updateInstance(*currentInstance, cameraManager, blas, drawCall, materialData, split);
+
+    psoSplit.markUpdate();   // NV-DXVK [Perf.SceneObj]: end of `update`
 
     return currentInstance;
   }

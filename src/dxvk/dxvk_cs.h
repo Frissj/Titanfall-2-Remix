@@ -9,6 +9,7 @@
 
 #include "dxvk_device.h"
 #include "dxvk_context.h"
+#include "dxvk_cs_cmd_probe.h"   // NV-DXVK [Perf.CsCmd]
 
 namespace dxvk {
   
@@ -72,8 +73,25 @@ namespace dxvk {
     
     DxvkCsTypedCmd             (DxvkCsTypedCmd&&) = delete;
     DxvkCsTypedCmd& operator = (DxvkCsTypedCmd&&) = delete;
-    
+
     void exec(DxvkContext* ctx) override {
+      // NV-DXVK [Perf.CsCmd]: attribute dxvk-cs time to the EmitCs call site.
+      // T is unique per lambda, so this instantiation's vtable pointer names
+      // the site exactly, and it is already in cache -- the virtual dispatch
+      // that reached this function just loaded it.
+      //
+      // The enabled test is FIRST and the body is duplicated on purpose. Doing
+      // it the tidy way (construct a Scope that early-returns) would still run
+      // slotFor's magic-static guard on every command with the probe off --
+      // ~103,000 needless guard loads per frame. This way the disabled path is
+      // one bool load and a predicted branch, and nothing else.
+      if (unlikely(csCmdProbe::g_enabled.load(std::memory_order_relaxed))) {
+        csCmdProbe::Scope probe(
+          csCmdProbe::slotFor<DxvkCsTypedCmd>(*reinterpret_cast<void* const*>(this)));
+        m_command(ctx);
+        return;
+      }
+
       m_command(ctx);
     }
     
@@ -105,6 +123,15 @@ namespace dxvk {
     DxvkCsDataCmd& operator = (DxvkCsDataCmd&&) = delete;
 
     void exec(DxvkContext* ctx) override {
+      // NV-DXVK [Perf.CsCmd]: see the matching probe in DxvkCsTypedCmd::exec,
+      // including why the enabled test comes first and the body is duplicated.
+      if (unlikely(csCmdProbe::g_enabled.load(std::memory_order_relaxed))) {
+        csCmdProbe::Scope probe(
+          csCmdProbe::slotFor<DxvkCsDataCmd>(*reinterpret_cast<void* const*>(this)));
+        m_command(ctx, &m_data);
+        return;
+      }
+
       m_command(ctx, &m_data);
     }
 

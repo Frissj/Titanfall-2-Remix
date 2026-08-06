@@ -76,6 +76,8 @@ dxvk_src = files([
   'dxvk_context_state.h',
   'dxvk_cs.cpp',
   'dxvk_cs.h',
+  'dxvk_cs_cmd_probe.cpp',
+  'dxvk_cs_cmd_probe.h',
   'dxvk_data.cpp',
   'dxvk_data.h',
   'dxvk_descriptor.cpp',

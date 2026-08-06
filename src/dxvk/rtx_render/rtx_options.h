@@ -615,6 +615,31 @@ namespace dxvk {
     RTX_OPTION("rtx", uint32_t, captureSourceGeometryWarmFrames, 3, "How many consecutive frames a newly-seen draw keeps being captured by rtx.captureSourceGeometry.\n"
                "Engine re-batches create a new BlasEntry on TWO consecutive frames (paired dedup-misses observed via [MtnDedup]), so the window must cover at least the first 2 sightings; 3 adds one frame of slack. Larger values waste copy bandwidth on draws that will not re-bake.");
 
+    RTX_OPTION("rtx", bool, perfSceneObjSplit, false,
+               "[Perf.SceneObj] -- split InstanceManager::processSceneObjectImpl into find / mid / add / update. DEFAULT OFF.\n"
+               "This is the DEEPEST LEAF the measured chain reaches: frame 73.6 ms -> dxvk-cs 73.3 (99.6%) -> commitGeometryToRT 54 -> submitDrawState 50 -> processDrawCallState 39 -> [ProcDCS] instMs 32. So processSceneObject is ~32 ms/frame at 29us/call, 44% of the whole frame.\n"
+               "find = findSimilarInstance, the dedup search. If it dominates, the fix is the dedup key rather than the instance work -- and note the propId round-robin already documented under rtx.suppressStablePropIdVsHashes forces 100% of some shaders' lookups into the nearest-neighbour stage. mid = decision logic plus the per-draw diagnostics between search and instance work. add = addInstance, only on a dedup miss (addedPct reports how often). update = updateInstance, expected to dominate on a steady scene where nearly every draw dedups.\n"
+               "COST ~0.23 ms/frame (4 clock reads per call). Turn off after the capture.");
+
+    RTX_OPTION("rtx", bool, perfMaterialSplit, false,
+               "[Perf.MatData] -- split SceneManager::determineMaterialData into repl / portal / convert. DEFAULT OFF.\n"
+               "Measured at 8us/draw = ~9 ms/frame = 12% of the frame ([Perf.SubmitState] material stage). The function is only ~45 lines, so 8us is suspicious on its face.\n"
+               "convert = input.getMaterialData().as<OpaqueMaterialData>(). MaterialData is RETURNED BY VALUE from determineMaterialData and carries 18 TextureRefs plus dozens of scalars, so if convert dominates the cost is per-draw object construction and copying, not lookup, and the fix is to stop materialising a fresh one every draw. repl/portal are hash lookups.\n"
+               "The exit* counters report which return path was actually taken, so a stage that looks cheap because it rarely runs is not mistaken for one that is fast.");
+
+    RTX_OPTION("rtx", bool, perfSubmitStateSplit, false,
+               "[Perf.SubmitState] -- split SceneManager::submitDrawState into entry / hash / material / process. DEFAULT OFF; turn it on for a capture and back off afterwards.\n"
+               "WHY HERE. The chain is measured and every link agrees: [Perf.Busy] frame 73.6 ms -> [Perf.CsSplit] dxvk-cs exec 73.3 ms (99.6%, so dxvk-cs IS the frame) -> [Perf.CsCmd] RtxContext::commitGeometryToRT 53.1 ms/frame across 1102 calls at 48.2us -> [CommitRT] submitMs 50 of perFrameMs 52 with finalizeMs 0. So ~96% of the biggest item on the critical thread is this one function, and finalizeMs=0 means it is computing rather than blocked on worker futures.\n"
+               "WHAT THE STAGES DECIDE. process = drawReplacements/processDrawCallState, the real instance + BLAS-input build; if it dominates, the cost is genuine scene work and the lever is how much geometry reaches here. entry = the category/fog/transform bookkeeping and the per-draw diagnostics this function has accreted; hash = getHash + trackMeshHash + getReplacementsForMesh, plus two LegacyAssetHash retries that repeat all three on a miss. If either of those dominates, the cost is overhead and can be cut directly.\n"
+               "COST. 4 clock reads per draw (~205 ns), ~0.23 ms/frame at 1102 draws/frame, under 0.4%. Uses a destructor guard so the buffer-cache-overflow early return still counts as a draw with only entry charged -- otherwise those draws vanish and the per-draw average reads better than it is.");
+
+    RTX_OPTION("rtx", bool, perfCsCmdProbe, false,
+               "[Perf.CsCmd] -- attribute dxvk-cs execution time to the EmitCs call site that produced each command. DEFAULT OFF; turn it on for a capture and back off afterwards.\n"
+               "WHAT IT ANSWERS. dxvk-cs is the frame (execMs/frame 73.3 of a 73.6 ms frame, busyPct 99.7). One fat chunk per frame is 22.4 ms and is already split by [Perf.PrepScene] (merge 11.0, accelLight 4.7, gc 2.2, surfMat 1.2). The other ~50 ms, spread over ~1370 small chunks, has never been attributed -- and it is the larger half.\n"
+               "WHY THE EXISTING ANSWER DOES NOT COUNT. HANDOFF_PERF_2026-08-06_v3 sec 3b called that 50 ms flat with no hot function. It was measured with rtx.perfGapSampler aimed at dxvk-cs, and that sampler was eating ~16 ms/frame of the very thread it profiled -- the <10ms CsSplit bucket fell 16.2 -> 0.64 ms/frame when it was switched off. A profiler that suspends its target 500x/s and consumes 22% of it manufactures a flat histogram. Do not carry that verdict forward.\n"
+               "HOW IT DIFFERS FROM A SAMPLING PROFILER. Counts are EXACT (one increment per command, keyed on the command's vtable pointer, which is unique per EmitCs lambda and already in cache). Only the DURATION is sampled, 1-in-64 per type, and the estimate is count x mean -- so a hot site cannot hide behind sampling probability and a once-per-frame site is still reported with its true count.\n"
+               "COST. ~103,000 commands/frame. Timestamping all of them would be ~8.4 ms/frame, the same mistake the gap sampler made; at 1-in-64 it is ~0.13 ms/frame, under 0.2%. Off, it is one bool load and a predicted branch per command.");
+
     // NV-DXVK [Perf.ChunkTrim] (2026-08-06): automatic release of EMPTY DXVK
     // allocator chunks. See SceneManager::manageTextureVram.
     RTX_OPTION("rtx", bool, autoFreeUnusedChunks, true,

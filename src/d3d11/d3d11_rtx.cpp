@@ -42,6 +42,8 @@
 #include <tlhelp32.h>   // NV-DXVK [GapSampler]: module snapshot for RIP resolution
 #include <thread>       // NV-DXVK [GapSampler]: the sampler thread
 
+#include "../dxvk/dxvk_cs_cmd_probe.h"  // NV-DXVK [Perf.CsCmd]
+
 // NV-DXVK [WC staging]: copy FROM write-combined (WC) mapped GPU memory into
 // cached system memory. Plain memcpy reads WC with ordinary loads â€” every
 // load is an uncached memory transaction, ~300 MB/s effective. movntdqa
@@ -43867,6 +43869,91 @@ namespace dxvk {
                   " slack=", (slack     >> 20), "MB |", cats));
               }
               s_prevCatValid = true;
+            }
+
+            // NV-DXVK [Perf.CsCmd] (2026-08-06): who owns dxvk-cs. See
+            // dxvk_cs_cmd_probe.h for the method and rtx.perfCsCmdProbe for
+            // why the previous answer to this question does not count.
+            //
+            // Sorted by ESTIMATED TIME, not count -- the <100us CsSplit bucket
+            // is 1037 chunks/frame of genuinely tiny work, so a count ranking
+            // would put the cheapest sites on top. estMs is per frame, using
+            // the same frame count the [Perf] line above was averaged over, so
+            // the numbers are directly comparable with [Perf.CsSplit]'s
+            // per-frame split and with [Perf.PrepScene].
+            //
+            // Slots are printed as d3d11+0xRVA of the command's vtable and
+            // resolve against d3d11.pdb in Titanfall2\bin\x64_retail. An
+            // unresolved RVA still separates the types, which is enough to say
+            // "three sites own 80% of the 50 ms" before any symbol lookup.
+            if (RtxOptions::perfCsCmdProbe()) {
+              namespace ccp = dxvk::csCmdProbe;
+
+              // Enable on the first window that asks, so the counters below are
+              // always a whole window rather than a partial one.
+              if (!ccp::g_enabled.load(std::memory_order_relaxed)) {
+                ccp::g_enabled.store(true, std::memory_order_relaxed);
+                ccp::resetCounters();
+                Logger::warn("[Perf.CsCmd] enabled; first full window follows");
+              } else {
+                const uint32_t nSlots = ccp::g_slotCount.load(std::memory_order_acquire);
+                const uint64_t frames = std::max<uint64_t>(1u, s_frameTimeSamples);
+
+                struct Row { const void* vptr; uint64_t count; uint64_t est; uint64_t meanNs; };
+                std::vector<Row> rows;
+                rows.reserve(nSlots);
+
+                uint64_t totalEst = 0;
+                uint64_t totalCount = 0;
+
+                for (uint32_t i = 0; i < nSlots; ++i) {
+                  const uint64_t c = ccp::g_slots[i].count.load(std::memory_order_relaxed);
+                  if (!c)
+                    continue;
+
+                  const uint64_t s  = ccp::g_slots[i].samples.load(std::memory_order_relaxed);
+                  const uint64_t ns = ccp::g_slots[i].ns.load(std::memory_order_relaxed);
+                  // No sample yet -> no mean -> contributes count but no time.
+                  const uint64_t meanNs = s ? (ns / s) : 0ull;
+
+                  rows.push_back({ ccp::g_slots[i].vptr, c, c * meanNs, meanNs });
+                  totalEst   += c * meanNs;
+                  totalCount += c;
+                }
+
+                std::sort(rows.begin(), rows.end(),
+                  [] (const Row& a, const Row& b) { return a.est > b.est; });
+
+                const uint64_t d3d11Base =
+                  reinterpret_cast<uint64_t>(GetModuleHandleA("d3d11.dll"));
+
+                std::string top;
+                const size_t shown = std::min<size_t>(rows.size(), 12);
+                for (size_t i = 0; i < shown; ++i) {
+                  const uint64_t a = reinterpret_cast<uint64_t>(rows[i].vptr);
+                  top += str::format(
+                    " | ",
+                    (d3d11Base && a > d3d11Base)
+                      ? str::format("d3d11+0x", std::hex, (a - d3d11Base), std::dec)
+                      : str::format("0x", std::hex, a, std::dec),
+                    " est=", (rows[i].est / 1000000.0 / frames), "ms/f",
+                    " n=", (rows[i].count / frames),
+                    " mean=", rows[i].meanNs, "ns");
+                }
+
+                Logger::warn(str::format(
+                  "[Perf.CsCmd] frames=", frames,
+                  " types=", rows.size(), "/", ccp::kMaxSlots,
+                  " cmds/frame=", (totalCount / frames),
+                  " estTotal=", (totalEst / 1000000.0 / frames), "ms/f",
+                  " overflow=", ccp::g_overflow.load(std::memory_order_relaxed),
+                  top));
+
+                ccp::resetCounters();
+              }
+            } else if (dxvk::csCmdProbe::g_enabled.load(std::memory_order_relaxed)) {
+              dxvk::csCmdProbe::g_enabled.store(false, std::memory_order_relaxed);
+              Logger::warn("[Perf.CsCmd] disabled");
             }
           }
 

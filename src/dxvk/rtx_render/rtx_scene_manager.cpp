@@ -1769,9 +1769,120 @@ namespace dxvk {
   std::atomic<uint32_t> g_dropTraceRawFrame{ 0xFFFFFFFFu };
   std::atomic<uint32_t> g_dropTraceRawSubmits{ 0u };
 
+  // NV-DXVK [Perf.SubmitState]: stage timer for SceneManager::submitDrawState.
+  // Modelled on [CommitRT] in rtx_context.cpp so the two lines read the same
+  // way and can be compared directly.
+  //
+  // A DESTRUCTOR guard rather than inline accumulation at the end, because
+  // submitDrawState has an early `return` on the buffer-cache-overflow drop
+  // path. That return happens before any stage boundary, so it must still
+  // count as a draw with only `entry` charged -- inline accumulation would
+  // silently drop those draws and make the per-draw average look better than
+  // it is. Stages that never ran contribute 0 by construction.
+  namespace {
+    struct SubmitStateSplitGuard {
+      using clk = std::chrono::steady_clock;
+
+      bool            on;
+      clk::time_point t0, t1, t2, t3;
+      bool            has1 = false, has2 = false, has3 = false;
+
+      explicit SubmitStateSplitGuard(bool enabled)
+      : on(enabled) {
+        if (on)
+          t0 = clk::now();
+      }
+
+      // Stage boundaries. Called positionally from submitDrawState.
+      void mark1() { if (on) { t1 = clk::now(); has1 = true; } }
+      void mark2() { if (on) { t2 = clk::now(); has2 = true; } }
+      void mark3() { if (on) { t3 = clk::now(); has3 = true; } }
+
+      static int64_t ns(clk::time_point a, clk::time_point b) {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count();
+      }
+
+      ~SubmitStateSplitGuard() {
+        if (!on)
+          return;
+
+        const auto tEnd = clk::now();
+
+        static thread_local int64_t  sEntry = 0, sHash = 0, sMat = 0, sProc = 0;
+        static thread_local uint64_t sDraws = 0;
+        static thread_local clk::time_point sLastLog{};
+        static thread_local bool sInit = false;
+
+        if (!sInit) { sLastLog = t0; sInit = true; }
+
+        sEntry += ns(t0, has1 ? t1 : tEnd);
+        if (has1) sHash += ns(t1, has2 ? t2 : tEnd);
+        if (has2) sMat  += ns(t2, has3 ? t3 : tEnd);
+        if (has3) sProc += ns(t3, tEnd);
+        ++sDraws;
+
+        // Frame id is not reachable from here without the device, so count
+        // windows in wall time and report per-draw plus per-window totals; the
+        // caller's [CommitRT] line already carries the per-frame view.
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(tEnd - sLastLog).count() >= 3000) {
+          const int64_t d = sDraws ? int64_t(sDraws) : 1;
+          const int64_t tot = sEntry + sHash + sMat + sProc;
+          Logger::info(str::format(
+            "[Perf.SubmitState] draws=", sDraws,
+            " avgUsPerDraw=", (tot / 1000 / d),
+            " | entry=", (sEntry / 1000 / d), "us",
+            " hash=", (sHash / 1000 / d), "us",
+            " material=", (sMat / 1000 / d), "us",
+            " process=", (sProc / 1000 / d), "us",
+            " | pct entry=", (tot ? (sEntry * 100 / tot) : 0),
+            " hash=", (tot ? (sHash * 100 / tot) : 0),
+            " material=", (tot ? (sMat * 100 / tot) : 0),
+            " process=", (tot ? (sProc * 100 / tot) : 0)));
+          sEntry = sHash = sMat = sProc = 0;
+          sDraws = 0;
+          sLastLog = tEnd;
+        }
+      }
+    };
+  }
+
   void SceneManager::submitDrawState(Rc<DxvkContext> ctx, const DrawCallState& input, const MaterialData* overrideMaterialData) {
     ScopedCpuProfileZone();
     s_spawnDiagSubmitTotal.fetch_add(1, std::memory_order_relaxed);
+
+    // NV-DXVK [Perf.SubmitState] (2026-08-06): split THIS function, because it
+    // is the frame.
+    //
+    // THE CHAIN THAT ARRIVES HERE, all of it measured on the same clean window
+    // (44 min flat memory, no gap sampler, 73.6 ms frames):
+    //   [Perf.Busy]     wallMs 73.6            the frame
+    //   [Perf.CsSplit]  dxvk-cs exec 73.3      99.6% -- dxvk-cs IS the frame
+    //   [Perf.CsCmd]    commitGeometryToRT 53.1 ms/f, 1102 calls @ 48.2us
+    //   [CommitRT]      submitMs 50 of perFrameMs 52, finalizeMs 0, otherMs 1
+    // So ~96% of the largest item on the critical thread is this function, and
+    // finalizeMs=0 says it is COMPUTING, not blocked on worker futures. Two
+    // independent instruments (a vtable-keyed command probe and CommitRT's own
+    // wall timer) agree to within 2%, which is why this is worth splitting
+    // rather than re-measuring.
+    //
+    // WHAT THE STAGES SEPARATE:
+    //   entry     everything before the replacement-hash lookup -- the category
+    //             /fog/transform bookkeeping and the pile of per-draw
+    //             diagnostics that accumulated in this function.
+    //   hash      getHash(geometryAssetHashRule) + trackMeshHash +
+    //             getReplacementsForMesh, plus the two LegacyAssetHash retries
+    //             which each repeat all three on a miss.
+    //   material  determineMaterialData.
+    //   process   drawReplacements / processDrawCallState -- the actual
+    //             instance + BLAS-input build.
+    // If `process` owns it, the cost is real scene work and the lever is how
+    // much geometry reaches here. If `entry` or `hash` owns it, the cost is
+    // bookkeeping this function accreted and can be cut directly.
+    //
+    // COST: 4 clock reads per draw (~205 ns), ~0.23 ms/frame at 1102 draws --
+    // under 0.4%. Gated off by default; turn it on for a capture only.
+    const bool ssOn = RtxOptions::perfSubmitStateSplit();
+    SubmitStateSplitGuard ssGuard(ssOn);
 
     // NV-DXVK [MeshTrace] funnel stage 1. This is the earliest point a game
     // draw is visible to RT, so a mesh counted here WAS submitted — the fact
@@ -2233,8 +2344,10 @@ namespace dxvk {
     }
 
 
+    ssGuard.mark1();   // NV-DXVK [Perf.SubmitState]: end of `entry`
+
     const XXH64_hash_t activeReplacementHash = input.getHash(RtxOptions::geometryAssetHashRule());
-    
+
     // Track this mesh hash for mesh hash checking
     trackMeshHash(activeReplacementHash);
     
@@ -2265,7 +2378,11 @@ namespace dxvk {
       }
     }
 
+    ssGuard.mark2();   // NV-DXVK [Perf.SubmitState]: end of `hash`
+
     MaterialData renderMaterialData = determineMaterialData(overrideMaterialData, input);
+
+    ssGuard.mark3();   // NV-DXVK [Perf.SubmitState]: end of `material`
 
     if (pReplacements != nullptr) {
       drawReplacements(ctx, &input, pReplacements, renderMaterialData);
@@ -2274,19 +2391,95 @@ namespace dxvk {
     }
   }
 
+  // NV-DXVK [Perf.MatData]: stage timer for determineMaterialData, measured at
+  // 8us/draw = ~9 ms/frame = 12% of the frame by [Perf.SubmitState].
+  //
+  // The function is only ~45 lines, so 8us is suspicious on its face and the
+  // candidates are specific:
+  //   repl     m_pReplacer->getReplacementMaterial -- a hash lookup per draw.
+  //   portal   RtxOptions::getRayPortalTextureIndex -- another hash lookup.
+  //   convert  input.getMaterialData().as<OpaqueMaterialData>() -- builds a
+  //            whole MaterialData, and note that MaterialData is RETURNED BY
+  //            VALUE from this function. It carries 18 TextureRefs plus dozens
+  //            of scalars, so if `convert` owns the time the cost is object
+  //            construction + copy per draw, not lookup, and the fix is to stop
+  //            materialising a fresh one for every draw.
+  // exitPct fields say which path is actually taken, so a stage that looks
+  // cheap because it rarely runs cannot be confused with one that is fast.
+  namespace {
+    struct MatDataSplitGuard {
+      using clk = std::chrono::steady_clock;
+      bool on;
+      clk::time_point t0, tRepl, tPortal;
+      bool hasRepl = false, hasPortal = false;
+      int  exitPath = 0;   // 0=convert 1=override 2=replacement 3=highlight 4=portal
+
+      explicit MatDataSplitGuard(bool enabled) : on(enabled) { if (on) t0 = clk::now(); }
+      void markRepl()   { if (on) { tRepl   = clk::now(); hasRepl   = true; } }
+      void markPortal() { if (on) { tPortal = clk::now(); hasPortal = true; } }
+      void exit(int p)  { exitPath = p; }
+
+      static int64_t ns(clk::time_point a, clk::time_point b) {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count();
+      }
+
+      ~MatDataSplitGuard() {
+        if (!on) return;
+        const auto tEnd = clk::now();
+
+        static thread_local int64_t  sRepl = 0, sPortal = 0, sConv = 0;
+        static thread_local uint64_t sCalls = 0, sExit[5] = { 0, 0, 0, 0, 0 };
+        static thread_local clk::time_point sLastLog{};
+        static thread_local bool sInit = false;
+        if (!sInit) { sLastLog = t0; sInit = true; }
+
+        sRepl += ns(t0, hasRepl ? tRepl : tEnd);
+        if (hasRepl)   sPortal += ns(tRepl,   hasPortal ? tPortal : tEnd);
+        if (hasPortal) sConv   += ns(tPortal, tEnd);
+        ++sCalls;
+        sExit[exitPath < 5 ? exitPath : 0]++;
+
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(tEnd - sLastLog).count() >= 3000) {
+          const int64_t c = sCalls ? int64_t(sCalls) : 1;
+          const int64_t tot = sRepl + sPortal + sConv;
+          Logger::info(str::format(
+            "[Perf.MatData] calls=", sCalls,
+            " avgUsPerCall=", (tot / 1000 / c),
+            " | repl=", (sRepl / 1000 / c), "us",
+            " portal=", (sPortal / 1000 / c), "us",
+            " convert=", (sConv / 1000 / c), "us",
+            " | pct repl=", (tot ? (sRepl * 100 / tot) : 0),
+            " portal=", (tot ? (sPortal * 100 / tot) : 0),
+            " convert=", (tot ? (sConv * 100 / tot) : 0),
+            " | exit convert=", sExit[0], " override=", sExit[1],
+            " replacement=", sExit[2], " highlight=", sExit[3], " portal=", sExit[4]));
+          sRepl = sPortal = sConv = 0;
+          sCalls = 0;
+          for (int i = 0; i < 5; ++i) sExit[i] = 0;
+          sLastLog = tEnd;
+        }
+      }
+    };
+  }
+
   MaterialData SceneManager::determineMaterialData(const MaterialData* overrideMaterialData, const DrawCallState& input) {
+    MatDataSplitGuard mdSplit(RtxOptions::perfMaterialSplit());
+
     // First see if we have an explicit override
     if (overrideMaterialData != nullptr) {
+      mdSplit.exit(1);
       return *overrideMaterialData;
-    } 
+    }
 
     // test if any direct material replacements exist
     MaterialData* pReplacementMaterial = m_pReplacer->getReplacementMaterial(input.getMaterialData().getHash());
+    mdSplit.markRepl();
     if (pReplacementMaterial != nullptr) {
       // Make a copy - dont modify the replacement data.
       MaterialData renderMaterialData = *pReplacementMaterial;
       // merge in the input material from game
       renderMaterialData.mergeLegacyMaterial(input.getMaterialData());
+      mdSplit.exit(2);
       return renderMaterialData;
     }
 
@@ -2304,17 +2497,20 @@ namespace dxvk {
                                                                           Vector2(1.f, 0.f), Vector2(0.f, 1.f), Vector2(0.f, 0.f),
                                                                           /* Tf2SkyboxFog */ false,
                                                                           /* AlbedoIsPremultiplied */ false));
+      mdSplit.exit(3);
       return sHighlightMaterialData;
     }
 
     // Check if a Ray Portal override is needed
     size_t rayPortalTextureIndex;
+    mdSplit.markPortal();
     if (RtxOptions::getRayPortalTextureIndex(input.getMaterialData().getHash(), rayPortalTextureIndex)) {
       assert(rayPortalTextureIndex < maxRayPortalCount);
       assert(rayPortalTextureIndex < std::numeric_limits<uint8_t>::max());
 
       MaterialData renderMaterialData = input.getMaterialData().as<RayPortalMaterialData>();
       renderMaterialData.getRayPortalMaterialData().setRayPortalIndex(rayPortalTextureIndex);
+      mdSplit.exit(4);
       return renderMaterialData;
     }
 
