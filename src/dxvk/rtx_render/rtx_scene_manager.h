@@ -81,6 +81,16 @@ protected:
   SparseUniqueCache<RtSurfaceMaterial, SurfaceMaterialHashFn> m_surfaceMaterialExtensionCache;
   fast_unordered_cache<uint32_t> m_preCreationSurfaceMaterialMap;
 
+  // NV-DXVK [perf]: memoizes LegacyMaterialData::as<OpaqueMaterialData>() for one
+  // frame, keyed on LegacyMaterialData::getOpaqueConversionKey(). Cleared every
+  // frame next to m_preCreationSurfaceMaterialMap above and for the same stated
+  // reason -- the conversion reads rtx options and texture indices that can move
+  // between frames. Touched only from submitDrawState on the cs thread, like the
+  // uniqueHashes set in the same function, so it carries no lock.
+  fast_unordered_cache<OpaqueMaterialData> m_legacyOpaqueConversionCache;
+  uint64_t m_legacyOpaqueConversionHits = 0;
+  uint64_t m_legacyOpaqueConversionMisses = 0;
+
   struct VolumeMaterialHashFn {
     size_t operator() (const RtVolumeMaterial& mat) const {
       return (size_t)mat.getHash();
@@ -563,6 +573,7 @@ private:
   // frames where they spike are joinable by f= against the on-screen flick.
   struct MaterialChurnSample {
     uint64_t matLookups = 0;   // createSurfaceMaterial calls
+    uint64_t matMemoHits = 0;  // ...answered by the single-entry memo, before any work
     uint64_t matPreMiss = 0;   // ...that missed the per-frame pre-creation map
     uint64_t matInserts = 0;   // ...that produced a brand new material index
     uint64_t matExtInserts = 0;// new subsurface-extension material indices
@@ -588,6 +599,50 @@ private:
   // into m_surfaceMaterialCache is the part that should be zero in a steady scene.
   uint64_t m_matLookupCount = 0;
   uint64_t m_matPreMissCount = 0;
+  uint64_t m_matMemoHitCount = 0;
+
+  // NV-DXVK [perf]: single-entry memo in front of createSurfaceMaterial.
+  //
+  // WHY. createSurfaceMaterial reads nothing from the instance -- only
+  // (renderMaterialData, drawCallState) -- yet it is called from
+  // SceneManager::onInstanceUpdated, which runs once per INSTANCE. [MatChurn]
+  // measures the consequence directly: matLookup=15456 per frame against
+  // matBuild=351, i.e. ~97.7% of calls cannot produce a distinct answer. The
+  // existing m_preCreationSurfaceMaterialMap already dedups them, but only
+  // AFTER the prologue has resolved the sampler (Rc refcount churn plus a
+  // SparseUniqueCache map lookup), touched two static log-once sets, and folded
+  // four XXH64s into preCreationHash. Instances of one draw arrive consecutively
+  // (processSceneObjectFanout loops placements of a single draw call), so one
+  // entry collapses that run to its first element.
+  //
+  // EXACTNESS. preCreationHash -- the key the existing per-frame map uses -- is
+  // a digest of exactly five things: renderMaterialData.getHash(), samplerIndex,
+  // samplerIndex2, hasTexcoords and isUsingRaytracedRenderTarget. The first,
+  // fourth and fifth are stored below verbatim. The two sampler indices are a
+  // deterministic function of the three sampler pointers plus isEye(), which are
+  // stored below as well, so equal keys here imply an equal preCreationHash and
+  // therefore the identical cache index. This memo is not a widening of the
+  // existing contract -- it keys on strictly more state than preCreationHash
+  // does, so anything it serves the old map would have served too.
+  //
+  // LIFETIME. Same as m_preCreationSurfaceMaterialMap, and invalidated at the
+  // same two sites, for the same stated reason: the build path reads rtx options
+  // and texture indices that can move between frames. frameId is belt-and-braces
+  // on top of that.
+  struct SurfaceMaterialMemo {
+    uint32_t     frameId                 = UINT32_MAX;
+    XXH64_hash_t materialHash            = 0;
+    const void*  samplerOverride         = nullptr;
+    const void*  drawSampler             = nullptr;
+    const void*  drawSampler2            = nullptr;
+    uint32_t     materialType            = UINT32_MAX;
+    uint32_t     indexInCache            = UINT32_MAX;
+    bool         hasTexcoords            = false;
+    bool         isEye                   = false;
+    bool         isRaytracedRenderTarget = false;
+    bool         valid                   = false;
+  };
+  SurfaceMaterialMemo m_lastSurfaceMaterial;
 
   void logMaterialChurn();
 };

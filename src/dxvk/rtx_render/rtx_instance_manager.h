@@ -250,7 +250,12 @@ private:
     }
     return surface.objectToWorld;
   }
-  void onTransformChanged();
+  // NV-DXVK [perf] handoff v5 sec 4b(a): objectToWorldChanged lets a caller that
+  // has already proven surface.objectToWorld is byte-identical skip the
+  // transpose + 48-byte memcpy into m_vkInstance.transform. move()/moveAgain()
+  // compute exactly that memcmp for their own return value, so the test is free.
+  // Defaults true: a caller that cannot prove it gets the old behaviour.
+  void onTransformChanged(bool objectToWorldChanged = true);
   friend class InstanceManager;
 
   // Unique ID of the RtInstance.
@@ -421,7 +426,11 @@ public:
     DrawCallCache* drawCallCache, std::vector<RtInstance*>& out_instances);
 
   // Binds a raytracing material to the specified instance.
-  void bindMaterial(RtInstance& instance, const RtSurfaceMaterial& material);
+  // NV-DXVK [perf]: indexInCache lets the caller skip the resource-cache lookup
+  // below when it already knows the answer -- SceneManager::createSurfaceMaterial
+  // returns it through out_indexInCache. UINT32_MAX keeps the old behaviour for
+  // any caller that cannot supply one.
+  void bindMaterial(RtInstance& instance, const RtSurfaceMaterial& material, uint32_t indexInCache = UINT32_MAX);
 
   // Creates a copy of a reference instance and adds it to the instance pool
   // Temporary single frame instances generated every frame should disable valid id generation to avoid overflowing it

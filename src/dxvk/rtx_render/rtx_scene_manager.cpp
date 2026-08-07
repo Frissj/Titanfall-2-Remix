@@ -289,6 +289,10 @@ namespace dxvk {
     m_bufferCache.clear();
     m_surfaceMaterialCache.clear();
     m_preCreationSurfaceMaterialMap.clear();
+    // NV-DXVK [perf]: the memo holds an index INTO m_surfaceMaterialCache, so it
+    // must die with it -- a scene reset renumbers every material.
+    m_lastSurfaceMaterial.valid = false;
+    m_legacyOpaqueConversionCache.clear();
     m_surfaceMaterialExtensionCache.clear();
     m_volumeMaterialCache.clear();
     
@@ -1620,6 +1624,34 @@ namespace dxvk {
 
     // Not currently safe to cache these across frames (due to texture indices and rtx options potentially changing)
     m_preCreationSurfaceMaterialMap.clear();
+    // NV-DXVK [perf]: the createSurfaceMaterial memo answers the same question
+    // over the same inputs, so it carries the same lifetime. Cleared here rather
+    // than relying on its frameId alone so the two can never disagree.
+    m_lastSurfaceMaterial.valid = false;
+    // NV-DXVK [perf]: same constraint, same lifetime. as<OpaqueMaterialData>() reads
+    // rtx.legacyMaterial.* and rtx.ignoreAlphaOnTextures, so an entry must not
+    // outlive the frame it was built in.
+    m_legacyOpaqueConversionCache.clear();
+
+    // NV-DXVK [Perf.MatCache]: hit rate for the conversion cache above. hitPct is
+    // 1 - (distinct materials / draws), so a low value means the scene really does
+    // draw that many distinct materials -- read it before concluding the cache is
+    // broken.
+    if (RtxOptions::cacheLegacyMaterialConversionCounts()) {
+      static std::chrono::steady_clock::time_point sLastLog = std::chrono::steady_clock::now();
+      const auto now = std::chrono::steady_clock::now();
+      if (std::chrono::duration_cast<std::chrono::milliseconds>(now - sLastLog).count() >= 3000) {
+        const uint64_t total = m_legacyOpaqueConversionHits + m_legacyOpaqueConversionMisses;
+        Logger::info(str::format(
+          "[Perf.MatCache] calls=", total,
+          " hits=", m_legacyOpaqueConversionHits,
+          " misses=", m_legacyOpaqueConversionMisses,
+          " hitPct=", (total ? (m_legacyOpaqueConversionHits * 100 / total) : 0)));
+        m_legacyOpaqueConversionHits = 0;
+        m_legacyOpaqueConversionMisses = 0;
+        sLastLog = now;
+      }
+    }
 
     m_thinOpaqueMaterialExist = false;
     m_sssMaterialExist = false;
@@ -2514,8 +2546,38 @@ namespace dxvk {
       return renderMaterialData;
     }
 
-    // Standard legacy material conversion
-    return input.getMaterialData().as<OpaqueMaterialData>();
+    // Standard legacy material conversion.
+    //
+    // NV-DXVK [perf]: this is the only exit TF2 ever takes ([Perf.MatData] exit
+    // convert=100%), and it rebuilds an OpaqueMaterialData -- 18 TextureRefs plus
+    // 42 constants -- once per draw call for a scene that draws far fewer distinct
+    // materials than draw calls. Memoized for the frame.
+    //
+    // Cached at THIS level rather than around the whole function on purpose: the
+    // four exits above are cheap (repl 2%, portal 2% by [Perf.MatData]) but they
+    // decide WHICH material a draw gets, and caching across them would let a
+    // stale key choose an exit. Here the cache can only ever substitute the
+    // conversion result, never change the routing.
+    //
+    // Returned by value, as before: drawReplacements takes a non-const
+    // MaterialData& and may mutate it, so callers must not get a handle on the
+    // cache's copy.
+    if (!RtxOptions::cacheLegacyMaterialConversion()) {
+      return input.getMaterialData().as<OpaqueMaterialData>();
+    }
+
+    const XXH64_hash_t convKey = input.getMaterialData().getOpaqueConversionKey();
+    auto iter = m_legacyOpaqueConversionCache.find(convKey);
+    if (iter != m_legacyOpaqueConversionCache.end()) {
+      ++m_legacyOpaqueConversionHits;
+      return iter->second;
+    }
+
+    // Construct straight into the map so the miss path costs one move rather than
+    // an extra full copy of the material.
+    ++m_legacyOpaqueConversionMisses;
+    auto inserted = m_legacyOpaqueConversionCache.emplace(convKey, input.getMaterialData().as<OpaqueMaterialData>());
+    return inserted.first->second;
   }
 
   void SceneManager::createEffectLight(Rc<DxvkContext> ctx, const DrawCallState& input, const RtInstance* instance) {
@@ -2826,18 +2888,32 @@ namespace dxvk {
   }
 
   void SceneManager::onInstanceUpdated(RtInstance& instance, const DrawCallState& drawCall, const MaterialData& material, const bool hasTransformChanged, const bool hasVerticesChanged, const bool isFirstUpdateThisFrame) {
-    auto capturer = m_device->getCommon()->capturer();
-    if (hasTransformChanged) {
-      capturer->setInstanceUpdateFlag(instance, GameCapturer::InstFlag::XformUpdate);
+    // NV-DXVK [perf]: DxvkObjects::capturer() returns Rc<GameCapturer> BY VALUE,
+    // so binding it unconditionally costs an atomic increment on entry and an
+    // atomic decrement on scope exit, per INSTANCE per frame (~15,500x) -- for a
+    // pointer that only the two branches below use, and [Perf.UpdInst] measures
+    // those branches at xfChg=1% and prevPos=0%. Same shape as RtInstance::move()
+    // in the v5 handoff (process note 5): the test was already here, it just sat
+    // downstream of the work it could have skipped. Behaviour is unchanged --
+    // when neither flag is set, the old code acquired the pointer and used it for
+    // nothing.
+    if (hasTransformChanged || hasVerticesChanged) {
+      auto capturer = m_device->getCommon()->capturer();
+      if (hasTransformChanged) {
+        capturer->setInstanceUpdateFlag(instance, GameCapturer::InstFlag::XformUpdate);
+      }
+
+      if (hasVerticesChanged) {
+        capturer->setInstanceUpdateFlag(instance, GameCapturer::InstFlag::PositionsUpdate);
+        capturer->setInstanceUpdateFlag(instance, GameCapturer::InstFlag::NormalsUpdate);
+      }
     }
 
-    if (hasVerticesChanged) {
-      capturer->setInstanceUpdateFlag(instance, GameCapturer::InstFlag::PositionsUpdate);
-      capturer->setInstanceUpdateFlag(instance, GameCapturer::InstFlag::NormalsUpdate);
-    }
-
-    // Create and bind the RT material
-    const RtSurfaceMaterial& surfaceMaterial = createSurfaceMaterial(material, drawCall);
+    // Create and bind the RT material.
+    // NV-DXVK [perf]: take the cache index while we are here. bindMaterial below
+    // used to re-derive it with a second map lookup, per instance per frame.
+    uint32_t surfaceMaterialIndex = UINT32_MAX;
+    const RtSurfaceMaterial& surfaceMaterial = createSurfaceMaterial(material, drawCall, &surfaceMaterialIndex);
 
     // [SkyDiag] One line per distinct (vsHash, albedoHash, cameraType) draw -
     // a full picture of how every surface is being classified. Used to find
@@ -2855,7 +2931,25 @@ namespace dxvk {
     // boot/menu/loading draws don't burn the 512-entry budget. Frame-id
     // gating is unreliable here because the game runs at low framerates.
     // Deduped so a stable scene yields a bounded log.
-    if (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+    //
+    // NV-DXVK [perf]: SATURATION LATCH. This probe is charged to the `tail`
+    // bucket of [Perf.UpdInst] (4.6 ms/frame, the largest stage of
+    // updateInstance) and it runs once per INSTANCE -- ~15,500x per frame -- for
+    // the entire session, because g_engineHookCaptureCount > 16 is a monotonic
+    // "in gameplay" latch that never goes back down. The budget is 512 keys and
+    // the log holds exactly 512 [SkyDiag] lines, so it saturated long ago and has
+    // since paid, per instance per frame: a TextureRef::getImageHash() (two
+    // derefs into cold image memory), the key build, and a global mutex acquire
+    // -- to produce nothing.
+    //
+    // This is the same failure as rtx.logTlasSet in the v5 handoff (sec 0b): the
+    // whole cost sits UPSTREAM of the test that discards the result. The fix is
+    // the same shape -- make saturation visible to the gate instead of only to
+    // the insert. A fresh run still collects its full 512 lines; a saturated run
+    // costs one relaxed bool load. Nothing about what gets logged changes.
+    static std::atomic<bool> s_skyDiagSaturated { false };
+    if (!s_skyDiagSaturated.load(std::memory_order_relaxed) &&
+        tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
       static std::mutex s_skyDiagMu;
       static std::unordered_set<uint64_t> s_skyDiagSeen;
       const LegacyMaterialData& skyDiagMat = drawCall.getMaterialData();
@@ -2874,8 +2968,14 @@ namespace dxvk {
       bool firstSkyDiag = false;
       {
         std::lock_guard<std::mutex> g(s_skyDiagMu);
-        if (s_skyDiagSeen.size() < 512 && s_skyDiagSeen.insert(key).second)
-          firstSkyDiag = true;
+        if (s_skyDiagSeen.size() < 512) {
+          firstSkyDiag = s_skyDiagSeen.insert(key).second;
+          // Publish saturation to the gate above. Set inside the lock so the
+          // size() that decides it is the same one the insert just produced.
+          if (s_skyDiagSeen.size() >= 512) {
+            s_skyDiagSaturated.store(true, std::memory_order_relaxed);
+          }
+        }
       }
       if (firstSkyDiag) {
         const Matrix4& o2w = drawCall.getTransformData().objectToWorld;
@@ -2995,7 +3095,7 @@ namespace dxvk {
     }
 
     if(isFirstUpdateThisFrame) {
-      m_instanceManager.bindMaterial(instance, surfaceMaterial);
+      m_instanceManager.bindMaterial(instance, surfaceMaterial, surfaceMaterialIndex);
     }
 
     // Update portal
@@ -3642,6 +3742,56 @@ namespace dxvk {
     const bool hasTexcoords = drawCallState.hasTextureCoordinates();
     const auto renderMaterialDataType = renderMaterialData.getType();
 
+    // NV-DXVK [perf]: single-entry memo. See SurfaceMaterialMemo in the header
+    // for why this is exact rather than a heuristic -- in short, it keys on
+    // strictly more state than the preCreationHash below does, so it can only
+    // ever serve what that map would have served. Every field read here is a
+    // plain load; none of them is the sampler resolution or the hashing this
+    // skips.
+    const uint32_t     memoFrameId         = m_device->getCurrentFrameId();
+    const XXH64_hash_t memoMaterialHash    = renderMaterialData.getHash();
+    const void* const  memoSamplerOverride = renderMaterialData.getSamplerOverride().ptr();
+    const void* const  memoDrawSampler     = drawCallState.getMaterialData().getSampler().ptr();
+    const void* const  memoDrawSampler2    = drawCallState.getMaterialData().getSampler2().ptr();
+    const bool         memoIsEye           = drawCallState.isEye();
+    const bool         memoIsRtRenderTarget = drawCallState.isUsingRaytracedRenderTarget;
+
+    if (m_lastSurfaceMaterial.valid
+        && m_lastSurfaceMaterial.frameId                 == memoFrameId
+        && m_lastSurfaceMaterial.materialHash            == memoMaterialHash
+        && m_lastSurfaceMaterial.materialType            == static_cast<uint32_t>(renderMaterialDataType)
+        && m_lastSurfaceMaterial.samplerOverride         == memoSamplerOverride
+        && m_lastSurfaceMaterial.drawSampler             == memoDrawSampler
+        && m_lastSurfaceMaterial.drawSampler2            == memoDrawSampler2
+        && m_lastSurfaceMaterial.hasTexcoords            == hasTexcoords
+        && m_lastSurfaceMaterial.isEye                   == memoIsEye
+        && m_lastSurfaceMaterial.isRaytracedRenderTarget == memoIsRtRenderTarget) {
+      // Counted as a lookup so matLookup keeps meaning "calls into this
+      // function" and stays comparable across the change; matMemo is the new
+      // split-out. matBuild is untouched by construction -- a memo hit can only
+      // occur where the preCreation map would also have hit.
+      ++m_matLookupCount;
+      ++m_matMemoHitCount;
+      if (out_indexInCache) {
+        *out_indexInCache = m_lastSurfaceMaterial.indexInCache;
+      }
+      return m_surfaceMaterialCache.at(m_lastSurfaceMaterial.indexInCache);
+    }
+
+    auto rememberSurfaceMaterial = [&](const uint32_t indexInCache) {
+      m_lastSurfaceMaterial.frameId                 = memoFrameId;
+      m_lastSurfaceMaterial.materialHash            = memoMaterialHash;
+      m_lastSurfaceMaterial.materialType            = static_cast<uint32_t>(renderMaterialDataType);
+      m_lastSurfaceMaterial.samplerOverride         = memoSamplerOverride;
+      m_lastSurfaceMaterial.drawSampler             = memoDrawSampler;
+      m_lastSurfaceMaterial.drawSampler2            = memoDrawSampler2;
+      m_lastSurfaceMaterial.hasTexcoords            = hasTexcoords;
+      m_lastSurfaceMaterial.isEye                   = memoIsEye;
+      m_lastSurfaceMaterial.isRaytracedRenderTarget = memoIsRtRenderTarget;
+      m_lastSurfaceMaterial.indexInCache            = indexInCache;
+      m_lastSurfaceMaterial.valid                   = true;
+    };
+
     // We're going to use this to create a modified sampler for replacement textures.
     // Legacy and replacement materials should follow same filtering but due to lack of override capability per texture
     // legacy textures use original sampler to stay true to the original intent while replacements use more advanced filtering
@@ -3820,6 +3970,7 @@ namespace dxvk {
 
     auto iter = m_preCreationSurfaceMaterialMap.find(preCreationHash);
     if (iter != m_preCreationSurfaceMaterialMap.end()) {
+      rememberSurfaceMaterial(iter->second);
       if (out_indexInCache) {
         *out_indexInCache = iter->second;
       }
@@ -4445,6 +4596,7 @@ namespace dxvk {
     // Cache this
     const uint32_t index = m_surfaceMaterialCache.track(*surfaceMaterial);
     m_preCreationSurfaceMaterialMap[preCreationHash] = index;
+    rememberSurfaceMaterial(index);
     if (out_indexInCache) {
       *out_indexInCache = index;
     }
@@ -4643,6 +4795,7 @@ namespace dxvk {
 
     MaterialChurnSample cur;
     cur.matLookups      = m_matLookupCount;
+    cur.matMemoHits     = m_matMemoHitCount;
     cur.matPreMiss      = m_matPreMissCount;
     cur.matInserts      = m_surfaceMaterialCache.getInsertCount();
     cur.matExtInserts   = m_surfaceMaterialExtensionCache.getInsertCount();
@@ -4677,6 +4830,14 @@ namespace dxvk {
       // Materials. matNew is the headline: a nonzero steady-state value means
       // material identities are being minted for a scene that is not changing.
       " matLookup=", d(cur.matLookups, p.matLookups),
+      // NV-DXVK [perf]: matMemo is the single-entry memo's share of matLookup --
+      // the calls that returned before resolving a sampler or hashing anything.
+      // matLookup - matMemo is the number that actually reaches the prologue, and
+      // should track the DRAW count rather than the instance count. matBuild must
+      // not move when the memo lands: a memo hit can only occur where the
+      // per-frame pre-creation map would also have hit, so any change there means
+      // the memo key is wrong.
+      " matMemo=", d(cur.matMemoHits, p.matMemoHits),
       " matBuild=", d(cur.matPreMiss, p.matPreMiss),
       " matNew=", d(cur.matInserts, p.matInserts),
       " matExtNew=", d(cur.matExtInserts, p.matExtInserts),
@@ -4726,7 +4887,7 @@ namespace dxvk {
     // always means the gate can be flipped at runtime with no rebuild.
     auto tPs = std::chrono::steady_clock::now();
     int64_t ps_lightMatch = 0, ps_gc = 0, ps_setup1 = 0, ps_instSetup = 0,
-            ps_merge = 0, ps_accelLight = 0,
+            ps_merge = 0, ps_accel = 0, ps_light = 0,
             ps_surfMat = 0, ps_cull = 0, ps_tlas = 0, ps_tail = 0;
     auto markPs = [&tPs](int64_t& sink) {
       const auto now = std::chrono::steady_clock::now();
@@ -4999,10 +5160,18 @@ namespace dxvk {
     m_accelManager.mergeInstancesIntoBlas(ctx, execBarriers, textureManager.getTextureTable(), m_cameraManager, m_instanceManager, m_opacityMicromapManager.get());
     markPs(ps_merge);
 
-    // Call on the other managers to prepare their GPU data for the current scene
+    // Call on the other managers to prepare their GPU data for the current scene.
+    //
+    // NV-DXVK [perf]: these two used to share one `accelLight` bucket, which read
+    // as "4.9 ms/frame on a light stage" on a map whose light table is empty
+    // ([EngineLights.census] resident=0 active=0) and sent one investigation
+    // looking for phantom light work. The bucket was a portmanteau of two
+    // different managers. Split so the accel half and the light half are never
+    // again attributed to each other.
     m_accelManager.prepareSceneData(ctx, execBarriers, m_instanceManager);
+    markPs(ps_accel);
     m_lightManager.prepareSceneData(ctx, m_cameraManager);
-    markPs(ps_accelLight);
+    markPs(ps_light);
 
     // Upload surface material buffer BEFORE the GPU culling dispatch so the
     // compute shader can copy template material entries to per-instance slots.
@@ -5186,7 +5355,8 @@ namespace dxvk {
     if (RtxOptions::logPrepSceneSplit() && (m_device->getCurrentFrameId() % 10u) == 5u) {
       Logger::warn(str::format("[Perf.PrepScene] frame=", m_device->getCurrentFrameId(),
         " lightMatch=", ps_lightMatch, " gc=", ps_gc, " setup1=", ps_setup1,
-        " instSetup=", ps_instSetup, " merge=", ps_merge, " accelLight=", ps_accelLight,
+        " instSetup=", ps_instSetup, " merge=", ps_merge,
+        " accel=", ps_accel, " light=", ps_light,
         " surfMat=", ps_surfMat, " cull=", ps_cull, " tlas=", ps_tlas, " tail=", ps_tail,
         " inst=", m_instanceManager.getActiveCount(),
         " surf=", m_accelManager.getSurfaceCount()));

@@ -34,6 +34,9 @@
 #include "rtx_draw_call_cache.h"
 #include "rtx_camera_manager.h"
 #include "rtx_options.h"
+// NV-DXVK [VsColor][perf]: for DebugView::debugViewIdx() and
+// DEBUG_VIEW_VERTEX_SHADER_ID, used by vsDebugIdIsConsumed() below.
+#include "rtx_debug_view.h"
 #include "rtx_materials.h"
 #include "rtx_terrain_baker.h"
 
@@ -169,13 +172,20 @@ namespace dxvk {
   // renumbering would repaint the scene every frame and be exactly as useless
   // as surfaceIndex is for cross-frame attribution.
   //
-  // Cost: one hash lookup per draw against a table that stops growing after
-  // the first few frames (this level has ~31 distinct VSes), and ONE log line
-  // per VS for the entire run -- not per frame, and not per draw. There is no
-  // throttle and no sampling: every draw gets a correct id every frame, the
-  // identification is simply built so that being complete is already cheap.
+  // COST -- the note here used to read "one hash lookup per draw ... being
+  // complete is already cheap". CORRECTED 2026-08-06: it is not per draw, it is
+  // PER INSTANCE. The only caller is updateInstance, which [Perf.UpdInst]
+  // measures at instPerFrame=16,209 against ~1,110 draws -- 14.6x the assumed
+  // rate. And it is not a bare hash lookup: it takes a std::mutex and does a map
+  // insert-or-find, every instance, every frame, forever.
   //
-  // Ids start at 1; 0 is reserved for "unassigned" and paints black.
+  // (Third time this exact error has appeared: rtx.perfSceneObjSplit was budgeted
+  // per draw and billed per instance at 11x, and rtx.perfNonOpaqueCensus said
+  // "once per second" while accumulating per instance. Anything reached from
+  // updateInstance or processSceneObject is per INSTANCE. Count it that way.)
+  //
+  // Ids start at 1; 0 is reserved for "unassigned" and paints black -- which is
+  // what vsDebugIdIsConsumed() below relies on to skip the work entirely.
   static uint16_t acquireVsDebugId(XXH64_hash_t vsHash) {
     if (vsHash == 0) {
       return 0;
@@ -189,7 +199,12 @@ namespace dxvk {
     bool isNew = false;
     {
       std::lock_guard<std::mutex> g(sVsIdMu);
-      auto [it, inserted] = sVsIds.emplace(vsHash, sNextVsId);
+      // try_emplace, not emplace: emplace is specified to construct the
+      // value_type before it can know whether the key is already present, so on
+      // the steady-state path -- which is every call after the first few frames,
+      // since this table stops growing at ~31 entries -- it can build and then
+      // discard a node. try_emplace constructs nothing on a hit.
+      auto [it, inserted] = sVsIds.try_emplace(vsHash, sNextVsId);
       if (inserted) {
         // The colour lattice holds 124 usable codes (see vsDebugIdToColor).
         // Saturate rather than wrap: a run that somehow exceeds it degrades
@@ -225,6 +240,34 @@ namespace dxvk {
     }
 
     return assigned;
+  }
+
+  // NV-DXVK [VsColor][perf]: is anything actually going to READ vsDebugId?
+  //
+  // It is a pure diagnostic value and it has exactly two consumers, both
+  // switchable and both off in normal play:
+  //   1. geometry_resolver.slangh, the DEBUG_VIEW_VERTEX_SHADER_ID case
+  //      (rtx.debugView.debugViewIdx == 861), which paints the VS id as a colour.
+  //   2. identExpectedOf() in rtx_context.cpp plus geometry_resolver.slangh's
+  //      COVERAGE_OBS_IDENT_REGION packing, both reached only from
+  //      dispatchTlasProbe, which early-returns unless rtx.logResolveCensus.
+  // Nothing functional reads it. It rides in flags0 bits 5..15, and both the
+  // C++ and slang sides already define 0 as "unassigned" (the shader paints
+  // black for vsId == 0), so leaving it 0 is a defined state, not corruption.
+  //
+  // WHY THIS GATE EXISTS: acquireVsDebugId takes a mutex and does a map lookup,
+  // and updateInstance calls it once per INSTANCE -- 16,209 times per frame by
+  // [Perf.UpdInst]. That is a measurable slice of the `surf` stage spent
+  // producing a number that, with both switches off, no code path ever reads.
+  //
+  // WHEN A SWITCH IS FLIPPED ON, ids repopulate on the next update rather than
+  // instantly; [Perf.UpdInst] reports first=99%, so that is one frame.
+  //
+  // IF YOU ADD A THIRD CONSUMER OF vsDebugId, ADD IT HERE IN THE SAME COMMIT --
+  // otherwise it will silently read 0 and you will be debugging the wrong thing.
+  static bool vsDebugIdIsConsumed() {
+    return DebugView::debugViewIdx() == DEBUG_VIEW_VERTEX_SHADER_ID
+        || RtxOptions::logResolveCensus();
   }
 
   // NV-DXVK [DropTrace]: per-frame dropship submit counter, defined at
@@ -607,6 +650,11 @@ namespace dxvk {
   // with calls > 0, m_isCreatedByRenderer is the gate. If calls are 0, nothing
   // ever asks these instances to move.
   //
+  // NV-DXVK [perf]: as of the sec 4b(b) early-out, a call can legitimately reach
+  // the write site and decline to write, so mapWritesExpected no longer equals
+  // mapWrMove + mapWrInsert on its own. mapSkipInSync carries the difference and
+  // the three must still sum. Compare the SUM, not the write counts.
+  //
   // Counters are atomic; the flush uses exchange, so a concurrent increment can
   // be lost across a frame boundary. That costs a unit or two on a count in the
   // hundreds and is not worth a lock on a per-instance path.
@@ -624,6 +672,19 @@ namespace dxvk {
     std::atomic<uint32_t> s_mgWrMove      { 0u };
     std::atomic<uint32_t> s_mgWrInsert    { 0u };
     std::atomic<uint32_t> s_mgWrMapSzMax  { 0u };
+    // NV-DXVK [perf]: calls that reached the write site and deliberately did not
+    // write, because the map is keyed on m_stablePropId and already in sync (see
+    // the sec 4b(b) note in onTransformChanged). Counted so mapWritesExpected
+    // keeps balancing -- WITHOUT this the skip would present as exactly the
+    // "expected > 0 while writes are missing" symptom this probe exists to catch,
+    // and the next reader would chase a bug that is a deliberate early-out.
+    // The invariant is now:
+    //     mapWritesExpected == mapWrMove + mapWrInsert + mapSkipInSync
+    std::atomic<uint32_t> s_mgSkipInSync  { 0u };
+
+    void mapSkipAccount() {
+      s_mgSkipInSync.fetch_add(1u, std::memory_order_relaxed);
+    }
 
     void mapWriteAccount(bool isInsert, uint32_t mapSzAfter) {
       (isInsert ? s_mgWrInsert : s_mgWrMove).fetch_add(1u, std::memory_order_relaxed);
@@ -654,6 +715,7 @@ namespace dxvk {
           const uint32_t wrM  = s_mgWrMove.exchange(0u);
           const uint32_t wrI  = s_mgWrInsert.exchange(0u);
           const uint32_t wrSz = s_mgWrMapSzMax.exchange(0u);
+          const uint32_t skIS = s_mgSkipInSync.exchange(0u);
           if (observed != kInvalidFrameIndex) {
             Logger::info(str::format(
               "[MapGate] f=", observed,
@@ -666,6 +728,11 @@ namespace dxvk {
               " mapWritesExpected=", (otc - otcR) + (tp - tpR),
               " mapWrMove=", wrM,
               " mapWrInsert=", wrI,
+              // NV-DXVK [perf]: deliberate no-write early-outs. Read the balance,
+              // not the raw write count: mapWrMove + mapWrInsert + mapSkipInSync
+              // should equal mapWritesExpected. A shortfall is still a real
+              // missing write; mapSkipInSync alone is not.
+              " mapSkipInSync=", skIS,
               " mapSzMax=", wrSz));
           }
         }
@@ -690,19 +757,64 @@ namespace dxvk {
     }
   }
 
-  void RtInstance::onTransformChanged() {
+  void RtInstance::onTransformChanged(const bool objectToWorldChanged) {
     // NV-DXVK [MapGate]: account BEFORE the m_isCreatedByRenderer branch, which
     // is the whole point - inside it, this call would be as invisible as
     // [MapWrite] already is.
     mapGateAccount(m_frameLastUpdated, /*isTeleport*/ false,
                    m_isCreatedByRenderer, m_linkedBlas == nullptr);
 
-    // The D3D matrix on input, needs to be transposed before feeding to the VK API (left/right handed conversion)
-    // NOTE: VkTransformMatrixKHR is 4x3 matrix, and Matrix4 is 4x4
-    const auto t = transpose(surface.objectToWorld);
-    memcpy(&m_vkInstance.transform, &t, sizeof(VkTransformMatrixKHR));
+    // NV-DXVK [perf] handoff v5 sec 4b(a): TEST BEFORE RECOMPUTING -- using the
+    // CALLER's knowledge, because this function has none of its own.
+    // m_vkInstance.transform is a pure function of surface.objectToWorld (a
+    // Matrix4 transpose plus a 48-byte memcpy), and move()/moveAgain() already
+    // computed the byte-compare that decides it, for their own return value.
+    // [MapGate] reports onTransformChanged=15441 per frame and [Perf.UpdInst]
+    // reports xfChg=1% standing / 13-18% walking, so the write is landing on
+    // bytes it does not change on 82-99% of those calls.
+    //
+    // This half is universally sound, unlike the spatial-map block below: it
+    // reads nothing but surface.objectToWorld, so "the matrix is byte-identical"
+    // is the whole precondition.
+    if (objectToWorldChanged) {
+      // The D3D matrix on input, needs to be transposed before feeding to the VK API (left/right handed conversion)
+      // NOTE: VkTransformMatrixKHR is 4x3 matrix, and Matrix4 is 4x4
+      const auto t = transpose(surface.objectToWorld);
+      memcpy(&m_vkInstance.transform, &t, sizeof(VkTransformMatrixKHR));
+    }
 
     if (!m_isCreatedByRenderer) {
+      // NV-DXVK [perf] handoff v5 sec 4b(b): when m_stablePropId is non-zero the
+      // spatial map is keyed on the PROPID, not on the transform -- SpatialMap
+      // ::move takes overrideHash verbatim and never hashes the matrix in that
+      // case. So m_spatialCacheHash == m_stablePropId proves both halves at once:
+      // this instance is filed under its propId, and the map is already in sync.
+      // move() would recompute the same key, compare equal, and return without
+      // touching the map -- so everything between here and it is set up for a
+      // call that does nothing: calcFirstInstanceObjectToWorld (a Matrix4
+      // multiply whenever instancesToObject is set), getTransformedCentroid (an
+      // AABB transform), and two accounting reads. Note this case needs no
+      // transform test at all, precisely because the key does not depend on the
+      // transform.
+      //
+      // NOT WIDENED to m_stablePropId == 0, and the blocking reason is NOT the
+      // one v5 sec 4b gives (the transformHash++ collision path). It is simpler
+      // and harder: there the key is XXH64(firstInstanceObjectToWorld), and
+      // objectToWorldChanged == false does not prove that matrix is unchanged --
+      // calcFirstInstanceObjectToWorld multiplies surface.objectToWorld by
+      // (*surface.instancesToObject)[0], and those CONTENTS can change under a
+      // stable pointer while objectToWorld stays byte-identical. Skipping on the
+      // caller's memcmp would freeze an instanced prop at a stale key. Widening
+      // needs the composed matrix compared, not the base one.
+      if (m_stablePropId != 0
+          && m_spatialCacheHash == static_cast<XXH64_hash_t>(m_stablePropId)) {
+        // Keep [MapGate] balanced -- see s_mgSkipInSync. An unaccounted skip
+        // would read as a missing write, which is the exact failure that probe
+        // was built to detect.
+        mapSkipAccount();
+        return;
+      }
+
       // NOTE: This code would cache instances based on predicted position instead of current position, but in testing it fails too frequently
       // const Vector3 newPos = 2.f * surface.objectToWorld[3].xyz() - surface.prevObjectToWorld[3].xyz();
 
@@ -718,11 +830,17 @@ namespace dxvk {
       // erase the propId slot and re-insert at a new slot — that's how an
       // instance can "exist" yet its propId lookup miss. Log first 32 +
       // every 256th to bound output. Only fires when divergence is real.
-      const BlasEntry* pBlasOtc = m_linkedBlas;
-      if (pBlasOtc != nullptr
-          && pBlasOtc->input.getTransformData().vertexShaderHash == 0x2904d2163ef31a17ull
+      // NV-DXVK [perf]: CONDITION ORDER. The two cheap member compares now gate
+      // the BlasEntry deref chain (m_linkedBlas->input.getTransformData()
+      // .vertexShaderHash), which was being walked per instance per frame --
+      // [MapGate] says 15441x -- for a probe that has logged ZERO lines across a
+      // 25,700-frame run. Divergence is the rare case, so testing it first turns
+      // the common path into two loads and a not-taken branch. Same predicate,
+      // same output, just no longer paid by every instance that cannot match.
+      if (m_stablePropId != 0
           && m_spatialCacheHash != static_cast<XXH64_hash_t>(m_stablePropId)
-          && m_stablePropId != 0) {
+          && m_linkedBlas != nullptr
+          && m_linkedBlas->input.getTransformData().vertexShaderHash == 0x2904d2163ef31a17ull) {
         static thread_local uint32_t sOtcProbe = 0;
         if (sOtcProbe < 32 || (sOtcProbe & 0xFF) == 0) {
           Logger::warn(str::format(
@@ -899,25 +1017,77 @@ namespace dxvk {
     }
   }
   
+  // NV-DXVK [perf]: TEST BEFORE RECOMPUTING.
+  //
+  // normalObjectToWorld is a pure function of objectToWorld, and the invariant
+  // "normalObjectToWorld == transpose(inverse(Matrix3(objectToWorld)))" is held
+  // by exactly five sites -- the three teleport overloads plus move/moveAgain --
+  // each of which writes the two together. So when the incoming matrix is
+  // byte-identical to the stored one, the recompute lands on the value that is
+  // already there and skipping it is observationally equivalent.
+  //
+  // WHY IT MATTERS: inverse(Matrix3) is DOUBLE precision -- ~30 double
+  // multiplies and a double divide, then 18 narrowing converts -- plus a Matrix3
+  // construction and a transpose. move() runs once per INSTANCE per frame
+  // (~16,100 by [Perf.UpdInst], first=99%), and that probe measures xfChg at
+  // 6-18%. So on 82-94% of instances the old order computed the whole thing and
+  // only afterwards discovered, via the memcmp it already had to do, that
+  // nothing had moved. The comparison was always there; it was just downstream
+  // of the work it could have skipped.
+  //
+  // The memcmp is over the full Matrix4 while the normal matrix depends only on
+  // the upper 3x3. That is deliberately conservative: a translation-only change
+  // recomputes unnecessarily, which is correct but not maximally lazy, and it
+  // lets one comparison serve both this decision and the return value.
+  //
+  // NOW ALSO EXTENDED to onTransformChanged(), which takes the same flag -- see
+  // the two notes at the top of that function. It splits in two: the
+  // transpose+memcpy into m_vkInstance.transform is a pure function of
+  // surface.objectToWorld and is skipped here on the same proof, while the
+  // spatial-map block is skipped only on the m_stablePropId != 0 path, where the
+  // map key does not depend on the transform at all. The m_stablePropId == 0
+  // path still runs every frame: its key is XXH64(calcFirstInstanceObjectToWorld
+  // ()), which composes objectToWorld with (*instancesToObject)[0], and this
+  // memcmp says nothing about the latter.
   bool RtInstance::move(const Matrix4& objectToWorld) {
+    // See the note below on why this comparison moved above the recompute.
+    // The transform has changed even a tiny bit: the result feeds the 'isStatic'
+    // surface flag, which the GPU uses to skip motion vector calculation. We need
+    // nonzero motion vectors on objects moving even slightly to make RTXDI
+    // temporal bias correction work. This comparison is not robust if the
+    // transforms are reconstructed from baked object-to-view matrices, but it
+    // works well e.g. in Portal. Even if it detects truly static objects as
+    // moving, that's fine because that will only have a minor performance effect
+    // of calculating extra motion vectors.
+    const bool transformChanged =
+      memcmp(surface.objectToWorld.data, objectToWorld.data, sizeof(Matrix4)) != 0;
+
     surface.prevObjectToWorld = surface.objectToWorld;
     surface.objectToWorld = objectToWorld;
-    surface.normalObjectToWorld = transpose(inverse(Matrix3(objectToWorld)));
-    onTransformChanged();
+    if (transformChanged) {
+      surface.normalObjectToWorld = transpose(inverse(Matrix3(objectToWorld)));
+    }
+    onTransformChanged(transformChanged);
 
-    // See if the transform has changed even a tiny bit.
-    // The result is used for the 'isStatic' surface flag, which is in turn used to skip motion vector calculation
-    // on the GPU. We need nonzero motion vectors on objects moving even slightly to make RTXDI temporal bias correction work.
-    // This comparison is not robust if the transforms are reconstructed from baked object-to-view matrices,
-    // but it works well e.g. in Portal. Even if it detects truly static objects as moving, that's fine because that will only
-    // have a minor performance effect of calculation extra motion vectors.
-    return memcmp(surface.prevObjectToWorld.data, surface.objectToWorld.data, sizeof(Matrix4)) != 0;
+    return transformChanged;
   }
 
   bool RtInstance::moveAgain(const Matrix4& objectToWorld) {
+    // Note the two comparisons are against DIFFERENT references and both are
+    // needed. The normal matrix depends on whether objectToWorld itself changed;
+    // the return value is whether it differs from the frame's PREVIOUS transform,
+    // which move() already advanced. They coincide in move() and do not here.
+    const bool objectToWorldChanged =
+      memcmp(surface.objectToWorld.data, objectToWorld.data, sizeof(Matrix4)) != 0;
+
     surface.objectToWorld = objectToWorld;
-    surface.normalObjectToWorld = transpose(inverse(Matrix3(objectToWorld)));
-    onTransformChanged();
+    if (objectToWorldChanged) {
+      surface.normalObjectToWorld = transpose(inverse(Matrix3(objectToWorld)));
+    }
+    // Note this is objectToWorldChanged, NOT the return value below. The vk
+    // transform tracks surface.objectToWorld, which is what this compare covers;
+    // the return value asks a different question (against prevObjectToWorld).
+    onTransformChanged(objectToWorldChanged);
 
     // See comment in move()
     return memcmp(surface.prevObjectToWorld.data, surface.objectToWorld.data, sizeof(Matrix4)) != 0;
@@ -4972,7 +5142,7 @@ namespace dxvk {
     return false;
   }
 
-  void InstanceManager::bindMaterial(RtInstance& instance, const RtSurfaceMaterial& material) {
+  void InstanceManager::bindMaterial(RtInstance& instance, const RtSurfaceMaterial& material, const uint32_t indexInCache) {
     if (material.getType() == RtSurfaceMaterialType::Opaque) {
       instance.m_albedoOpacityTextureIndex = material.getOpaqueSurfaceMaterial().getAlbedoOpacityTextureIndex();
       instance.m_samplerIndex = material.getOpaqueSurfaceMaterial().getSamplerIndex();
@@ -4986,8 +5156,20 @@ namespace dxvk {
     instance.m_vkInstance.instanceCustomIndex = (instance.m_vkInstance.instanceCustomIndex & ~(surfaceMaterialTypeMask << CUSTOM_INDEX_MATERIAL_TYPE_BIT));
     instance.m_vkInstance.instanceCustomIndex |= ((uint32_t)material.getType() << CUSTOM_INDEX_MATERIAL_TYPE_BIT);
 
-    // Fetch the material from the cache
-    m_pResourceCache->find(material, instance.surface.surfaceMaterialIndex);
+    // Fetch the material from the cache.
+    //
+    // NV-DXVK [perf]: ResourceCache::find is an unordered_map lookup keyed on the
+    // whole RtSurfaceMaterial, and this runs once per INSTANCE per frame
+    // (~15,500x). The only caller has just come out of createSurfaceMaterial,
+    // which resolved that exact index and hands it back through out_indexInCache
+    // -- both refer to m_surfaceMaterialCache, so the lookup was re-deriving a
+    // value the caller already held. Same shape as the other wins in the v5
+    // handoff: not a faster lookup, no lookup.
+    if (indexInCache != UINT32_MAX) {
+      instance.surface.surfaceMaterialIndex = indexInCache;
+    } else {
+      m_pResourceCache->find(material, instance.surface.surfaceMaterialIndex);
+    }
   }
 
   // Updates the state of the instance with the draw call inputs
@@ -5007,12 +5189,144 @@ namespace dxvk {
   // ->frameLastUpdated dereferences it and AVs. Gate every deref on this == fid.
   static uint32_t    s_zigGunInstanceFrameId = UINT32_MAX;
 
+  // NV-DXVK [Perf.UpdInst]: stage split of updateInstance -- the deepest leaf of
+  // the measured chain and the biggest single item left in the frame (~20 ms of
+  // ~65, [Perf.SceneObj] update=62% of a function that runs ~16,100x/frame).
+  //
+  // SAMPLED DURATIONS, EXACT COUNTS. This function runs once per INSTANCE, not
+  // once per draw. Nine steady_clock reads on every instance would be
+  // 9 x 16,100 x ~41 ns = ~6.6 ms/frame -- a third of the thing being measured.
+  // That is the rtx.perfGapSampler mistake (v4 sec 0c) and the 11x mis-sizing of
+  // rtx.perfSceneObjSplit, which was budgeted per DRAW and billed per INSTANCE.
+  // So: time 1 instance in 64 (~252/frame, ~0.09 ms) and count every instance
+  // exactly. estMsPerFrame is mean x true count, which is the [Perf.CsCmd]
+  // construction -- a hot stage cannot hide behind sampling probability and a
+  // rarely-taken stage is not mistaken for a cheap one.
+  //
+  // THE COUNTERS MATTER MORE THAN THE TIMINGS. They are read from values the
+  // function already computes, and REDUNDANT (= no transform change, no material
+  // change, no previous positions) answers sec 4c's open question directly: how
+  // much of this 20 ms is rebuilding state that did not change?
+  namespace {
+    struct UpdInstSplitGuard {
+      using clk = std::chrono::steady_clock;
+      static constexpr int      kStages     = 9;
+      static constexpr uint32_t kSampleMask = 63u;   // duration-sample 1 in 64
+
+      bool on = false;
+      bool timed = false;
+      uint32_t frameId = 0;
+      clk::time_point t;
+      int64_t ns[kStages] = {};
+
+      // Exact, every instance. Set once at the end from the function's own values.
+      bool cFirst = false, cXfChg = false, cMatChg = false, cPrevPos = false, cStatic = false;
+
+      UpdInstSplitGuard(bool enabled, uint32_t fid) : on(enabled), frameId(fid) {
+        if (!on) {
+          return;
+        }
+        static thread_local uint32_t s_seq = 0;
+        timed = ((s_seq++ & kSampleMask) == 0u);
+        if (timed) {
+          t = clk::now();
+        }
+      }
+
+      void mark(int s) {
+        if (!timed) {
+          return;
+        }
+        const auto now = clk::now();
+        ns[s] = std::chrono::duration_cast<std::chrono::nanoseconds>(now - t).count();
+        t = now;
+      }
+
+      void counts(bool first, bool xfChg, bool matChg, bool prevPos, bool isStatic) {
+        cFirst = first; cXfChg = xfChg; cMatChg = matChg; cPrevPos = prevPos; cStatic = isStatic;
+      }
+
+      ~UpdInstSplitGuard() {
+        if (!on) {
+          return;
+        }
+
+        static thread_local int64_t  sNs[kStages] = {};
+        static thread_local uint64_t sSamples = 0, sInst = 0, sFrames = 0;
+        static thread_local uint64_t sFirst = 0, sXfChg = 0, sMatChg = 0, sPrevPos = 0,
+                                     sStatic = 0, sRedundant = 0;
+        static thread_local uint32_t sLastFrame = UINT32_MAX;
+        static thread_local clk::time_point sLastLog{};
+        static thread_local bool sInit = false;
+
+        const auto tEnd = clk::now();
+        if (!sInit) { sLastLog = tEnd; sInit = true; }
+
+        if (sLastFrame != frameId) { sLastFrame = frameId; ++sFrames; }
+
+        ++sInst;
+        if (timed) {
+          ++sSamples;
+          for (int i = 0; i < kStages; ++i) {
+            sNs[i] += ns[i];
+          }
+        }
+        if (cFirst)   ++sFirst;
+        if (cXfChg)   ++sXfChg;
+        if (cMatChg)  ++sMatChg;
+        if (cPrevPos) ++sPrevPos;
+        if (cStatic)  ++sStatic;
+        if (!cXfChg && !cMatChg && !cPrevPos) ++sRedundant;
+
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(tEnd - sLastLog).count() < 3000) {
+          return;
+        }
+
+        const int64_t  smp    = sSamples ? int64_t(sSamples) : 1;
+        const uint64_t frames = sFrames ? sFrames : 1;
+        const uint64_t inst   = sInst ? sInst : 1;
+        const double   perFrm = double(sInst) / double(frames);
+
+        // us/inst is the sampled mean; estMs is that mean x the EXACT instance
+        // count, so the two columns answer different questions -- which stage is
+        // expensive per instance, and which stage owns the frame.
+        std::string us, est;
+        static const char* kNames[kStages] = {
+          "entry", "surf", "xform", "flags", "viewmodel", "billboard", "census", "anticull", "tail"
+        };
+        for (int i = 0; i < kStages; ++i) {
+          const double meanNs = double(sNs[i]) / double(smp);
+          us  += str::format(" ", kNames[i], "=", (meanNs / 1000.0));
+          est += str::format(" ", kNames[i], "=", (meanNs * perFrm / 1e6));
+        }
+
+        Logger::info(str::format(
+          "[Perf.UpdInst] inst=", sInst, " frames=", sFrames,
+          " instPerFrame=", perFrm, " samples=", sSamples,
+          " | usPerInst", us,
+          " | estMsPerFrame", est,
+          " | first=",     (sFirst     * 100 / inst),
+          "% xfChg=",      (sXfChg     * 100 / inst),
+          "% matChg=",     (sMatChg    * 100 / inst),
+          "% prevPos=",    (sPrevPos   * 100 / inst),
+          "% static=",     (sStatic    * 100 / inst),
+          "% REDUNDANT=",  (sRedundant * 100 / inst), "%"));
+
+        for (int i = 0; i < kStages; ++i) { sNs[i] = 0; }
+        sSamples = sInst = sFrames = 0;
+        sFirst = sXfChg = sMatChg = sPrevPos = sStatic = sRedundant = 0;
+        sLastLog = tEnd;
+      }
+    };
+  }
+
   void InstanceManager::updateInstance(RtInstance& currentInstance,
                                        const CameraManager& cameraManager,
                                        const BlasEntry& blas,
                                        const DrawCallState& drawCall,
                                        MaterialData& materialData,
                                        const FanoutSplit* split) {
+    UpdInstSplitGuard uiSplit(RtxOptions::perfUpdateInstSplit(), m_device->getCurrentFrameId());
     // NV-DXVK [sticky IgnoreAntiCulling]: preserve IgnoreAntiCulling across
     // shader-variant draws that update the same RtInstance within a frame.
     // The mountain mesh is drawn with multiple d3d11 shader variants (e.g.
@@ -5178,6 +5492,8 @@ namespace dxvk {
       mergeInstanceHeuristics(currentInstance, drawCall, alphaState);
     }
     
+    uiSplit.mark(0);   // NV-DXVK [Perf.UpdInst]: end of `entry`
+
     // Updates done only once a frame unless overriden due to an explicit state
     if (isFirstUpdateThisFrame || overridePreviousCameraUpdate) {
 
@@ -5268,8 +5584,12 @@ namespace dxvk {
         // BlasEntry the blas reports only whichever VS created it, which is the
         // exact aliasing that made every VS-gated probe in this investigation a
         // blind spot. The draw's own hash is what actually produced the pixel.
+        // NV-DXVK [perf]: skipped entirely unless something reads it -- see
+        // vsDebugIdIsConsumed(). This is once per INSTANCE, not once per draw.
         currentInstance.surface.vsDebugId =
-          acquireVsDebugId(drawCall.getTransformData().vertexShaderHash);
+          vsDebugIdIsConsumed()
+            ? acquireVsDebugId(drawCall.getTransformData().vertexShaderHash)
+            : uint16_t(0);
 
         // Note: Extract spritesheet information from the associated material data as it ends up stored in the Surface
         // not in the Surface Material like most material information.
@@ -5465,6 +5785,8 @@ namespace dxvk {
           break;
         }
       }
+
+      uiSplit.mark(1);   // NV-DXVK [Perf.UpdInst]: end of `surf`
 
       // Update transform
       {
@@ -5750,6 +6072,8 @@ namespace dxvk {
       }
     }
 
+    uiSplit.mark(2);   // NV-DXVK [Perf.UpdInst]: end of `xform`
+
     // We only have 1 hit shader.
     currentInstance.m_vkInstance.instanceShaderBindingTableRecordOffset = 0;
 
@@ -5899,6 +6223,8 @@ namespace dxvk {
     // This value cancels out of the rendered facing flag (see the note in
     // determineInstanceFlags); it survives only into isFrontFaceFlipped and the
     // USD capture, where per-prop is the correct answer.
+    uiSplit.mark(3);   // NV-DXVK [Perf.UpdInst]: end of `flags` (vkInstance flags, decal, opaque/non-opaque routing)
+
     currentInstance.m_isObjectToWorldMirrored = isMirrorTransform(currentInstance.surface.objectToWorld);
 
     bool billboardsGotGenerated = false;
@@ -6001,6 +6327,8 @@ namespace dxvk {
       }
     }
 
+    uiSplit.mark(4);   // NV-DXVK [Perf.UpdInst]: end of `viewmodel`
+
     if (RtxOptions::enableSeparateUnorderedApproximations() &&
         (drawCall.cameraType == CameraType::Main || drawCall.cameraType == CameraType::ViewModel) &&
         currentInstance.m_isUnordered &&
@@ -6031,7 +6359,24 @@ namespace dxvk {
     // where the 39%-of-instances number came from and why it disagrees so hard
     // with the 3.1%-of-primitives number.
     //
-    // Reported once per second so it is safe to leave on during a timing run.
+    uiSplit.mark(5);   // NV-DXVK [Perf.UpdInst]: end of `billboard`
+
+    // COST -- and the earlier note here said "reported once per second so it is
+    // safe to leave on during a timing run", which was wrong in the way that
+    // matters. It REPORTS once per second; it ACCUMULATES per instance, right
+    // here, inside updateInstance -- the ~20 ms/frame function that is the single
+    // biggest item in the frame (v4 sec 4c). Per qualifying instance this takes
+    // a mutex and probes an unordered_map, and its own output says how often:
+    // instPerFrame=8853-9304. Default flipped to OFF 2026-08-06.
+    //
+    // Two things keep it honest if you turn it back on:
+    //   - the option test is the FIRST term of the gate below, so when off the
+    //     whole block is one bool load per instance;
+    //   - while on, it is charged to the [Perf.SceneObj] `update` bucket, i.e.
+    //     it inflates the exact number 4c exists to attribute. Turn it off
+    //     before splitting updateInstance.
+    // The mutex is uncontended in practice (updateInstance runs on dxvk-cs) but
+    // uncontended is not free, and neither is the map probe's cache miss.
     if (RtxOptions::perfNonOpaqueCensus()
         && !currentInstance.m_isHidden
         && currentInstance.getVkInstance().mask != 0) {
@@ -6180,6 +6525,8 @@ namespace dxvk {
     //   U_BLENDED/U_EMISSIVE -> unordered TLAS (m_isUnordered billboard path)
     //   <none/hidden> -> mask==0, not traced at all
     // Keyed per vsHash, gameplay-gated.
+    uiSplit.mark(6);   // NV-DXVK [Perf.UpdInst]: end of `census` (~0 when rtx.perfNonOpaqueCensus is off, which is the default)
+
     if (drawCall.testCategoryFlags(InstanceCategories::IgnoreAntiCulling)
         && !currentInstance.surface.alphaState.isBlendingDisabled
         && tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
@@ -6250,6 +6597,8 @@ namespace dxvk {
       }
     }
 
+    uiSplit.mark(7);   // NV-DXVK [Perf.UpdInst]: end of `anticull`
+
     // Updates done only once a frame unless overriden due to an explicit state
     if (isFirstUpdateThisFrame || overridePreviousCameraUpdate ||
         (billboardsGotGenerated && RtxOptions::getEnableOpacityMicromap())) {
@@ -6258,6 +6607,17 @@ namespace dxvk {
         event.onInstanceUpdatedCallback(currentInstance, drawCall, materialData, hasTransformChanged, hasPreviousPositions, isFirstUpdateThisFrame);
       }
     }
+
+    uiSplit.mark(8);   // NV-DXVK [Perf.UpdInst]: end of `tail` (the event-handler fanout)
+    // NV-DXVK [Perf.UpdInst]: exact per-instance counters, taken from the values
+    // this function already computed. REDUNDANT (no transform change, no material
+    // change, no previous positions) is the one that answers sec 4c's open
+    // question -- how much of ~20 ms/frame is rebuilding unchanged state.
+    uiSplit.counts(isFirstUpdateThisFrame,
+                   hasTransformChanged,
+                   currentInstance.surface.hasMaterialChanged,
+                   hasPreviousPositions,
+                   currentInstance.surface.isStatic);
   }
 
   void InstanceManager::removeInstance(RtInstance* instance) {

@@ -2107,6 +2107,29 @@ struct LegacyMaterialData {
   template<typename T>
   T as() const;
 
+  // NV-DXVK [perf]: memoization key for as<OpaqueMaterialData>(). A digest of
+  // EVERY field that conversion reads.
+  //
+  // getHash() is NOT a usable key on its own and must not be substituted for
+  // this. updateCachedHash() below digests 11 texture hashes plus blend and
+  // alpha-test state and nothing else, while as<OpaqueMaterialData>() also reads
+  // sourceUsesEmission, sourceEmissiveTint, sourceAlphaModulatesEmissive,
+  // sourceIsUnlitUI, sourceTf2FogCapable, sourceAlbedoIsPremultiplied,
+  // sourceForceIgnoreAlphaChannel, hasScreenSpaceEmissive, the three
+  // screenSpaceEmissiveUv1* values, screenSpaceEmissiveMaskTexture and the
+  // sampler. Two draws sharing every texture and blend state but carrying a
+  // different per-draw c_emissiveTint have equal getHash() and unequal
+  // conversions, so keying on getHash() would serve one the other's emissive.
+  //
+  // Widening updateCachedHash() to cover them is not an alternative: getHash()
+  // is the user-facing material hash written into rtx.conf tags and the key
+  // m_pReplacer->getReplacementMaterial() looks up. This is a separate,
+  // internal-only digest precisely so that hash can stay put.
+  //
+  // Defined next to as<OpaqueMaterialData>() in rtx_materials.cpp. If you add a
+  // field to that conversion, add it here in the same commit.
+  XXH64_hash_t getOpaqueConversionKey() const;
+
   const void printDebugInfo(const char* name = "") const {
 #ifdef REMIX_DEVELOPMENT
     Logger::warn(str::format(

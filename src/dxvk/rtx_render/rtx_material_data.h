@@ -228,13 +228,18 @@
 #define WRITE_CONSTANT_MEMBER_FUNC(name, usd_attr, type, minVal, maxVal, defaultVal) \
       type& get##name() { return m_##name; } \
       const type& get##name() const { return m_##name; } \
-      void set##name(const type value) { m_##name = value; m_dirty.set(DirtyFlags::k_##name); sanitizeData(); updateCachedHash(); } \
+      void set##name(const type value) { set##name##Deferred(value); finalizeEdits(); } \
+      /* NV-DXVK [perf]: writes the field and its dirty bit only - no sanitize, no */ \
+      /* rehash. For builders that set many fields in a row. See finalizeEdits().  */ \
+      void set##name##Deferred(const type value) { m_##name = value; m_dirty.set(DirtyFlags::k_##name); } \
       static pxr::TfToken get##name##Token() { return pxr::TfToken("inputs:"#usd_attr); }
 
 #define WRITE_TEXTURE_MEMBER_FUNC(name, usd_attr, type, minVal, maxVal, defaultVal) \
       type& get##name() { return m_##name; } \
       const type& get##name() const { return m_##name; } \
-      void set##name(const type value) { m_##name = value; m_dirty.set(DirtyFlags::k_##name); sanitizeData(); updateCachedHash(); } \
+      void set##name(const type value) { set##name##Deferred(value); finalizeEdits(); } \
+      /* NV-DXVK [perf]: writes the field and its dirty bit only - see above.      */ \
+      void set##name##Deferred(const type value) { m_##name = value; m_dirty.set(DirtyFlags::k_##name); } \
       static pxr::TfToken get##name##Token() { return pxr::TfToken("inputs:"#usd_attr); }
 
 #define WRITE_CONSTANT_DESERIALIZER(name, usd_attr, type, minVal, maxVal, defaultVal) \
@@ -335,6 +340,27 @@ struct name##Data {                                                             
                                                                                                      \
   void merge(const name##Data& input)  {                                                             \
     X_PARAMS(WRITE_PARAMETER_MERGE)                                                                  \
+    updateCachedHash();                                                                              \
+  }                                                                                                  \
+                                                                                                     \
+  /* NV-DXVK [perf]: flushes a run of set*Deferred() writes.                                    */   \
+  /*                                                                                            */   \
+  /* Every generated set*() ends in sanitizeData() + updateCachedHash(), and BOTH walk every    */   \
+  /* field                                                                                      */   \
+  /* of the material: for the opaque material that is 18 TextureRef::getImageHash() calls (two  */   \
+  /* pointer derefs into cold image memory apiece) plus 42 chained XXH64 calls, ~450ns a pass.  */   \
+  /* A builder that sets ~18 fields therefore hashes the whole material ~18 times to produce    */   \
+  /* one result. That is the 8us/call measured by [Perf.MatData] inside                         */   \
+  /* LegacyMaterialData::as<OpaqueMaterialData>() - ~9 ms/frame, 12% of a TF2 frame.            */   \
+  /*                                                                                            */   \
+  /* set*Deferred() writes the field and its dirty bit and nothing else; one finalizeEdits() at */   \
+  /* the end of the run yields a byte-identical material, because clamping is per-field and     */   \
+  /* idempotent (the last write to a field is the one that survives, and every other field is   */   \
+  /* re-clamped by the final pass anyway) and the cached hash depends only on the final field   */   \
+  /* values. Call it once after the last set*Deferred(); a material left un-finalized keeps a   */   \
+  /* stale getHash().                                                                           */   \
+  void finalizeEdits() {                                                                             \
+    sanitizeData();                                                                                  \
     updateCachedHash();                                                                              \
   }                                                                                                  \
                                                                                                      \

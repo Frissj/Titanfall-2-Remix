@@ -2892,6 +2892,43 @@ namespace dxvk {
 
   void AccelManager::prepareSceneData(Rc<DxvkContext> ctx, DxvkBarrierSet& execBarriers, InstanceManager& instanceManager) {
     ScopedCpuProfileZone();
+
+    // NV-DXVK [Perf.Accel]: CPU wall-time sub-split of this function.
+    //
+    // WHY. This function is the `accel` half of what [Perf.PrepScene] used to
+    // report as one `accelLight` bucket at 4.8-5.3 ms/frame. That number was read
+    // as "7% of the frame on a light stage with zero lights", but the bucket
+    // spanned two managers and the light half was never separated out.
+    //
+    // The two buckets to read FIRST are tlasSet and instProbe. Both are
+    // diagnostics, both default to TRUE (rtx.logTlasSet,
+    // rtx.debugInstanceUploadProbe), and both do work proportional to the
+    // instance count on EVERY frame: tlasSet std::sorts one entry per TLAS
+    // instance (~9k+) and then copies the whole vector to keep it for next
+    // frame's diff; instProbe maps a host-visible staging buffer and memcmps
+    // 256 KB out of it, then memcpys 256 KB back in. Reads out of host-visible
+    // memory run far below cached-RAM bandwidth, so that compare is not the
+    // 20 us its byte count suggests.
+    //
+    // If those two own the bucket, the finding is the same one HANDOFF v3 sec 0c
+    // paid for with rtx.perfGapSampler: a diagnostic that defaults on and eats
+    // the stage it lives in. Confirm by measurement here, not by argument -- the
+    // buckets are named separately precisely so the claim is falsifiable.
+    //
+    // Timestamps are unconditional (9 steady_clock::now() at ~41 ns is ~0.4 us
+    // against a ~5 ms stage) so the gate can be flipped at runtime with no
+    // rebuild, matching [Perf.PrepScene]. Emitted on the same gate and the same
+    // frame throttle as [Perf.PrepScene] so the two lines are directly
+    // cross-readable: the buckets below must sum to that line's `accel`.
+    auto tAcc = std::chrono::steady_clock::now();
+    int64_t acc_isect = 0, acc_billboard = 0, acc_size = 0, acc_alloc = 0,
+            acc_upload = 0, acc_tlasSet = 0, acc_instProbe = 0, acc_tail = 0;
+    auto markAcc = [&tAcc](int64_t& sink) {
+      const auto now = std::chrono::steady_clock::now();
+      sink = std::chrono::duration_cast<std::chrono::microseconds>(now - tAcc).count();
+      tAcc = now;
+    };
+
     bool haveInstances = false;
     for (const auto& instances : m_mergedInstances) {
       if (!instances.empty()) {
@@ -2905,6 +2942,7 @@ namespace dxvk {
     }
 
     createAndBuildIntersectionBlas(ctx, execBarriers);
+    markAcc(acc_isect);
 
     // Prepare billboard data and instances
     std::vector<MemoryBillboard> memoryBillboards;
@@ -2978,6 +3016,7 @@ namespace dxvk {
 
       numActiveBillboards = index;
     }
+    markAcc(acc_billboard);
 
     // Allocate the instance buffer and copy its contents from host to device memory
     // STORAGE_BUFFER_BIT is required for the PointInstancer GPU culling compute shader
@@ -3065,6 +3104,8 @@ namespace dxvk {
       }
     }
 
+    markAcc(acc_size);
+
     if ((m_vkInstanceBuffer == nullptr || info.size > m_vkInstanceBuffer->info().size) && info.size != 0) {
       m_vkInstanceBuffer = m_device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXAccelerationStructure, "Instance Buffer");
       Logger::debug("DxvkRaytrace: Vulkan AS Instance Realloc");
@@ -3096,6 +3137,7 @@ namespace dxvk {
         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
         VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     }
+    markAcc(acc_alloc);
 
     // Write only the CPU-populated (normal) instance data.  PointInstancer
     // regions are left for the GPU culling shader to fill directly.
@@ -3108,6 +3150,7 @@ namespace dxvk {
       // Advance past both normal and PointInstancer regions for this TLAS type
       offset += (m_mergedInstances[t].size() + m_pointInstancerSlotsPerType[t]) * sizeof(VkAccelerationStructureInstanceKHR);
     }
+    markAcc(acc_upload);
 
     // NV-DXVK [TlasSet]: WHICH geometry is in the TLAS this frame, not how much.
     //
@@ -3451,6 +3494,7 @@ namespace dxvk {
         s_prevPi = s_curPi;
       }
     }
+    markAcc(acc_tlasSet);
 
     // NV-DXVK [InstUpProbe]: harvest the ring slot this frame is about to
     // recycle (its GPU snapshot executed ~4 frames ago), then stage this
@@ -3701,6 +3745,8 @@ namespace dxvk {
       }
     }
 
+    markAcc(acc_instProbe);
+
     // Vk billboard buffer
     if (numActiveBillboards) {
       info.size = align(numActiveBillboards * sizeof(MemoryBillboard), kBufferAlignment);
@@ -3710,6 +3756,28 @@ namespace dxvk {
 
       // Write billboard data
       ctx->writeToBuffer(m_billboardsBuffer, 0, numActiveBillboards * sizeof(MemoryBillboard), memoryBillboards.data());
+    }
+    markAcc(acc_tail);
+
+    // NV-DXVK [Perf.Accel]: same gate and same frame throttle as [Perf.PrepScene]
+    // (rtx.logPrepSceneSplit, fid%10==5) so both lines describe the same frame and
+    // these buckets can be checked against that line's `accel` directly.
+    //
+    // tlasSet and instProbe are the two diagnostic buckets. `instances` is here so
+    // a bucket that scales with scene size is distinguishable from one that does
+    // not -- a fixed cost and an O(n) cost look identical in a single sample.
+    if (RtxOptions::logPrepSceneSplit() && (m_device->getCurrentFrameId() % 10u) == 5u) {
+      uint32_t mergedTotal = 0;
+      for (int t = 0; t < Tlas::Count; ++t) {
+        mergedTotal += uint32_t(m_mergedInstances[t].size());
+      }
+      Logger::warn(str::format("[Perf.Accel] frame=", m_device->getCurrentFrameId(),
+        " isect=", acc_isect, " billboard=", acc_billboard, " size=", acc_size,
+        " alloc=", acc_alloc, " upload=", acc_upload,
+        " tlasSet=", acc_tlasSet, " instProbe=", acc_instProbe, " tail=", acc_tail,
+        " | instances=", mergedTotal,
+        " tlasSetOn=", (RtxOptions::logTlasSet() ? 1 : 0),
+        " instProbeOn=", (RtxOptions::debugInstanceUploadProbe() ? 1 : 0)));
     }
   }
 

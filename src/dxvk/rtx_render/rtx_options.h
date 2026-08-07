@@ -621,11 +621,28 @@ namespace dxvk {
                "find = findSimilarInstance, the dedup search. If it dominates, the fix is the dedup key rather than the instance work -- and note the propId round-robin already documented under rtx.suppressStablePropIdVsHashes forces 100% of some shaders' lookups into the nearest-neighbour stage. mid = decision logic plus the per-draw diagnostics between search and instance work. add = addInstance, only on a dedup miss (addedPct reports how often). update = updateInstance, expected to dominate on a steady scene where nearly every draw dedups.\n"
                "COST ~0.23 ms/frame (4 clock reads per call). Turn off after the capture.");
 
+    RTX_OPTION("rtx", bool, perfUpdateInstSplit, false,
+               "[Perf.UpdInst] -- split InstanceManager::updateInstance into entry / surf / xform / flags / viewmodel / billboard / census / anticull / tail. DEFAULT OFF.\n"
+               "WHY. This is the deepest leaf of the measured chain and the single biggest item left in the frame: [Perf.SubmitState] process=96% -> [ProcDCS] instMs 32-33 at 28-29 us/draw -> [Perf.SceneObj] update=62%, i.e. ~20 ms/frame across ~16,100 instances. HANDOFF_PERF_2026-08-06_v4 sec 4c is explicit that it must be SPLIT before anything here is optimised, because the last time this function was reasoned about without a split the answer was wrong.\n"
+               "SAMPLED DURATIONS, EXACT COUNTS -- the [Perf.CsCmd] method, and it is not optional here. updateInstance runs ~16,100 times per frame, so timestamping all nine stages on every instance would cost ~6.6 ms/frame: a third of the function, which is precisely the rtx.perfGapSampler failure (v4 sec 0c) and the 11x mis-sizing of rtx.perfSceneObjSplit. Durations are therefore taken on 1 instance in 64 (~252/frame, ~0.09 ms) while the counters below are exact on every instance. estMsPerFrame is mean x true count, so a rare-but-expensive stage cannot hide behind sampling probability.\n"
+               "THE COUNTERS ARE THE POINT, not the timings. first/xfChg/matChg/prevPos/static are read from values the function ALREADY computes, and REDUNDANT = !xfChg && !matChg && !prevPos is the answer to sec 4c's open question: why does a scene with addedPct=0 and bBuild=3 re-update 16,000 instances every frame? A high REDUNDANT% means most of this work is rebuilding state that did not change, and skipping or incrementalising it is worth far more than micro-optimising the stages.\n"
+               "COST ~0.2 ms/frame total. Turn it off before taking any frame-time number.");
+
     RTX_OPTION("rtx", bool, perfMaterialSplit, false,
                "[Perf.MatData] -- split SceneManager::determineMaterialData into repl / portal / convert. DEFAULT OFF.\n"
                "Measured at 8us/draw = ~9 ms/frame = 12% of the frame ([Perf.SubmitState] material stage). The function is only ~45 lines, so 8us is suspicious on its face.\n"
                "convert = input.getMaterialData().as<OpaqueMaterialData>(). MaterialData is RETURNED BY VALUE from determineMaterialData and carries 18 TextureRefs plus dozens of scalars, so if convert dominates the cost is per-draw object construction and copying, not lookup, and the fix is to stop materialising a fresh one every draw. repl/portal are hash lookups.\n"
                "The exit* counters report which return path was actually taken, so a stage that looks cheap because it rarely runs is not mistaken for one that is fast.");
+
+    RTX_OPTION("rtx", bool, cacheLegacyMaterialConversion, true,
+               "Memoize LegacyMaterialData::as<OpaqueMaterialData>() for the duration of a frame. DEFAULT ON; set False to A/B against the uncached path without a rebuild.\n"
+               "WHY. The conversion runs once per no-replacement draw ([Perf.MatData] exit convert=100% on TF2) and builds a fresh OpaqueMaterialData -- 18 TextureRefs plus 42 constants -- every time, even though a scene draws far fewer distinct materials than draw calls. Cached on rtx.cacheLegacyMaterialConversionCounts you can see the ratio directly.\n"
+               "KEY. LegacyMaterialData::getOpaqueConversionKey(), a digest of every field the conversion reads. Deliberately NOT getHash(): the material hash covers 11 texture hashes plus blend and alpha-test state only, while the conversion also reads the source* emissive/fog/premultiplied markers, the screen-space emissive params and the sampler, so getHash() would collide two draws that need different materials.\n"
+               "LIFETIME. Cleared every frame, alongside m_preCreationSurfaceMaterialMap and for the same reason: the conversion also reads rtx.legacyMaterial.* and rtx.ignoreAlphaOnTextures, which the user can change at any time, and texture indices move. A frame is short enough that no option change survives it.");
+
+    RTX_OPTION("rtx", bool, cacheLegacyMaterialConversionCounts, false,
+               "[Perf.MatCache] -- report hit/miss/unique-material counts for rtx.cacheLegacyMaterialConversion every 3s. DEFAULT OFF.\n"
+               "hitPct is the whole story: it equals 1 - (distinct materials / draw calls), so a low number means the scene genuinely draws that many distinct materials and the cache cannot help, not that the cache is broken. Costs two counter increments per draw.");
 
     RTX_OPTION("rtx", bool, perfSubmitStateSplit, false,
                "[Perf.SubmitState] -- split SceneManager::submitDrawState into entry / hash / material / process. DEFAULT OFF; turn it on for a capture and back off afterwards.\n"
@@ -761,10 +778,23 @@ namespace dxvk {
     // is a content property, not a shading option - which is why it stayed
     // invisible to every rtx.conf knob tried so far. This census reports how much
     // of the scene is non-opaque and which routing branch put it there.
-    RTX_OPTION("rtx", bool, perfNonOpaqueCensus, true,
+    RTX_OPTION("rtx", bool, perfNonOpaqueCensus, false,
                "DIAGNOSTIC: log [Perf.NonOpaque] once per second, a per-branch "
                "census of how instances were classified opaque vs non-opaque, "
-               "since only non-opaque hits drive the primary-ray resolve loop.");
+               "since only non-opaque hits drive the primary-ray resolve loop.\n"
+               "DEFAULT FLIPPED true -> false 2026-08-06. IT REPORTS once per "
+               "second but it ACCUMULATES PER INSTANCE, and it does so inside "
+               "InstanceManager::updateInstance -- the ~20 ms/frame function that "
+               "HANDOFF_PERF_2026-08-06_v4 sec 4c names as the single biggest item "
+               "in the frame. Per qualifying instance it takes a std::mutex and "
+               "does an unordered_map<vsHash> lookup; [Perf.NonOpaque] itself "
+               "reports instPerFrame=8853-9304, so that is ~8,900 lock/unlock "
+               "pairs and ~8,900 map probes every frame.\n"
+               "TURN IT OFF BEFORE MEASURING 4c. Left on, it is counted inside the "
+               "[Perf.SceneObj] `update` bucket, so it inflates the very number 4c "
+               "exists to attribute. The option test is the first term of the "
+               "gate, so off it costs one bool load per instance and nothing "
+               "else.");
     // NV-DXVK [perf]: geometryData.boundingBox is computed over the whole vertex
     // RANGE (for vi in 0..vertCount), not over the vertices the draw's index
     // buffer actually references. Several draws sharing one vertex buffer
@@ -3419,7 +3449,7 @@ namespace dxvk {
                "GPU-backlogged frame — the single-frame whole-batch geometry "
                "dropouts. Disable only to A/B-prove the mechanism.");
 
-    RTX_OPTION("rtx", bool, debugInstanceUploadProbe, true,
+    RTX_OPTION("rtx", bool, debugInstanceUploadProbe, false,
                "DIAGNOSTIC: verify the merged TLAS instance-buffer upload "
                "byte-for-byte against what the TLAS build consumes, in the "
                "build's own command stream. Logs [InstUpProbe] cmp=OK "
@@ -3427,7 +3457,20 @@ namespace dxvk {
                "any divergence. Join mismatch frames against [ResolveCensus] "
                "ordSeen=0 dropout frames: mismatch on a dropout frame = the "
                "upload race IS the geometry flicker; OK on dropout frames "
-               "exonerates the instance bytes (bug is build/driver side).");
+               "exonerates the instance bytes (bug is build/driver side).\n"
+               "DEFAULT FLIPPED true -> false 2026-08-06. IT IS NOT CHEAP AND IT "
+               "DEFAULTED ON. Every frame it maps a host-visible staging buffer "
+               "and memcmps 256 KB OUT OF IT, then resize + memcpy 256 KB back. "
+               "Reads from host-visible memory run far below cached-RAM "
+               "bandwidth, so that compare costs far more than its byte count "
+               "suggests. Measured with [Perf.Accel]: this probe plus "
+               "rtx.logTlasSet were together ~4.8 ms of a 73.6 ms frame -- the "
+               "whole of what HANDOFF_PERF_2026-08-06_v4 sec 4b recorded as "
+               "'accelLight 4.9 ms on a stage with zero lights'. With both off, "
+               "AccelManager::prepareSceneData falls to ~50 us. Turn this back "
+               "on only for an active instance-upload flicker hunt, and off "
+               "again after -- a diagnostic that defaults on and eats the stage "
+               "it lives in is the same trap rtx.perfGapSampler set (v4 sec 0c).");
 
     // NV-DXVK: per-draw sub-view reproject gate trace. The existing probes on
     // this path cannot answer "which gate rejected this draw":
@@ -3528,16 +3571,30 @@ namespace dxvk {
     // sort per frame. Every count-based instrument reports this scene as
     // perfectly stable while meshes are visibly missing, so a count is known to
     // be the wrong shape for this artifact.
-    RTX_OPTION("rtx", bool, logTlasSet, true,
-               "DIAGNOSTIC, cheap: logs [TlasSet], one line per frame per TLAS "
-               "giving the order-independent signature of the instance SET fed to "
-               "the acceleration-structure build, plus appeared/vanished counts "
-               "diffed against the previous frame, and maskZero/blasNull for "
-               "entries that are present but will be skipped by the tracer. "
-               "[TlasSet.gone] names the BLAS and world position of what left "
-               "(capped at 8 per frame). vanished>0 with a still camera is the "
-               "geometry leaving the TLAS, caught at the last point before the "
-               "build.");
+    RTX_OPTION("rtx", bool, logTlasSet, false,
+               "DIAGNOSTIC, O(instances) PER FRAME: logs [TlasSet], one line per "
+               "frame per TLAS giving the order-independent signature of the "
+               "instance SET fed to the acceleration-structure build, plus "
+               "appeared/vanished counts diffed against the previous frame, and "
+               "maskZero/blasNull for entries that are present but will be "
+               "skipped by the tracer. [TlasSet.gone] names the BLAS and world "
+               "position of what left (capped at 8 per frame). vanished>0 with a "
+               "still camera is the geometry leaving the TLAS, caught at the last "
+               "point before the build.\n"
+               "DEFAULT FLIPPED true -> false 2026-08-06, AND THE WORD 'cheap' "
+               "REMOVED FROM THIS STRING -- it was the claim that justified the "
+               "on-by-default. Per frame it builds one entry per TLAS instance, "
+               "std::sorts ~9,000+ of them, linear-diffs against last frame, then "
+               "copies the whole vector to keep for the next diff. Measured with "
+               "[Perf.Accel]: this plus rtx.debugInstanceUploadProbe were "
+               "together ~4.8 ms of a 73.6 ms frame.\n"
+               "IT WAS ALSO PRODUCING NOTHING. '[TlasSet' sits in the project's "
+               "rtx.logDenyTags, and log.cpp applies that filter inside emitMsg, "
+               "i.e. AFTER str::format has already built the string -- so the "
+               "sort, the diff, the copy and the formatting were all paid and "
+               "every line was then discarded. If you enable this, REMOVE "
+               "'[TlasSet' from rtx.logDenyTags in the same edit or it will cost "
+               "the frame and tell you nothing.");
 
     // NV-DXVK [MatChurn]: the material/texture identity churn counters. Left ON
     // by default because it is the current line of investigation and the cost is
