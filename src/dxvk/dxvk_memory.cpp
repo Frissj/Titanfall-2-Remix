@@ -447,9 +447,39 @@ DxvkMemory::DxvkMemory() { }
     }
 
     // Ignore most hints for host-visible allocations since they
-    // usually don't make much sense for those resources
+    // usually don't make much sense for those resources.
+    //
+    // NV-DXVK [perf/HostVisibleSmallPool] 2026-08-07: Small is now PRESERVED.
+    //
+    // checkHints() makes the hint set the pool key -- a chunk only accepts
+    // allocations whose hints match its own -- so clearing Small here does not
+    // merely drop an optimisation, it merges every small host-visible allocation
+    // into the same chunks as large long-lived ones. Stock DXVK could afford that
+    // because host-visible meant write-combined staging that nothing recycled.
+    // That assumption does not survive RTX_D3D11_CACHED_DYNAMIC_SRV_BUFFERS: the
+    // t31 per-instance transform buffer is host-visible, well under the 256 KB
+    // threshold, and Map(WRITE_DISCARD)-renamed on ~94% of draws ([Perf.T31Src]
+    // samePtrPct ~6%), i.e. ~500 allocate/release cycles per frame.
+    //
+    // MEASURED consequence of merging them: allocated climbed to 8673 MB with
+    // 2250 MB of slack, and a FORCED, UNLIMITED trim recovered zero chunks
+    // ([Perf.ChunkTrim] chunks=0 recovered=0MB). Not a trim-policy failure --
+    // every chunk held at least one live short-lived suballocation, so none was
+    // ever empty and nothing was reclaimable. Frame time ratcheted 51.6 -> 62.7 ms
+    // with fenceWaitMs flat at ~22 ms, i.e. the cost was CPU-side allocator work
+    // and pressure, not GPU.
+    //
+    // Preserving Small routes exactly those allocations into the Small pool's own
+    // 16 MB chunks, where lifetimes are alike and a chunk can actually empty. That
+    // is the mechanism the comment above already describes for "resources with
+    // potentially weird lifetimes" -- a per-frame renamed slice is the canonical
+    // one. It also cuts the trim's granularity from a 128/320 MB chunk to 16 MB,
+    // which is what makes the reclaim invisible instead of a visible cliff.
+    //
+    // Everything else still goes: GpuReadable/GpuWritable genuinely say nothing
+    // about a host-visible resource, and Transient keeps its existing meaning.
     if (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
-      hints = hints & DxvkMemoryFlag::Transient;
+      hints = hints & DxvkMemoryFlags(DxvkMemoryFlag::Transient, DxvkMemoryFlag::Small);
 
     // Try to allocate from a memory type which supports the given flags exactly
     auto dedAllocPtr = dedAllocReq.prefersDedicatedAllocation ? &dedAllocInfo : nullptr;

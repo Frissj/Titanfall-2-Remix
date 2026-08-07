@@ -2,6 +2,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdarg>   // NV-DXVK: perfAppend's va_list, for the clamped log builders
 #include <cstdlib>   // NV-DXVK [Perf.WcCopy]: getenv/strtol for the kill switch
 #include <string>
 
@@ -781,6 +782,59 @@ std::atomic<uint64_t> g_t31CacheHits       { 0 };
 std::atomic<uint64_t> g_t31CacheMisses     { 0 };
 std::atomic<uint64_t> g_t31CacheBytesSaved { 0 };
 std::atomic<uint64_t> g_t31CacheBytesCopied{ 0 };
+// NV-DXVK [T31Range]: the hypothesis above was REFUTED by its own counter --
+// measured 5.8% hits, i.e. the engine does rewrite t31 between draws. It does so
+// via Map(WRITE_NO_OVERWRITE) (an append into a shared dynamic buffer), which
+// bumps GetMapGeneration() and correctly invalidates the key every draw.
+//
+// The waste that leaves is not the miss rate, it is the miss SIZE: on each miss
+// we re-copied the entire buffer, so draw N re-read every earlier draw's block
+// as well as its own -- quadratic in draws per frame. bytesRanged counts the
+// bytes NOT copied because no charIdx in the draw referenced them. It is the
+// number that says whether ranging worked; bytesSaved still only counts key
+// hits, which may legitimately stay near zero.
+std::atomic<uint64_t> g_t31CacheBytesRanged{ 0 };
+
+// NV-DXVK [Perf.T31Src]: WHY is the t31 read ~407 MB/s when memcpyFromWC uses
+// streaming loads? [Perf.LoopCut] measured t31_copy at ~15 us for ~6.3 KB, which
+// is an order of magnitude off what WC system memory should give. Two mechanisms
+// fit that rate and they need OPPOSITE fixes, so this counts the thing that
+// separates them instead of guessing a third time.
+//
+// Page count alone cannot separate them -- for a contiguous copy pages and bytes
+// are proportional, so "time scales with size" is consistent with BOTH a
+// per-page fault and plain slow bandwidth. What separates them is whether the
+// MAPPING survives between draws:
+//
+//   samePtrPct HIGH  -> the slice is not being renamed, so the pages stay
+//                       resident and are faulted in once, not per draw. Faults
+//                       are then not the story and ~407 MB/s IS this memory's
+//                       read speed -- i.e. the buffer is device-local host-
+//                       visible (BAR over PCIe), and the fix is to stop reading
+//                       it on the CPU at all.
+//   samePtrPct LOW   -> Map(WRITE_DISCARD) renames the slice every draw, every
+//                       copy touches fresh pages, and the cost is fault setup.
+//                       The fix is then mapping lifetime, not the heap.
+//
+// sameGenPct is the control: it should stay near zero (that is why the cache
+// cannot hit) and confirms the generation really does move every draw.
+// usPerPage against usPerKB says which unit the cost is denominated in.
+std::atomic<uint64_t> g_t31SrcCalls      { 0 };
+std::atomic<uint64_t> g_t31SrcSameBuf    { 0 };
+std::atomic<uint64_t> g_t31SrcSamePtr    { 0 };
+std::atomic<uint64_t> g_t31SrcSameGen    { 0 };
+std::atomic<uint64_t> g_t31PagesTouched  { 0 };
+// Own byte counter rather than reusing g_t31CacheBytesCopied: [Perf.T31Cache]
+// emits FIRST and exchanges that one to zero, so usPerKB would divide by 0.
+std::atomic<uint64_t> g_t31SrcBytesCopied{ 0 };
+
+// NV-DXVK [Perf.T31Warm]: the sink for the double-read probe's scratch
+// destinations. The probe copies the same source range two extra times into
+// buffers nothing ever reads, which is exactly the shape a compiler is allowed
+// to delete. Folding a byte from each into an atomic makes the writes observable
+// and the copies non-removable. Never read back and never logged -- the VALUE is
+// meaningless, only the fact that it is consumed matters.
+std::atomic<uint32_t> g_t31WarmSink { 0 };
 
 // NV-DXVK [T31Cache]: kill switch, as a compile-time constant next to the code
 // it affects rather than an env var, per the convention the other three perf
@@ -9076,6 +9130,399 @@ namespace dxvk {
   static thread_local int64_t  s_perfInstCoCbReadNsAcc = 0; // CB resolve + read + diag
   static thread_local int64_t  s_perfInstCoVpScanNsAcc = 0; // tryReadVP row scan
 
+  // NV-DXVK [ParFanout]: how much of the fanout actually took the parallel path.
+  // rtx.parallelInstanceFanoutMinInstances excludes small draws, and the mean
+  // instances-per-call is modest, so "the feature is on" and "the feature is doing
+  // anything" are different statements. Compare parInst against instances on the
+  // [Perf.InstDraw] line before reading loop_ms as a verdict on the split.
+  static thread_local uint32_t s_perfInstParCalls      = 0;
+  static thread_local int64_t  s_perfInstParInstances  = 0;
+
+  // NV-DXVK [Perf.LoopCut]: loop_ms is the biggest bucket in the fanout and holds
+  // three unrelated things -- the [T31Range] gather, the t31 memcpyFromWC, and the
+  // actual per-instance loop. Sizing any of them by subtracting the others across
+  // two captures does not work here: this game's per-draw cost swings 2x in the
+  // SAME scene, so cross-window ms deltas are noise. Three per-CALL marks make one
+  // window self-sufficient instead. Per call, not per instance -- ~3 clock reads
+  // against ~500 calls/frame is ~0.06 ms/frame, which is under the resolution of
+  // the thing being measured, unlike a per-instance mark would be.
+  static thread_local int64_t  s_perfInstT31GatherNsAcc = 0;
+  static thread_local int64_t  s_perfInstT31CopyNsAcc   = 0;
+  static thread_local int64_t  s_perfInstLoopBodyNsAcc  = 0;
+  // Own call counter: [Perf.LoopCut] emits next to [Perf.T31Cache], which is not
+  // in the same block as [Perf.InstDraw]'s reset. Counting separately means the
+  // line cannot silently divide by an already-zeroed count if either emit moves.
+  static thread_local uint64_t s_perfInstLoopCutCalls   = 0;
+
+  // NV-DXVK [Perf.T31Warm]: the ONE question [Perf.T31Src] could not answer.
+  // t31_copy costs ~6.5 us per 4 KB page of source, and TWO mechanisms produce
+  // that number with OPPOSITE fixes:
+  //
+  //   (a) FIRST-TOUCH on a newly renamed slice. samePtrPct is 6%, i.e. the game
+  //       Maps t31 WRITE_DISCARD per draw and DXVK hands back a fresh slice, so
+  //       every copy is the first read of freshly-committed pages and pays soft
+  //       faults / TLB fills. Fixable: warm the slice, or make the discard pool
+  //       recycle a small ring so the pages stay resident.
+  //   (b) The memory is simply this slow to read. Write-combined (or device-
+  //       local host-visible over PCIe) source lines are never cached, so the
+  //       read is a cold uncached fetch however recently the game wrote it.
+  //       NOT fixable while we read it on the CPU at all.
+  //
+  // No ratio over the EXISTING counters can separate these: pagesPerCall is
+  // pinned at 2.19-2.20 in every window, so pages and bytes never move
+  // independently and usPerPage vs usPerKB is the same measurement twice. That
+  // was tried and it is not a discriminator -- do not retry it.
+  //
+  // What DOES separate them is reading the same bytes twice in a row. Under (a)
+  // the first copy pays the one-time cost and the pages are warm for the second.
+  // Under (b) nothing is warm afterwards, because movntdqa on WC/UC memory does
+  // not populate the cache -- so the second copy costs the same as the first.
+  // (On ordinary WB memory movntdqa behaves as a normal cached load, which is
+  // why the (a) branch shows up as a large drop rather than no change.)
+  //
+  //   copy2 << copy1  -> (a): chase slice warming / discard-pool reuse.
+  //   copy2 ~= copy1  -> (b): no CPU-side fix exists; move the decode GPU-side.
+  //
+  // copy3 is the control. It is a THIRD read of the same range into a SECOND
+  // scratch, so copy2 and copy3 differ only in which destination they write.
+  // copy2 ~= copy3 says the destination is not what is being measured; a large
+  // copy2 > copy3 would mean the scratch destination was cold and the verdict
+  // needs re-reading. Without it, "copy2 is slow" has two explanations again.
+  //
+  // Sampled 1 copy in kT31WarmSampleMask+1: the probe TRIPLES the cost of the
+  // thing it measures, so it must not run every call. Mins are kept alongside
+  // means because this game's per-draw cost swings ~2x in a fixed scene (see
+  // HANDOFF s7.5) -- the minimum of many samples is the closest thing to an
+  // interference-free measurement, and the mean/min gap shows the swing.
+  static thread_local uint64_t s_perfT31WarmCopies  = 0;   // every real copy, for sampling
+  static thread_local uint64_t s_perfT31WarmSamples = 0;   // copies that ran the probe
+  static thread_local int64_t  s_perfT31Warm1NsAcc  = 0;
+  static thread_local int64_t  s_perfT31Warm2NsAcc  = 0;
+  static thread_local int64_t  s_perfT31Warm3NsAcc  = 0;
+  static thread_local int64_t  s_perfT31Warm1MinNs  = INT64_MAX;
+  static thread_local int64_t  s_perfT31Warm2MinNs  = INT64_MAX;
+  static thread_local int64_t  s_perfT31Warm3MinNs  = INT64_MAX;
+  static thread_local int64_t  s_perfT31Warm1MaxNs  = 0;
+  static thread_local uint64_t s_perfT31WarmBytes   = 0;   // bytes per probed copy, summed
+  // The two probe destinations. At namespace scope rather than function-local so
+  // the thread_local init check only runs where they are referenced -- inside the
+  // sampled branch -- instead of on every copy. Contents are never read.
+  static thread_local std::vector<uint8_t> s_t31WarmScratchA;
+  static thread_local std::vector<uint8_t> s_t31WarmScratchB;
+  // 1 in 64. At ~517 calls/frame with a ~100% miss rate that is ~8 samples per
+  // frame -- enough to converge inside one emit window, small enough to stay
+  // cheap. Two extra copies on 1 call in 64 means this costs, WORST case (branch
+  // (b), where the extra reads are as slow as the first), 2 * 14.3 us / 64 =
+  // ~0.45 us/call = ~0.23 ms on a ~51 ms frame, and it adds 3.1% to this call
+  // site's byte total on [Perf.WcCopy] -- expect that line to move slightly and
+  // do not read it as a regression. It does NOT touch [Perf.LoopCut] t31_copy;
+  // see the tLoopMark compensation at the use site.
+  constexpr uint64_t kT31WarmSampleMask = 63u;
+
+  // NV-DXVK [Perf.T31Bin] / [Perf.T31Hist]: what the first [Perf.T31Warm] capture
+  // could not settle.
+  //
+  // That capture killed both branches (a) and (b) as posed: min is 0.5-0.7 us for
+  // c1, c2 AND c3 in every window, max is 310-5403 us, and c2's mean sits level
+  // with c1's (higher in 5 of 20 windows). c2 re-reads exactly what c1 just read,
+  // so under ANY first-touch mechanism c2 has to be cheap. It is not. And a 6.5 KB
+  // memcpy taking 5.4 ms is not a memory-bandwidth number in any heap.
+  //
+  // So t31_copy is a body at ~0.7 us plus a rare tail, and "14.3 us/call over 2.2
+  // pages = 6.5 us/page" was a mean over a bimodal distribution -- there is no
+  // per-page cost to fix. [InstStall] agrees from outside: the same 1.4-2.1 ms
+  // stalls land in setupPostUs and innerSubmitUs, buckets with no t31 memcpy in
+  // them at all. And it burns CPU rather than blocking (busyPct 94-97% against
+  // blockedMs 1.3-3.2/frame, versus ~7.3 ms/frame of tail).
+  //
+  // TWO GAPS REMAIN, and these two instruments close them.
+  //
+  // [Perf.T31Bin] -- samePtrPct is 5.7-7.1%, and the first probe did not record
+  // WHICH calls the 0.70 us floor came from. ~48 same-pointer samples per window
+  // is more than enough to set a minimum on its own, so "the renamed-slice read is
+  // fast" is NOT yet established -- only "some read is fast". Binning c1/c2 on
+  // t31SamePtr separates them directly. This is the number that decides whether
+  // HANDOFF s5 (stop CPU-reading t31) is aimed at anything real: if the renamed
+  // case has a cheap body too, the CPU read is not the cost and s5 fixes nothing.
+  //
+  // [Perf.T31Hist] -- mean-vs-min INFERS a bimodal split. Counts show it. Six
+  // buckets say outright how many copies are in the body and how many are in the
+  // tail, with no averaging in between, and c2's histogram next to c1's says
+  // whether the tail is specific to the first touch or hits any read at random.
+  static constexpr int64_t kT31HistEdgesNs[5] = { 1000, 2000, 5000, 20000, 100000 };
+
+  static inline uint32_t t31HistBucket(int64_t ns) {
+    for (uint32_t i = 0; i < 5; ++i)
+      if (ns < kT31HistEdgesNs[i]) return i;
+    return 5;
+  }
+
+  // Index 0 = slice was RENAMED this call (samePtr false, ~94%), 1 = same pointer.
+  static thread_local uint64_t s_perfT31BinN[2]      = { 0, 0 };
+  static thread_local int64_t  s_perfT31Bin1NsAcc[2] = { 0, 0 };
+  static thread_local int64_t  s_perfT31Bin2NsAcc[2] = { 0, 0 };
+  static thread_local int64_t  s_perfT31Bin1MinNs[2] = { INT64_MAX, INT64_MAX };
+  static thread_local int64_t  s_perfT31Bin2MinNs[2] = { INT64_MAX, INT64_MAX };
+  static thread_local uint64_t s_perfT31Hist1[6]     = {};
+  static thread_local uint64_t s_perfT31Hist2[6]     = {};
+
+  // NV-DXVK [Perf.T31Tail] / [Perf.T31TailPos]: WHERE the tail comes from.
+  //
+  // [Perf.T31Bin] and [Perf.T31Hist] between them closed the t31 question and
+  // opened this one. Settled, do not re-litigate:
+  //   - The renamed-slice read costs 0.70 us for ~6.5 KB (T31Bin renamed c1min,
+  //     n=715-786 every window). Cached WB speed. The CPU read is NOT the cost,
+  //     so HANDOFF s5 is worth ~0.4-0.7 ms/frame, not 7.4.
+  //   - First-touch is real but tiny: c1's <1us bucket is ~19, c2's ~155, so
+  //     re-reading moves the body 1.4 -> 0.8 us. ~0.3 ms/frame.
+  //   - The TAIL does not warm at all. c1 and c2's >=20us buckets are equal
+  //     ([132 65 9] vs [122 67 7] and so on, every window). ~9% of copies carry
+  //     ~64% of t31_copy, and re-reading the identical bytes microseconds later
+  //     pays the identical price. That cannot be a property of the read.
+  //   - It burns CPU rather than blocking (busyPct 92-97%, blockedMs 1.6-4.8).
+  //   - It is not specific to this code: [InstStall] shows the same magnitude in
+  //     setupPostUs (1.4-1.9 ms) and innerSubmitUs (2.1 ms), which contain no t31
+  //     memcpy. Deleting the copy would move the cost, not remove it.
+  //
+  // So ~4.7 ms/frame is something interrupting the frame thread, and the next
+  // question is its SHAPE, because that decides where to look:
+  //   bursty (runs of adjacent copies) -> one event stalls a stretch of the
+  //     thread; look for a discrete cause with duration (a fault storm, a
+  //     shootdown, a lock convoy).
+  //   periodic (fixed count per frame, or clustered at one position) -> a cadence
+  //     the frame or another thread runs on; look at what happens once per frame.
+  //   ambient (geometric inter-arrival, mean ~11, flat across the frame) -> steady
+  //     external interference, not something this code sequences.
+  //
+  // TIMED ON EVERY COPY, not on the 1-in-64 warm sample. Inter-arrival measured in
+  // sampled space would be meaningless -- two adjacent real tails would almost
+  // never both be sampled, so bursty and ambient would look identical. Two clock
+  // reads per copy at ~41 ns is ~42 us/frame; the whole probe is un-billed from
+  // t31_copy at the end of the block so the headline number stays comparable.
+  //
+  // kT31TailNs is taken from the measured histogram edge (>=20 us is the bucket
+  // that holds ~64% of the time), not chosen a priori -- and every event's raw
+  // duration goes into the sampled dump anyway, so the cutoff traps nobody.
+  constexpr int64_t kT31TailNs = 20000;
+
+  static thread_local uint64_t s_t31TailPrevFrame    = ~0ull;
+  static thread_local uint32_t s_t31TailOrdinal      = 0;   // copies so far THIS frame
+  static thread_local uint32_t s_t31PrevFrameCopies  = 1;   // denominator for position
+  static thread_local uint32_t s_t31TailCopiesSince  = 0;   // copies since previous tail
+  static thread_local uint32_t s_t31TailThisFrame    = 0;
+  static thread_local uint64_t s_t31TailGapHist[8]   = {};  // 1,2,3-4,5-8,9-16,17-32,33-64,>64
+  static thread_local uint64_t s_t31TailPosHist[8]   = {};  // eighths of the frame's copies
+  static thread_local uint64_t s_t31TailCount        = 0;
+  static thread_local int64_t  s_t31TailNsAcc        = 0;
+  static thread_local int64_t  s_t31TailMaxNs        = 0;
+  static thread_local uint64_t s_t31TailFrames       = 0;
+  static thread_local uint32_t s_t31TailPerFrameMin  = UINT32_MAX;
+  static thread_local uint32_t s_t31TailPerFrameMax  = 0;
+  static thread_local uint64_t s_t31AllCopies        = 0;   // denominator for tailPct
+  static thread_local int64_t  s_t31AllCopyNsAcc     = 0;   // denominator for tailTimePct
+  static thread_local uint64_t s_t31TailDumpCtr      = 0;
+  // ~4700 tails/window, so 1-in-512 gives ~9 raw lines. Raw events exist because
+  // an aggregate cannot show a pattern nobody thought to bucket for.
+  constexpr uint64_t kT31TailDumpMask = 511u;
+
+  // NV-DXVK [Perf.T31Size] / [Perf.T31Span]: the last two numbers this needs.
+  //
+  // CORRECTION that produced these. The earlier reading of [Perf.T31Bin] paired
+  // c1min (0.70 us) with avgKB (6.5) and concluded the read runs at ~9 GB/s, i.e.
+  // cached, i.e. the CPU read is not the cost. That pairing is invalid -- a
+  // MINIMUM duration and a MEAN size come from different copies, and the 0.70 us
+  // sample was the smallest copy in the window, not an average one.
+  //
+  // [Perf.T31TailEvt] settled it with raw pairs instead: 52.0 KB -> 38.4-38.8 us,
+  // 34.3 KB -> 25.2-25.5 us, 49.8 KB -> 37.1 us. Three sizes, one rate, 1.38 GB/s,
+  // agreeing to under 1% and repeating all capture. The non-tail population lands
+  // on the same line (45.9k copies at 3.3 us each is ~4.5 KB at 1.38 GB/s). It is
+  // ONE size-proportional population, so branch (b) is the live answer after all,
+  // and c1/c2's equal >=20us buckets are (b) behaving exactly as predicted rather
+  // than the external interruption they were read as.
+  //
+  // Which makes SIZE the whole story, and size here is not need. [T31Range] copies
+  // the UNION SPAN of the draw's charIdx values, so a draw with scattered indices
+  // stages 52 KB to use a handful of 208-byte entries. Two levers follow and these
+  // two lines size them, so the next move is a fix and not another probe:
+  //
+  //   [Perf.T31Size] -- us and GB/s per size bucket. FLAT GB/s across buckets means
+  //     the cost is purely bytes x rate, there is no per-call component left to
+  //     chase, and the only lever is copying fewer bytes. A bucket off the line is
+  //     the real-outlier population separated out at last.
+  //   [Perf.T31Span] -- usedPct = (distinct entries x 208) / span actually copied.
+  //     That is the waste [T31Range] leaves on the table, and `runs` says whether
+  //     per-run copying can collect it: few runs per draw = a handful of memcpys
+  //     replaces one fat one; hundreds = per-call overhead eats the win and the
+  //     answer is s5 (drop the CPU read) instead.
+  //
+  // usedBytes uses DISTINCT entries via a bitset, not maxInstances*208, because
+  // instances share charIdx and the naive product would overstate need and
+  // understate the waste -- flattering the status quo is the one direction this
+  // number must not err in.
+  constexpr uint32_t kT31MaxEntryBits = 4096u;   // 64 words; ~294 entries in play
+
+  static thread_local uint64_t s_t31EntryBits[kT31MaxEntryBits / 64u] = {};
+  static thread_local uint64_t s_t31SizeN[8]     = {};
+  static thread_local int64_t  s_t31SizeNs[8]    = {};
+  static thread_local uint64_t s_t31SizeBytes[8] = {};
+  static thread_local uint64_t s_t31SpanN            = 0;
+  static thread_local uint64_t s_t31SpanCopiedBytes  = 0;
+  static thread_local uint64_t s_t31SpanUsedBytes    = 0;
+  static thread_local uint64_t s_t31SpanRuns         = 0;
+  static thread_local uint64_t s_t31SpanEntries      = 0;
+  static thread_local uint64_t s_t31SpanOverflow     = 0;   // charIdx past the bitset
+  static thread_local int64_t  s_t31SpanNsAcc        = 0;
+  // Stashed by the [Perf.T31Tail] emit before it resets, so [Perf.T31Span] can put
+  // its projection in ms/FRAME. A window figure alone invites the reader to divide
+  // by a frame count they have to go and find on another line.
+  static thread_local uint64_t s_t31LastWindowFrames = 0;
+
+  // NV-DXVK [Perf.FanoutRej]: the number HANDOFF s5 turns on.
+  //
+  // Moving the t31 decode GPU-side means the CPU can no longer know how many
+  // instances survive before surface slots are reserved, because the rejects
+  // (OOB / non-finite / zero-row0) are only visible once the bytes are decoded.
+  // The resolution is worst-case reservation with the culling shader writing
+  // mask=0 for rejects -- which is what it already does for distance-culled
+  // instances, so it is the existing design rather than a new mechanism. What
+  // that costs is exactly the reject rate:
+  //
+  //   dropped ~= 0  -> worst-case reservation IS the current count, the change
+  //                    is invisible to surface indexing, and [FindStage] cannot
+  //                    move. The design question dissolves.
+  //   dropped > 0   -> we would reserve slots for instances that today never
+  //                    exist, and surfaceIndexOfFirstInstance arithmetic in
+  //                    rtx_accel_manager has to be re-checked before anything
+  //                    else lands.
+  //
+  // The counters ALREADY EXIST and already increment unconditionally at the
+  // fanout compaction (both the parallel phase-2 and the serial loop). Only the
+  // [SpawnGeomDiag.hist] line that prints them is gated, behind kDiagLogs, which
+  // is a compile-time false -- and flipping that would turn on every diagnostic
+  // in this file, not one number. So this accumulates the same per-frame
+  // counters into a window and prints them next to the other [Perf.*] lines
+  // under rtx.logSubmitStall. Nothing on the hot path changes.
+  static thread_local uint64_t s_fanoutRejSeen      = 0;
+  static thread_local uint64_t s_fanoutRejOob       = 0;
+  static thread_local uint64_t s_fanoutRejNonFinite = 0;
+  static thread_local uint64_t s_fanoutRejZeroRow0  = 0;
+  static thread_local uint64_t s_fanoutRejFrames    = 0;
+
+  // NV-DXVK [Perf.FanoutGate]: the denominator [Perf.FanoutRej] was missing.
+  //
+  // seenPerFrame read as 65.5% of [Perf.InstDraw] instances/frame, stable to a
+  // tenth of a percent, and that looked like instances going missing. It is not:
+  // the two counters count different populations by construction.
+  // s_perfInstInstancesAcc adds instanceCount on EVERY SubmitInstancedDraw (the
+  // RAII guard), while m_geomDiagFanoutInstSeen only increments inside the fanout
+  // loop, which sits behind `!m_instBufCache.empty() && t31Data`. maxInstances is
+  // plain `= instanceCount` at both sites, so nothing is truncated inside the
+  // fanout -- the gap is entirely draws that never enter it.
+  //
+  // This measures that gate directly, so the ratio stops being a mystery someone
+  // re-derives, and splits the misses by REASON and by shader:
+  //   noT31   -- no t31 buffer bound at all
+  //   noCache -- instance-buffer cache empty
+  // The VS census is the part that matters beyond bookkeeping. If the misses are
+  // all particle/decal/UI shaders, the 34.5% is a category that legitimately has
+  // no bone path and the question is closed. If a world or model VS appears in
+  // there, that is instanced geometry quietly skipping the RT fanout -- a
+  // correctness lead, not a perf one, and this repo has form for exactly that
+  // (see the vanishing-floor and missing-prop histories).
+  //
+  // vsKey is the GetCurrentVsPsHashes space (memoized on shader pointers, cheap),
+  // NOT RtSurface::getHash() -- those are different numbers and comparing them
+  // across lines is a known trap here.
+  static thread_local uint64_t s_fanoutGateCallsPass  = 0;
+  static thread_local uint64_t s_fanoutGateCallsMiss  = 0;
+  static thread_local uint64_t s_fanoutGateInstPass   = 0;
+  static thread_local uint64_t s_fanoutGateInstMiss   = 0;
+  static thread_local uint64_t s_fanoutGateInstNoT31  = 0;
+  static thread_local uint64_t s_fanoutGateInstNoCache= 0;
+
+  // 8-way miss census by VS. Linear scan, lowest-count victim on overflow -- the
+  // same shape as the other small memo tables in this file, and 8 ways is plenty
+  // when the expectation is a handful of distinct shaders.
+  constexpr uint32_t kFanoutGateVsWays = 8u;
+  static thread_local uint64_t s_fanoutGateVsKey[kFanoutGateVsWays]   = {};
+  static thread_local uint64_t s_fanoutGateVsInst[kFanoutGateVsWays]  = {};
+
+  // NV-DXVK: append helper for the incremental snprintf lines below. snprintf
+  // returns the length it WOULD have written, so accumulating its return value
+  // lets the offset run past the buffer; `cap - off` is size_t and underflows to
+  // a huge value, and `buf + off` is already out of bounds. That is a stack smash,
+  // not a truncated log line. This clamps and reports truncation instead.
+  static inline void perfAppend(char* buf, size_t cap, size_t& off, const char* fmt, ...) {
+    if (off >= cap - 1u)
+      return;                                  // full; drop the rest
+    va_list ap;
+    va_start(ap, fmt);
+    const int n = std::vsnprintf(buf + off, cap - off, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    off = (size_t(n) >= cap - off) ? (cap - 1u)   // truncated: pin to the end
+                                   : (off + size_t(n));
+  }
+
+  static inline void fanoutGateNoteVs(uint64_t vsKey, uint32_t instances) {
+    uint32_t victim = 0;
+    for (uint32_t i = 0; i < kFanoutGateVsWays; ++i) {
+      if (s_fanoutGateVsInst[i] != 0 && s_fanoutGateVsKey[i] == vsKey) {
+        s_fanoutGateVsInst[i] += instances;
+        return;
+      }
+      if (s_fanoutGateVsInst[i] == 0) {          // free slot
+        s_fanoutGateVsKey[i]  = vsKey;
+        s_fanoutGateVsInst[i] = instances;
+        return;
+      }
+      if (s_fanoutGateVsInst[i] < s_fanoutGateVsInst[victim])
+        victim = i;
+    }
+    s_fanoutGateVsKey[victim]  = vsKey;
+    s_fanoutGateVsInst[victim] = instances;      // evict the smallest
+  }
+
+  // KB edges: <1 <2 <4 <8 <16 <32 <64 >=64
+  static inline uint32_t t31SizeBucket(size_t bytes) {
+    const size_t kb = bytes >> 10;
+    if (kb < 1u)  return 0u;
+    if (kb < 2u)  return 1u;
+    if (kb < 4u)  return 2u;
+    if (kb < 8u)  return 3u;
+    if (kb < 16u) return 4u;
+    if (kb < 32u) return 5u;
+    if (kb < 64u) return 6u;
+    return 7u;
+  }
+
+  static inline uint32_t t31GapBucket(uint32_t gap) {
+    if (gap <= 1u)  return 0u;
+    if (gap == 2u)  return 1u;
+    if (gap <= 4u)  return 2u;
+    if (gap <= 8u)  return 3u;
+    if (gap <= 16u) return 4u;
+    if (gap <= 32u) return 5u;
+    if (gap <= 64u) return 6u;
+    return 7u;
+  }
+
+  // NV-DXVK [ParFanout]: one decoded instance. Phase 1 (parallel) fills these and
+  // touches nothing shared; phase 2 (serial) walks them IN ORDER and does every
+  // side effect -- the compacting appends, the first-survivor m_fanoutRawT0
+  // capture, and the four reject counters. Splitting it this way is what makes the
+  // output identical to the serial loop rather than merely equivalent: the loop
+  // skips rejected instances, so the output index is not the loop index and a
+  // plain parallel-for would reorder tforms.
+  struct FanoutSlot {
+    Matrix4 cur;
+    Matrix4 prev;
+    float   rawT[3];   // pre-camOrigin translation, for the [CamOrig] probe
+    uint8_t status;    // 0 = ok, 1 = t31 OOB, 2 = non-finite, 3 = zero row0
+    uint8_t hasPrev;   // 0 = no usable previous-frame matrix; duplicate cur
+  };
+
   // NV-DXVK [Perf.InstDraw] LEAST-SQUARES accumulators â€” cost = intercept + slope*instances.
   //
   // WHY THESE EXIST. Window aggregates cannot separate per-call from per-instance
@@ -9116,6 +9563,17 @@ namespace dxvk {
     const auto tInst0 = std::chrono::steady_clock::now();
     int64_t innerSubmitUs = 0;
     int64_t loopUs = 0;   // time in the per-instance transform-build loop(s)
+    // NV-DXVK [Perf.LoopCut]: the three-way cut of loopUs. Own timer chain, kept
+    // separate from markInst's -- that one is mid-sequence at the dbgTrack mark by
+    // the time tLoop0 opens, so reusing it would bill the gap between them here.
+    int64_t loopGatherNs = 0, loopCopyNs = 0, loopBodyNs = 0;
+    auto tLoopMark = std::chrono::steady_clock::now();   // re-seeded at tLoop0
+    auto markLoop = [&](int64_t& sink) {
+      if (!kInstTiming) return;
+      const auto now = std::chrono::steady_clock::now();
+      sink += std::chrono::duration_cast<std::chrono::nanoseconds>(now - tLoopMark).count();
+      tLoopMark = now;
+    };
     // NV-DXVK [Perf.InstDraw]: split of setupPost (= build - loop), which the
     // aggregate showed is 47.6% of this path AND scales per-instance (0.63
     // us/instance) â€” so it is not the per-call setup its name implies. Two
@@ -9563,6 +10021,27 @@ namespace dxvk {
                   vsCbs[sl].buffer->Desc()->ByteWidth,
                   " off=", vsCbs[sl].constantOffset));
               }
+            }
+          }
+
+          // NV-DXVK [Perf.FanoutGate]: census of THIS gate -- see the counter
+          // declarations. Sits immediately above the branch it measures so the
+          // two can never drift apart. Costs two bools and an add per call when
+          // logging is on, and the VS lookup only on the miss path.
+          if (RtxOptions::logSubmitStall()) {
+            const bool gNoCache = m_instBufCache.empty();
+            const bool gNoT31   = (t31Data == nullptr);
+            if (!gNoCache && !gNoT31) {
+              ++s_fanoutGateCallsPass;
+              s_fanoutGateInstPass += uint64_t(instanceCount);
+            } else {
+              ++s_fanoutGateCallsMiss;
+              s_fanoutGateInstMiss += uint64_t(instanceCount);
+              if (gNoT31)   s_fanoutGateInstNoT31   += uint64_t(instanceCount);
+              if (gNoCache) s_fanoutGateInstNoCache += uint64_t(instanceCount);
+              XXH64_hash_t mVs = 0, mPs = 0;
+              GetCurrentVsPsHashes(mVs, mPs);
+              fanoutGateNoteVs(uint64_t(mVs), instanceCount);
             }
           }
 
@@ -10516,7 +10995,16 @@ namespace dxvk {
               }
             }
 
+            // NV-DXVK [ParFanout]: hoisted out of the per-instance loop below so
+            // the parallel path can test it as an eligibility gate. Function-local
+            // static either way -- initialised once, on first use.
+            static const bool s_fanoutDiag = []() {
+              const char* v = std::getenv("RTX_D3D11_DIAG");
+              return v != nullptr && v[0] == '1';
+            }();
+
             const auto tLoop0 = std::chrono::steady_clock::now();
+            tLoopMark = tLoop0;   // NV-DXVK [Perf.LoopCut]: seed the three-way cut
             // NV-DXVK [InstStall]: bulk-copy the mapped t31 buffer into a cached
             // CPU vector ONCE, sequentially. The per-instance loop below indexes
             // t31 by a scattered charIdx (charIdx*208), so reading straight from
@@ -10543,38 +11031,505 @@ namespace dxvk {
               // is keyed on all three and re-copies whenever any of them
               // differs. Length is checked via the cache's own size so a
               // resize can never leave us reading past the fill.
-              const bool t31CacheHit =
+              // NV-DXVK [T31Range]: work out which bytes this draw will actually
+              // read BEFORE copying anything. Every reader of t31Read indexes it by
+              // charIdx*208 and consumes at most one whole 208-byte entry (48 bytes
+              // current matrix, 48 more for the previous-frame matrix, and the full
+              // entry on the [T31Struct] dump path), so the referenced set is the
+              // union of those entries. charIdx comes from m_instBufCache, which is
+              // an ordinary CPU vector at 100% hit rate -- this pass reads no
+              // write-combined memory and costs a few ns per instance.
+              //
+              // The gather deliberately mirrors the loops' arithmetic exactly. If it
+              // ever computed a NARROWER range than a reader uses, the reader would
+              // see uninitialised bytes -- so it takes the whole entry, not the 48 or
+              // 96 bytes a particular path happens to need.
+              size_t needBegin = t31Len;
+              size_t needEnd   = 0u;
+
+              // NV-DXVK [Perf.T31Span]: the sample decision moves HERE, ahead of the
+              // gather, because the distinct-entry set can only be built while the
+              // charIdx values are being walked. It gates the warm probe further
+              // down too, so there is still exactly one sampled-call decision -- the
+              // counter now advances per gather rather than per copy, which is the
+              // same population (the cache hits 0% of the time).
+              const bool t31Sampled =
+                     kInstTiming
+                  && ((++s_perfT31WarmCopies & kT31WarmSampleMask) == 0u);
+              uint32_t t31Distinct = 0;
+              uint32_t t31Runs     = 0;
+              uint32_t t31Overflow = 0;
+              if (t31Sampled)
+                std::memset(s_t31EntryBits, 0, sizeof(s_t31EntryBits));
+
+              for (uint32_t gi = 0; gi < maxInstances; ++gi) {
+                const size_t gOff = static_cast<size_t>(instVb.offset)
+                                  + static_cast<size_t>(startInstance + gi) * stride + boneOff;
+                uint32_t gIdx = 0;
+                if (boneIdxSem->format == VK_FORMAT_R16G16B16A16_UINT) {
+                  if (gOff + 2 <= m_instBufCache.size())
+                    gIdx = *reinterpret_cast<const uint16_t*>(instData + gOff);
+                } else {
+                  if (gOff + 4 <= m_instBufCache.size())
+                    gIdx = *reinterpret_cast<const uint32_t*>(instData + gOff);
+                }
+                const size_t eBegin = static_cast<size_t>(gIdx) * BYTES_PER_INSTANCE;
+                if (eBegin >= t31Len)
+                  continue;                       // rejected downstream as OOB
+                const size_t eEnd = std::min(eBegin + BYTES_PER_INSTANCE, t31Len);
+                if (eBegin < needBegin) needBegin = eBegin;
+                if (eEnd   > needEnd)   needEnd   = eEnd;
+                // NV-DXVK [Perf.T31Span]: entry index IS gIdx (eBegin = gIdx*208),
+                // so the set needs no division. Instances share charIdx, which is
+                // the whole point -- distinct entries, not instance count.
+                if (t31Sampled) {
+                  if (gIdx < kT31MaxEntryBits)
+                    s_t31EntryBits[gIdx >> 6] |= (1ull << (gIdx & 63u));
+                  else
+                    ++t31Overflow;   // reported, never silently dropped
+                }
+              }
+              if (needBegin > needEnd) { needBegin = 0u; needEnd = 0u; }  // nothing in range
+
+              // NV-DXVK [Perf.T31Span]: distinct entries and contiguous runs, over
+              // non-zero words only. Kernighan rather than an intrinsic so this
+              // carries no ISA assumption the rest of the file does not already
+              // make. ~64 iterations plus one per set bit, on 1 call in 64.
+              if (t31Sampled) {
+                bool prevBit = false;
+                for (uint32_t w = 0; w < (kT31MaxEntryBits / 64u); ++w) {
+                  const uint64_t bits = s_t31EntryBits[w];
+                  if (bits == 0ull) { prevBit = false; continue; }
+                  for (uint64_t b = bits; b; b &= (b - 1ull)) ++t31Distinct;
+                  // A run starts at every set bit whose predecessor is clear; the
+                  // predecessor of bit 0 is the previous word's top bit.
+                  const uint64_t starts = bits & ~((bits << 1) | (prevBit ? 1ull : 0ull));
+                  for (uint64_t b = starts; b; b &= (b - 1ull)) ++t31Runs;
+                  prevBit = ((bits >> 63) & 1ull) != 0ull;
+                }
+              }
+              markLoop(loopGatherNs);   // NV-DXVK [Perf.LoopCut]: t31_gather
+
+              // The key still catches both ways the bytes can change under us:
+              // Map(WRITE_DISCARD) renames the slice (MapPtr moves) and
+              // Map(WRITE_NO_OVERWRITE) writes in place (only MapGen moves).
+              // Getting this wrong is a stale per-instance transform, which
+              // looks like geometry in the wrong place, not a crash -- so it
+              // is keyed on all three and re-copies whenever any of them
+              // differs. A hit ALSO requires the cached fill range to contain
+              // what this draw needs; a narrower fill is a miss, not a hit.
+              // NV-DXVK [Perf.T31Src]: sampled BEFORE the cache state is
+              // overwritten below. See the counter declarations for what the
+              // three ratios decide between.
+              const bool t31SameBuf = (m_t31CacheSrcBuf == t31SrcBuf);
+              const bool t31SamePtr = (m_t31CacheMapPtr == t31Data);
+              const bool t31SameGen = (m_t31CacheMapGen == t31SrcGen);
+              g_t31SrcCalls.fetch_add(1, std::memory_order_relaxed);
+              if (t31SameBuf) g_t31SrcSameBuf.fetch_add(1, std::memory_order_relaxed);
+              if (t31SamePtr) g_t31SrcSamePtr.fetch_add(1, std::memory_order_relaxed);
+              if (t31SameGen) g_t31SrcSameGen.fetch_add(1, std::memory_order_relaxed);
+
+              const bool t31KeyMatch =
                      kEnableT31ReadCache
-                  && m_t31CacheSrcBuf == t31SrcBuf
-                  && m_t31CacheMapPtr == t31Data
-                  && m_t31CacheMapGen == t31SrcGen
+                  && t31SameBuf
+                  && t31SamePtr
+                  && t31SameGen
                   && m_t31ReadCache.size() == t31Len;
+              const bool t31CacheHit =
+                     t31KeyMatch
+                  && m_t31CacheFillBegin <= needBegin
+                  && m_t31CacheFillEnd   >= needEnd;
 
               if (t31CacheHit) {
                 g_t31CacheHits.fetch_add(1, std::memory_order_relaxed);
-                g_t31CacheBytesSaved.fetch_add(t31Len, std::memory_order_relaxed);
+                g_t31CacheBytesSaved.fetch_add(needEnd - needBegin, std::memory_order_relaxed);
               } else {
+                // Sized to the FULL buffer so every reader keeps indexing by absolute
+                // offset with its bounds checks unchanged; only the fill is narrowed.
+                // resize() keeps capacity across draws, so this does not reallocate
+                // once warmed.
                 m_t31ReadCache.resize(t31Len);
-                // NV-DXVK [Perf.InstDraw] 2026-07-27: was std::memcpy. The source is
-                // the MAPPED t31 buffer â€” write-combined per the m_t31ReadCache decl
-                // in d3d11_rtx.h â€” and plain memcpy reads WC with ordinary loads at
-                // ~300 MB/s effective (see memcpyFromWC at the top of this file).
-                // movntdqa fills a whole line-fill buffer per transaction instead.
-                // Same bytes either way, so the "no visual change" note above still
-                // holds. Precedent: the per-draw index snapshot went from ~64 ms/frame
-                // to 219 us/window on this exact substitution.
-                // This copy sits INSIDE the loop timer (tLoop0 opens above it), so
-                // the win lands in [Perf.InstDraw] loop_ms, NOT prep_ms.
-                memcpyFromWC(m_t31ReadCache.data(), t31Data, t31Len);
-                m_t31CacheSrcBuf = t31SrcBuf;
-                m_t31CacheMapPtr = t31Data;
-                m_t31CacheMapGen = t31SrcGen;
+
+                size_t copyBegin = needBegin;
+                size_t copyEnd   = needEnd;
+                if (t31KeyMatch && m_t31CacheFillEnd > m_t31CacheFillBegin) {
+                  // Same bytes, wider window: keep what we already hold and copy the
+                  // union in one pass rather than thrash between two narrow ranges.
+                  copyBegin = std::min(copyBegin, m_t31CacheFillBegin);
+                  copyEnd   = std::max(copyEnd,   m_t31CacheFillEnd);
+                }
+
+                // NV-DXVK [Perf.T31Src]: 4 KB pages the copy actually spans, from
+                // the SOURCE offsets -- what the fault path would see. Counted on
+                // the miss path only, which is where the copy happens.
+                if (copyEnd > copyBegin) {
+                  const size_t pgFirst = copyBegin / 4096u;
+                  const size_t pgLast  = (copyEnd - 1u) / 4096u;
+                  g_t31PagesTouched.fetch_add(uint64_t(pgLast - pgFirst + 1u),
+                                              std::memory_order_relaxed);
+                  g_t31SrcBytesCopied.fetch_add(uint64_t(copyEnd - copyBegin),
+                                                std::memory_order_relaxed);
+                }
+
+                if (copyEnd > copyBegin) {
+                  // NV-DXVK [Perf.InstDraw] 2026-07-27: was std::memcpy. The source is
+                  // the MAPPED t31 buffer â€” write-combined per the m_t31ReadCache decl
+                  // in d3d11_rtx.h â€” and plain memcpy reads WC with ordinary loads at
+                  // ~300 MB/s effective (see memcpyFromWC at the top of this file).
+                  // movntdqa fills a whole line-fill buffer per transaction instead.
+                  // Same bytes either way, so the "no visual change" note above still
+                  // holds. Precedent: the per-draw index snapshot went from ~64 ms/frame
+                  // to 219 us/window on this exact substitution.
+                  // This copy sits INSIDE the loop timer (tLoop0 opens above it), so
+                  // the win lands in [Perf.InstDraw] loop_ms, NOT prep_ms.
+                  // NV-DXVK [Perf.T31Warm]: the double-read probe. See the counter
+                  // declarations above SubmitInstancedDraw for what it decides and
+                  // why no existing counter can. Structure matters here:
+                  //   copy1 = the REAL copy below, which is the first touch of this
+                  //           slice's source pages. It cannot be moved or repeated,
+                  //           so the probe brackets it rather than adding a copy in
+                  //           front of it -- a warm-up read would destroy the very
+                  //           thing being measured.
+                  //   copy2 = same source range, second touch, scratch A.
+                  //   copy3 = same source range, third touch, scratch B (control).
+                  // Decided at the gather above, so the distinct-entry set and this
+                  // copy's timings describe the same call.
+                  const bool warmSample = t31Sampled;
+                  const size_t warmLen = copyEnd - copyBegin;
+                  if (warmSample) {
+                    // Resized OUTSIDE the timed region. A reallocation inside it
+                    // would be billed to copy2 and would read as branch (b).
+                    if (s_t31WarmScratchA.size() < warmLen) s_t31WarmScratchA.resize(warmLen);
+                    if (s_t31WarmScratchB.size() < warmLen) s_t31WarmScratchB.resize(warmLen);
+                  }
+                  // NV-DXVK [Perf.T31Tail]: tCopy0/tCopy1 bracket the REAL copy on
+                  // every call now, not just the warm samples -- see the tail
+                  // declarations for why sampled inter-arrival is meaningless. The
+                  // warm probe reuses tCopy1 as its c1 endpoint, so sampled calls
+                  // take no extra clock reads than they did before.
+                  const auto tCopy0 = kInstTiming
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point {};
+
+                  memcpyFromWC(m_t31ReadCache.data() + copyBegin,
+                               t31Data + copyBegin,
+                               copyEnd - copyBegin);
+
+                  const auto tCopy1 = kInstTiming
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point {};
+
+                  // The probe copies run FIRST, before any bookkeeping, so nothing
+                  // this block does lands inside c2's measurement.
+                  auto tWarm2 = tCopy1;
+                  auto tWarm3 = tCopy1;
+                  if (warmSample) {
+                    memcpyFromWC(s_t31WarmScratchA.data(), t31Data + copyBegin, warmLen);
+                    tWarm2 = std::chrono::steady_clock::now();
+                    memcpyFromWC(s_t31WarmScratchB.data(), t31Data + copyBegin, warmLen);
+                    tWarm3 = std::chrono::steady_clock::now();
+                  }
+
+                  if (kInstTiming) {
+                    const int64_t ns1 = std::chrono::duration_cast<std::chrono::nanoseconds>(tCopy1 - tCopy0).count();
+
+                    // ---- NV-DXVK [Perf.T31Tail]: runs on EVERY copy ----
+                    ++s_t31AllCopies;
+                    s_t31AllCopyNsAcc += ns1;
+
+                    // NV-DXVK [Perf.T31Size]: also every copy. The flatness test
+                    // needs the whole size range, and restricting it to the 1-in-64
+                    // sample would thin the rare big buckets to nothing.
+                    const uint32_t szB = t31SizeBucket(warmLen);
+                    ++s_t31SizeN[szB];
+                    s_t31SizeNs[szB]    += ns1;
+                    s_t31SizeBytes[szB] += uint64_t(warmLen);
+
+                    // NV-DXVK [Perf.T31Span]: sampled, paired with THIS copy's ns.
+                    if (warmSample) {
+                      ++s_t31SpanN;
+                      s_t31SpanCopiedBytes += uint64_t(warmLen);
+                      s_t31SpanUsedBytes   += uint64_t(t31Distinct) * BYTES_PER_INSTANCE;
+                      s_t31SpanRuns        += t31Runs;
+                      s_t31SpanEntries     += t31Distinct;
+                      s_t31SpanOverflow    += t31Overflow;
+                      s_t31SpanNsAcc       += ns1;
+                    }
+
+                    const uint64_t curFrame = m_context->m_device->getCurrentFrameId();
+                    if (curFrame != s_t31TailPrevFrame) {
+                      if (s_t31TailPrevFrame != ~0ull) {
+                        // Close the frame that just ended. Its copy count becomes
+                        // the position denominator for the next one -- the count is
+                        // only known at the rollover, and it is stable frame to
+                        // frame (~517), so using the previous frame's is exact
+                        // enough to bucket into eighths.
+                        ++s_t31TailFrames;
+                        if (s_t31TailThisFrame < s_t31TailPerFrameMin) s_t31TailPerFrameMin = s_t31TailThisFrame;
+                        if (s_t31TailThisFrame > s_t31TailPerFrameMax) s_t31TailPerFrameMax = s_t31TailThisFrame;
+                        if (s_t31TailOrdinal > 0u) s_t31PrevFrameCopies = s_t31TailOrdinal;
+                      }
+                      s_t31TailPrevFrame = curFrame;
+                      s_t31TailOrdinal   = 0;
+                      s_t31TailThisFrame = 0;
+                    }
+                    ++s_t31TailOrdinal;
+                    ++s_t31TailCopiesSince;
+
+                    if (ns1 >= kT31TailNs) {
+                      ++s_t31TailCount;
+                      ++s_t31TailThisFrame;
+                      s_t31TailNsAcc += ns1;
+                      if (ns1 > s_t31TailMaxNs) s_t31TailMaxNs = ns1;
+                      ++s_t31TailGapHist[t31GapBucket(s_t31TailCopiesSince)];
+
+                      const uint32_t den = s_t31PrevFrameCopies ? s_t31PrevFrameCopies : 1u;
+                      uint32_t pos = uint32_t((uint64_t(s_t31TailOrdinal - 1u) * 8ull) / den);
+                      if (pos > 7u) pos = 7u;
+                      ++s_t31TailPosHist[pos];
+
+                      // Raw events. An aggregate cannot show a pattern nobody
+                      // thought to bucket for, so a thin sample goes out whole.
+                      if ((++s_t31TailDumpCtr & kT31TailDumpMask) == 0u) {
+                        char tdBuf[224];
+                        std::snprintf(tdBuf, sizeof(tdBuf),
+                          "[Perf.T31TailEvt] frame=%llu ord=%u/%u us=%.1f gapCopies=%u KB=%.1f",
+                          (unsigned long long) curFrame,
+                          s_t31TailOrdinal, den,
+                          double(ns1) / 1e3,
+                          s_t31TailCopiesSince,
+                          double(warmLen) / 1024.0);
+                        Logger::info(tdBuf);
+                      }
+                      s_t31TailCopiesSince = 0;
+                    }
+                  }
+
+                  if (warmSample) {
+                    const int64_t ns1 = std::chrono::duration_cast<std::chrono::nanoseconds>(tCopy1 - tCopy0).count();
+                    const int64_t ns2 = std::chrono::duration_cast<std::chrono::nanoseconds>(tWarm2 - tCopy1).count();
+                    const int64_t ns3 = std::chrono::duration_cast<std::chrono::nanoseconds>(tWarm3 - tWarm2).count();
+                    s_perfT31Warm1NsAcc += ns1;
+                    s_perfT31Warm2NsAcc += ns2;
+                    s_perfT31Warm3NsAcc += ns3;
+                    if (ns1 < s_perfT31Warm1MinNs) s_perfT31Warm1MinNs = ns1;
+                    if (ns2 < s_perfT31Warm2MinNs) s_perfT31Warm2MinNs = ns2;
+                    if (ns3 < s_perfT31Warm3MinNs) s_perfT31Warm3MinNs = ns3;
+                    if (ns1 > s_perfT31Warm1MaxNs) s_perfT31Warm1MaxNs = ns1;
+                    s_perfT31WarmBytes += uint64_t(warmLen);
+                    ++s_perfT31WarmSamples;
+
+                    // NV-DXVK [Perf.T31Bin]: t31SamePtr was captured above, BEFORE
+                    // the cache key was overwritten, so it still describes THIS
+                    // call. bin 0 = DXVK renamed the slice under us (the ~94% case
+                    // and the one HANDOFF s5 is about), bin 1 = same mapped pointer
+                    // as the previous draw.
+                    const uint32_t warmBin = t31SamePtr ? 1u : 0u;
+                    ++s_perfT31BinN[warmBin];
+                    s_perfT31Bin1NsAcc[warmBin] += ns1;
+                    s_perfT31Bin2NsAcc[warmBin] += ns2;
+                    if (ns1 < s_perfT31Bin1MinNs[warmBin]) s_perfT31Bin1MinNs[warmBin] = ns1;
+                    if (ns2 < s_perfT31Bin2MinNs[warmBin]) s_perfT31Bin2MinNs[warmBin] = ns2;
+
+                    // NV-DXVK [Perf.T31Hist]: raw counts, no averaging.
+                    ++s_perfT31Hist1[t31HistBucket(ns1)];
+                    ++s_perfT31Hist2[t31HistBucket(ns2)];
+
+                    // Consume both destinations so neither copy can be eliminated
+                    // as a dead store. Two distinct buffers, so copy3 cannot be
+                    // proved to overwrite copy2 either.
+                    g_t31WarmSink.fetch_add(
+                      uint32_t(s_t31WarmScratchA[0]) + uint32_t(s_t31WarmScratchB[warmLen - 1u]),
+                      std::memory_order_relaxed);
+
+                  }
+
+                  // Un-bill the ENTIRE probe from [Perf.LoopCut] t31_copy. markLoop
+                  // measures (now - tLoopMark) and tLoopMark is still sitting at the
+                  // t31_gather mark, so advancing it past everything done since the
+                  // real copy finished leaves t31_copy reading what it read before
+                  // any of this existed. This now has to cover the per-copy tail
+                  // bookkeeping as well as the two extra copies, because the tail
+                  // path runs on EVERY call -- otherwise the headline number drifts
+                  // up and the next reader sees a regression that is not there.
+                  // It held across the last landing: t31_copy stayed 13.1-14.6 us.
+                  if (kInstTiming) {
+                    tLoopMark += (std::chrono::steady_clock::now() - tCopy1);
+                  }
+                }
+                m_t31CacheSrcBuf    = t31SrcBuf;
+                m_t31CacheMapPtr    = t31Data;
+                m_t31CacheMapGen    = t31SrcGen;
+                m_t31CacheFillBegin = copyBegin;
+                m_t31CacheFillEnd   = copyEnd;
                 g_t31CacheMisses.fetch_add(1, std::memory_order_relaxed);
-                g_t31CacheBytesCopied.fetch_add(t31Len, std::memory_order_relaxed);
+                g_t31CacheBytesCopied.fetch_add(copyEnd - copyBegin, std::memory_order_relaxed);
+                // Bytes the old whole-buffer copy would have read and this one did not.
+                g_t31CacheBytesRanged.fetch_add(t31Len - (copyEnd - copyBegin),
+                                                std::memory_order_relaxed);
               }
               t31Read = m_t31ReadCache.data();
               t31ReadLen = t31Len;
+              markLoop(loopCopyNs);   // NV-DXVK [Perf.LoopCut]: t31_copy
             }
+            // ===================== NV-DXVK [ParFanout] =====================
+            // Parallel DECODE + serial COMPACT of the per-instance transform build.
+            // See rtx.parallelInstanceFanout for why this is two phases and not a
+            // plain parallel-for: the loop compacts (rejects `continue`, so output
+            // index != loop index), captures m_fanoutRawT0 from the FIRST survivor,
+            // and reads tforms->back() for instances with no previous-frame matrix.
+            //
+            // Eligibility excludes every per-instance diagnostic. Those log, build
+            // strings, take a mutex and index a string-keyed map; none of it should
+            // run off the frame thread or out of loop order. When any is live we fall
+            // through to the serial loop below, which is unchanged.
+            const uint32_t kParMinInst = RtxOptions::parallelInstanceFanoutMinInstances();
+            const bool parFanoutEligible =
+                   RtxOptions::parallelInstanceFanout()
+                && m_pGeometryWorkers != nullptr
+                // Immediate context only, same restriction rtx.batchSubmitDrawStages
+                // takes. A deferred context can reach SubmitDraw from a game worker
+                // thread; scheduling onto the geometry pool from a pool thread and
+                // then blocking on the join is a deadlock shape. Schedule() falling
+                // back to inline on a full queue makes that unlikely, not impossible,
+                // and this guard makes the question not arise.
+                && m_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE
+                && maxInstances >= kParMinInst
+                && !mtnFiLog
+                && !dumpThisDraw
+                && !s_fanoutDiag
+                && !RtxOptions::dumpFanoutInstanceStruct();
+
+            if (parFanoutEligible) {
+              // Grows monotonically, never shrinks, so after the first few draws there
+              // is no per-call allocation or element construction. thread_local because
+              // SubmitInstancedDraw can be entered from more than one thread (see the
+              // [Perf.SdThreads] note on SubmitDraw).
+              static thread_local std::vector<FanoutSlot> s_fanoutSlots;
+              if (s_fanoutSlots.size() < maxInstances)
+                s_fanoutSlots.resize(maxInstances);
+              FanoutSlot* const slots = s_fanoutSlots.data();
+
+              // ---- Phase 1: decode instance i into slots[i]. No shared writes. ----
+              // The arithmetic is a line-for-line copy of the serial loop's, in the
+              // same order with the same operands, so a static prop reproduces the
+              // same BITS and not merely the same value -- which is what the
+              // prev-matrix hash correspondence downstream depends on.
+              auto decodeRange = [&](uint32_t begin, uint32_t end) {
+                for (uint32_t i = begin; i < end; ++i) {
+                  FanoutSlot& s = slots[i];
+                  s.hasPrev = 0;
+                  const size_t instOff = static_cast<size_t>(instVb.offset)
+                                       + static_cast<size_t>(startInstance + i) * stride + boneOff;
+                  uint32_t charIdx = 0;
+                  if (boneIdxSem->format == VK_FORMAT_R16G16B16A16_UINT) {
+                    if (instOff + 2 <= m_instBufCache.size())
+                      charIdx = *reinterpret_cast<const uint16_t*>(instData + instOff);
+                  } else {
+                    if (instOff + 4 <= m_instBufCache.size())
+                      charIdx = *reinterpret_cast<const uint32_t*>(instData + instOff);
+                  }
+                  const size_t t31Off = static_cast<size_t>(charIdx) * BYTES_PER_INSTANCE;
+                  if (t31Off + 48 > t31ReadLen) { s.status = 1; continue; }
+
+                  float lm[12];
+                  std::memcpy(lm, t31Read + t31Off, 48);
+                  const float* m = lm;
+                  bool allFinite = true;
+                  for (int f = 0; f < 12; ++f) if (!std::isfinite(m[f])) { allFinite = false; break; }
+                  if (!allFinite) { s.status = 2; continue; }
+                  if (m[0] == 0.f && m[1] == 0.f && m[2] == 0.f && m[3] == 0.f) { s.status = 3; continue; }
+
+                  const float adjTx = haveCamOrigin ? (m[3]  + camOrigin[0]) : m[3];
+                  const float adjTy = haveCamOrigin ? (m[7]  + camOrigin[1]) : m[7];
+                  const float adjTz = haveCamOrigin ? (m[11] + camOrigin[2]) : m[11];
+                  s.rawT[0] = m[3]; s.rawT[1] = m[7]; s.rawT[2] = m[11];
+                  s.cur = Matrix4(
+                    Vector4(m[0], m[4], m[8],  0.0f),
+                    Vector4(m[1], m[5], m[9],  0.0f),
+                    Vector4(m[2], m[6], m[10], 0.0f),
+                    Vector4(adjTx, adjTy, adjTz, 1.0f));
+
+                  if (havePrevCamOrigin && t31Off + 96 <= t31ReadLen) {
+                    float pm[12];
+                    std::memcpy(pm, t31Read + t31Off + 48, 48);
+                    bool prevAllZero = true;
+                    for (int f = 0; f < 12; ++f) {
+                      if (pm[f] != 0.0f) { prevAllZero = false; break; }
+                    }
+                    bool prevFinite = true;
+                    for (int f = 0; f < 12; ++f) {
+                      if (!std::isfinite(pm[f])) { prevFinite = false; break; }
+                    }
+                    if (!prevAllZero && prevFinite) {
+                      const float pTx = pm[3]  + prevCamOrigin[0];
+                      const float pTy = pm[7]  + prevCamOrigin[1];
+                      const float pTz = pm[11] + prevCamOrigin[2];
+                      s.prev = Matrix4(
+                        Vector4(pm[0], pm[4], pm[8],  0.0f),
+                        Vector4(pm[1], pm[5], pm[9],  0.0f),
+                        Vector4(pm[2], pm[6], pm[10], 0.0f),
+                        Vector4(pTx, pTy, pTz, 1.0f));
+                      s.hasPrev = 1;
+                    }
+                  }
+                  s.status = 0;
+                }
+              };
+
+              // Same chunking idiom as flushGeometryBatch: scheduling is O(threads)
+              // not O(instances), the tail range runs on this thread so it is not idle
+              // across the join, and a full worker queue falls back to inline.
+              const uint32_t workers = std::max<uint32_t>(1u, m_pGeometryWorkers->numThreads());
+              const uint32_t chunks  = std::min(workers, maxInstances);
+              const uint32_t chunkSz = (maxInstances + chunks - 1u) / chunks;
+              std::vector<Future<void>> parFuts;
+              parFuts.reserve(chunks);
+              uint32_t pBegin = 0;
+              for (uint32_t c = 0; c < chunks; ++c) {
+                const uint32_t pEnd = std::min(pBegin + chunkSz, maxInstances);
+                const bool lastChunk = (c + 1u == chunks) || (pEnd >= maxInstances);
+                if (lastChunk) {
+                  decodeRange(pBegin, maxInstances);   // this thread takes the tail
+                  break;
+                }
+                Future<void> f = m_pGeometryWorkers->Schedule(
+                  [decodeRange, pBegin, pEnd]() { decodeRange(pBegin, pEnd); });
+                if (f.valid()) parFuts.push_back(f);
+                else           decodeRange(pBegin, pEnd);
+                pBegin = pEnd;
+              }
+              for (auto& f : parFuts)
+                f.get();   // barrier: every slot is written past this point
+
+              // ---- Phase 2: compact IN ORDER. Every side effect lives here. ----
+              for (uint32_t i = 0; i < maxInstances; ++i) {
+                ++m_geomDiagFanoutInstSeen;
+                const FanoutSlot& s = slots[i];
+                if (s.status == 1) { ++m_geomDiagFanoutInstOob;       continue; }
+                if (s.status == 2) { ++m_geomDiagFanoutInstBadFinite; continue; }
+                if (s.status == 3) { ++m_geomDiagFanoutInstZeroRow0;  continue; }
+                // Keyed on tforms->empty() rather than the loop counter, for the same
+                // reason the serial path is: the rejects above `continue`, so loop
+                // index i and instance index 0 are not the same thing.
+                if (tforms->empty()) {
+                  m_fanoutRawT0[0] = s.rawT[0];
+                  m_fanoutRawT0[1] = s.rawT[1];
+                  m_fanoutRawT0[2] = s.rawT[2];
+                  m_fanoutRawT0Valid = true;
+                }
+                tforms->push_back(s.cur);
+                // tforms->back() is the element just pushed -- identical to the serial
+                // path's "identity-as-absent" duplicate for a historyless placement.
+                if (s.hasPrev) prevTforms->push_back(s.prev);
+                else           prevTforms->push_back(tforms->back());
+              }
+
+              ++s_perfInstParCalls;
+              s_perfInstParInstances += int64_t(maxInstances);
+            } else
+            // The serial path. This is the `else` body -- unchanged, and the only one
+            // that runs when any per-instance diagnostic above is live.
             for (uint32_t i = 0; i < maxInstances; ++i) {
               ++m_geomDiagFanoutInstSeen;
               // NV-DXVK [instVb.offset fix]: the per-instance index buffer is
@@ -10702,10 +11657,6 @@ namespace dxvk {
               // fanout loop at ~306us/instance. Gate it behind RTX_D3D11_DIAG so
               // it costs nothing in normal play; re-measure loopUs to see how
               // much of the 306us was this probe vs the raw t31 reads.
-              static const bool s_fanoutDiag = []() {
-                const char* v = std::getenv("RTX_D3D11_DIAG");
-                return v != nullptr && v[0] == '1';
-              }();
               if (s_fanoutDiag) {
                 const float l0 = std::sqrt(m[0]*m[0] + m[4]*m[4] + m[8]*m[8]);
                 const float l1 = std::sqrt(m[1]*m[1] + m[5]*m[5] + m[9]*m[9]);
@@ -10880,6 +11831,14 @@ namespace dxvk {
             if (kInstTiming) {
               loopUs += std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - tLoop0).count();
+              // NV-DXVK [Perf.LoopCut]: close inst_loop and fold this call into the
+              // window. gather + copy + body == loop_ms by construction, so a residual
+              // on the emitted line means a mark is misplaced, not that time vanished.
+              markLoop(loopBodyNs);
+              s_perfInstT31GatherNsAcc += loopGatherNs;
+              s_perfInstT31CopyNsAcc   += loopCopyNs;
+              s_perfInstLoopBodyNsAcc  += loopBodyNs;
+              ++s_perfInstLoopCutCalls;
             }
 
             // NV-DXVK [SpaceMismatch] Red-plane root-cause probe. The BSP
@@ -45592,6 +46551,16 @@ namespace dxvk {
     m_geomDiagFanoutBucket256  = 0;
     m_geomDiagFanoutBucket1k   = 0;
     m_geomDiagFanoutBucketBig  = 0;
+    // NV-DXVK [Perf.FanoutRej]: fold this frame into the window BEFORE the reset
+    // below throws it away. Placed here, outside the emitGeomDiag gate, because
+    // that gate is kDiagLogs and these four counters are the one thing in the
+    // block that is needed with the rest of it off.
+    s_fanoutRejSeen      += m_geomDiagFanoutInstSeen;
+    s_fanoutRejOob       += m_geomDiagFanoutInstOob;
+    s_fanoutRejNonFinite += m_geomDiagFanoutInstBadFinite;
+    s_fanoutRejZeroRow0  += m_geomDiagFanoutInstZeroRow0;
+    ++s_fanoutRejFrames;
+
     m_geomDiagFanoutInstSeen      = 0;
     m_geomDiagFanoutInstOob       = 0;
     m_geomDiagFanoutInstBadFinite = 0;
@@ -46363,13 +47332,17 @@ namespace dxvk {
         {
           const double instN = double(s_perfInstCount ? s_perfInstCount : 1u);
           const double instI = double(s_perfInstInstancesAcc ? s_perfInstInstancesAcc : 1);
-          char inBuf[448];
+          char inBuf[512];
           std::snprintf(inBuf, sizeof(inBuf),
             "[Perf.InstDraw] calls=%u fanoutCalls=%u instances=%lld"
             " total_ms=%.2f inner_ms=%.2f build_ms=%.2f loop_ms=%.2f setupPost_ms=%.2f"
             " | semScan_ms=%.2f prep_ms=%.2f residual_ms=%.2f"
             " prepPerInst_us=%.3f residPerInst_us=%.3f"
-            " max_us=%lld perCall_us=%.2f perInst_us=%.2f instPerCall=%.2f",
+            " max_us=%lld perCall_us=%.2f perInst_us=%.2f instPerCall=%.2f"
+            // NV-DXVK [ParFanout]: how much of the work rtx.parallelInstanceFanout
+            // actually took. parInst near 0 with the flag on means the min-instances
+            // threshold is excluding the population -- tune it before reading loop_ms.
+            " parCalls=%u parInst=%lld",
             s_perfInstCount, s_perfInstFanoutCalls,
             (long long) s_perfInstInstancesAcc,
             double(s_perfInstTotalAcc) / 1e3,
@@ -46387,7 +47360,9 @@ namespace dxvk {
             (long long) s_perfInstMaxTotal,
             double(s_perfInstTotalAcc) / instN,
             double(s_perfInstTotalAcc) / instI,
-            instI / instN);
+            instI / instN,
+            s_perfInstParCalls,
+            (long long) s_perfInstParInstances);
           Logger::info(inBuf);
 
           // NV-DXVK [Perf.InstDraw] the regression. THIS is the line that answers
@@ -46675,18 +47650,469 @@ namespace dxvk {
             const uint64_t tm = g_t31CacheMisses.exchange(0, std::memory_order_relaxed);
             const uint64_t ts = g_t31CacheBytesSaved.exchange(0, std::memory_order_relaxed);
             const uint64_t tc = g_t31CacheBytesCopied.exchange(0, std::memory_order_relaxed);
+            // NV-DXVK [T31Range]: rangedMB is the real verdict now. hitPct measures
+            // the KEY, which Map(WRITE_NO_OVERWRITE) legitimately breaks every draw,
+            // so it can stay near zero and nothing is wrong. rangedMB is the traffic
+            // ranging removed on the MISS path -- that is what should show up as a
+            // fall in the d3d11 t31 entry on [Perf.WcCopy] and in [Perf.InstDraw]
+            // loop_ms. rangedPct is that as a share of what the old whole-buffer
+            // copy would have read.
+            const uint64_t tr = g_t31CacheBytesRanged.exchange(0, std::memory_order_relaxed);
             const uint64_t tt = th + tm;
-            char tcBuf[288];
+            char tcBuf[352];
             std::snprintf(tcBuf, sizeof(tcBuf),
               "[Perf.T31Cache] hits=%llu misses=%llu hitPct=%.1f"
-              " savedMB=%.2f copiedMB=%.2f avgCopy_KB=%.1f enabled=%d",
+              " savedMB=%.2f copiedMB=%.2f rangedMB=%.2f rangedPct=%.1f"
+              " avgCopy_KB=%.1f enabled=%d",
               (unsigned long long) th, (unsigned long long) tm,
               tt ? 100.0 * double(th) / double(tt) : 0.0,
               double(ts) / (1024.0 * 1024.0),
               double(tc) / (1024.0 * 1024.0),
+              double(tr) / (1024.0 * 1024.0),
+              (tc + tr) ? 100.0 * double(tr) / double(tc + tr) : 0.0,
               tm ? double(tc) / 1024.0 / double(tm) : 0.0,
               kEnableT31ReadCache ? 1 : 0);
             Logger::info(tcBuf);
+
+            // NV-DXVK [Perf.LoopCut]: loop_ms, fully attributed, PER CALL. This is
+            // the line to read instead of diffing loop_ms across captures -- the
+            // three parts and their sum come from the same window, so it is immune
+            // to this game's 2x per-draw swing in a fixed scene.
+            //   t31_gather  the [T31Range] charIdx pass (no WC access)
+            //   t31_copy    the memcpyFromWC itself -- the ONLY number that says
+            //               whether the t31 traffic is worth any more effort
+            //   inst_loop   the actual per-instance transform build
+            // sum_us should equal [Perf.InstDraw] loop_ms / calls; a gap means a
+            // mark is misplaced. Shares rtx.logSubmitStall with the rest.
+            {
+              const uint64_t lcN = s_perfInstLoopCutCalls ? s_perfInstLoopCutCalls : 1ull;
+              const double g = double(s_perfInstT31GatherNsAcc) / 1e3 / double(lcN);
+              const double c = double(s_perfInstT31CopyNsAcc)   / 1e3 / double(lcN);
+              const double b = double(s_perfInstLoopBodyNsAcc)  / 1e3 / double(lcN);
+              char lcBuf[256];
+              std::snprintf(lcBuf, sizeof(lcBuf),
+                "[Perf.LoopCut] calls=%llu perCall_us: t31_gather=%.2f t31_copy=%.2f"
+                " inst_loop=%.2f sum_us=%.2f | ms: t31_gather=%.1f t31_copy=%.1f inst_loop=%.1f",
+                (unsigned long long) lcN, g, c, b, g + c + b,
+                double(s_perfInstT31GatherNsAcc) / 1e6,
+                double(s_perfInstT31CopyNsAcc)   / 1e6,
+                double(s_perfInstLoopBodyNsAcc)  / 1e6);
+              Logger::info(lcBuf);
+
+              // NV-DXVK [Perf.T31Src]: the discriminator. Emitted here, BEFORE the
+              // reset below, because usPerPage/usPerKB need t31_copy from the same
+              // window. See the counter declarations for how to read it:
+              //   samePtrPct high -> mapping persists, pages resident, ~400 MB/s is
+              //                      the HEAP. Fix = stop CPU-reading this buffer.
+              //   samePtrPct low  -> slice renamed every draw, cost is fault setup.
+              //                      Fix = mapping lifetime.
+              // sameGenPct is the control and should stay near 0.
+              {
+                const uint64_t sc = g_t31SrcCalls.exchange(0, std::memory_order_relaxed);
+                const uint64_t sb = g_t31SrcSameBuf.exchange(0, std::memory_order_relaxed);
+                const uint64_t sp = g_t31SrcSamePtr.exchange(0, std::memory_order_relaxed);
+                const uint64_t sg = g_t31SrcSameGen.exchange(0, std::memory_order_relaxed);
+                const uint64_t pg = g_t31PagesTouched.exchange(0, std::memory_order_relaxed);
+                const uint64_t sby = g_t31SrcBytesCopied.exchange(0, std::memory_order_relaxed);
+                const double   scD = double(sc ? sc : 1ull);
+                const double copyUs = double(s_perfInstT31CopyNsAcc) / 1e3;
+                const double copyKB = double(sby) / 1024.0;
+                char tsBuf[320];
+                std::snprintf(tsBuf, sizeof(tsBuf),
+                  "[Perf.T31Src] calls=%llu sameBufPct=%.1f samePtrPct=%.1f sameGenPct=%.1f"
+                  " pages=%llu pagesPerCall=%.2f usPerPage=%.2f usPerKB=%.2f",
+                  (unsigned long long) sc,
+                  100.0 * double(sb) / scD,
+                  100.0 * double(sp) / scD,
+                  100.0 * double(sg) / scD,
+                  (unsigned long long) pg,
+                  double(pg) / scD,
+                  pg ? copyUs / double(pg) : 0.0,
+                  copyKB > 0.0 ? copyUs / copyKB : 0.0);
+                Logger::info(tsBuf);
+              }
+
+              // NV-DXVK [Perf.T31Warm]: the double-read probe. c1 is the real copy
+              // (first touch of a freshly renamed slice), c2 and c3 re-read the SAME
+              // source range immediately after into two scratch buffers. Read the
+              // MINS first: this game's per-draw cost swings ~2x in a fixed scene, so
+              // a mean over ~8 samples/frame can be one preemption wearing a lab coat.
+              // The mean/min gap on c1 and max_us say how much swing there was.
+              //
+              // c3 is the control, not a third data point. c2 and c3 differ only in
+              // destination, so c2 ~= c3 is what licenses reading c2 as a statement
+              // about the SOURCE. If c2 > c3 noticeably, the scratch destination was
+              // cold and c2 is contaminated -- fix that before believing the verdict.
+              //
+              // Deliberately no computed verdict: the two branches want opposite
+              // work and a threshold that classified them would be the third guess
+              // about this mechanism. The ratio is printed; the legend is fixed text.
+              {
+                const uint64_t wn = s_perfT31WarmSamples;
+                const double   wd = double(wn ? wn : 1ull);
+                const double   c1MinUs = wn ? double(s_perfT31Warm1MinNs) / 1e3 : 0.0;
+                const double   c2MinUs = wn ? double(s_perfT31Warm2MinNs) / 1e3 : 0.0;
+                const double   c3MinUs = wn ? double(s_perfT31Warm3MinNs) / 1e3 : 0.0;
+                const bool     rOk = wn && s_perfT31Warm1MinNs > 0;
+                char twBuf[512];
+                std::snprintf(twBuf, sizeof(twBuf),
+                  "[Perf.T31Warm] samples=%llu avgKB=%.2f | mean_us: c1=%.2f c2=%.2f c3=%.2f"
+                  " | min_us: c1=%.2f c2=%.2f c3=%.2f | c1max_us=%.2f"
+                  " | minRatio c2/c1=%.3f c3/c1=%.3f"
+                  " | c2<<c1 => (a) slice first-touch, warm/recycle it;"
+                  " c2~=c1 => (b) uncached read, no CPU fix -- go GPU-side",
+                  (unsigned long long) wn,
+                  wn ? double(s_perfT31WarmBytes) / 1024.0 / wd : 0.0,
+                  double(s_perfT31Warm1NsAcc) / 1e3 / wd,
+                  double(s_perfT31Warm2NsAcc) / 1e3 / wd,
+                  double(s_perfT31Warm3NsAcc) / 1e3 / wd,
+                  c1MinUs, c2MinUs, c3MinUs,
+                  wn ? double(s_perfT31Warm1MaxNs) / 1e3 : 0.0,
+                  rOk ? double(s_perfT31Warm2MinNs) / double(s_perfT31Warm1MinNs) : 0.0,
+                  rOk ? double(s_perfT31Warm3MinNs) / double(s_perfT31Warm1MinNs) : 0.0);
+                Logger::info(twBuf);
+
+                s_perfT31WarmSamples = 0;
+                s_perfT31Warm1NsAcc  = 0;
+                s_perfT31Warm2NsAcc  = 0;
+                s_perfT31Warm3NsAcc  = 0;
+                s_perfT31Warm1MinNs  = INT64_MAX;
+                s_perfT31Warm2MinNs  = INT64_MAX;
+                s_perfT31Warm3MinNs  = INT64_MAX;
+                s_perfT31Warm1MaxNs  = 0;
+                s_perfT31WarmBytes   = 0;
+                // s_perfT31WarmCopies is NOT reset: it is the sampling phase, and
+                // restarting it every window would re-sample the same position in
+                // each window's draw order rather than walking through it.
+
+                // NV-DXVK [Perf.T31Bin]: the samePtr split. `renamed` is the case
+                // HANDOFF s5 exists for -- DXVK handed back a fresh slice and this
+                // is genuinely the first CPU read of those bytes. `samePtr` is the
+                // control: the previous draw already read this exact mapping.
+                //
+                // renamed c1min ~= samePtr c1min  -> the renamed read is ALSO fast,
+                //   the CPU read is not the cost, and s5 (move the decode GPU-side)
+                //   would buy nothing. Go find what produces the tail instead.
+                // renamed c1min >> samePtr c1min  -> the first read of a renamed
+                //   slice really is expensive and s5's premise survives.
+                //
+                // Read the MINS, not the means: both bins carry the same tail and
+                // the means are tail-dominated. n= is there because the samePtr bin
+                // is only ~6% of samples -- if it drops to single digits in a
+                // window, its min is not yet a floor and the comparison is not ripe.
+                {
+                  const uint64_t bn0 = s_perfT31BinN[0];
+                  const uint64_t bn1 = s_perfT31BinN[1];
+                  const double   bd0 = double(bn0 ? bn0 : 1ull);
+                  const double   bd1 = double(bn1 ? bn1 : 1ull);
+                  char tbBuf[448];
+                  std::snprintf(tbBuf, sizeof(tbBuf),
+                    "[Perf.T31Bin] renamed: n=%llu c1mean=%.2f c1min=%.2f c2mean=%.2f c2min=%.2f"
+                    " | samePtr: n=%llu c1mean=%.2f c1min=%.2f c2mean=%.2f c2min=%.2f"
+                    " | c1min equal => CPU read is not the cost, s5 buys nothing",
+                    (unsigned long long) bn0,
+                    double(s_perfT31Bin1NsAcc[0]) / 1e3 / bd0,
+                    bn0 ? double(s_perfT31Bin1MinNs[0]) / 1e3 : 0.0,
+                    double(s_perfT31Bin2NsAcc[0]) / 1e3 / bd0,
+                    bn0 ? double(s_perfT31Bin2MinNs[0]) / 1e3 : 0.0,
+                    (unsigned long long) bn1,
+                    double(s_perfT31Bin1NsAcc[1]) / 1e3 / bd1,
+                    bn1 ? double(s_perfT31Bin1MinNs[1]) / 1e3 : 0.0,
+                    double(s_perfT31Bin2NsAcc[1]) / 1e3 / bd1,
+                    bn1 ? double(s_perfT31Bin2MinNs[1]) / 1e3 : 0.0);
+                  Logger::info(tbBuf);
+
+                  s_perfT31BinN[0] = s_perfT31BinN[1] = 0;
+                  s_perfT31Bin1NsAcc[0] = s_perfT31Bin1NsAcc[1] = 0;
+                  s_perfT31Bin2NsAcc[0] = s_perfT31Bin2NsAcc[1] = 0;
+                  s_perfT31Bin1MinNs[0] = s_perfT31Bin1MinNs[1] = INT64_MAX;
+                  s_perfT31Bin2MinNs[0] = s_perfT31Bin2MinNs[1] = INT64_MAX;
+                }
+
+                // NV-DXVK [Perf.T31Hist]: the distribution as counts. Mean-vs-min
+                // only INFERS the body/tail split; this states it. c2's row next to
+                // c1's is the discriminator for where the tail comes from -- if the
+                // tail were the first touch of a fresh slice, c2 (which re-reads the
+                // range c1 just read) would sit entirely in the low buckets. A c2
+                // row shaped like c1's says the tail hits any read at random and is
+                // not a property of the copy at all.
+                {
+                  char thBuf[448];
+                  std::snprintf(thBuf, sizeof(thBuf),
+                    "[Perf.T31Hist] us buckets [<1 <2 <5 <20 <100 >=100]"
+                    " c1=[%llu %llu %llu %llu %llu %llu]"
+                    " c2=[%llu %llu %llu %llu %llu %llu]",
+                    (unsigned long long) s_perfT31Hist1[0], (unsigned long long) s_perfT31Hist1[1],
+                    (unsigned long long) s_perfT31Hist1[2], (unsigned long long) s_perfT31Hist1[3],
+                    (unsigned long long) s_perfT31Hist1[4], (unsigned long long) s_perfT31Hist1[5],
+                    (unsigned long long) s_perfT31Hist2[0], (unsigned long long) s_perfT31Hist2[1],
+                    (unsigned long long) s_perfT31Hist2[2], (unsigned long long) s_perfT31Hist2[3],
+                    (unsigned long long) s_perfT31Hist2[4], (unsigned long long) s_perfT31Hist2[5]);
+                  Logger::info(thBuf);
+
+                  for (uint32_t i = 0; i < 6u; ++i) {
+                    s_perfT31Hist1[i] = 0;
+                    s_perfT31Hist2[i] = 0;
+                  }
+                }
+
+                // NV-DXVK [Perf.T31Tail]: the shape of the ~4.7 ms/frame that is
+                // NOT the read. Measured on every copy, so gaps are in real copies.
+                //
+                //   gap[] is copies since the previous tail. A geometric decay with
+                //     mean ~= copies/tails is AMBIENT interference -- nothing this
+                //     code sequences, and the search moves off the frame thread.
+                //     A spike in gap[0] (adjacent copies) is BURSTY -- one event
+                //     stalls a stretch of the thread, and it has a discrete cause
+                //     with a duration to go find.
+                //   perFrame min/max pinned to the same small number is PERIODIC --
+                //     a once-a-frame cadence; read it with pos[] below.
+                //
+                // tailPct vs tailTimePct is the whole point restated: a small
+                // tailPct against a large tailTimePct is the bimodality that made
+                // every mean in this file's history a lie.
+                {
+                  const uint64_t tc  = s_t31TailCount;
+                  const uint64_t ac  = s_t31AllCopies ? s_t31AllCopies : 1ull;
+                  const double   ans = double(s_t31AllCopyNsAcc ? s_t31AllCopyNsAcc : 1);
+                  char ttBuf[512];
+                  std::snprintf(ttBuf, sizeof(ttBuf),
+                    "[Perf.T31Tail] copies=%llu tails=%llu tailPct=%.2f tailTimePct=%.1f"
+                    " tailMean_us=%.1f tailMax_us=%.1f | perFrame: n=%llu min=%u max=%u mean=%.1f"
+                    " | gap[1,2,3-4,5-8,9-16,17-32,33-64,>64]=[%llu %llu %llu %llu %llu %llu %llu %llu]",
+                    (unsigned long long) s_t31AllCopies,
+                    (unsigned long long) tc,
+                    100.0 * double(tc) / double(ac),
+                    100.0 * double(s_t31TailNsAcc) / ans,
+                    tc ? double(s_t31TailNsAcc) / 1e3 / double(tc) : 0.0,
+                    double(s_t31TailMaxNs) / 1e3,
+                    (unsigned long long) s_t31TailFrames,
+                    s_t31TailPerFrameMin == UINT32_MAX ? 0u : s_t31TailPerFrameMin,
+                    s_t31TailPerFrameMax,
+                    s_t31TailFrames ? double(tc) / double(s_t31TailFrames) : 0.0,
+                    (unsigned long long) s_t31TailGapHist[0], (unsigned long long) s_t31TailGapHist[1],
+                    (unsigned long long) s_t31TailGapHist[2], (unsigned long long) s_t31TailGapHist[3],
+                    (unsigned long long) s_t31TailGapHist[4], (unsigned long long) s_t31TailGapHist[5],
+                    (unsigned long long) s_t31TailGapHist[6], (unsigned long long) s_t31TailGapHist[7]);
+                  Logger::info(ttBuf);
+
+                  // Position within the frame's copy stream, in eighths. FLAT means
+                  // the interference does not care where in the frame we are. A
+                  // concentrated eighth names a phase, and the draw ordinal at that
+                  // point is directly comparable to [SubmitStall]'s frame ordinal.
+                  char tpBuf[256];
+                  std::snprintf(tpBuf, sizeof(tpBuf),
+                    "[Perf.T31TailPos] frame eighths=[%llu %llu %llu %llu %llu %llu %llu %llu]"
+                    " copiesPerFrame=%u",
+                    (unsigned long long) s_t31TailPosHist[0], (unsigned long long) s_t31TailPosHist[1],
+                    (unsigned long long) s_t31TailPosHist[2], (unsigned long long) s_t31TailPosHist[3],
+                    (unsigned long long) s_t31TailPosHist[4], (unsigned long long) s_t31TailPosHist[5],
+                    (unsigned long long) s_t31TailPosHist[6], (unsigned long long) s_t31TailPosHist[7],
+                    s_t31PrevFrameCopies);
+                  Logger::info(tpBuf);
+
+                  s_t31LastWindowFrames = s_t31TailFrames;   // for [Perf.T31Span]
+
+                  s_t31TailCount       = 0;
+                  s_t31TailNsAcc       = 0;
+                  s_t31TailMaxNs       = 0;
+                  s_t31TailFrames      = 0;
+                  s_t31TailPerFrameMin = UINT32_MAX;
+                  s_t31TailPerFrameMax = 0;
+                  s_t31AllCopies       = 0;
+                  s_t31AllCopyNsAcc    = 0;
+                  for (uint32_t i = 0; i < 8u; ++i) {
+                    s_t31TailGapHist[i] = 0;
+                    s_t31TailPosHist[i] = 0;
+                  }
+                  // s_t31TailCopiesSince, s_t31TailPrevFrame, s_t31TailOrdinal and
+                  // s_t31TailDumpCtr are NOT reset -- they are live state carrying
+                  // across the window boundary. Zeroing copiesSince would fabricate
+                  // a gap[0] at every emit and manufacture the burstiness this line
+                  // is supposed to be testing for.
+                }
+
+                // NV-DXVK [Perf.T31Size]: the flatness test. GBs FLAT across buckets
+                // means cost = bytes x rate with no per-call component left, and the
+                // only lever is copying fewer bytes ([Perf.T31Span] sizes that). A
+                // bucket well BELOW the line is the genuine-outlier population,
+                // finally separated from the size effect it was hiding inside.
+                {
+                  // Same clamped-append discipline as [Perf.FanoutGate]: the raw
+                  // accumulate-the-return-value form overflows the moment the
+                  // counts get wide, and that is a stack smash rather than a
+                  // truncated line.
+                  char   tzBuf[768];
+                  size_t o = 0;
+                  perfAppend(tzBuf, sizeof(tzBuf), o,
+                    "[Perf.T31Size] KB[<1 <2 <4 <8 <16 <32 <64 >=64] n=[");
+                  for (uint32_t i = 0; i < 8u; ++i)
+                    perfAppend(tzBuf, sizeof(tzBuf), o, "%s%llu",
+                               i ? " " : "", (unsigned long long) s_t31SizeN[i]);
+                  perfAppend(tzBuf, sizeof(tzBuf), o, "] us=[");
+                  for (uint32_t i = 0; i < 8u; ++i)
+                    perfAppend(tzBuf, sizeof(tzBuf), o, "%s%.1f",
+                               i ? " " : "",
+                               s_t31SizeN[i] ? double(s_t31SizeNs[i]) / 1e3 / double(s_t31SizeN[i]) : 0.0);
+                  perfAppend(tzBuf, sizeof(tzBuf), o, "] GBs=[");
+                  for (uint32_t i = 0; i < 8u; ++i)
+                    perfAppend(tzBuf, sizeof(tzBuf), o, "%s%.2f",
+                               i ? " " : "",
+                               s_t31SizeNs[i] ? double(s_t31SizeBytes[i]) / double(s_t31SizeNs[i]) : 0.0);
+                  perfAppend(tzBuf, sizeof(tzBuf), o, "]");
+                  Logger::info(tzBuf);
+
+                  for (uint32_t i = 0; i < 8u; ++i) {
+                    s_t31SizeN[i]     = 0;
+                    s_t31SizeNs[i]    = 0;
+                    s_t31SizeBytes[i] = 0;
+                  }
+                }
+
+                // NV-DXVK [Perf.T31Span]: how much of what we copy is even wanted.
+                //
+                // usedPct is (distinct entries x 208) / span copied. saveMs is what
+                // copying only the wanted bytes would return, at the rate measured
+                // on these very samples -- an UPPER BOUND, because it charges no
+                // per-memcpy overhead, which is exactly what runsPerDraw is for:
+                //   runsPerDraw small  -> a few memcpys replace one fat one, and
+                //                         saveMs is close to real. Fix [T31Range].
+                //   runsPerDraw large  -> per-call overhead eats it; the answer is
+                //                         HANDOFF s5, drop the CPU read entirely.
+                // ovf must read 0. Non-zero means charIdx ran past the bitset, and
+                // distinct/runs are then undercounts -- believe neither until the
+                // bitset is widened.
+                {
+                  const uint64_t sn  = s_t31SpanN;
+                  const double   snd = double(sn ? sn : 1ull);
+                  const double   cb  = double(s_t31SpanCopiedBytes);
+                  const double   ub  = double(s_t31SpanUsedBytes);
+                  const double   usedPct = cb > 0.0 ? 100.0 * ub / cb : 0.0;
+                  // Scale the sampled time to the whole window: samples are 1-in-64
+                  // of gathers, so the window's copy time is [Perf.T31Tail]'s
+                  // s_t31AllCopyNsAcc -- but that is already reset above, so project
+                  // from the samples' own rate and their share of copies instead.
+                  const double   sampMs = double(s_t31SpanNsAcc) / 1e6;
+                  const double   saveMs = sampMs * (cb > 0.0 ? (1.0 - ub / cb) : 0.0)
+                                        * double(kT31WarmSampleMask + 1u);
+                  char tsBuf[448];
+                  std::snprintf(tsBuf, sizeof(tsBuf),
+                    "[Perf.T31Span] n=%llu copiedKB=%.1f usedKB=%.1f usedPct=%.1f"
+                    " entriesPerDraw=%.1f runsPerDraw=%.1f entriesPerRun=%.1f"
+                    " | sampledMs=%.1f projSaveMs_window=%.0f projSave_msPerFrame=%.2f ovf=%llu",
+                    (unsigned long long) sn,
+                    cb / 1024.0 / snd,
+                    ub / 1024.0 / snd,
+                    usedPct,
+                    double(s_t31SpanEntries) / snd,
+                    double(s_t31SpanRuns) / snd,
+                    s_t31SpanRuns ? double(s_t31SpanEntries) / double(s_t31SpanRuns) : 0.0,
+                    sampMs, saveMs,
+                    s_t31LastWindowFrames ? saveMs / double(s_t31LastWindowFrames) : 0.0,
+                    (unsigned long long) s_t31SpanOverflow);
+                  Logger::info(tsBuf);
+
+                  s_t31SpanN           = 0;
+                  s_t31SpanCopiedBytes = 0;
+                  s_t31SpanUsedBytes   = 0;
+                  s_t31SpanRuns        = 0;
+                  s_t31SpanEntries     = 0;
+                  s_t31SpanOverflow    = 0;
+                  s_t31SpanNsAcc       = 0;
+                }
+
+                // NV-DXVK [Perf.FanoutRej]: the go/no-go for HANDOFF s5's surface
+                // slot reservation. dropPct is the share of decoded instances the
+                // CPU compaction throws away today; it is what worst-case
+                // reservation would start reserving slots for.
+                //
+                //   dropPct 0.00 -> worst-case == current, [FindStage] cannot move,
+                //                   and the GPU decode can proceed on mask=0.
+                //   dropPct > 0  -> re-check surfaceIndexOfFirstInstance in
+                //                   rtx_accel_manager before anything lands.
+                //
+                // seenVsGatePct is the FIXED comparison: seen against the instances
+                // that actually passed the fanout gate, not against [Perf.InstDraw]
+                // instances, which counts every instanced draw whether it enters the
+                // fanout or not. It should read ~100. Anything else means the loop
+                // is not visiting every instance the gate let through, and only then
+                // is the reject rate below incomplete.
+                {
+                  const uint64_t fsn = s_fanoutRejSeen;
+                  const uint64_t fdr = s_fanoutRejOob + s_fanoutRejNonFinite + s_fanoutRejZeroRow0;
+                  char frBuf[384];
+                  std::snprintf(frBuf, sizeof(frBuf),
+                    "[Perf.FanoutRej] frames=%llu seen=%llu seenPerFrame=%.0f"
+                    " seenVsGatePct=%.1f"
+                    " dropped=%llu dropPct=%.4f [oob=%llu nonFinite=%llu zeroRow0=%llu]",
+                    (unsigned long long) s_fanoutRejFrames,
+                    (unsigned long long) fsn,
+                    s_fanoutRejFrames ? double(fsn) / double(s_fanoutRejFrames) : 0.0,
+                    s_fanoutGateInstPass ? 100.0 * double(fsn) / double(s_fanoutGateInstPass) : 0.0,
+                    (unsigned long long) fdr,
+                    fsn ? 100.0 * double(fdr) / double(fsn) : 0.0,
+                    (unsigned long long) s_fanoutRejOob,
+                    (unsigned long long) s_fanoutRejNonFinite,
+                    (unsigned long long) s_fanoutRejZeroRow0);
+                  Logger::info(frBuf);
+
+                  s_fanoutRejSeen      = 0;
+                  s_fanoutRejOob       = 0;
+                  s_fanoutRejNonFinite = 0;
+                  s_fanoutRejZeroRow0  = 0;
+                  s_fanoutRejFrames    = 0;
+                }
+
+                // NV-DXVK [Perf.FanoutGate]: what the other 34.5% is. missPct is
+                // instances in draws that never reached the fanout; noT31/noCache
+                // say which arm of the gate rejected them. The topVs census is the
+                // part with a correctness question attached -- particle/decal/UI
+                // shaders here are expected and close the matter; a world or model
+                // VS is instanced geometry skipping the RT fanout and wants its own
+                // investigation. vsKey is GetCurrentVsPsHashes, not getHash().
+                {
+                  const uint64_t gp = s_fanoutGateInstPass;
+                  const uint64_t gm = s_fanoutGateInstMiss;
+                  const uint64_t gt = gp + gm;
+                  char   fgBuf[768];
+                  size_t go = 0;
+                  perfAppend(fgBuf, sizeof(fgBuf), go,
+                    "[Perf.FanoutGate] callsPass=%llu callsMiss=%llu instPass=%llu"
+                    " instMiss=%llu missPct=%.1f [noT31=%llu noCache=%llu] topVs:",
+                    (unsigned long long) s_fanoutGateCallsPass,
+                    (unsigned long long) s_fanoutGateCallsMiss,
+                    (unsigned long long) gp,
+                    (unsigned long long) gm,
+                    gt ? 100.0 * double(gm) / double(gt) : 0.0,
+                    (unsigned long long) s_fanoutGateInstNoT31,
+                    (unsigned long long) s_fanoutGateInstNoCache);
+                  for (uint32_t i = 0; i < kFanoutGateVsWays; ++i) {
+                    if (s_fanoutGateVsInst[i] == 0)
+                      continue;
+                    perfAppend(fgBuf, sizeof(fgBuf), go, " 0x%llx=%llu",
+                               (unsigned long long) s_fanoutGateVsKey[i],
+                               (unsigned long long) s_fanoutGateVsInst[i]);
+                  }
+                  Logger::info(fgBuf);
+
+                  s_fanoutGateCallsPass   = 0;
+                  s_fanoutGateCallsMiss   = 0;
+                  s_fanoutGateInstPass    = 0;
+                  s_fanoutGateInstMiss    = 0;
+                  s_fanoutGateInstNoT31   = 0;
+                  s_fanoutGateInstNoCache = 0;
+                  for (uint32_t i = 0; i < kFanoutGateVsWays; ++i) {
+                    s_fanoutGateVsKey[i]  = 0;
+                    s_fanoutGateVsInst[i] = 0;
+                  }
+                }
+              }
+
+              s_perfInstT31GatherNsAcc = 0;
+              s_perfInstT31CopyNsAcc   = 0;
+              s_perfInstLoopBodyNsAcc  = 0;
+              s_perfInstLoopCutCalls   = 0;
+            }
 
             // NV-DXVK [Perf.BonePath]: the map chain itself â€” the residue of the
             // map half after three refuted guesses. direct= means mapPtr(0) hit
@@ -46770,6 +48196,10 @@ namespace dxvk {
           s_perfInstT31MapNsAcc = 0; s_perfInstDbgTrackNsAcc = 0;
           s_perfInstMtnProbeNsAcc = 0; s_perfInstCamOrigNsAcc = 0;
           s_perfInstCoCbReadNsAcc = 0; s_perfInstCoVpScanNsAcc = 0;
+          s_perfInstParCalls = 0; s_perfInstParInstances = 0;   // NV-DXVK [ParFanout]
+          // NV-DXVK [Perf.LoopCut] accumulators are NOT reset here -- that line
+          // emits next to [Perf.T31Cache] and resets its own, so a double-reset
+          // would silently drop whichever window fell between the two emits.
           s_perfInstRegN = 0; s_perfInstRegSumI = 0; s_perfInstRegSumI2 = 0;
           s_perfInstRegSumPrep = 0; s_perfInstRegSumIPrep = 0;
           s_perfInstRegSumTot = 0; s_perfInstRegSumITot = 0;

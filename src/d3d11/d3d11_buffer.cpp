@@ -18,6 +18,67 @@
 #define RTX_D3D11_CACHED_DYNAMIC_INDEX_BUFFERS true
 #endif
 
+#ifndef RTX_D3D11_CACHED_DYNAMIC_SRV_BUFFERS
+// NV-DXVK [perf/CachedDynamicSRV] 2026-08-07: the same substitution as the index
+// buffers above, extended to DYNAMIC SHADER_RESOURCE buffers, because the t31
+// per-instance transform buffer is one and Remix reads it back on the CPU on
+// every instanced draw.
+//
+// This is measured, not inferred. [Perf.LoopCut] t31_copy is 13-15 us/call at
+// ~517 calls/frame = 6-7 ms/frame, ~15% of a 51 ms frame and the single largest
+// item on the frame thread. [Perf.T31TailEvt] pinned the rate with raw pairs --
+// 52.0 KB -> 38.5 us, 34.3 KB -> 25.3 us, 49.8 KB -> 37.1 us, agreeing to under
+// 1% at 1.38 GB/s. That is write-combined BAR read speed, and no amount of
+// copying less or copying smarter moves it:
+//   [Perf.T31Cache]  hitPct 0.0     -- Map(WRITE_DISCARD) renames the slice per
+//                                      draw, so no key can ever hold
+//   [Perf.T31Span]   usedPct 92-95, runsPerDraw 1.0
+//                                   -- the span copied is already one contiguous
+//                                      run and almost entirely wanted bytes
+//   [Perf.T31Warm]   c2 ~= c1       -- re-reading the same bytes costs the same,
+//                                      which is what uncached memory does
+// The bytes are all wanted, the layout is already optimal, and the memory type
+// is the whole cost. So change the memory type.
+//
+// THE TRADE, same shape as the index-buffer case and equally not free: clearing
+// DEVICE_LOCAL moves these buffers to system RAM, so the GPU reaches them over
+// PCIe, and the game's Map(WRITE_DISCARD) writes become cached rather than
+// write-combining. t31 is read by the game's own vertex shaders during the
+// raster pass, not only by our extraction, so the GPU-side exposure here is
+// REAL and larger than it was for index data. It must be measured:
+//   [Perf.LoopCut] t31_copy   should fall from ~14 us/call toward ~2
+//   [Perf.T31Size] GBs        should rise from ~1.38 toward cached bandwidth
+//   [Perf.WcCopy]             should lose its largest entry
+//   [Perf.Busy]   cpuMs       should fall by ~5-6 ms/frame
+//   [Perf.Gpu] / [Perf.GpuPass]  WATCH THIS -- any rise in GPU pass time is the
+//                             PCIe cost landing, and if it exceeds the CPU win
+//                             this change is a loss even though t31_copy improved
+// Set to false to A/B it against stock behaviour.
+//
+// ============ KNOWN INTERACTION: VRAM SAWTOOTH WITH THE TRIM ============
+// 2026-08-07. Observed live with this ON: VRAM oscillates high/low EVERY FRAME
+// through the automatic geometry-cache trim. It does not crash, and it is not a
+// leak -- it is a free/realloc cycle running once a frame.
+//
+// The earlier reading of this was wrong and is recorded so it is not repeated:
+// two runs showed vkAllocateMemory vr=-2 with heapAllocated climbing
+// 7217 -> 7377 -> 7427 MiB and 75 failures in a second, which was taken for
+// progressive exhaustion from this change. It is the top of the sawtooth, not a
+// climb, and both of those runs also had [DumpDraw] texture dumping and an armed
+// [OnScreenAlbedoDump] inflating the baseline (see PERF_INSTRUMENTATION_MAP s8
+// on rtx-asset-exporter). A single OOM warning near the peak is the trim and
+// this change fighting, not this change leaking.
+//
+// WHY THE TWO INTERACT. Dropping DEVICE_LOCAL here is a change to the memory
+// TYPE these buffers are requested from, and the flags are a request rather than
+// a restriction -- so which pool a dynamic SRV buffer lands in moves, and with it
+// the slice-renaming that Map(WRITE_DISCARD) does on every draw. The trim then
+// reclaims against a pool whose occupancy it was tuned for, and the two chase
+// each other once a frame.
+// =======================================================================
+#define RTX_D3D11_CACHED_DYNAMIC_SRV_BUFFERS true
+#endif
+
 namespace dxvk {
 
   D3D11Buffer::D3D11Buffer(
@@ -279,11 +340,28 @@ namespace dxvk {
         //   [Perf.GpuPass]              watch for any rise in the RT passes
         // Set RTX_D3D11_CACHED_DYNAMIC_INDEX_BUFFERS to false to A/B it.
         //
-        // Scoped to INDEX buffers alone on purpose: vertex and constant buffers
-        // are not scanned per draw, so they keep write-combining, which is the
-        // right choice for a write-only streaming buffer.
+        // Scope note, revised 2026-08-07: this used to say "INDEX buffers alone
+        // on purpose", on the reasoning that nothing else was scanned per draw.
+        // That was true of what had been measured at the time. It is not true of
+        // SHADER_RESOURCE buffers -- the t31 per-instance transform buffer is
+        // read back on every instanced draw for the fanout, at 6-7 ms/frame, and
+        // that read was subsequently measured at 1.38 GB/s, i.e. the same
+        // write-combined ceiling this carve-out exists to escape. See
+        // RTX_D3D11_CACHED_DYNAMIC_SRV_BUFFERS at the top of this file.
+        //
+        // VERTEX and CONSTANT buffers still keep write-combining: they are
+        // genuinely write-only streaming data from our side. The instance buffer
+        // carrying charIdx is a vertex buffer and IS read per draw, but through
+        // m_instBufCache at a 100% hit rate ([Perf.InstBufCache]), so it costs
+        // one copy per buffer rather than one per draw and is not a target.
         if (RTX_D3D11_CACHED_DYNAMIC_INDEX_BUFFERS
          && (m_desc.BindFlags & D3D11_BIND_INDEX_BUFFER)) {
+          memoryFlags |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+          memoryFlags &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        }
+
+        if (RTX_D3D11_CACHED_DYNAMIC_SRV_BUFFERS
+         && (m_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
           memoryFlags |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
           memoryFlags &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
         }

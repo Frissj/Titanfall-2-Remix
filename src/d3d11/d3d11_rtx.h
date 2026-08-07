@@ -1078,6 +1078,24 @@ namespace dxvk {
     const void*                          m_t31CacheSrcBuf = nullptr;
     const void*                          m_t31CacheMapPtr = nullptr;
     uint64_t                             m_t31CacheMapGen = 0ull;
+    // NV-DXVK [T31Range]: which byte range of the source buffer m_t31ReadCache
+    // actually HOLDS. The vector is still sized to the full buffer so every
+    // reader can keep indexing it by ABSOLUTE offset (charIdx*208) with the
+    // bounds checks unchanged -- only the FILL is narrowed.
+    //
+    // WHY. GetMapGeneration() bumps on Map(WRITE_NO_OVERWRITE), which is the
+    // APPEND pattern: the engine writes draw N's block into a shared dynamic
+    // buffer and bumps the generation, so the key can never hold across draws
+    // ([Perf.T31Cache] measured 5.8% hits). Re-copying the WHOLE buffer on each
+    // of those misses makes the per-frame cost quadratic in draws -- draw N
+    // re-reads every earlier draw's block as well as its own. Copying only the
+    // entries this draw's charIdx values actually reference makes it linear,
+    // and it is a win whether or not the key ever hits again.
+    //
+    // Half-open [begin, end). begin == end is the empty state. A hit requires
+    // the key to match AND this range to CONTAIN the range the draw needs.
+    size_t                               m_t31CacheFillBegin = 0u;
+    size_t                               m_t31CacheFillEnd   = 0u;
     // NV-DXVK [CbStage]: staging buffer for the mapped (write-combined)
     // CBufCommonPerCamera read in the BSP fanout path. c_cameraOrigin and the
     // c_cameraRelativeToClip VP rows are read a scalar at a time out of WC
