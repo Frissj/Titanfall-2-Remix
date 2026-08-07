@@ -221,6 +221,27 @@ namespace dxvk {
       }
     }
 
+    // The key an entry with this transform is (or would be) filed under.
+    //
+    // NV-DXVK [perf]: exposed because the caller now needs to know whether the
+    // key changed BEFORE it decides how much work to do preparing the move --
+    // see RtInstance::onTransformChanged, which skips computing the centroid
+    // when it has not. Sharing one definition is the point: a caller that
+    // reimplemented this rule and drifted from move() would silently stop
+    // re-filing moved instances, which does not fault and does not log.
+    //
+    // Costs nothing when the caller already holds an overrideHash or a
+    // precomputed matrix hash, which is why calling it and then letting move()
+    // call it again is not a double hash.
+    static XXH64_hash_t computeKey(const Matrix4& transform, uint64_t overrideHash,
+                                   XXH64_hash_t precomputedMatrixHash) {
+      return (overrideHash != 0)
+             ? static_cast<XXH64_hash_t>(overrideHash)
+             : (precomputedMatrixHash != 0)
+               ? precomputedMatrixHash
+               : XXH64(&transform, sizeof(transform), 0);
+    }
+
     // NV-DXVK [perf] handoff v7 sec 4a: precomputedMatrixHash is XXH64 over
     // newTransform's bytes, already paid for by this frame's getDataAtTransform
     // lookup for the same object. 0 (the default) means "not available", which
@@ -232,13 +253,15 @@ namespace dxvk {
     // it is not checkable here (this function never sees the matrix the lookup
     // used). See RtInstance::onTransformChanged for how it is discharged.
     // Ignored entirely when overrideHash is set, since that path does not hash.
+    //
+    // `centroid` IS READ ONLY WHEN THE KEY CHANGES -- it is forwarded to the
+    // re-insert below and touched nowhere else. Callers that can decide the key
+    // ahead of time (via computeKey) are entitled to skip computing it and pass
+    // a default; if that ever stops being true, fix those callers, because the
+    // compiler will not.
     XXH64_hash_t move(const XXH64_hash_t& oldTransformHash, const Vector3& centroid, const Matrix4& newTransform, const T* data, uint64_t overrideHash = 0,
                       XXH64_hash_t precomputedMatrixHash = 0) {
-      XXH64_hash_t transformHash = (overrideHash != 0)
-                                   ? static_cast<XXH64_hash_t>(overrideHash)
-                                   : (precomputedMatrixHash != 0)
-                                     ? precomputedMatrixHash
-                                     : XXH64(&newTransform, sizeof(newTransform), 0);
+      const XXH64_hash_t transformHash = computeKey(newTransform, overrideHash, precomputedMatrixHash);
 
       if (oldTransformHash != transformHash) {
         // NV-DXVK [SpatialMove]: log when the erase+insert path fires. With

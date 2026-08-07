@@ -108,6 +108,47 @@ namespace dxvk {
       }
       expect(map.size() == size_t(kCount), "no-op moves did not change the map");
 
+      // computeKey must agree with the key insert() actually filed under, and
+      // with the key move() derives internally. RtInstance::onTransformChanged
+      // calls it to decide whether to bother computing a centroid at all, so a
+      // disagreement here means moved instances stop being re-filed -- silently.
+      for (int i = 0; i < kCount; ++i) {
+        using Map = SpatialMap<int>;
+        expect(Map::computeKey(data[i].transform, 0, 0) == keys[i],
+               str::format("computeKey matches filed key for ", i));
+        expect(Map::computeKey(data[i].transform, 0, keys[i]) == keys[i],
+               str::format("computeKey honours a precomputed hash for ", i));
+        expect(Map::computeKey(data[i].transform, 0xBEEFull, 0) == 0xBEEFull,
+               "computeKey honours an override hash");
+        expect(Map::computeKey(data[i].transform, 0xBEEFull, keys[i]) == 0xBEEFull,
+               "override hash outranks a precomputed hash");
+      }
+
+      // THE LAZY-CENTROID CONTRACT. When computeKey says the key is unchanged,
+      // the caller is entitled to pass a garbage centroid because move() must
+      // not read it. Feed it a deliberately wrong one and prove nothing shifts:
+      // not the size, not the keys, and not the cell grid the nearest-neighbour
+      // search reads. If move() ever starts consuming centroid unconditionally,
+      // this is what catches it.
+      for (int i = 0; i < kCount; ++i) {
+        const XXH64_hash_t key = SpatialMap<int>::computeKey(data[i].transform, 0, 0);
+        expect(key == keys[i], "unchanged key precondition");
+        map.move(keys[i], Vector3(88888.f), data[i].transform, &data[i].data, 0, key);
+      }
+      expect(map.size() == size_t(kCount), "no-op move with a bogus centroid changed the map");
+      expect(map.debugCellEntryCount() == map.size(), "no-op move with a bogus centroid disturbed the cells");
+      for (int i = 0; i < kCount; ++i) {
+        const int* found = map.getDataAtTransform(data[i].transform);
+        expect(found != nullptr && *found == i, str::format("still filed correctly after bogus-centroid move: ", i));
+      }
+      {
+        // The bogus centroid must not have leaked into the spatial grid either.
+        Vector3 nearest;
+        const int* owner = nullptr;
+        const float distSqr = map.debugClosestCachedDistSqr(Vector3(88888.f), nearest, &owner);
+        expect(distSqr > 1.f, "a bogus centroid was written into the cache");
+      }
+
       // An overrideHash key must NOT report a reusable matrix hash.
       {
         TestData extra(Vector3(999.f, 999.f, 999.f), 999);

@@ -823,6 +823,15 @@ namespace dxvk {
       // stable pointer while objectToWorld stays byte-identical. Skipping on the
       // caller's memcmp would freeze an instanced prop at a stale key. Widening
       // needs the composed matrix compared, not the base one.
+      //
+      // STILL NOT WIDENED, and it never will be on this test -- but the work it
+      // was trying to avoid is now avoided a different way. See the key/centroid
+      // block below: rather than guess from the base matrix whether the key
+      // changed, we compose the matrix, derive the key (which sec 4a's hash
+      // threading made free), and compare the KEY. That is the comparison this
+      // note says the widening needs, so the centroid no longer has to be
+      // computed speculatively. The early return here remains worth keeping: it
+      // is strictly cheaper still, skipping the compose as well.
       if (m_stablePropId != 0
           && m_spatialCacheHash == static_cast<XXH64_hash_t>(m_stablePropId)) {
         // Keep [MapGate] balanced -- see s_mgSkipInSync. An unaccounted skip
@@ -840,7 +849,6 @@ namespace dxvk {
       // matrix-bytes hashing) keeps a stable cache key tied to per-prop
       // identity. Default 0 = original matrix-hash behavior.
       const Matrix4 firstInstanceObjectToWorld = calcFirstInstanceObjectToWorld();
-      const Vector3 newPos = getBlas()->input.getGeometryData().boundingBox.getTransformedCentroid(firstInstanceObjectToWorld);
 
       // NV-DXVK [perf] handoff v7 sec 4a: discharge the precondition on the
       // caller's precomputed key. The hint carries the matrix it was hashed
@@ -857,6 +865,36 @@ namespace dxvk {
          && memcmp(keyHint.matrix->data, firstInstanceObjectToWorld.data, sizeof(Matrix4)) == 0)
         ? keyHint.hash
         : 0;
+
+      // NV-DXVK [perf]: THE CENTROID IS NOW LAZY.
+      //
+      // move() reads `centroid` only on the re-file path -- it is forwarded to
+      // the re-insert and touched nowhere else. Deriving it costs a load of
+      // input.geometryData.boundingBox out of a large BlasEntry (m_linkedBlas
+      // itself is hot, that field need not be) plus an AABB validity test and a
+      // Matrix4 x Vector4. It was paid by every instance every frame.
+      //
+      // How often it is actually wanted: [SpatialMove] fires only when the key
+      // changes, and its first-32-then-every-4096th throttle puts that at
+      // roughly 290 of the 15,450 moves per frame -- about 2%. The other 98%
+      // computed a world position that move() then ignored.
+      //
+      // What unblocked this is sec 4a. Deciding "did the key change?" used to
+      // mean hashing the matrix, which is what the note above rejected -- paying
+      // a hash to skip an AABB transform is not a trade. Now the hash is already
+      // in hand from the lookup, so computeKey is a compare and a select.
+      //
+      // computeKey is SpatialMap's own, deliberately: this predicate must be the
+      // same one move() applies internally. If it drifts, moved instances stop
+      // being re-filed, and that neither faults nor logs -- it surfaces frames
+      // later as dedup churn. Feeding move() the same precomputedMatrixHash then
+      // makes its internal call free, so the key is derived twice but hashed at
+      // most once.
+      const XXH64_hash_t newKey = BlasEntry::InstanceMap::computeKey(
+          firstInstanceObjectToWorld, m_stablePropId, precomputedMatrixHash);
+      const Vector3 newPos = (newKey != m_spatialCacheHash)
+        ? getBlas()->input.getGeometryData().boundingBox.getTransformedCentroid(firstInstanceObjectToWorld)
+        : Vector3();
 
       // NV-DXVK [Otc2904]: pre-move state for VS_2904d2 instances. If we
       // see m_spatialCacheHash != m_stablePropId here, this move() will
@@ -946,6 +984,15 @@ namespace dxvk {
       // The probe is a bucketed prefix compare - orders of magnitude below the
       // string build it replaces.
       if (!Logger::tagDenied("[MapWrite]")) {
+        // NV-DXVK [perf]: newPos above is only computed when the key changed, so
+        // on the common path it is a default-constructed zero rather than this
+        // instance's world position. Re-derive it HERE -- inside the denylist
+        // gate, so it costs nothing unless the tag is actually enabled -- because
+        // a census that silently logged (0,0,0) for 98% of instances would be
+        // worse than no census: this field is exactly what the sky-space-entry
+        // hunt reads it for.
+        const Vector3 logPos =
+          getBlas()->input.getGeometryData().boundingBox.getTransformedCentroid(firstInstanceObjectToWorld);
         Logger::info(str::format(
           "[MapWrite] f=", m_frameLastUpdated,
           " hidden=", (censusHidden() ? 1 : 0),
@@ -961,7 +1008,7 @@ namespace dxvk {
           " oldKey=0x", std::hex, static_cast<uint64_t>(oldKey), std::dec,
           " key=0x", std::hex, static_cast<uint64_t>(m_spatialCacheHash), std::dec,
           " mapSz=", m_linkedBlas->getSpatialMap().size(),
-          " newPos=(", newPos.x, ",", newPos.y, ",", newPos.z, ")",
+          " newPos=(", logPos.x, ",", logPos.y, ",", logPos.z, ")",
           " o2wT=(", firstInstanceObjectToWorld[3][0], ",",
             firstInstanceObjectToWorld[3][1], ",",
             firstInstanceObjectToWorld[3][2], ")"));
