@@ -62,7 +62,13 @@ namespace dxvk {
 
     const uint32_t LegacyAssetHash1 = (1 << (uint32_t)HashComponents::LegacyPositions1)
                                     | (1 << (uint32_t)HashComponents::LegacyIndices);
-    const uint32_t Total = 5;
+    // NV-DXVK: slot 5 is the RUNTIME-CONFIGURED rule (rtx.geometryAssetHashRule).
+    // The five constants above are compile-time; the asset rule is a user string,
+    // and the default "positions,indices,geometrydescriptor" deliberately matches
+    // none of them, so without its own slot every asset-hash query fell through to
+    // the generic per-component loop. See GeometryHashes::precombine().
+    const uint32_t ExtraRuntimeSlot = 5;
+    const uint32_t Total = 6;
   }
 
   // Structure contains data required to perform a hash operation on specific data
@@ -79,13 +85,29 @@ namespace dxvk {
   struct GeometryHashes {
     GeometryHashes() {
       memset(&fields[0], kEmptyHash, sizeof(fields));
+      // NV-DXVK: precombined[] used to be left UNINITIALISED here -- the memset
+      // above covers `fields` only. Every getter below returned precombined[N]
+      // unconditionally, so any geometry whose precombine() was never called
+      // (which is all D3D11 draw-path geometry, until finalizeGeometryHashes
+      // started calling it) served whatever was on the stack. Zeroed, and guarded
+      // by m_precombinedValid so a miss recomputes rather than returning garbage.
+      memset(&precombined[0], 0, sizeof(precombined));
     }
 
     // Simple getters for hash components
     const XXH64_hash_t& operator[](const HashComponents& field) const { return fields[(uint32_t) field]; }
           XXH64_hash_t& operator[](const HashComponents& field)       { return fields[(uint32_t) field]; }
 
-    void precombine() {
+    // NV-DXVK: call this ONCE, as soon as `fields` is final and before the geometry
+    // is queried. `extraRuleRaw` is the runtime-configured rule (pass
+    // RtxOptions::geometryAssetHashRule().raw()); 0 means "no runtime slot", which
+    // simply leaves asset-hash queries on the generic path.
+    //
+    // WHY IT MATTERS FOR FRAME TIME: getHashForRule is called per INSTANCE
+    // (~15,500/frame) but geometry is finalised per DRAW (~1,060/frame). Any rule
+    // without a slot runs getHashForRuleImpl -- a 9-iteration loop with a chained
+    // XXH64 per selected component -- on every one of those instance-rate calls.
+    void precombine(uint32_t extraRuleRaw = 0u) {
       precombined[0] = getHashForRuleImpl<rules::TopologicalHash>();
       precombined[1] = getHashForRuleImpl<rules::VertexDataHash>();
       precombined[2] = getHashForRuleImpl<rules::FullGeometryHash>();
@@ -95,21 +117,42 @@ namespace dxvk {
       if (operator[](HashComponents::LegacyPositions1) != kEmptyHash) {
         precombined[4] = getHashForRuleImpl<rules::LegacyAssetHash1>();
       }
+      // Skip the runtime slot when the rule is already one of the five above --
+      // it would just duplicate an entry the switch resolves first.
+      m_extraRuleRaw = 0u;
+      if (extraRuleRaw != 0u
+          && extraRuleRaw != rules::TopologicalHash
+          && extraRuleRaw != rules::VertexDataHash
+          && extraRuleRaw != rules::FullGeometryHash
+          && extraRuleRaw != rules::LegacyAssetHash0
+          && extraRuleRaw != rules::LegacyAssetHash1) {
+        precombined[rules::ExtraRuntimeSlot] = getHashForRuleImpl(HashRule(extraRuleRaw));
+        m_extraRuleRaw = extraRuleRaw;
+      }
+      m_precombinedValid = true;
     }
 
     template<uint32_t rule>
     XXH64_hash_t getHashForRule() const {
-      switch (rule) {
-      case rules::TopologicalHash:
-        return precombined[0];
-      case rules::VertexDataHash:
-        return precombined[1];
-      case rules::FullGeometryHash:
-        return precombined[2];
-      case rules::LegacyAssetHash0:
-        return precombined[3];
-      case rules::LegacyAssetHash1:
-        return precombined[4];
+      // NV-DXVK: the validity guard is a correctness fix, not an optimisation.
+      // These getters previously returned precombined[N] unconditionally, and
+      // precombine() is not reachable on every path that builds a GeometryHashes,
+      // so an unprecombined object served uninitialised memory as a geometry hash.
+      // Falling back to the generic combiner always yields the RIGHT value; it is
+      // merely slower, which is the correct trade for a hash used as an identity.
+      if (m_precombinedValid) {
+        switch (rule) {
+        case rules::TopologicalHash:
+          return precombined[0];
+        case rules::VertexDataHash:
+          return precombined[1];
+        case rules::FullGeometryHash:
+          return precombined[2];
+        case rules::LegacyAssetHash0:
+          return precombined[3];
+        case rules::LegacyAssetHash1:
+          return precombined[4];
+        }
       }
       return getHashForRuleImpl<rule>();
     }
@@ -126,6 +169,12 @@ namespace dxvk {
         return getHashForRule<rules::LegacyAssetHash0>();
       case rules::LegacyAssetHash1:
         return getHashForRule<rules::LegacyAssetHash1>();
+      }
+      // The runtime-configured rule. One compare against a cached raw mask, then an
+      // array read -- this is the path rtx.geometryAssetHashRule takes on every
+      // per-instance asset-hash query.
+      if (m_precombinedValid && m_extraRuleRaw != 0u && rule.raw() == m_extraRuleRaw) {
+        return precombined[rules::ExtraRuntimeSlot];
       }
       return getHashForRuleImpl(rule);
     }
@@ -168,6 +217,11 @@ namespace dxvk {
     // Array of hashes, indexed by HashComponent
     XXH64_hash_t fields[static_cast<uint32_t>(HashComponents::Count)];
     XXH64_hash_t precombined[rules::Total];
+    // NV-DXVK: which runtime rule precombined[ExtraRuntimeSlot] holds (0 = none),
+    // and whether precombine() has run at all. Without the latter the getters
+    // above cannot tell a real cached hash from stack residue.
+    uint32_t m_extraRuleRaw = 0u;
+    bool     m_precombinedValid = false;
   };
 
   /**

@@ -3241,6 +3241,14 @@ namespace dxvk {
     const uint64_t vsHash = static_cast<uint64_t>(drawCall.getTransformData().vertexShaderHash);
     out_instances.reserve(transforms->size());
 
+    // NV-DXVK [perf] 2026-08-07. Read ONCE per draw, not per placement.
+    // Gates the per-placement health probes below. See the block at the mtxHash /
+    // basisHash computation for why they had to be gated: they are the wrapper's
+    // copy of the [PassCensus]/[InstCounts] finding, and they are the reason
+    // [Perf.SceneObj]'s four buckets summed ~5.7 ms short of [ProcDCS] instMs --
+    // the guard brackets processSceneObjectImpl and never enters this function.
+    const bool fanoutStats = RtxOptions::logFanoutSplitStats();
+
     // The engine's per-placement HISTORY. Same re-check for the same reason: the
     // producer already length-gates it, and a desynced history would resolve a
     // placement onto a different prop's instance with full confidence.
@@ -3294,7 +3302,9 @@ namespace dxvk {
     // each propId against the previous frame's set. (Doing it after the loop, as
     // a pure aggregate would, leaves `prev` holding this frame's own inserts.)
     if (st.frame != currentFrameIdx) {
-      if (st.frame != 0xFFFFFFFFu && st.draws > 0) {
+      // NV-DXVK [perf] 2026-08-07: with fanoutStats off the counters below are not
+      // populated, so emitting the line would print zeroes and read as a collapse.
+      if (fanoutStats && st.frame != 0xFFFFFFFFu && st.draws > 0) {
         logFanoutSplitFrame(st.frame, vsHash, st.draws, st.nInst, st.live, st.created,
                             st.collide, st.mir, st.newProp, st.missProp,
                             st.mtxStable, st.basisStable,
@@ -3313,14 +3323,20 @@ namespace dxvk {
           const uint32_t hits = m_fanoutPrevHitCount.exchange(0, std::memory_order_relaxed);
           const uint32_t misses = m_fanoutPrevMissCount.exchange(0, std::memory_order_relaxed);
           if (hits != 0u || misses != 0u) {
+            // NV-DXVK [perf] 2026-08-07: the ~200-character explanation that used
+            // to be concatenated into every one of these lines now lives here.
+            // This emits ONCE PER FRAME (1054 lines in a 100 s capture), and the
+            // fixed prose was the overwhelming majority of each line's bytes --
+            // paid through the mutexed flush-per-line Logger, forever, to restate
+            // something that never changes. Reference text, read it here:
+            //   prevHit  the count of placements the ENGINE HISTORY resolved after
+            //            the current transform missed. Compare it against
+            //            nInst-mtxStable in [FanoutSplit] (rtx.logFanoutSplitStats).
+            //   prevMiss falls through to the nearest search exactly as before.
             Logger::info(str::format(
               "[FanoutPrev] f=", st.frame,
               " prevHit=", hits,
-              " prevMiss=", misses,
-              " (prevHit is the count of placements the ENGINE HISTORY resolved"
-              " after the current transform missed — compare against"
-              " nInst-mtxStable in [FanoutSplit]; prevMiss falls through to the"
-              " nearest search exactly as before)"));
+              " prevMiss=", misses));
           }
         }
       }
@@ -3340,10 +3356,12 @@ namespace dxvk {
     // collide with an earlier one, so the instance can no longer report where the
     // FIRST of the two stood. Without this the collision dump would compare a
     // placement against itself.
+    // NV-DXVK [perf] 2026-08-07: the parallel sPlacedMtxHash array is gone. It
+    // existed so the collide dump could print the FIRST placement's hash, which
+    // cost an XXH64 per placement to fill an array read a few dozen times a
+    // session. The dump now hashes sPlacedO2w[duplicateOf] when it actually fires.
     static thread_local std::vector<Matrix4> sPlacedO2w;
-    static thread_local std::vector<uint64_t> sPlacedMtxHash;
     sPlacedO2w.clear();
-    sPlacedMtxHash.clear();
 
     for (size_t placement = 0; placement < transforms->size(); ++placement) {
       FanoutSplit split;
@@ -3362,6 +3380,23 @@ namespace dxvk {
         split.hasPrevObjectToWorld = true;
       }
 
+      // NV-DXVK [perf] 2026-08-07 -- EVERYTHING FROM HERE TO THE END OF THE HEALTH
+      // PROBES IS NOW GATED, and it was the wrapper's ~5.7 ms.
+      // This ran per PLACEMENT (~14,600/frame: 15,489 processSceneObjectImpl calls
+      // against ~1,060 draws) and cost, every placement, every frame: two XXH64s
+      // (64 B and 36 B), two unordered_set lookups and two unordered_set INSERTS --
+      // ~29,000 hash-set operations per frame, whose nodes are then freed again at
+      // the next frame's rollover.
+      // Nothing the renderer reads depends on any of it. mirrored / mtxStable /
+      // basisStable / newProp / missProp exist only to fill [FanoutSplit], which is
+      // on the logDenyTags list, so the line they feed is formatted and discarded.
+      // Identical shape to [PassCensus] and [InstCounts] in processSceneObjectImpl,
+      // just outside the bracket [Perf.SceneObj] measures -- which is exactly why
+      // that probe's buckets summed short of [ProcDCS] instMs.
+      // The collide DETECTION below is functional and stays; only the collide DUMP
+      // needs mtxHash, and it recomputes it from sPlacedO2w when it fires.
+      bool submittedLastFrame = false;
+      if (fanoutStats) {
       if (isMirrorTransform(split.objectToWorld)) {
         ++mirrored;
       }
@@ -3385,7 +3420,7 @@ namespace dxvk {
       const uint64_t basisHash = static_cast<uint64_t>(XXH64(basis, sizeof(basis), 0));
 
       // Read membership BEFORE inserting, or every placement looks like a repeat.
-      const bool submittedLastFrame = st.prev.count(mtxHash) != 0;
+      submittedLastFrame = st.prev.count(mtxHash) != 0;
       st.cur.insert(mtxHash);
       if (submittedLastFrame) {
         ++mtxStable;
@@ -3394,6 +3429,7 @@ namespace dxvk {
         ++basisStable;
       }
       st.curBasis.insert(basisHash);
+      }   // if (fanoutStats)
 
       // existingInstance is always null here: a replacement draw never carries
       // isFanoutBatch (SceneManager::drawReplacements clears it), so there is no
@@ -3501,6 +3537,16 @@ namespace dxvk {
         // few dozen lines for the whole session, not per frame.
         {
           const Matrix4& firstO2w = sPlacedO2w[duplicateOf];
+          // NV-DXVK [perf] 2026-08-07: recomputed here instead of being carried
+          // per placement. This branch fires on a collision AND only on the first
+          // sighting of each (VS, transform) pair, capped at 400 for the session --
+          // a few dozen lines a run -- so two hashes here replace ~14,600 per frame.
+          // sPlacedO2w still holds the earlier placement's matrix, so the first
+          // hash is recoverable without a parallel array.
+          const uint64_t mtxHash =
+            static_cast<uint64_t>(XXH64(&split.objectToWorld, sizeof(Matrix4), 0));
+          const uint64_t firstMtxHash =
+            static_cast<uint64_t>(XXH64(&firstO2w, sizeof(Matrix4), 0));
           struct CollideKey { uint64_t vs, propId; };
           const CollideKey ck { vsHash, mtxHash };
           const uint64_t ckHash = XXH64(&ck, sizeof(ck), 0xC0111DEull);
@@ -3552,7 +3598,7 @@ namespace dxvk {
               "[FanoutCollide] f=", currentFrameIdx,
               " vs=0x", std::hex, vsHash, std::dec,
               " mtxHash=0x", std::hex, mtxHash, std::dec,
-              " firstMtxHash=0x", std::hex, sPlacedMtxHash[duplicateOf], std::dec,
+              " firstMtxHash=0x", std::hex, firstMtxHash, std::dec,
               " sameBytes=", (sameBytes ? 1 : 0),
               " maxRot=", maxRot,
               " basisScale=", basisScale,
@@ -3573,7 +3619,6 @@ namespace dxvk {
 
       out_instances.push_back(instance);
       sPlacedO2w.push_back(split.objectToWorld);
-      sPlacedMtxHash.push_back(mtxHash);
     }
 
     // Accumulate only — the [FanoutSplit] line for this frame is emitted by the
@@ -3617,28 +3662,78 @@ namespace dxvk {
   //   update  updateInstance -- transform/surface/material write. Expected to
   //           dominate on a steady scene where nearly every draw dedups.
   //
-  // COST: 4 clock reads per call (~205 ns), ~0.23 ms/frame at 1119 draws.
+  // COST -- SAMPLED DURATIONS, EXACT COUNTS. CORRECTED 2026-08-07: the line here
+  // used to read "4 clock reads per call (~205 ns), ~0.23 ms/frame at 1119 draws"
+  // and the guard stamped the clock on EVERY call. It is billed per INSTANCE, not
+  // per draw: [Perf.UpdInst] measures instPerFrame=15,500 against ~1,090 draws, so
+  // 5 reads x 15,500 x ~41 ns = ~3.2 ms/frame -- 14x the budgeted figure and ~6%
+  // of a 55 ms frame, on a probe whose job is to attribute 25 ms. That is the same
+  // per-draw/per-instance error catalogued at the top of this file (acquireVsDebugId,
+  // rtx.perfNonOpaqueCensus, and this guard once already).
+  //
+  // So: time 1 instance in 64 (~242/frame, ~0.05 ms) and count every instance
+  // exactly, matching UpdInstSplitGuard. estMsPerFrame is the sampled mean x the
+  // EXACT call count, which is directly comparable to [ProcDCS] instMs -- the two
+  // measure the same function.
+  //
   // Gated off by default via rtx.perfSceneObjSplit.
   namespace {
     struct SceneObjSplitGuard {
       using clk = std::chrono::steady_clock;
+      static constexpr uint32_t kSampleMask = 63u;   // duration-sample 1 in 64
 
       bool            on;
+      bool            timed   = false;
+      uint32_t        frameId = 0;
       clk::time_point t0, tFind, tMid, tAdd;
       bool            hasFind = false, hasMid = false, hasAdd = false;
       bool            added   = false;
 
-      explicit SceneObjSplitGuard(bool enabled)
-      : on(enabled) {
-        if (on)
+      // NV-DXVK [Perf.MidWork]: EXACT per-instance counters for the five
+      // diagnostic blocks that make up `mid`. COUNTED, NEVER TIMED. Each block is
+      // sub-microsecond against a ~41 ns clock read, so sub-timers here would be
+      // measurement-floored and would answer "how long" with noise -- the same
+      // trap as the FillMat per-draw buckets. What decides the fix is MECHANISM:
+      // how many instances pay a hash-map insert-or-find, and how many str::format
+      // calls are built only for the logger to throw them away. [PassCensus],
+      // [InstCounts], [VS2904Trace] and [SubViewKey.create] are all on the log.cpp
+      // denylist, so fmtDropped is work with no output at all.
+      uint32_t nMtn = 0, nSubvk = 0, nPass = 0, nProp = 0, nVs29 = 0;
+      uint32_t nMapOp = 0, nStrMap = 0, nFmt = 0, nFmtDropped = 0;
+
+      SceneObjSplitGuard(bool enabled, uint32_t fid)
+      : on(enabled), frameId(fid) {
+        if (!on) {
+          return;
+        }
+        static thread_local uint32_t s_seq = 0;
+        timed = ((s_seq++ & kSampleMask) == 0u);
+        if (timed) {
           t0 = clk::now();
+        }
       }
 
-      void markFind()   { if (on) { tFind = clk::now(); hasFind = true; } }
-      void markMid()    { if (on) { tMid  = clk::now(); hasMid  = true; } }
-      void markAdd()    { if (on) { tAdd  = clk::now(); hasAdd  = true; } }
+      void markFind()   { if (timed) { tFind = clk::now(); hasFind = true; } }
+      void markMid()    { if (timed) { tMid  = clk::now(); hasMid  = true; } }
+      void markAdd()    { if (timed) { tAdd  = clk::now(); hasAdd  = true; } }
       void noteAdded()  { added = true; }
       void markUpdate() { /* end of scope; the destructor stamps it */ }
+
+      // Called from inside each mid block, AFTER its gate, on the path that does
+      // real work -- so a block reading 0 here costs nothing beyond its gate.
+      // noteMapOp marks a uint64-keyed insert-or-find, noteStrMap a std::string-keyed
+      // one (far more expensive: it hashes and compares 19 characters), noteFmt a
+      // str::format that was actually built, and noteFmtDropped one the logger
+      // then discarded.
+      void noteMtn()        { if (on) ++nMtn; }
+      void noteSubvk()      { if (on) ++nSubvk; }
+      void notePass()       { if (on) ++nPass; }
+      void noteProp()       { if (on) ++nProp; }
+      void noteVs29()       { if (on) ++nVs29; }
+      void noteMapOp()      { if (on) ++nMapOp; }
+      void noteStrMap()     { if (on) ++nStrMap; }
+      void noteFmt()        { if (on) ++nFmt; }
+      void noteFmtDropped() { if (on) ++nFmtDropped; }
 
       static int64_t ns(clk::time_point a, clk::time_point b) {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count();
@@ -3651,37 +3746,87 @@ namespace dxvk {
         const auto tEnd = clk::now();
 
         static thread_local int64_t  sFind = 0, sMid = 0, sAdd = 0, sUpd = 0;
-        static thread_local uint64_t sCalls = 0, sAdds = 0;
+        static thread_local uint64_t sCalls = 0, sAdds = 0, sSamples = 0, sFrames = 0;
+        static thread_local uint64_t qMtn = 0, qSubvk = 0, qPass = 0, qProp = 0, qVs29 = 0;
+        static thread_local uint64_t qMapOp = 0, qStrMap = 0, qFmt = 0, qFmtDropped = 0;
+        static thread_local uint32_t sLastFrame = UINT32_MAX;
         static thread_local clk::time_point sLastLog{};
         static thread_local bool sInit = false;
-        if (!sInit) { sLastLog = t0; sInit = true; }
+        if (!sInit) { sLastLog = tEnd; sInit = true; }
 
-        sFind += ns(t0, hasFind ? tFind : tEnd);
-        if (hasFind) sMid += ns(tFind, hasMid ? tMid : tEnd);
-        if (hasMid)  sAdd += ns(tMid,  hasAdd ? tAdd : tEnd);
-        if (hasAdd)  sUpd += ns(tAdd,  tEnd);
+        if (sLastFrame != frameId) { sLastFrame = frameId; ++sFrames; }
+
         ++sCalls;
         if (added) ++sAdds;
 
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(tEnd - sLastLog).count() >= 3000) {
-          const int64_t c = sCalls ? int64_t(sCalls) : 1;
-          const int64_t tot = sFind + sMid + sAdd + sUpd;
-          Logger::info(str::format(
-            "[Perf.SceneObj] calls=", sCalls,
-            " addedPct=", (sCalls ? (sAdds * 100 / sCalls) : 0),
-            " avgUsPerCall=", (tot / 1000 / c),
-            " | find=", (sFind / 1000 / c), "us",
-            " mid=", (sMid / 1000 / c), "us",
-            " add=", (sAdd / 1000 / c), "us",
-            " update=", (sUpd / 1000 / c), "us",
-            " | pct find=", (tot ? (sFind * 100 / tot) : 0),
-            " mid=", (tot ? (sMid * 100 / tot) : 0),
-            " add=", (tot ? (sAdd * 100 / tot) : 0),
-            " update=", (tot ? (sUpd * 100 / tot) : 0)));
-          sFind = sMid = sAdd = sUpd = 0;
-          sCalls = sAdds = 0;
-          sLastLog = tEnd;
+        // Durations only on the sampled instances -- an unsampled call never read
+        // the clock, so t0/tFind/tMid/tAdd hold nothing to accumulate.
+        if (timed) {
+          ++sSamples;
+          sFind += ns(t0, hasFind ? tFind : tEnd);
+          if (hasFind) sMid += ns(tFind, hasMid ? tMid : tEnd);
+          if (hasMid)  sAdd += ns(tMid,  hasAdd ? tAdd : tEnd);
+          if (hasAdd)  sUpd += ns(tAdd,  tEnd);
         }
+
+        qMtn += nMtn; qSubvk += nSubvk; qPass += nPass; qProp += nProp; qVs29 += nVs29;
+        qMapOp += nMapOp; qStrMap += nStrMap; qFmt += nFmt; qFmtDropped += nFmtDropped;
+
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(tEnd - sLastLog).count() < 3000) {
+          return;
+        }
+
+        const double  smp    = double(sSamples ? sSamples : 1);
+        const double  frames = double(sFrames  ? sFrames  : 1);
+        const double  perFrm = double(sCalls) / frames;
+        const int64_t tot    = sFind + sMid + sAdd + sUpd;
+
+        // usPerCall is the sampled mean; estMsPerFrame is that mean x the EXACT
+        // call count, so a rare-but-expensive stage cannot hide behind sampling
+        // probability. Sum the four estMsPerFrame against [ProcDCS] instMs: they
+        // are the same function, and a large gap means a stage boundary is wrong.
+        const double usFind = double(sFind) / 1000.0 / smp;
+        const double usMid  = double(sMid)  / 1000.0 / smp;
+        const double usAdd  = double(sAdd)  / 1000.0 / smp;
+        const double usUpd  = double(sUpd)  / 1000.0 / smp;
+
+        Logger::info(str::format(
+          "[Perf.SceneObj] calls=", sCalls, " frames=", sFrames,
+          " callsPerFrame=", perFrm,
+          " samples=", sSamples,
+          " addedPct=", (sCalls ? (sAdds * 100 / sCalls) : 0),
+          " | usPerCall find=", usFind, " mid=", usMid, " add=", usAdd, " update=", usUpd,
+          " | estMsPerFrame find=", (usFind * perFrm / 1000.0),
+          " mid=", (usMid * perFrm / 1000.0),
+          " add=", (usAdd * perFrm / 1000.0),
+          " update=", (usUpd * perFrm / 1000.0),
+          " | pct find=", (tot ? (sFind * 100 / tot) : 0),
+          " mid=", (tot ? (sMid * 100 / tot) : 0),
+          " add=", (tot ? (sAdd * 100 / tot) : 0),
+          " update=", (tot ? (sUpd * 100 / tot) : 0)));
+
+        // EXACT, every instance -- no sampling, no floor. `mid` has no gate of its
+        // own, so these say which of its five blocks actually ran and what each one
+        // cost in mechanism terms. mapOps/strMaps are hash-map insert-or-finds per
+        // frame; fmtDropped is str::format work whose output the log.cpp denylist
+        // discards, i.e. pure waste that deleting the block recovers in full.
+        Logger::info(str::format(
+          "[Perf.MidWork] frames=", sFrames, " callsPerFrame=", perFrm,
+          " | perFrame mtn=", (double(qMtn) / frames),
+          " subvk=", (double(qSubvk) / frames),
+          " pass=", (double(qPass) / frames),
+          " prop=", (double(qProp) / frames),
+          " vs2904=", (double(qVs29) / frames),
+          " | mapOps=", (double(qMapOp) / frames),
+          " strMaps=", (double(qStrMap) / frames),
+          " fmt=", (double(qFmt) / frames),
+          " fmtDropped=", (double(qFmtDropped) / frames)));
+
+        sFind = sMid = sAdd = sUpd = 0;
+        sCalls = sAdds = sSamples = sFrames = 0;
+        qMtn = qSubvk = qPass = qProp = qVs29 = 0;
+        qMapOp = qStrMap = qFmt = qFmtDropped = 0;
+        sLastLog = tEnd;
       }
     };
   }
@@ -3691,7 +3836,7 @@ namespace dxvk {
     BlasEntry& blas, const DrawCallState& drawCall, MaterialData& materialData, RtInstance* existingInstance,
     DrawCallCache* drawCallCache, const FanoutSplit* split) {
 
-    SceneObjSplitGuard psoSplit(RtxOptions::perfSceneObjSplit());
+    SceneObjSplitGuard psoSplit(RtxOptions::perfSceneObjSplit(), m_device->getCurrentFrameId());
 
     // If the RtInstance represents multiple instances, use the full transform of the first copy for the spatial map.
     // this prevents a bad de-duplication when the same replacement asset is used in multiple GeomPointInstancer prims.
@@ -3769,6 +3914,11 @@ namespace dxvk {
         // lines/frame (00:48 capture) and the whole gather+format below is
         // wasted when the denylist would drop the line anyway.
         if (!Logger::tagDenied("[MtnDedup]")) {
+          // NV-DXVK [Perf.MidWork]: past the VS gate AND past the denylist, so
+          // this instance pays the full gather below (a transformed centroid, six
+          // geometry-hash reads, a texture hash and debugHashInputs).
+          psoSplit.noteMtn();
+          psoSplit.noteFmt();
           // Centroid is what the SpatialMap actually keys/cells on, and it is
           // NOT o2w.T — log both so a divergence is visible directly.
           const Vector3 mdCentroid =
@@ -3872,6 +4022,7 @@ namespace dxvk {
         + firstInstanceObjectToWorld[0][2] * firstInstanceObjectToWorld[0][2];
       const bool svScaled = svSc0Sq > 10000.0f;  // col0 len > 100 => reprojected
       if (svGameplay && (svPropId != 0ull || svScaled)) {
+        psoSplit.noteSubvk();   // NV-DXVK [Perf.MidWork]
         struct SvKeyAgg {
           uint32_t frame = 0xFFFFFFFFu;
           uint32_t cand = 0, hit = 0, create = 0, scaled = 0, detail = 0;
@@ -3880,6 +4031,7 @@ namespace dxvk {
         const uint32_t svFrame = m_device->getCurrentFrameId();
         if (sSvKey.frame != svFrame) {
           if (sSvKey.frame != 0xFFFFFFFFu && sSvKey.cand > 0u) {
+            psoSplit.noteFmt();   // NV-DXVK [Perf.MidWork]: this one does emit
             Logger::info(str::format(
               "[SubViewKey] f=", sSvKey.frame,
               " cand=", sSvKey.cand,
@@ -3914,6 +4066,10 @@ namespace dxvk {
             // draw's VS and the blas's VS are independent reads, so
             // blasVs != vs on a single line IS the shared-BlasEntry proof.
             // blasPtr cross-references directly against [MtnDedup]'s blasPtr.
+            // NV-DXVK [Perf.MidWork]: [SubViewKey.create] is on the log.cpp
+            // denylist, so this format is built and then discarded.
+            psoSplit.noteFmt();
+            psoSplit.noteFmtDropped();
             Logger::info(str::format(
               "[SubViewKey.create] f=", svFrame,
               " vs=0x", std::hex,
@@ -3932,94 +4088,21 @@ namespace dxvk {
         }
       }
     }
-    // NV-DXVK [PassCensus]: per-frame inventory of EVERY instance, bucketed by
-    // (VS hash, cameraType). Answers the architecture question the retention
-    // patches dodged: "where does the geometry that's missing in view 2 come
-    // from — a real camera or the shadow fanout?" For each bucket: count, how
-    // many were reprojected (col0 scale > 100 == sky_camera sub-view content),
-    // and the world-translation AABB. Flush one line per bucket at frame
-    // transition, gameplay-gated, <=40 lines/frame.
-    //
-    // Diff a VIEW-1 frame against a VIEW-2 frame:
-    //   a VS present in view 1, GONE in view 2  == the missing geometry. Its
-    //   cameraType is the verdict:
-    //     - same cameraType as the reprojected sky_camera sub-view (scaled>0)
-    //       -> the real sky_camera DOES carry it; conversion drops it in
-    //          view 2 -> proper fix lives in the sub-view conversion path.
-    //     - only ever the shadow-fanout cameraType (the 0x2947c634 family,
-    //       scaled==0, cam==6) -> NO real-camera source exists; the horizon
-    //       is sourced from a shadow render -> the fanout dependency is
-    //       structural and must be re-sourced, not retained.
-    // GATE CHANGE (2026-06-13): was gated on g_engineHookCaptureCount>16, which
-    // only opens AFTER the view-1->view-2 flip, so view 1 was never captured and
-    // a clean cross-view diff was impossible. Now accumulate EVERY frame and
-    // flush only "real" scene frames (>=100 instances), which captures the intro
-    // (view 1, lots of geometry) AND gameplay (view 2) while skipping menu/load
-    // frames (few instances). One run then yields the definitive view-1 vs
-    // view-2 per-VS diff: a VS instanced in view 1 but absent in view 2 is the
-    // dropped sky-camera sub-view content (the displaced/missing geometry).
-    {
-      {
-        struct PcEntry {
-          uint32_t count = 0, scaled = 0; int camType = -1;
-          float mn[3] = { 1e30f, 1e30f, 1e30f };
-          float mx[3] = { -1e30f, -1e30f, -1e30f };
-        };
-        static thread_local uint32_t sPcFrame = 0xFFFFFFFFu;
-        static thread_local uint32_t sPcTotal = 0;
-        static thread_local std::unordered_map<uint64_t, PcEntry> sPc;
-        const uint32_t pcF = m_device->getCurrentFrameId();
-        if (sPcFrame != pcF) {
-          if (sPcFrame != 0xFFFFFFFFu && sPcTotal >= 100u) {
-            uint32_t printed = 0;
-            for (const auto& kv : sPc) {
-              if (printed >= 40u) break;
-              const PcEntry& e = kv.second;
-              if (e.count < 2u) continue;  // skip per-frame singleton noise
-              ++printed;
-              Logger::info(str::format(
-                "[PassCensus] f=", sPcFrame,
-                " total=", sPcTotal,
-                " vs=0x", std::hex, kv.first, std::dec,
-                " cam=", e.camType,
-                " count=", e.count,
-                " scaled=", e.scaled,
-                " wMin=(", e.mn[0], ",", e.mn[1], ",", e.mn[2], ")",
-                " wMax=(", e.mx[0], ",", e.mx[1], ",", e.mx[2], ")"));
-            }
-          }
-          sPc.clear();
-          sPcTotal = 0;
-          sPcFrame = pcF;
-        }
-        const uint64_t pcVs =
-          static_cast<uint64_t>(drawCall.getTransformData().vertexShaderHash);
-        PcEntry& e = sPc[pcVs];
-        e.count += 1;
-        sPcTotal += 1;
-        e.camType = static_cast<int>(drawCall.cameraType);
-        const float pcSc0Sq =
-            firstInstanceObjectToWorld[0][0] * firstInstanceObjectToWorld[0][0]
-          + firstInstanceObjectToWorld[0][1] * firstInstanceObjectToWorld[0][1]
-          + firstInstanceObjectToWorld[0][2] * firstInstanceObjectToWorld[0][2];
-        if (pcSc0Sq > 10000.0f) e.scaled += 1;
-        for (int a = 0; a < 3; ++a) {
-          const float t = firstInstanceObjectToWorld[3][a];
-          e.mn[a] = std::min(e.mn[a], t);
-          e.mx[a] = std::max(e.mx[a], t);
-        }
-      }
-    }
+    // NV-DXVK [PassCensus] DELETED 2026-08-07 -- measured, not guessed.
+    // [Perf.MidWork] read pass == mapOps == callsPerFrame == 15,509.7 in all ten
+    // windows of the 02:58 capture: this accumulate path had NO gate of any kind
+    // -- not the gameplay gate the block above it uses, not a VS filter -- so a
+    // uint64-keyed unordered_map insert-or-find plus six min/max ran on EVERY
+    // instance of EVERY frame. [PassCensus] is on the log.cpp denylist, so every
+    // bucket it accumulated was discarded unread.
+    // Deleting beats guarding (v6 process note 2): no correctness surface, and it
+    // helps the instances a guard would have missed. The view-1/view-2 per-VS diff
+    // it was written for is answered and closed -- see the s2s two-views work.
     {
       const XXH64_hash_t vsHash = drawCall.getTransformData().vertexShaderHash;
-      char vsKey[24] = "VS_";
-      static const char hex[] = "0123456789abcdef";
-      for (int i = 0; i < 8; ++i) {
-        const uint8_t b = static_cast<uint8_t>(vsHash >> ((7 - i) * 8));
-        vsKey[3 + i*2 + 0] = hex[b >> 4];
-        vsKey[3 + i*2 + 1] = hex[b & 0xF];
-      }
-      vsKey[19] = '\0';
+      // NV-DXVK: the vsKey hex-format loop that used to sit here went with
+      // [InstCounts] below -- it existed only to build that map's string key and
+      // ran on every instance. [PropCensus] keys on vsHash directly.
 
       // NV-DXVK [PropCensus]: for VS_2904d2 sub-view mountains, track which
       // distinct world-position keys appear in this frame's submissions and
@@ -4035,6 +4118,7 @@ namespace dxvk {
       const bool gameplayActive =
         tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16;
       if (gameplayActive && vsHash == 0x2904d2163ef31a17ull) {
+        psoSplit.noteProp();   // NV-DXVK [Perf.MidWork]
         const float wpx = float(firstInstanceObjectToWorld[3][0]);
         const float wpy = float(firstInstanceObjectToWorld[3][1]);
         const float wpz = float(firstInstanceObjectToWorld[3][2]);
@@ -4085,38 +4169,17 @@ namespace dxvk {
         }
       }
 
-      struct InstStats {
-        uint32_t frameId  = 0;
-        uint32_t reused   = 0;
-        uint32_t created  = 0;
-      };
-      static thread_local std::unordered_map<std::string, InstStats> sStats;
-      static thread_local uint32_t sLastReportedFrame = UINT32_MAX;
-      const uint32_t curFrame = m_device->getCurrentFrameId();
-      auto& s = sStats[vsKey];
-      if (s.frameId != curFrame) {
-        s.frameId = curFrame;
-        s.reused = 0;
-        s.created = 0;
-      }
-      if (foundSimilar) s.reused += 1;
-      else              s.created += 1;
-      // Emit a per-VS summary once per frame, on the first observed
-      // draw of the new frame (across any VS). Keeps the log size
-      // bounded — one [InstCounts] line per active VS per frame.
-      if (sLastReportedFrame != curFrame) {
-        sLastReportedFrame = curFrame;
-        for (auto& kv : sStats) {
-          if (kv.second.frameId + 1 == curFrame
-              && (kv.second.reused + kv.second.created) > 0) {
-            Logger::info(str::format(
-              "[InstCounts] frame=", kv.second.frameId,
-              " vs=", kv.first,
-              " reused=", kv.second.reused,
-              " created=", kv.second.created));
-          }
-        }
-      }
+      // NV-DXVK [InstCounts] DELETED 2026-08-07 -- measured, not guessed.
+      // [Perf.MidWork] read strMaps == callsPerFrame == 15,509.7 in all ten
+      // windows of the 02:58 capture: a std::string-keyed unordered_map
+      // insert-or-find on EVERY instance of EVERY frame, plus the 8-iteration
+      // hex loop that built the key, plus ~77 str::format calls per frame that
+      // the log.cpp denylist then threw away. [InstCounts] is denied, so the
+      // entire structure produced no output at all. Deleting beats guarding
+      // (v6 process note 2): there is no correctness surface here, and the
+      // instances that would have missed any guard are helped too.
+      // The reused/created question it answered is now carried by [MapGate]'s
+      // mapWrMove/mapWrInsert and by [Perf.SceneObj] addedPct.
     }
 
     // NV-DXVK [VS_2904d2 trace]: this VS shows up in [InstCounts] as
@@ -4143,6 +4206,7 @@ namespace dxvk {
     {
       const XXH64_hash_t vsHash = drawCall.getTransformData().vertexShaderHash;
       if (vsHash == 0x2904d2163ef31a17ull) {
+        psoSplit.noteVs29();   // NV-DXVK [Perf.MidWork]
         thread_local uint32_t sLastFrame = UINT32_MAX;
         thread_local uint32_t sDrawIdx   = 0;
         const uint32_t curFrame = m_device->getCurrentFrameId();
@@ -4157,6 +4221,9 @@ namespace dxvk {
         if (sDrawIdx < 12) {
           const Matrix4& m = firstInstanceObjectToWorld;
           const uint32_t camType = static_cast<uint32_t>(drawCall.cameraType);
+          // NV-DXVK [Perf.MidWork]: denylisted -- built, then discarded.
+          psoSplit.noteFmt();
+          psoSplit.noteFmtDropped();
           Logger::info(str::format(
             "[VS2904Trace] frame=", curFrame, " draw=", sDrawIdx,
             " vsHash=0x", std::hex, vsHash, std::dec,
@@ -4509,7 +4576,77 @@ namespace dxvk {
     // surface.associatedGeometryHash is assigned from this exact expression, and
     // the rule is an RtxOption that the user can change at runtime, so the rule's
     // effect has to be baked in rather than assumed constant.
-    kd.geometryAssetHash = drawCall.getHash(RtxOptions::geometryAssetHashRule());
+    //
+    // NV-DXVK [perf] 2026-08-07 -- A SINGLE-ENTRY MEMO WAS TRIED HERE AND REVERTED.
+    // MEASURED, so it is not re-attempted.
+    //
+    // The observation that motivated it is real and still stands:
+    // GeometryHashes::getHashForRule(rule) dispatches to its precombined[] cache
+    // for five known rules (rtx_hashing.h ~117), but the configured asset rule --
+    // rtx.geometryAssetHashRuleString = "positions,indices,geometrydescriptor",
+    // i.e. VertexPosition|Indices|GeometryDescriptor -- matches NONE of them
+    // (TopologicalHash has no positions, VertexDataHash no indices or descriptor,
+    // FullGeometryHash carries extras). So this call falls through to
+    // getHashForRuleImpl, a 9-iteration loop with a chained XXH64 per selected
+    // component, once per INSTANCE (~15,500/frame) against only ~1,060 draws.
+    //
+    // The memo keyed on the three selected component hashes plus legacyHash, which
+    // is exact by construction, and consecutive instances of a fanout batch share a
+    // draw so it should have hit ~93%. It still LOST: [Perf.SceneObj] update went
+    // 9.52 -> 9.96 ms between two settled, exporter-free captures, and this was one
+    // of only two changes inside updateInstance between them.
+    //
+    // WHY, most likely: `static thread_local` with a non-trivial initialiser is
+    // dynamically initialised, so every access pays a TLS-init guard check on top
+    // of three field loads and four compares -- more than the loop it skipped.
+    // Same lesson as the surf guard: a detector that touches more memory than the
+    // work it avoids cannot win, and the stage is the only thing that decides it.
+    //
+    // The real fix is upstream: give the configured asset rule a precombined slot
+    // so this becomes an array read like the other five. Done -- see
+    // GeometryHashes::precombine() / getHashForRule(). The memo below is retained
+    // on top of it.
+    {
+      static constexpr uint32_t kMemoMask =
+          (1u << static_cast<uint32_t>(HashComponents::VertexPosition))
+        | (1u << static_cast<uint32_t>(HashComponents::Indices))
+        | (1u << static_cast<uint32_t>(HashComponents::GeometryDescriptor));
+
+      const HashRule& assetRule = RtxOptions::geometryAssetHashRule();
+
+      if (assetRule.raw() != kMemoMask) {
+        kd.geometryAssetHash = drawCall.getHash(assetRule);
+      } else {
+        const GeometryHashes& gh = drawCall.getGeometryData().hashes;
+        const XXH64_hash_t hPos  = gh[HashComponents::VertexPosition];
+        const XXH64_hash_t hIdx  = gh[HashComponents::Indices];
+        const XXH64_hash_t hDesc = gh[HashComponents::GeometryDescriptor];
+
+        // NV-DXVK [perf]: PLAIN STATICS, NOT thread_local-with-initialiser. The
+        // first version used `static thread_local AssetHashMemo memo` with default
+        // member initialisers, which makes it DYNAMICALLY initialised -- every
+        // access pays a TLS-init guard check, and update measured 9.52 -> 9.96 ms.
+        // Constant-initialised thread_local scalars need no guard: they land in
+        // .tbss and cost one TLS base fetch shared by all five.
+        static thread_local XXH64_hash_t memoPos    = 0;
+        static thread_local XXH64_hash_t memoIdx    = 0;
+        static thread_local XXH64_hash_t memoDesc   = 0;
+        static thread_local XXH64_hash_t memoLegacy = 0;
+        static thread_local XXH64_hash_t memoOut    = 0;
+        static thread_local bool         memoValid  = false;
+
+        if (memoValid && memoPos == hPos && memoIdx == hIdx
+            && memoDesc == hDesc && memoLegacy == kd.legacyHash) {
+          kd.geometryAssetHash = memoOut;
+        } else {
+          kd.geometryAssetHash = drawCall.getHash(assetRule);
+          memoPos = hPos; memoIdx = hIdx; memoDesc = hDesc;
+          memoLegacy = kd.legacyHash;
+          memoOut = kd.geometryAssetHash;
+          memoValid = true;
+        }
+      }
+    }
     kd.categoryFlags     = static_cast<uint32_t>(categoryFlags.raw());
     kd.vertexShaderHash  = static_cast<uint64_t>(drawCall.getTransformData().vertexShaderHash);
     kd.tFactor           = lm.tFactor;
@@ -4582,8 +4719,26 @@ namespace dxvk {
     RtInstance* result = nullptr;
 
     const uint32_t currentFrameIdx = m_device->getCurrentFrameId();
-    const Vector3 worldPosition = blas.input.getGeometryData().boundingBox.getTransformedCentroid(firstInstanceObjectToWorld);
-    
+    // NV-DXVK [perf] 2026-08-07: DECLARED here, ASSIGNED past the exact stage.
+    // Computing it is a pointer chase into blas.input's geometry plus a matrix
+    // transform of the bounding-box centroid, and nothing before the nearest stage
+    // reads it -- the exact-hash lookup returns without touching it, and so does
+    // the engine-history retry. With static=97% and addedPct=0 the exact stage
+    // answers almost every call, so this was computed and discarded on the
+    // overwhelming majority of instances.
+    //
+    // It cannot simply move inside the search block: that block closes before the
+    // ray-portal virtual-instance code below, which reads worldPosition too. So the
+    // declaration stays at function scope and the assignment sits at the one point
+    // every surviving path passes through.
+    //
+    // INVARIANT, and the reason this is safe: the assignment is unconditional
+    // within the search block, placed after both early returns. Any path that
+    // reaches this variable's later uses has executed it. If you add an early exit
+    // to the search block that falls through rather than returning, move the
+    // assignment above it.
+    Vector3 worldPosition;
+
     const float uniqueObjectDistanceSqr = RtxOptions::getUniqueObjectDistanceSqr();
 
     RtInstance* pSimilar = nullptr;
@@ -4605,7 +4760,16 @@ namespace dxvk {
     // [FindSim]/[FindSimMtn] site in this function at once; the throttle
     // counters simply stop advancing while denied, which is the same state a
     // fresh run starts in.
-    const bool isProbeVS = !Logger::tagDenied("[FindSim]")
+    // NV-DXVK [perf] 2026-08-07: HOISTED INTO A STATIC. Logger::tagDenied is not a
+    // flag read -- it strlen()s the tag, indexes the bucket by tag[1] and memcmps
+    // every entry in that bucket. 'F' is a populated bucket here ([FindSim],
+    // [FanoutSplit], [FanoutPrev]), and this ran PER INSTANCE, ~15,500 times a
+    // frame, alongside the second one below. The denylist is published once by
+    // Logger::setDenyTags during RtxOptions init and never changes afterwards, so
+    // a function-local static is the correct lifetime -- the same fix already
+    // applied to kUVxDenied further down this file.
+    static const bool kFindSimDenied = Logger::tagDenied("[FindSim]");
+    const bool isProbeVS = !kFindSimDenied
                         && ((vsHashProbe == 0x2904d2163ef31a17ull)
                          || lookupHash(RtxOptions::findSimilarProbeVsHashes(), vsHashProbe));
     // NV-DXVK [FindSimMtn]: the s2s "two views" black-sky root. The reprojected
@@ -4618,7 +4782,12 @@ namespace dxvk {
     // extra collapses are propId collisions (engine reused a stablePropId for
     // distinct panels) or distance merges (panels fall within the dedup radius
     // after reproject). Own counters so it captures full frames of all 14.
-    const bool isMtnProbe = !Logger::tagDenied("[FindSimMtn]")
+    // NV-DXVK [perf] 2026-08-07: hoisted for the same reason as kFindSimDenied.
+    // Note this tag is NOT covered by the "[FindSim]" denylist entry even though
+    // it starts the same way -- tagDenied matches whole entries, and "[FindSim]"
+    // includes the closing bracket, so it cannot prefix-match "[FindSimMtn]".
+    static const bool kFindSimMtnDenied = Logger::tagDenied("[FindSimMtn]");
+    const bool isMtnProbe = !kFindSimMtnDenied
                          && (vsHashProbe == 0x29146e1dd50b0314ull);
 
     // Search the BLAS for an instance matching ours
@@ -4644,11 +4813,16 @@ namespace dxvk {
         if (isMtnProbe) {
           thread_local uint32_t sMtnExact = 0;
           if (sMtnExact < 80u || (sMtnExact & 0xFFu) == 0u) {
+            // NV-DXVK [perf]: computed here rather than eagerly at function entry.
+            // This site is throttled AND behind isMtnProbe, so it runs a handful of
+            // times per session instead of ~15,500 times per frame.
+            const Vector3 mtnWorldPos =
+              blas.input.getGeometryData().boundingBox.getTransformedCentroid(firstInstanceObjectToWorld);
             Logger::info(str::format(
               "[FindSimMtn] #", sMtnExact, " f=", currentFrameIdx,
               " outcome=COLLAPSE stage=exact propId=0x", std::hex, stablePropId, std::dec,
               " spatialMapSize=", blas.getSpatialMap().size(),
-              " worldPos=(", worldPosition.x, ",", worldPosition.y, ",", worldPosition.z, ")"));
+              " worldPos=(", mtnWorldPos.x, ",", mtnWorldPos.y, ",", mtnWorldPos.z, ")"));
           }
           sMtnExact += 1;
         }
@@ -4690,6 +4864,15 @@ namespace dxvk {
         }
         ++m_fanoutPrevMissCount;
       }
+
+      // NV-DXVK [perf] 2026-08-07: the centroid is computed HERE, not at function
+      // entry. Both exact stages have missed by this point, so every remaining path
+      // -- the exact-miss probe, the nearest search, and the ray-portal code after
+      // this block -- genuinely needs it. Instances that resolved exactly returned
+      // above without paying for the geometry pointer chase or the transform.
+      // Unconditional within this block by design; see the declaration's invariant.
+      worldPosition =
+        blas.input.getGeometryData().boundingBox.getTransformedCentroid(firstInstanceObjectToWorld);
 
       // NV-DXVK [FindSim2904 exact-miss]: log propId we looked up. Pair
       // against [PropIdTrace] at the same frame to see if lookup propId
@@ -5599,14 +5782,33 @@ namespace dxvk {
       // still emitted exactly once across all threads rather than once per
       // thread - the thread-local set only ever suppresses work, never grants
       // permission to log.
+      // NV-DXVK [perf] 2026-08-07: SINGLE-ENTRY FRONT on top of the thread-local
+      // set. The note above is right about the principle and the fix it describes
+      // did not finish the job: a thread_local unordered_set::insert is still a
+      // hash plus a bucket probe plus a cache miss, paid by EVERY sub-view instance
+      // EVERY frame, to gate a line that fires once per VS for the whole session.
+      // Sub-view instances arrive in runs that share a vertex shader, so comparing
+      // against the last hash this thread already resolved collapses the steady
+      // state to one 8-byte compare and touches the set only on a VS change.
+      // Sized honestly: this is small -- the block is already gated on svFlip, so
+      // it is bounded by the sub-view population, not by all ~15,500 instances.
+      // Do not expect it to move [Perf.UpdInst] entry on its own.
       const XXH64_hash_t vsFn = drawCall.getTransformData().vertexShaderHash;
-      static thread_local std::unordered_set<XXH64_hash_t> tFnSeen;
+      static thread_local XXH64_hash_t tLastFn = 0;
+      static thread_local bool tLastFnValid = false;
       bool firstFn = false;
-      if (tFnSeen.insert(vsFn).second) {
-        static std::mutex sFnMu;
-        static std::unordered_set<XXH64_hash_t> sFnLog;
-        std::lock_guard<std::mutex> g(sFnMu);
-        firstFn = sFnLog.insert(vsFn).second;
+      if (!tLastFnValid || vsFn != tLastFn) {
+        static thread_local std::unordered_set<XXH64_hash_t> tFnSeen;
+        if (tFnSeen.insert(vsFn).second) {
+          static std::mutex sFnMu;
+          static std::unordered_set<XXH64_hash_t> sFnLog;
+          std::lock_guard<std::mutex> g(sFnMu);
+          firstFn = sFnLog.insert(vsFn).second;
+        }
+        // Only after the set has resolved this hash, so a VS is never skipped
+        // before its first-sighting question has been asked.
+        tLastFn = vsFn;
+        tLastFnValid = true;
       }
       if (firstFn) {
         Logger::info(str::format(

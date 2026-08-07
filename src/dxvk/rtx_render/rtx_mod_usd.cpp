@@ -1618,7 +1618,11 @@ bool UsdMod::Impl::processMesh(const pxr::UsdPrim& prim, Args& args) {
       newGeomData.indexCount = submesh.GetNumIndices();
       // Set these as hashed so that the geometryData acts like it's static.
       newGeomData.hashes[HashComponents::Indices] = newGeomData.hashes[HashComponents::VertexPosition] = getNextGeomHash();
-      newGeomData.hashes.precombine();
+      // NV-DXVK: pass the runtime asset rule so replacement geometry gets the same
+      // precombined slot 5 the draw path gets in finalizeGeometryHashes -- otherwise
+      // every per-instance asset-hash query on a replacement falls through to the
+      // generic per-component combiner.
+      newGeomData.hashes.precombine(RtxOptions::geometryAssetHashRule().raw());
     }
   }
 

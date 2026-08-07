@@ -382,6 +382,26 @@ namespace dxvk {
       throw DxvkError("Position hash should never be empty");
     }
 
+    // NV-DXVK [perf + correctness] 2026-08-07: build the precombined rule cache HERE.
+    //
+    // This is the one point on the D3D11 draw path where `hashes` becomes final --
+    // either resolved from the future above or pre-computed by the batch path -- so
+    // it is the only correct place to combine them.
+    //
+    // CORRECTNESS: precombine() previously had three callers (USD mods, the particle
+    // system, the remix API) and none of them are on this path, so draw-path geometry
+    // reached GeometryHashes::getHashForRule with precombined[] never written. The
+    // constructor memsets `fields` only. Those getters returned the array
+    // unconditionally, i.e. uninitialised memory used as a geometry identity.
+    //
+    // PERFORMANCE: this runs once per DRAW (~1,060/frame). getHashForRule is called
+    // once per INSTANCE (~15,500/frame) -- notably by computeInstStateKey for the
+    // asset hash -- and without a cache slot the configured rule fell through to the
+    // 9-iteration generic combiner on every one of those calls. Passing the rule's
+    // raw mask gives it slot 5, turning that into a compare plus an array read.
+    // ~14.6x fewer combines, and the combine moves off the per-instance path.
+    geometryData.hashes.precombine(RtxOptions::geometryAssetHashRule().raw());
+
     return true;
   }
 

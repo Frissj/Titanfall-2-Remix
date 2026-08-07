@@ -811,7 +811,8 @@ namespace dxvk {
       particleGeometry.frontFace = VK_FRONT_FACE_CLOCKWISE;
       particleGeometry.hashes[HashComponents::Indices] = particleHashConstant ^ particleSystem.getGeneration();
       particleGeometry.hashes[HashComponents::VertexPosition] = particleHashConstant ^ particleSystem.getGeneration();
-      particleGeometry.hashes.precombine();
+      // NV-DXVK: runtime asset rule -> precombined slot 5, matching the draw path.
+      particleGeometry.hashes.precombine(RtxOptions::geometryAssetHashRule().raw());
 
       const RtCamera& camera = ctx->getSceneManager().getCamera();
 

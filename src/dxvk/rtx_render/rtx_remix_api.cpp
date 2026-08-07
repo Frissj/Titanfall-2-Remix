@@ -1066,7 +1066,11 @@ namespace {
         dst.hashes[dxvk::HashComponents::VertexTexcoord] = hack_getNextGeomHash();
         dst.hashes[dxvk::HashComponents::GeometryDescriptor] = hack_getNextGeomHash();
         dst.hashes[dxvk::HashComponents::VertexLayout] = hack_getNextGeomHash();
-        dst.hashes.precombine();
+        // NV-DXVK: runtime asset rule -> precombined slot 5, matching the draw path.
+        // Explicitly qualified: this sits in an anonymous namespace at GLOBAL scope
+        // (namespace dxvk closed near the top of this file), like the dxvk::
+        // qualifications on every line above.
+        dst.hashes.precombine(dxvk::RtxOptions::geometryAssetHashRule().raw());
       }
       allocatedSurfaces.push_back(std::move(dst));
     }
