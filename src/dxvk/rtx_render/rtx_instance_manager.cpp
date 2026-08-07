@@ -601,7 +601,24 @@ namespace dxvk {
       // COPY CTOR: DONE - clones inherit the hold (see the note in the init
       // list); a clone rendering the collapsed first bake is the artifact the
       // member exists to prevent.
-      static_assert(RtInstanceSize == 816, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+      //
+      // 816 -> 824 on 2026-08-07: added XXH64_hash_t m_instStateKey (handoff v5
+      // sec 4c — ONE digest covering every input read by both the `surf` block and
+      // the event-fanout gate of updateInstance, so each can be skipped when none
+      // of them moved. This briefly went to 832 while those were two separate
+      // keys; merging them removed the second word AND the second gather, which
+      // was the whole cost.
+      // COPY CTOR: DELIBERATELY NOT COPIED, and this is the safe direction rather
+      // than an oversight. The ctor takes `surface(src.surface)` by value, so a
+      // clone already holds the source's surface CONTENTS; leaving the key at
+      // kEmptyHash means the clone's first updateInstance cannot match and runs
+      // both full paths, re-deriving those contents and its material binding from
+      // its own draw. Copying the key would do the opposite — assert that the
+      // clone's surface and binding are already correct for a draw it has never
+      // seen — which is exactly the false hit this key exists to prevent. The
+      // binding half is the dangerous one: the symptom would be a stale material
+      // INDEX, i.e. the clone rendering with another surface's textures.
+      static_assert(RtInstanceSize == 824, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }
@@ -4393,6 +4410,155 @@ namespace dxvk {
     return out;
   }
 
+  // NV-DXVK [perf] handoff v5 sec 4c: EXACT change-detector for the `surf` block
+  // of updateInstance (~0.167 us/inst floor-corrected, ~2.6 ms/frame at 15,500
+  // instances). That block is ~25 straight-line writes into currentInstance
+  // .surface derived entirely from (drawCall, materialData, categoryFlags,
+  // alphaState); with matChg=0% every frame, it rewrites the same bytes.
+  //
+  // DISCIPLINE (v5 sec 0a): a field read by the block but missing from this key is
+  // a FALSE HIT -- one surface silently rendered with another draw's state. Every
+  // entry below is therefore justified against what the block actually reads. If
+  // you add a read to that block, add it here in the same commit.
+  //
+  // WHAT THE TWO MATERIAL HASHES DO AND DO NOT COVER -- both were verified, not
+  // assumed:
+  //   materialHash = MaterialData::getHash(). The generated updateCachedHash() in
+  //     rtx_material_data.h is X_TEXTURES(WRITE_TEXTURE_HASH) +
+  //     X_CONSTANTS(WRITE_CONSTANT_HASH), i.e. EVERY texture and EVERY constant of
+  //     the render material. That covers SpriteSheetRows/Cols/FPS,
+  //     UseLegacyAlphaState, IsUnlitOutput, Tf2SkyboxFog and
+  //     SubsurfaceDiffusionProfile -- all of the block's materialData reads.
+  //   legacyHash = LegacyMaterialData::getHash(). Its HashData (rtx_materials.h
+  //     ~2215) is 11 texture hashes + all eight blendMode fields + the three
+  //     alphaTest fields, and NOTHING ELSE. So the texture arg/op sources, the
+  //     texture operations, tFactor, isTextureFactorBlend and
+  //     isVertexColorBakedLighting are NOT covered by it and are keyed
+  //     individually below. Keying on legacyHash alone would have been the exact
+  //     sec 0a defect.
+  //
+  // NOT IN THE KEY, ON PURPOSE -- these are hoisted out of the guarded region at
+  // the call site because they legitimately change every frame:
+  //   drawCall.drawCallID   -> surface.objectPickingValue (per-frame draw counter)
+  //   m_isInsideFrustum     -> surface.isInsideFrustum (moves with the camera)
+  // and the m_isHidden promotions, which `entry` resets each frame.
+  static XXH64_hash_t computeInstStateKey(const DrawCallState& drawCall,
+                                          const MaterialData& materialData,
+                                          const RtSurface::AlphaState& alphaState,
+                                          const CategoryFlags& categoryFlags,
+                                          bool vsDebugIdConsumed,
+                                          uint64_t bindingEpoch) {
+    const LegacyMaterialData& lm = drawCall.getMaterialData();
+
+    // ONE KEY, TWO DECISIONS. This digest feeds BOTH the `surf` guard and the
+    // `tail` event-fanout gate, and is computed exactly once per instance.
+    //
+    // WHY MERGED. Measured: with a key each, surf paid ~30 ns to skip ~25 ns of
+    // writes -- a net LOSS (surf 0.211 baseline -> 0.250 at v1, -> 0.233 after the
+    // key shrank) -- while tail paid ~30 ns to skip ~50 ns, a win. Sharing one
+    // gather makes surf's share free: the union of both input sets costs barely
+    // more to hash than either alone, because the cost here is the SCATTERED READS
+    // (LegacyMaterialData, DrawCallTransforms, the MaterialData variant,
+    // GeometryHashes, three samplers), not the hashing.
+    //
+    // SIZE. XXH3_64bits tiers at <=16, <=128, <=240 and >240 bytes. The original
+    // 152-byte version sat in the <=240 tier and that WAS costing -- but the
+    // boundary that matters is 128, not 64 (an earlier comment here said 64; that
+    // was wrong). At 88 bytes this stays in the same <=128 tier a 56-byte key
+    // would, so merging the tail fields in is very nearly free.
+    //
+    // The 48-byte eye texture transform is deliberately NOT here: eye draws never
+    // skip (see the isEye escape at the call site), which costs nothing -- there
+    // are a handful of them -- and keeps every other instance out of the next tier.
+    struct InstStateKeyData {
+      XXH64_hash_t materialHash;       // full render-material digest   (surf + tail)
+      XXH64_hash_t legacyHash;         // 11 tex hashes + blend + alpha (surf)
+      XXH64_hash_t geometryAssetHash;  // drawCall.getHash(rule)        (surf)
+      uint64_t     vertexShaderHash;   // vsDebugId source              (surf)
+      uint64_t     samplerOverride;    // createSurfaceMaterial inputs  (tail)
+      uint64_t     drawSampler;        //                               (tail)
+      uint64_t     drawSampler2;       //                               (tail)
+      uint64_t     bindingEpoch;       // cache-slot recycling stamp    (tail)
+      uint32_t     categoryFlags;      //                               (surf)
+      uint32_t     typeAndTexgen;      // materialType | texgenMode << 16
+      uint32_t     tFactor;            //                               (surf)
+      uint32_t     texArgOps;          // six arg/op enums, 5 bits each (surf)
+      uint32_t     alphaAndMisc;       // alpha state + misc flag bits  (surf + tail)
+    };
+    static_assert(sizeof(InstStateKeyData) <= 128,
+                  "InstStateKeyData must stay <=128 bytes to keep XXH3 off its "
+                  "long-input path; if you must add a field, pack it into an "
+                  "existing word.");
+    // Same reasoning as LegacyMaterialData::updateCachedHash: memset the whole
+    // object so trailing/interior padding is deterministic. Do NOT switch to an
+    // aggregate initialiser -- that copies a temporary's padding and produced a
+    // material hash that changed with the call path (see the note there).
+    static_assert(alignof(InstStateKeyData) <= 8 && sizeof(InstStateKeyData) % 4 == 0);
+    InstStateKeyData kd;
+    std::memset(&kd, 0, sizeof(kd));
+
+    kd.materialHash      = materialData.getHash();
+    kd.legacyHash        = lm.getHash();
+    // tail-only inputs: createSurfaceMaterial resolves a sampler from these three
+    // pointers, and the binding epoch says whether any previously-handed-out cache
+    // index could have been recycled since. See ResourceCache::getBindingEpoch().
+    kd.samplerOverride   = reinterpret_cast<uint64_t>(materialData.getSamplerOverride().ptr());
+    kd.drawSampler       = reinterpret_cast<uint64_t>(lm.getSampler().ptr());
+    kd.drawSampler2      = reinterpret_cast<uint64_t>(lm.getSampler2().ptr());
+    kd.bindingEpoch      = bindingEpoch;
+    // surface.associatedGeometryHash is assigned from this exact expression, and
+    // the rule is an RtxOption that the user can change at runtime, so the rule's
+    // effect has to be baked in rather than assumed constant.
+    kd.geometryAssetHash = drawCall.getHash(RtxOptions::geometryAssetHashRule());
+    kd.categoryFlags     = static_cast<uint32_t>(categoryFlags.raw());
+    kd.vertexShaderHash  = static_cast<uint64_t>(drawCall.getTransformData().vertexShaderHash);
+    kd.tFactor           = lm.tFactor;
+    kd.typeAndTexgen     = static_cast<uint32_t>(materialData.getType())
+                         | (static_cast<uint32_t>(drawCall.getTransformData().texgenMode) << 16);
+
+    // Six enums, five bits each = 30 bits. RtTextureArgSource and
+    // DxvkRtTextureOperation are both small enumerations; the masks are asserted
+    // rather than assumed so a new enumerator cannot silently alias two states
+    // into one key and serve a surface the wrong texture stage setup.
+    auto arg5 = [](auto e) -> uint32_t {
+      const uint32_t v = static_cast<uint32_t>(e);
+      assert(v < 32u && "texture arg/op enum outgrew its 5-bit slot in SurfKeyData");
+      return v & 0x1Fu;
+    };
+    kd.texArgOps         = (arg5(lm.textureColorArg1Source)      )
+                         | (arg5(lm.textureColorArg2Source)  << 5)
+                         | (arg5(lm.textureColorOperation)   << 10)
+                         | (arg5(lm.textureAlphaArg1Source)  << 15)
+                         | (arg5(lm.textureAlphaArg2Source)  << 20)
+                         | (arg5(lm.textureAlphaOperation)   << 25);
+
+    // alphaState is copied wholesale into surface.alphaState, so every field of it
+    // is an input. Packed explicitly rather than memcmp'd so padding can never
+    // silently widen the key.
+    kd.alphaAndMisc      = (static_cast<uint32_t>(alphaState.alphaTestType)  & 0xFu)
+                         | ((static_cast<uint32_t>(alphaState.alphaTestReferenceValue) & 0xFFu) << 4)
+                         | ((static_cast<uint32_t>(alphaState.blendType)     & 0x1Fu) << 12)
+                         | (alphaState.isBlendingDisabled ? 1u << 17 : 0u)
+                         | (alphaState.isFullyOpaque      ? 1u << 18 : 0u)
+                         | (alphaState.invertedBlend      ? 1u << 19 : 0u)
+                         | (alphaState.emissiveBlend      ? 1u << 20 : 0u)
+                         | (alphaState.isParticle         ? 1u << 21 : 0u)
+                         | (alphaState.isDecal            ? 1u << 22 : 0u)
+                         | (lm.isTextureFactorBlend       ? 1u << 23 : 0u)
+                         | (lm.isVertexColorBakedLighting ? 1u << 24 : 0u)
+                         // vsDebugId is written from acquireVsDebugId only when a
+                         // consumer is on, and forced to 0 otherwise -- so the
+                         // consumer state itself changes the written value.
+                         | (vsDebugIdConsumed             ? 1u << 25 : 0u)
+                         // Anti-culling decides whether surface.isInsideFrustum
+                         // tracks the instance flag or is pinned true. The flag is
+                         // written outside the guard, but the MODE still selects
+                         // which of the two the block would write.
+                         | (RtxOptions::AntiCulling::isObjectAntiCullingEnabled() ? 1u << 26 : 0u);
+
+    return XXH3_64bits(&kd, sizeof(kd));
+  }
+
   void InstanceManager::mergeInstanceHeuristics(RtInstance& instanceToModify, const DrawCallState& drawCall, const RtSurface::AlphaState& alphaState) const {
     // "Opaqueness" takes priority!
     if (
@@ -5221,6 +5387,16 @@ namespace dxvk {
 
       // Exact, every instance. Set once at the end from the function's own values.
       bool cFirst = false, cXfChg = false, cMatChg = false, cPrevPos = false, cStatic = false;
+      // NV-DXVK [perf] sec 4c: set when the surf-state guard skipped the block.
+      // Reported as surfSkip= so the fix is verified by MECHANISM (the guard fired
+      // on N% of instances) and not only by the surf timing moving -- a key that
+      // is accidentally always-equal and a key that is correctly always-equal look
+      // identical in the timing alone.
+      bool cSurfSkip = false;
+      void surfSkipped() { cSurfSkip = true; }
+      // NV-DXVK [perf] sec 4c: set when the event fanout was skipped outright.
+      bool cTailSkip = false;
+      void tailSkipped() { cTailSkip = true; }
 
       UpdInstSplitGuard(bool enabled, uint32_t fid) : on(enabled), frameId(fid) {
         if (!on) {
@@ -5254,7 +5430,7 @@ namespace dxvk {
         static thread_local int64_t  sNs[kStages] = {};
         static thread_local uint64_t sSamples = 0, sInst = 0, sFrames = 0;
         static thread_local uint64_t sFirst = 0, sXfChg = 0, sMatChg = 0, sPrevPos = 0,
-                                     sStatic = 0, sRedundant = 0;
+                                     sStatic = 0, sRedundant = 0, sSurfSkip = 0, sTailSkip = 0;
         static thread_local uint32_t sLastFrame = UINT32_MAX;
         static thread_local clk::time_point sLastLog{};
         static thread_local bool sInit = false;
@@ -5276,6 +5452,8 @@ namespace dxvk {
         if (cMatChg)  ++sMatChg;
         if (cPrevPos) ++sPrevPos;
         if (cStatic)  ++sStatic;
+        if (cSurfSkip) ++sSurfSkip;
+        if (cTailSkip) ++sTailSkip;
         if (!cXfChg && !cMatChg && !cPrevPos) ++sRedundant;
 
         if (std::chrono::duration_cast<std::chrono::milliseconds>(tEnd - sLastLog).count() < 3000) {
@@ -5310,11 +5488,22 @@ namespace dxvk {
           "% matChg=",     (sMatChg    * 100 / inst),
           "% prevPos=",    (sPrevPos   * 100 / inst),
           "% static=",     (sStatic    * 100 / inst),
-          "% REDUNDANT=",  (sRedundant * 100 / inst), "%"));
+          "% REDUNDANT=",  (sRedundant * 100 / inst),
+          // NV-DXVK [perf] sec 4c: share of instances whose surf block was skipped
+          // because every input it reads was unchanged. Expect this to track
+          // REDUNDANT closely in a settled scene; a low value with REDUNDANT high
+          // means the key is picking up something that moves per frame, which is a
+          // bug in computeSurfStateKey, not a property of the scene.
+          "% surfSkip=",   (sSurfSkip  * 100 / inst),
+          // NV-DXVK [perf] sec 4c: share of instances whose event fanout was
+          // skipped outright. Should sit just under surfSkip in a settled scene.
+          // A COLLAPSE here while surfSkip stays high points at the binding epoch
+          // moving every frame (streaming churn), not at the material key.
+          "% tailSkip=",   (sTailSkip  * 100 / inst), "%"));
 
         for (int i = 0; i < kStages; ++i) { sNs[i] = 0; }
         sSamples = sInst = sFrames = 0;
-        sFirst = sXfChg = sMatChg = sPrevPos = sStatic = sRedundant = 0;
+        sFirst = sXfChg = sMatChg = sPrevPos = sStatic = sRedundant = sSurfSkip = sTailSkip = 0;
         sLastLog = tEnd;
       }
     };
@@ -5486,6 +5675,11 @@ namespace dxvk {
     const RtSurface::AlphaState alphaState = calculateAlphaState(drawCall, materialData);
     bool hasTransformChanged = false;
     bool hasPreviousPositions = false;
+    // NV-DXVK [perf] sec 4c: result of the single per-instance state-key compare,
+    // set in the `surf` block below and read again by the event-fanout gate at the
+    // bottom. Defaults false so any path that does not reach the compare (e.g.
+    // !isFirstUpdateThisFrame with overridePreviousCameraUpdate) runs both blocks.
+    bool instStateUnchanged = false;
 
     if (!isFirstUpdateThisFrame) {
       // This is probably the same instance, being drawn twice!  Merge it
@@ -5494,6 +5688,37 @@ namespace dxvk {
     
     uiSplit.mark(0);   // NV-DXVK [Perf.UpdInst]: end of `entry`
 
+    // NV-DXVK [perf] handoff v5 sec 4c -- THE `surf` SKIP WAS INVESTIGATED AND IS
+    // NOT AVAILABLE. Recorded here so it is not re-attempted.
+    //
+    // 4c proposes an exact change-detector over this block's inputs, on the
+    // grounds that it is gated on isFirstUpdateThisFrame (99%) with matChg=0%,
+    // and that "its inputs are enumerable". The inputs are enumerable. The
+    // block is not skippable anyway, for two structural reasons that no amount
+    // of key-auditing fixes:
+    //
+    //   (1) IT IS NOT ASSIGNMENT-ONLY. It promotes currentInstance.m_isHidden in
+    //       two places -- the matTf2Fog hide and the sourcePsWritesCoverageMask
+    //       hide further down. `entry` RESETS m_isHidden every frame from the
+    //       Hidden category flag, and `flags` later reads it to force the
+    //       instance mask to 0. Skipping this block therefore un-hides the TF2
+    //       fog-pipeline surfaces and the SV_Coverage sky overlay -- both
+    //       previously-diagnosed visual bugs, silently reintroduced.
+    //
+    //   (2) ITS OUTPUT LEGITIMATELY CHANGES EVERY FRAME. surface.objectPickingValue
+    //       is assigned drawCall.drawCallID, and that is a PER-FRAME draw counter
+    //       (D3D11Rtx::m_drawCallID, reset by resetDrawCallID() and accumulated
+    //       across deferred contexts each frame). So a "nothing changed" key is
+    //       false by construction: include drawCallID and the detector never
+    //       fires, exclude it and objectPickingValue freezes, breaking picking.
+    //
+    // Closing 4c for this stage means RESTRUCTURING it -- hoisting the two
+    // m_isHidden promotions and the picking-value assignment out of the skipped
+    // region -- not gating it. At 0.167 us/inst floor-corrected (~2.6 ms) that is
+    // worth doing, but it is a redesign with its own verification, not the
+    // key-audit 4c describes. The cheap wins inside the block (the two probe
+    // latches below) were taken instead.
+    //
     // Updates done only once a frame unless overriden due to an explicit state
     if (isFirstUpdateThisFrame || overridePreviousCameraUpdate) {
 
@@ -5509,6 +5734,64 @@ namespace dxvk {
 
         currentInstance.m_texcoordHash = drawCall.getGeometryData().hashes[HashComponents::VertexTexcoord];
         currentInstance.m_indexHash = drawCall.getGeometryData().hashes[HashComponents::Indices];
+
+        // NV-DXVK [perf] handoff v5 sec 4c: THE `surf` SKIP.
+        //
+        // Everything from here to the vsDebugId assignment below derives purely
+        // from (drawCall, materialData, m_categoryFlags, alphaState) and is
+        // rewritten byte-identically every frame -- matChg=0% in every capture ever
+        // taken. computeSurfStateKey() digests exactly those inputs; see the note
+        // above it for what each entry is justified against, and in particular for
+        // which fields the two material hashes do NOT cover (that was the sec 0a
+        // defect and it is the thing to re-check if a surface ever renders with
+        // another draw's state).
+        //
+        // Reads deliberately left OUTSIDE the guard because they genuinely change
+        // per frame, so a skip must not freeze them:
+        //   surface.objectPickingValue <- drawCall.drawCallID, a per-frame counter
+        //   surface.isInsideFrustum    <- m_isInsideFrustum, moves with the camera
+        // and the two m_isHidden promotions in the Opaque case further down, which
+        // `entry` resets from the Hidden category flag every frame and `flags`
+        // consumes. Those stay outside entirely.
+        //
+        // isEmissive/isMatte are RESETS paired with promotions that live outside
+        // the guard (the switch below), so skipping is consistent in both
+        // directions: the promotion re-applies every frame, and the reset re-runs
+        // whenever the material identity that drives the promotion changes.
+        //
+        // MEASURED HISTORY, so the shape is not re-litigated. v1 of this guard was
+        // a NET LOSS: surf 0.211 baseline -> 0.250 us/inst at surfSkip=99%. v2
+        // shrank the key from 152 bytes and deleted four dead variant reads from
+        // the switch below, reaching 0.233 -- better, still a loss. The cause was
+        // never the hashing; it is that this block's ~25 writes go SEQUENTIALLY
+        // into one hot RtSurface while any key must READ from four scattered
+        // objects (LegacyMaterialData, DrawCallTransforms, the MaterialData
+        // variant, GeometryHashes). A detector that touches more memory than the
+        // work it skips cannot win on its own.
+        //
+        // v3 stops trying to make it win on its own: the key is SHARED with the
+        // event-fanout gate at the bottom of this function, which saves ~50 ns of
+        // real work per instance and was already paying for a near-identical
+        // gather of its own. One digest, one scatter, two skips -- surf's share of
+        // the detector is now marginal rather than the whole cost.
+        const bool instKeyEligible = !drawCall.isEye();
+        const XXH64_hash_t instStateKey = instKeyEligible
+          ? computeInstStateKey(drawCall, materialData, alphaState,
+                                currentInstance.m_categoryFlags, vsDebugIdIsConsumed(),
+                                m_pResourceCache->getBindingEpoch())
+          : kEmptyHash;
+
+        // Decided ONCE here, consumed twice: by this block and by the event-fanout
+        // gate at the bottom of the function. The key covers the union of both
+        // blocks' inputs, so one match authorises both skips -- and the fanout adds
+        // its own escapes (transform change, billboards, RayPortal) on top, which
+        // are only known later, after the xform stage has run.
+        instStateUnchanged = instKeyEligible && (instStateKey == currentInstance.m_instStateKey);
+        currentInstance.m_instStateKey = instStateKey;
+
+        if (instStateUnchanged) {
+          uiSplit.surfSkipped();
+        } else {
 
         // Surface meta data
         currentInstance.surface.isEmissive = false;
@@ -5561,7 +5844,6 @@ namespace dxvk {
         // Note: Skip the spritesheet adjustment logic in the surface interaction when using Ray Portal materials as this logic
         // is done later in the Surface Material Interaction (and doing it in both places will just double up the animation).
         currentInstance.surface.skipSurfaceInteractionSpritesheetAdjustment = (currentInstance.m_materialType == MaterialDataType::RayPortal);
-        currentInstance.surface.isInsideFrustum = RtxOptions::AntiCulling::isObjectAntiCullingEnabled() ? currentInstance.m_isInsideFrustum : true;
 
         currentInstance.surface.blendModeState = drawCall.getMaterialData().blendMode;
 
@@ -5575,10 +5857,8 @@ namespace dxvk {
           currentInstance.surface.eyeParams = eyeParams;
         }
 
-        uint8_t spriteSheetRows = 0, spriteSheetCols = 0, spriteSheetFPS = 0;
         materialData.getSpriteSheetData(currentInstance.surface.spriteSheetRows, currentInstance.surface.spriteSheetCols, currentInstance.surface.spriteSheetFPS);
         currentInstance.m_isAnimated = currentInstance.surface.spriteSheetFPS != 0;
-        currentInstance.surface.objectPickingValue = drawCall.drawCallID;
         // NV-DXVK [VsColor]: stamp the per-pixel vertex-shader identity. Taken
         // from the DRAW (not the linked BlasEntry): when several draws share a
         // BlasEntry the blas reports only whichever VS created it, which is the
@@ -5591,16 +5871,36 @@ namespace dxvk {
             ? acquireVsDebugId(drawCall.getTransformData().vertexShaderHash)
             : uint16_t(0);
 
+        }   // NV-DXVK [perf] sec 4c: end of the surf-state guard
+
+        // NV-DXVK [perf] sec 4c: PER-FRAME, NEVER SKIPPED. Hoisted out of the
+        // guard because their sources change every frame and a skip would freeze
+        // them -- drawCallID is a per-frame draw counter (D3D11Rtx::m_drawCallID,
+        // reset each frame) and m_isInsideFrustum tracks the camera. Neither is in
+        // computeSurfStateKey by construction: keying on drawCallID would make the
+        // key differ every frame and the guard would never fire.
+        currentInstance.surface.isInsideFrustum = RtxOptions::AntiCulling::isObjectAntiCullingEnabled() ? currentInstance.m_isInsideFrustum : true;
+        currentInstance.surface.objectPickingValue = drawCall.drawCallID;
+
         // Note: Extract spritesheet information from the associated material data as it ends up stored in the Surface
         // not in the Surface Material like most material information.
         switch (materialData.getType()) {
         case MaterialDataType::Opaque:
         {
-          spriteSheetRows = materialData.getOpaqueMaterialData().getSpriteSheetRows();
-          spriteSheetCols = materialData.getOpaqueMaterialData().getSpriteSheetCols();
-          spriteSheetFPS = materialData.getOpaqueMaterialData().getSpriteSheetFPS();
-
-          const bool useLegacyAlphaState = materialData.getOpaqueMaterialData().getUseLegacyAlphaState();
+          // NV-DXVK [perf]: FOUR DEAD VARIANT ACCESSES REMOVED HERE.
+          //
+          // This case used to open by reading getSpriteSheetRows/Cols/FPS into
+          // locals and getUseLegacyAlphaState() into another -- none of which was
+          // ever read again. The spritesheet values were already written straight
+          // into the surface by materialData.getSpriteSheetData() above (which
+          // runs its own switch over the same type), so the material was being
+          // asked for them twice and one copy thrown away; and the only
+          // useLegacyAlphaState that matters is calculateAlphaState's own local.
+          //
+          // Each of those was a std::get<OpaqueMaterialData> into a 184-byte
+          // variant alternative plus a getter, once per Opaque instance per frame
+          // (~15,500). Deleting beats guarding: no key, no detector cost, no
+          // correctness surface at all.
 
           // NV-DXVK: TF2 worldspace VGUI/HUD shaders are inherently unlit —
           // the PS writes the final composed UI color directly. Setting
@@ -5669,14 +5969,28 @@ namespace dxvk {
           {
             const uint64_t vsHfh = uint64_t(drawCall.getTransformData().vertexShaderHash);
             if (vsHfh == 0x29566a60d473af50ull) {
-              static std::mutex sFhMu;
-              static std::unordered_set<uint32_t> sFhSeen;
               const uint32_t key = (ignoreAntiCullCat ? 4u : 0u)
                                  | (matTf2Fog ? 2u : 0u)
                                  | (currentInstance.m_isHidden ? 1u : 0u);
+              // NV-DXVK [perf]: the key is three bits, so eight values exhaust
+              // this probe -- and the log holds two lines. Everything after that
+              // was a process-global mutex acquired per instance of this VS per
+              // frame to re-discover a combination already recorded. A
+              // thread-local bitmask fronts the shared set: steady state is a
+              // shift and a test. Same idiom as [FlipNormalDiag] above -- the
+              // thread-local only ever SUPPRESSES work, and the shared set stays
+              // the authority for "first globally", so the line is still emitted
+              // exactly once across all threads rather than once per thread.
+              static thread_local uint8_t tFhSeen = 0;
+              const uint8_t fhBit = static_cast<uint8_t>(1u << key);
               bool firstFh = false;
-              { std::lock_guard<std::mutex> g(sFhMu);
-                if (sFhSeen.insert(key).second) firstFh = true; }
+              if ((tFhSeen & fhBit) == 0) {
+                tFhSeen |= fhBit;
+                static std::mutex sFhMu;
+                static std::unordered_set<uint32_t> sFhSeen;
+                std::lock_guard<std::mutex> g(sFhMu);
+                if (sFhSeen.insert(key).second) firstFh = true;
+              }
               if (firstFh)
                 Logger::warn(str::format(
                   "[FogHideProbe] VS=0x29566a60 matTf2Fog=", (matTf2Fog ? 1 : 0),
@@ -5708,11 +6022,23 @@ namespace dxvk {
           {
             if (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u
                 && (ignoreAntiCullCat || matTf2Fog)) {
-              static std::mutex sTf2CcMu;
-              static std::unordered_set<uint64_t> sTf2CcSeen;
               const uint64_t vsHashCc = uint64_t(drawCall.getTransformData().vertexShaderHash);
+              // NV-DXVK [perf]: this probe caps at 32 distinct VS hashes and the
+              // log shows only 14 ever appear -- so the size() < 32 check NEVER
+              // stops handing out the mutex, and every sub-view / fog instance
+              // took a process-global lock every frame for a line emitted once
+              // per VS long ago. Unlike a saturating budget there is nothing to
+              // latch on, so front it with a thread-local set: the steady state
+              // is one hash lookup and no lock at all. Same idiom as
+              // [FlipNormalDiag] above -- the thread-local only ever SUPPRESSES
+              // work, never grants permission to log, so the shared set remains
+              // the authority for "first globally" and the line is still emitted
+              // exactly once across all threads.
+              static thread_local std::unordered_set<uint64_t> tTf2CcSeen;
               bool firstCc = false;
-              {
+              if (tTf2CcSeen.insert(vsHashCc).second) {
+                static std::mutex sTf2CcMu;
+                static std::unordered_set<uint64_t> sTf2CcSeen;
                 std::lock_guard<std::mutex> g(sTf2CcMu);
                 if (sTf2CcSeen.size() < 32u
                     && sTf2CcSeen.insert(vsHashCc).second) {
@@ -5768,16 +6094,13 @@ namespace dxvk {
           break;
         }
         case MaterialDataType::Translucent:
-          spriteSheetRows = materialData.getTranslucentMaterialData().getSpriteSheetRows();
-          spriteSheetCols = materialData.getTranslucentMaterialData().getSpriteSheetCols();
-          spriteSheetFPS = materialData.getTranslucentMaterialData().getSpriteSheetFPS();
-
+          // NV-DXVK [perf]: same three dead reads as the Opaque case above, same
+          // deletion. Kept as an explicit empty case rather than folded away
+          // because /we4062 makes an unhandled enumerator a build error, and
+          // because "this type needs nothing here" is worth stating.
           break;
         case MaterialDataType::RayPortal:
-          spriteSheetRows = materialData.getRayPortalMaterialData().getSpriteSheetRows();
-          spriteSheetCols = materialData.getRayPortalMaterialData().getSpriteSheetCols();
-          spriteSheetFPS = materialData.getRayPortalMaterialData().getSpriteSheetFPS();
-
+          // NV-DXVK [perf]: dead reads removed, see the Opaque case above.
           break;
         case MaterialDataType::Count:
         case MaterialDataType::Invalid:
@@ -6032,7 +6355,25 @@ namespace dxvk {
         // post-transform; if the wall transform is identity then the runtime
         // value IS what the BSP+VS-decode produces; if it's a strong scale,
         // the source decode is at a different magnitude.
-        {
+        //
+        // NV-DXVK [perf]: THE WHOLE PROBE IS NOW GATED. "[RTX-InstMgr.UVx]" is in
+        // log.cpp's built-in denylist (log.cpp:455) and log.cpp applies that
+        // filter inside emitMsg -- AFTER str::format has built the string. So
+        // this block ran on every instance every frame and threw every line away,
+        // paying for: six FNV steps over the texture transform, a full Matrix4
+        // identity comparison whose result is read only by the discarded line, a
+        // multiply, and an unordered_set insert into a set that never saturates.
+        // The log confirms it: ZERO [RTX-InstMgr.UVx] lines in the entire run.
+        // Process note 6 of the v5 handoff, and the same fix already applied at
+        // the [MapWrite] site in onTransformChanged.
+        //
+        // Latched rather than re-asked: tagDenied is an atomic acquire load, a
+        // strlen and a bucket walk. That is cheap for a per-draw site and NOT
+        // cheap ~15,500 times a frame, and the answer cannot change -- the
+        // denylist is published by Logger::setDenyTags during RtxOptions init,
+        // long before the first gameplay frame, and is never rewritten after.
+        static const bool kUVxDenied = Logger::tagDenied("[RTX-InstMgr.UVx]");
+        if (!kUVxDenied) {
           const auto& m = currentInstance.surface.textureTransform;
           const bool isIdent = (m == Matrix4());
           // Hash of the four 2D-relevant entries (col0.x, col0.y, col1.x, col1.y, col3.x, col3.y)
@@ -6602,8 +6943,71 @@ namespace dxvk {
     // Updates done only once a frame unless overriden due to an explicit state
     if (isFirstUpdateThisFrame || overridePreviousCameraUpdate ||
         (billboardsGotGenerated && RtxOptions::getEnableOpacityMicromap())) {
-      // Inform the listeners
+
+      // NV-DXVK [perf] handoff v5 sec 4c: SKIP THE FANOUT ITSELF.
+      //
+      // The earlier 4c work memoized the CALLEE (createSurfaceMaterial) but still
+      // made the CALL, ~15,500 times a frame through two std::function
+      // indirections. What the two handlers actually produce for a settled
+      // instance is a material index it already holds: m_surfaceMaterialCache is
+      // never cleared per frame (only in SceneManager::clear(); [MatChurn] reports
+      // matClear=0 and matNew=0 in every settled capture), so surfaceMaterialIndex
+      // is stable across frames.
+      //
+      // The shared m_instStateKey covers what these handlers consume, because it
+      // was WIDENED to do so: createSurfaceMaterial reads three sampler pointers
+      // that the surf block does not, and those are carried in the key precisely
+      // so one digest can authorise both skips. Reusing a surf-only key here would
+      // have been a false hit of exactly the sec 0a kind.
+      //
+      // The binding epoch is the part that makes this sound across frames rather
+      // than merely within one: see ResourceCache::getBindingEpoch(). Caching a
+      // material index across frames is exactly what m_preCreationSurfaceMaterialMap
+      // documents as unsafe, and the epoch is what re-establishes safety -- it
+      // moves the moment either cache frees or clears a slot (inserts cannot move
+      // an existing index, and including them made the gate never fire).
+      //
+      // ESCAPES -- conditions under which the fanout must run in full, because a
+      // handler does per-frame work that has nothing to do with the material:
+      //   hasTransformChanged / hasPreviousPositions -> GameCapturer update flags
+      //   billboardsGotGenerated                     -> OMM builds on first sight
+      //   RayPortal material                         -> processRayPortalData
+      //
+      // NOTE: "OMM is enabled" is deliberately NOT an escape. It was, in the first
+      // version of this gate, and that was wrong: rtx.opacityMicromap.enable is ON
+      // in this configuration ("[RTX] Opacity Micromap: enabled" in the log), so a
+      // blanket OMM escape made fanoutMustRun unconditionally true and the gate
+      // never fired once. OMM's own handler is instead marked NOT skippable via
+      // InstanceEventHandler::skippableWhenBindingUnchanged, so it keeps seeing
+      // every instance while SceneManager's handler -- the expensive one -- is
+      // skipped. Per-handler is the correct granularity here; a global flag can
+      // only ever be as permissive as its most demanding listener.
+      const bool fanoutMustRun =
+        hasTransformChanged || hasPreviousPositions || billboardsGotGenerated ||
+        materialData.getType() == MaterialDataType::RayPortal;
+
+      // NO SECOND KEY. instStateUnchanged was decided once in the `surf` block from
+      // a digest covering the union of both blocks' inputs -- including the three
+      // sampler pointers and the binding epoch that only this gate needs. Hashing
+      // again here was the previous shape and it was pure waste: the cost of these
+      // keys is the scattered reads, not the hash, and both gates read the same
+      // objects. If the fanout is forced to run, the key stays as written above,
+      // which is correct: this frame DID re-derive the binding, so next frame may
+      // legitimately skip on it.
+      const bool skipFanout = instStateUnchanged && !fanoutMustRun;
+
+      if (skipFanout) {
+        uiSplit.tailSkipped();
+      }
+
+      // Inform the listeners. When the binding is provably unchanged only the
+      // handlers that OPTED IN to being skippable are dropped; everything else
+      // still sees every instance, so a listener that does per-frame work
+      // unrelated to the material cannot be starved by this gate.
       for (auto& event : m_eventHandlers) {
+        if (skipFanout && event.skippableWhenBindingUnchanged) {
+          continue;
+        }
         event.onInstanceUpdatedCallback(currentInstance, drawCall, materialData, hasTransformChanged, hasPreviousPositions, isFirstUpdateThisFrame);
       }
     }

@@ -156,6 +156,13 @@ namespace dxvk {
     instanceEvents.onInstanceAddedCallback = [this](RtInstance& instance) { onInstanceAdded(instance); };
     instanceEvents.onInstanceUpdatedCallback = [this](RtInstance& instance, const DrawCallState& drawCall, const MaterialData& material, bool hasTransformChanged, bool hasVerticesChanged, bool isFirstUpdateThisFrame) { onInstanceUpdated(instance, drawCall, material, hasTransformChanged, hasVerticesChanged, isFirstUpdateThisFrame); };
     instanceEvents.onInstanceDestroyedCallback = [this](RtInstance& instance) { onInstanceDestroyed(instance); };
+    // NV-DXVK [perf] sec 4c: this handler's onInstanceUpdated resolves a surface
+    // material and binds its index. m_surfaceMaterialCache is never cleared per
+    // frame, so for an instance whose material inputs and the binding epoch are
+    // both unchanged it re-derives the index the instance already holds. Opt in to
+    // being skipped in that case -- see the gate at the bottom of updateInstance.
+    // The RayPortal path (processRayPortalData) is excluded there, not here.
+    instanceEvents.skippableWhenBindingUnchanged = true;
     m_instanceManager.addEventHandler(instanceEvents);
     
     if (env::getEnvVar("DXVK_RTX_CAPTURE_ENABLE_ON_FRAME") != "") {
@@ -1620,6 +1627,32 @@ namespace dxvk {
     if (m_uniqueObjectSearchDistance != RtxOptions::uniqueObjectDistance()) {
       m_uniqueObjectSearchDistance = RtxOptions::uniqueObjectDistance();
       m_drawCallCache.rebuildSpatialMaps();
+    }
+
+    // NV-DXVK [perf] sec 4c: refresh the binding epoch BEFORE the per-frame caches
+    // below are cleared, so a consumer reading it this frame sees the state the
+    // indices were actually left in. Summing monotonic counters means any insert,
+    // free or clear on either cache moves it, and nothing has to remember to set a
+    // flag -- see getBindingEpoch() in the header for why a cross-frame cache of a
+    // material index is unsound without this.
+    //
+    // INSERTS ARE DELIBERATELY EXCLUDED. The first version of this summed insert
+    // counts too, and that was wrong in a way the log made obvious: [MatChurn]
+    // reports matNew=2..4 and texNew=2 EVERY frame in normal play while matClear,
+    // texFree and texClear stay 0, so an insert-sensitive epoch moved every frame
+    // and invalidated every cached binding -- tailSkip read 0-4%.
+    //
+    // An insert cannot invalidate anything. SparseUniqueCache::track either pops a
+    // free-list slot or push_back()s; in both cases every existing entry keeps its
+    // index. Only free() (which pushes an index back for reuse) and clear() can
+    // make a previously-handed-out index refer to something else, and those are
+    // exactly the two events a cross-frame binding cache must not miss.
+    {
+      auto& epochTextureManager = m_device->getCommon()->getTextureManager();
+      m_bindingEpoch = m_surfaceMaterialCache.getFreeCount()
+                     + m_surfaceMaterialCache.getClearCount()
+                     + epochTextureManager.getCacheFreeCount()
+                     + epochTextureManager.getCacheClearCount();
     }
 
     // Not currently safe to cache these across frames (due to texture indices and rtx options potentially changing)

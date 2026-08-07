@@ -68,6 +68,23 @@ public:
   bool find(const RtSurfaceMaterial& surf, uint32_t& outIdx) const { return m_surfaceMaterialCache.find(surf, outIdx); }
   const RtSurfaceMaterial& get(const uint32_t index) const { return m_surfaceMaterialCache.getObjectTable()[index]; }
 
+  // NV-DXVK [perf] handoff v5 sec 4c: BINDING EPOCH.
+  //
+  // A monotonic stamp that changes whenever a surface-material index or a
+  // bindless texture slot COULD have moved -- i.e. whenever either cache took an
+  // insert, a free or a clear. It exists so a consumer can cache "this instance
+  // is already bound to material index N" across frames without re-deriving it.
+  //
+  // WHY IT IS REQUIRED, not belt-and-braces: m_preCreationSurfaceMaterialMap is
+  // cleared every frame with the stated reason "not currently safe to cache these
+  // across frames (due to texture indices and rtx options potentially changing)".
+  // Any cross-frame cache of a material index inherits that hazard exactly. In a
+  // settled scene [MatChurn] reports matNew=0 texNew=0 texFree=0 texClear=0 so the
+  // epoch is flat and the cache holds; during streaming it moves and every cached
+  // binding is invalidated in the same frame the slot moved. Without it, a texture
+  // that streamed into a recycled bindless slot would render on the wrong surface.
+  uint64_t getBindingEpoch() const { return m_bindingEpoch; }
+
 protected:
   BufferRefTable<RaytraceBuffer> m_bufferCache;
   BufferRefTable<Rc<DxvkSampler>> m_materialSamplerCache;
@@ -111,6 +128,11 @@ protected:
   };
 
   SparseUniqueCache<Rc<DxvkSampler>, SamplerHashFn, SamplerKeyEqual> m_samplerCache;
+
+  // NV-DXVK [perf] sec 4c: see getBindingEpoch(). Recomputed once per frame in
+  // SceneManager from the caches' own monotonic insert/free/clear counters, so it
+  // cannot drift out of sync with them the way a hand-maintained dirty flag would.
+  uint64_t m_bindingEpoch = 0;
 };
 
 struct ExternalDrawState {

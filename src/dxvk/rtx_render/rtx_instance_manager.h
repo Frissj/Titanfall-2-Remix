@@ -304,6 +304,18 @@ private:
   XXH64_hash_t m_materialDataHash = kEmptyHash;
   XXH64_hash_t m_texcoordHash = kEmptyHash;
   XXH64_hash_t m_indexHash = kEmptyHash;
+  // NV-DXVK [perf] handoff v5 sec 4c: ONE digest covering every input that BOTH
+  // the `surf` block and the event-fanout gate of updateInstance read -- material
+  // and legacy-material hashes, geometry asset hash, category flags, texgen, alpha
+  // state, the texture arg/op stages, the three samplers, and the ResourceCache
+  // binding epoch. Computed once per instance by computeInstStateKey() in
+  // rtx_instance_manager.cpp; see the note there for what each material hash does
+  // and does not cover, and why one shared key beats two.
+  //
+  // kEmptyHash means "never written", which forces the first update of a fresh
+  // instance through both full paths regardless of what the incoming draw hashes
+  // to. Eye draws also park kEmptyHash here, so they never skip.
+  XXH64_hash_t m_instStateKey = kEmptyHash;
   VkAccelerationStructureInstanceKHR m_vkInstance;
   VkGeometryFlagsKHR m_geometryFlags = 0;
   uint32_t m_firstBillboard = 0;
@@ -345,6 +357,20 @@ struct InstanceEventHandler {
   std::function<void(RtInstance&, const DrawCallState& drawCall, const MaterialData&, bool, bool, bool)> onInstanceUpdatedCallback;
   // Callback triggered whenever an instance has been removed from the database
   std::function<void(RtInstance&)> onInstanceDestroyedCallback;
+
+  // NV-DXVK [perf] handoff v5 sec 4c: may this handler's onInstanceUpdated be
+  // skipped when the instance's material binding is provably unchanged?
+  //
+  // Set by the REGISTRAR, because only the handler's owner knows what its callback
+  // depends on. SceneManager's handler is skippable: for an unchanged binding it
+  // re-derives the same surfaceMaterialIndex the instance already holds.
+  // OpacityMicromapManager's is NOT: it does per-instance staging bookkeeping that
+  // has nothing to do with the material, so it must see every instance.
+  //
+  // Defaults to false so a handler added later is correct by default and opts in
+  // deliberately -- the failure direction for a wrong `true` here is a handler
+  // silently not running.
+  bool skippableWhenBindingUnchanged = false;
 
   InstanceEventHandler() = delete;
   InstanceEventHandler(void* _eventHandlerOwnerAddress) : eventHandlerOwnerAddress(_eventHandlerOwnerAddress) { }
