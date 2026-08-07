@@ -353,9 +353,16 @@ private:
   // the `surf` block and the event-fanout gate of updateInstance read -- material
   // and legacy-material hashes, geometry asset hash, category flags, texgen, alpha
   // state, the texture arg/op stages, the three samplers, and the ResourceCache
-  // binding epoch. Computed once per instance by computeInstStateKey() in
-  // rtx_instance_manager.cpp; see the note there for what each material hash does
-  // and does not cover, and why one shared key beats two.
+  // binding epoch. See the notes in rtx_instance_manager.cpp for what each
+  // material hash does and does not cover, and why one shared key beats two.
+  //
+  // NV-DXVK [perf] 2026-08-07: built in TWO stages now. Everything above except
+  // the category flags is draw-scoped, so computeDrawStateKey() digests it once
+  // per draw into DrawScopedState::stateKey, and mixInstStateKey() folds in this
+  // instance's category flags. Same equivalence classes, one fifteenth of the
+  // gathers. The absolute value differs from the pre-split scheme, which is
+  // harmless: it is only ever compared against this same instance's value from
+  // the previous frame.
   //
   // kEmptyHash means "never written", which forces the first update of a fresh
   // instance through both full paths regardless of what the incoming draw hashes
@@ -622,12 +629,36 @@ private:
   // the caller can feed it to SpatialKeyHint regardless of the outcome.
   RtInstance* findSimilarInstance(BlasEntry& blas, const MaterialData& material, const Matrix4& firstInstanceObjectToWorld, CameraType::Enum cameraType, const RayPortalManager& rayPortalManager, uint64_t stablePropId = 0, DrawCallCache* drawCallCache = nullptr, const Matrix4* prevObjectToWorld = nullptr, XXH64_hash_t* outQueryMatrixHash = nullptr);
 
+  // NV-DXVK [perf] 2026-08-07: the per-DRAW inputs an instance update needs.
+  //
+  // A fanout batch turns one draw into ~15 placements ([Perf.SceneObj]
+  // callsPerFrame=15,665 against [ProcDCS] draws=1,060), and both of these used
+  // to be rebuilt from scratch by every one of them even though neither can
+  // differ between placements: alphaState is a pure function of (drawCall,
+  // materialData), and stateKey digests only draw-, material- and frame-scoped
+  // inputs. Built once by the caller that owns the draw and handed down.
+  //
+  // If you add a field here, it must be constant across a draw's placements. The
+  // per-placement half of the state key is mixInstStateKey().
+  struct DrawScopedState {
+    RtSurface::AlphaState alphaState {};
+    // Digest of every draw-scoped instance-state key input, or kEmptyHash when
+    // keyEligible is false.
+    XXH64_hash_t stateKey = kEmptyHash;
+    // False for eye draws, which never take the surf/tail skip.
+    bool keyEligible = false;
+  };
+
+  DrawScopedState computeDrawScopedState(const DrawCallState& drawCall,
+                                         const MaterialData& materialData) const;
+
   // Shared body of processSceneObject / processSceneObjectFanout. split is null
   // for an ordinary draw and non-null for one placement of a split fanout batch.
+  // drawState is shared by every placement of the draw - see DrawScopedState.
   RtInstance* processSceneObjectImpl(
     const CameraManager& cameraManager, const RayPortalManager& rayPortalManager,
     BlasEntry& blas, const DrawCallState& drawCall, MaterialData& materialData, RtInstance* existingInstance,
-    DrawCallCache* drawCallCache, const FanoutSplit* split);
+    DrawCallCache* drawCallCache, const FanoutSplit* split, const DrawScopedState& drawState);
 
   RtInstance* addInstance(BlasEntry& blas);
   void processInstanceBuffers(const BlasEntry& blas, RtInstance& currentInstance) const;
@@ -635,6 +666,7 @@ private:
   void updateInstance(
     RtInstance& currentInstance, const CameraManager& cameraManager,
     const BlasEntry& blas, const DrawCallState& drawCall, MaterialData& materialData,
+    const DrawScopedState& drawState,
     const FanoutSplit* split = nullptr, const SpatialKeyHint& keyHint = SpatialKeyHint());
 
   void removeInstance(RtInstance* instance);

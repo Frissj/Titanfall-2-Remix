@@ -3277,8 +3277,12 @@ namespace dxvk {
     const CameraManager& cameraManager, const RayPortalManager& rayPortalManager,
     BlasEntry& blas, const DrawCallState& drawCall, MaterialData& materialData, RtInstance* existingInstance,
     DrawCallCache* drawCallCache) {
+    // One placement, so "once per draw" and "once per instance" coincide here --
+    // this call is not where the 15x lives (see DrawScopedState), but the state
+    // has to be built somewhere and processSceneObjectImpl must not build it.
+    const DrawScopedState drawState = computeDrawScopedState(drawCall, materialData);
     return processSceneObjectImpl(cameraManager, rayPortalManager, blas, drawCall, materialData,
-                                  existingInstance, drawCallCache, nullptr);
+                                  existingInstance, drawCallCache, nullptr, drawState);
   }
 
   void InstanceManager::processSceneObjectFanout(
@@ -3288,12 +3292,18 @@ namespace dxvk {
 
     out_instances.clear();
 
+    // NV-DXVK [perf] 2026-08-07: BUILT ONCE PER DRAW, ahead of the placement loop
+    // -- this is the site the 15x lives at. Every placement below used to rebuild
+    // both halves of this for itself: calculateAlphaState, and a state-key gather
+    // that pointer-chases five draw-scoped objects. See DrawScopedState.
+    const DrawScopedState drawState = computeDrawScopedState(drawCall, materialData);
+
     const std::vector<Matrix4>* transforms = drawCall.getTransformData().instancesToObject;
     if (transforms == nullptr || transforms->empty()) {
       // Not actually a batch — fall back to the ordinary single-instance path so
       // this entry point is safe to call unconditionally.
       RtInstance* single = processSceneObjectImpl(cameraManager, rayPortalManager, blas, drawCall,
-                                                  materialData, nullptr, drawCallCache, nullptr);
+                                                  materialData, nullptr, drawCallCache, nullptr, drawState);
       if (single != nullptr) {
         out_instances.push_back(single);
       }
@@ -3506,7 +3516,7 @@ namespace dxvk {
       // pass created.
       const size_t instanceCountBefore = m_instances.size();
       RtInstance* instance = processSceneObjectImpl(cameraManager, rayPortalManager, blas, drawCall,
-                                                    materialData, nullptr, drawCallCache, &split);
+                                                    materialData, nullptr, drawCallCache, &split, drawState);
       if (m_instances.size() > instanceCountBefore) {
         ++created;
         // The decisive split of `created`. A prop the game did not submit last
@@ -3898,7 +3908,7 @@ namespace dxvk {
   RtInstance* InstanceManager::processSceneObjectImpl(
     const CameraManager& cameraManager, const RayPortalManager& rayPortalManager,
     BlasEntry& blas, const DrawCallState& drawCall, MaterialData& materialData, RtInstance* existingInstance,
-    DrawCallCache* drawCallCache, const FanoutSplit* split) {
+    DrawCallCache* drawCallCache, const FanoutSplit* split, const DrawScopedState& drawState) {
 
     SceneObjSplitGuard psoSplit(RtxOptions::perfSceneObjSplit(), m_device->getCurrentFrameId());
 
@@ -4321,7 +4331,7 @@ namespace dxvk {
     // this function and is never reassigned after the lookup, so the hint's
     // pointer stays valid for the whole of updateInstance.
     const SpatialKeyHint keyHint{ &firstInstanceObjectToWorld, queryMatrixHash };
-    updateInstance(*currentInstance, cameraManager, blas, drawCall, materialData, split, keyHint);
+    updateInstance(*currentInstance, cameraManager, blas, drawCall, materialData, drawState, split, keyHint);
 
     psoSplit.markUpdate();   // NV-DXVK [Perf.SceneObj]: end of `update`
 
@@ -4584,16 +4594,45 @@ namespace dxvk {
   //   drawCall.drawCallID   -> surface.objectPickingValue (per-frame draw counter)
   //   m_isInsideFrustum     -> surface.isInsideFrustum (moves with the camera)
   // and the m_isHidden promotions, which `entry` resets each frame.
-  static XXH64_hash_t computeInstStateKey(const DrawCallState& drawCall,
+  // NV-DXVK [perf] 2026-08-07: THE DRAW-SCOPED HALF OF THE INSTANCE STATE KEY.
+  //
+  // This used to be the whole key and ran once per INSTANCE. Every input it
+  // reads is a property of the DRAW, the material, or the frame -- drawCall
+  // (const), materialData (never mutated on this path), alphaState (a pure
+  // function of those two), bindingEpoch (snapshotted once per frame in
+  // SceneManager::onFrameEnd) and two option reads. The only input that varied
+  // between the placements of a draw was categoryFlags, which now lives in
+  // mixInstStateKey below.
+  //
+  // WHY THAT MATTERED. [Perf.SceneObj] callsPerFrame=15,665 against [ProcDCS]
+  // draws=1,060: about 15 placements per draw, each repeating this identical
+  // gather. And the gather IS the cost -- see the note below: it is the
+  // SCATTERED READS across LegacyMaterialData, DrawCallTransforms, the
+  // MaterialData variant, GeometryHashes and three samplers, all of them
+  // draw-scoped objects. Process note #2 in the CPU handoff ("a probe billed per
+  // DRAW but running per INSTANCE is off by ~15x") for the fifth time in this
+  // file, and the first time on code that is not a probe.
+  //
+  // NOT A MEMO. There is no detector, no key on the memo, and nothing to miss:
+  // the caller that owns the draw computes this once and hands it down. That is
+  // the difference from the geometryAssetHash memo recorded further down, which
+  // was measured and reverted -- it stayed inside the per-instance call and paid
+  // a TLS guard per access to skip work smaller than the guard.
+  //
+  // The absolute key value is NOT preserved across this change and does not need
+  // to be: the key is only ever compared against the same instance's key from
+  // the previous frame, so the equivalence classes are what matter, and hashing
+  // the draw digest with categoryFlags preserves them exactly. One frame of
+  // "everything changed" on the first frame after the switch, then steady.
+  static XXH64_hash_t computeDrawStateKey(const DrawCallState& drawCall,
                                           const MaterialData& materialData,
                                           const RtSurface::AlphaState& alphaState,
-                                          const CategoryFlags& categoryFlags,
                                           bool vsDebugIdConsumed,
                                           uint64_t bindingEpoch) {
     const LegacyMaterialData& lm = drawCall.getMaterialData();
 
     // ONE KEY, TWO DECISIONS. This digest feeds BOTH the `surf` guard and the
-    // `tail` event-fanout gate, and is computed exactly once per instance.
+    // `tail` event-fanout gate.
     //
     // WHY MERGED. Measured: with a key each, surf paid ~30 ns to skip ~25 ns of
     // writes -- a net LOSS (surf 0.211 baseline -> 0.250 at v1, -> 0.233 after the
@@ -4621,12 +4660,15 @@ namespace dxvk {
       uint64_t     drawSampler;        //                               (tail)
       uint64_t     drawSampler2;       //                               (tail)
       uint64_t     bindingEpoch;       // cache-slot recycling stamp    (tail)
-      uint32_t     categoryFlags;      //                               (surf)
       uint32_t     typeAndTexgen;      // materialType | texgenMode << 16
       uint32_t     tFactor;            //                               (surf)
       uint32_t     texArgOps;          // six arg/op enums, 5 bits each (surf)
       uint32_t     alphaAndMisc;       // alpha state + misc flag bits  (surf + tail)
     };
+    // NOTE: categoryFlags is deliberately absent -- it is the one per-instance
+    // input, and mixing it in here is what forced the whole gather to run per
+    // instance. Anything you add to this struct MUST be draw-scoped; if it can
+    // differ between two placements of one draw, it belongs in mixInstStateKey.
     static_assert(sizeof(InstStateKeyData) <= 128,
                   "InstStateKeyData must stay <=128 bytes to keep XXH3 off its "
                   "long-input path; if you must add a field, pack it into an "
@@ -4722,7 +4764,6 @@ namespace dxvk {
         }
       }
     }
-    kd.categoryFlags     = static_cast<uint32_t>(categoryFlags.raw());
     kd.vertexShaderHash  = static_cast<uint64_t>(drawCall.getTransformData().vertexShaderHash);
     kd.tFactor           = lm.tFactor;
     kd.typeAndTexgen     = static_cast<uint32_t>(materialData.getType())
@@ -4769,6 +4810,58 @@ namespace dxvk {
                          | (RtxOptions::AntiCulling::isObjectAntiCullingEnabled() ? 1u << 26 : 0u);
 
     return XXH3_64bits(&kd, sizeof(kd));
+  }
+
+  // NV-DXVK [perf] 2026-08-07: the per-instance half. Everything expensive was
+  // already folded into drawStateKey by the caller that owns the draw; all that
+  // is left is the one input that genuinely varies between placements.
+  //
+  // categoryFlags is not simply drawCall.getCategoryFlags(): updateInstance
+  // OR-preserves a sticky IgnoreAntiCulling bit onto it, so two placements of the
+  // same draw CAN legitimately differ here. That is precisely why it is mixed per
+  // instance rather than hoisted with the rest.
+  //
+  // 16 bytes lands in XXH3's smallest input tier, and both operands are already
+  // in registers -- no pointer chasing at all, which was the entire cost of the
+  // draw-scoped half.
+  static XXH64_hash_t mixInstStateKey(XXH64_hash_t drawStateKey,
+                                      const CategoryFlags& categoryFlags) {
+    struct InstMixData {
+      XXH64_hash_t drawStateKey;
+      uint32_t     categoryFlags;
+      uint32_t     reserved;
+    };
+    static_assert(sizeof(InstMixData) == 16,
+                  "InstMixData must stay in XXH3's <=16-byte tier.");
+    // Same padding discipline as InstStateKeyData: memset rather than an
+    // aggregate initialiser, so `reserved` and any interior padding are
+    // deterministic and the digest cannot vary by call path.
+    InstMixData md;
+    std::memset(&md, 0, sizeof(md));
+    md.drawStateKey  = drawStateKey;
+    md.categoryFlags = static_cast<uint32_t>(categoryFlags.raw());
+    return XXH3_64bits(&md, sizeof(md));
+  }
+
+  // NV-DXVK [perf] 2026-08-07: everything an instance needs from its draw call
+  // that does not depend on which placement it is. Built once per draw by the
+  // callers below and handed down through processSceneObjectImpl.
+  //
+  // alphaState is in here for the same reason as the key: calculateAlphaState is
+  // a pure function of (drawCall, materialData), and it was being recomputed for
+  // every placement so it could be copied wholesale into surface.alphaState.
+  InstanceManager::DrawScopedState InstanceManager::computeDrawScopedState(
+      const DrawCallState& drawCall, const MaterialData& materialData) const {
+    DrawScopedState state;
+    state.alphaState = calculateAlphaState(drawCall, materialData);
+    // Eye draws never take the skip (see the isEye escape at the consumer), so
+    // there is nothing for a key to authorise and no reason to build one.
+    state.keyEligible = !drawCall.isEye();
+    state.stateKey = state.keyEligible
+      ? computeDrawStateKey(drawCall, materialData, state.alphaState,
+                            vsDebugIdIsConsumed(), m_pResourceCache->getBindingEpoch())
+      : kEmptyHash;
+    return state;
   }
 
   void InstanceManager::mergeInstanceHeuristics(RtInstance& instanceToModify, const DrawCallState& drawCall, const RtSurface::AlphaState& alphaState) const {
@@ -5841,6 +5934,7 @@ namespace dxvk {
                                        const BlasEntry& blas,
                                        const DrawCallState& drawCall,
                                        MaterialData& materialData,
+                                       const DrawScopedState& drawState,
                                        const FanoutSplit* split,
                                        const SpatialKeyHint& keyHint) {
     UpdInstSplitGuard uiSplit(RtxOptions::perfUpdateInstSplit(), m_device->getCurrentFrameId());
@@ -6019,7 +6113,13 @@ namespace dxvk {
        // Don't overwrite transform from when the instance was seen with the main camera
        !currentInstance.isCameraRegistered(CameraType::Main));
 
-    const RtSurface::AlphaState alphaState = calculateAlphaState(drawCall, materialData);
+    // NV-DXVK [perf] 2026-08-07: was calculateAlphaState(drawCall, materialData)
+    // here, once per placement. It is a pure function of those two, neither of
+    // which varies across a draw's placements, so it is now computed once per
+    // draw in computeDrawScopedState. Bound by reference: it is copied wholesale
+    // into surface.alphaState further down, and that copy is the only consumer
+    // that needs its own storage.
+    const RtSurface::AlphaState& alphaState = drawState.alphaState;
     bool hasTransformChanged = false;
     bool hasPreviousPositions = false;
     // NV-DXVK [perf] sec 4c: result of the single per-instance state-key compare,
@@ -6121,11 +6221,14 @@ namespace dxvk {
         // real work per instance and was already paying for a near-identical
         // gather of its own. One digest, one scatter, two skips -- surf's share of
         // the detector is now marginal rather than the whole cost.
-        const bool instKeyEligible = !drawCall.isEye();
+        // NV-DXVK [perf] 2026-08-07: the gather that used to sit here now runs
+        // once per DRAW (computeDrawScopedState), and what is left per instance
+        // is a 16-byte hash of two registers. See computeDrawStateKey for why the
+        // split is sound -- every input except m_categoryFlags is draw-, material-
+        // or frame-scoped, and m_categoryFlags is exactly what gets mixed in here.
+        const bool instKeyEligible = drawState.keyEligible;
         const XXH64_hash_t instStateKey = instKeyEligible
-          ? computeInstStateKey(drawCall, materialData, alphaState,
-                                currentInstance.m_categoryFlags, vsDebugIdIsConsumed(),
-                                m_pResourceCache->getBindingEpoch())
+          ? mixInstStateKey(drawState.stateKey, currentInstance.m_categoryFlags)
           : kEmptyHash;
 
         // Decided ONCE here, consumed twice: by this block and by the event-fanout
