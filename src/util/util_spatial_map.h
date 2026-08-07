@@ -26,6 +26,7 @@
 #include "util_matrix.h"
 #include "util_vector.h"
 #include "util_fast_cache.h"
+#include "util_flat_cache.h"
 #include "util_string.h"
 #include "./log/log.h"
 
@@ -41,7 +42,17 @@ namespace dxvk {
       Entry() : data(nullptr), centroid(0.f), transformHash(0) { }
       Entry(const T* data, const Vector3& centroid, XXH64_hash_t transformHash) : data(data), centroid(centroid), transformHash(transformHash) { }
       Entry(const Entry& other) : data(other.data), centroid(other.centroid), transformHash(other.transformHash) { }
+      // Declaring the copy constructor above suppresses the implicit MOVE
+      // assignment and deprecates the implicit copy assignment. The flat cache
+      // below assigns entries when it back-shifts a probe run and when it
+      // rehashes, so spell both out rather than lean on a deprecated implicit.
+      Entry& operator=(const Entry& other) = default;
     };
+    // NV-DXVK [perf] handoff v7 sec 4b: the exact-lookup cache is open-addressed
+    // (see util_flat_cache.h for why). Deliberately scoped to SpatialMap: the
+    // ~30 other fast_unordered_cache users are not lookup-bound and are left on
+    // std::unordered_map.
+    using Cache = fast_flat_cache<Entry>;
   public:
     SpatialMap(float cellSize) : m_cellSize(cellSize) {
       if (m_cellSize <= 0) {
@@ -66,13 +77,30 @@ namespace dxvk {
     // though it's the same static prop). Caller MUST pass the same
     // overrideHash to insert/move/erase for the same prop, otherwise
     // entries leak.
-    const T* getDataAtTransform(const Matrix4& transform, uint64_t overrideHash = 0) const {
-      const XXH64_hash_t transformHash = (overrideHash != 0)
+    //
+    // NV-DXVK [perf] handoff v7 sec 4a: outMatrixHash, when non-null, receives
+    // the XXH64 this lookup just paid for, so the caller can hand it back to
+    // move() instead of hashing the same 64 bytes a second time in the same
+    // frame ([MapGate]: 15,447 move()s per frame against 15,488 lookups, and
+    // for a static prop -- 97% of them -- it is the identical matrix).
+    //
+    // Writes 0 when an overrideHash was used, and that is not a detail: on that
+    // path the key is the caller's propId, NOT a hash of the matrix bytes, so
+    // feeding it to a matrix-keyed move() would file the entry under the wrong
+    // key. 0 means "no reusable matrix hash", which makes every consumer fall
+    // back to hashing.
+    const T* getDataAtTransform(const Matrix4& transform, uint64_t overrideHash = 0,
+                                XXH64_hash_t* outMatrixHash = nullptr) const {
+      const bool useOverride = (overrideHash != 0);
+      const XXH64_hash_t transformHash = useOverride
                                          ? static_cast<XXH64_hash_t>(overrideHash)
                                          : XXH64(&transform, sizeof(transform), 0);
-      auto pair = m_cache.find(transformHash);
-      if ( pair != m_cache.end()) {
-        return pair->second.data;
+      if (outMatrixHash != nullptr) {
+        *outMatrixHash = useOverride ? 0 : transformHash;
+      }
+      const size_t slot = m_cache.findSlot(transformHash);
+      if (slot != Cache::kInvalidSlot) {
+        return m_cache.valueAt(slot).data;
       }
       return nullptr;
     }
@@ -135,7 +163,7 @@ namespace dxvk {
         // bump fire so we get the cold-start picture without spam.
         bool bumpLogged = false;
         const XXH64_hash_t origHash = transformHash;
-        while(m_cache.find(transformHash) != m_cache.end()) {
+        while (m_cache.contains(transformHash)) {
           // Note: This can happen if an instance is moved to the same position as another existing instance.
           // It can cause a single frame of NaN, but shouldn't cause any crashes.
           // TODO(REMIX-4134): Once spatial map is used on draw calls and not rtInstances, it should be safe to restore the assert() below.
@@ -155,9 +183,7 @@ namespace dxvk {
           transformHash++;
         }
       }
-      auto [iter, success] = m_cache.emplace(std::piecewise_construct,
-          std::forward_as_tuple(transformHash),
-          std::forward_as_tuple(data, centroid, transformHash));
+      const bool success = m_cache.insert(transformHash, Entry(data, centroid, transformHash));
       if (!success) {
         ONCE(Logger::err("Failed to add entry in SpatialMap::insert()."));
         assert(false);
@@ -168,8 +194,8 @@ namespace dxvk {
     }
 
     void erase(const XXH64_hash_t& transformHash) {
-      auto pair = m_cache.find(transformHash);
-      if (pair != m_cache.end()) {
+      const size_t slot = m_cache.findSlot(transformHash);
+      if (slot != Cache::kInvalidSlot) {
         // NV-DXVK [SpatialErase]: log every erase. If a propId we expected
         // to stay alive gets erased between insertion and the next lookup,
         // it'll show up here. Rate-limited heavily (first 32 + every 4096th)
@@ -182,8 +208,11 @@ namespace dxvk {
             " mapSize=", m_cache.size()));
         }
         sEraseProbe += 1;
-        eraseFromCell(pair->second.centroid, transformHash);
-        m_cache.erase(pair);
+        // Copied out before the erase: eraseAt() backward-shifts the probe run,
+        // which can overwrite this slot's value in place.
+        const Vector3 centroid = m_cache.valueAt(slot).centroid;
+        eraseFromCell(centroid, transformHash);
+        m_cache.eraseAt(slot);
       } else {
         // Note: This can happen if a duplicate hash is encountered in the insert() call.
         // TODO(REMIX-4134): Once spatial map is used on draw calls and not rtInstances, it should be safe to restore the assert() below.
@@ -192,10 +221,24 @@ namespace dxvk {
       }
     }
 
-    XXH64_hash_t move(const XXH64_hash_t& oldTransformHash, const Vector3& centroid, const Matrix4& newTransform, const T* data, uint64_t overrideHash = 0) {
+    // NV-DXVK [perf] handoff v7 sec 4a: precomputedMatrixHash is XXH64 over
+    // newTransform's bytes, already paid for by this frame's getDataAtTransform
+    // lookup for the same object. 0 (the default) means "not available", which
+    // is the original behaviour -- and because the value is exactly what this
+    // function would have computed, the resulting key, the erase/insert decision
+    // and every downstream lookup are bit-identical either way.
+    //
+    // The CALLER owns the precondition that the two matrices are the same bytes;
+    // it is not checkable here (this function never sees the matrix the lookup
+    // used). See RtInstance::onTransformChanged for how it is discharged.
+    // Ignored entirely when overrideHash is set, since that path does not hash.
+    XXH64_hash_t move(const XXH64_hash_t& oldTransformHash, const Vector3& centroid, const Matrix4& newTransform, const T* data, uint64_t overrideHash = 0,
+                      XXH64_hash_t precomputedMatrixHash = 0) {
       XXH64_hash_t transformHash = (overrideHash != 0)
                                    ? static_cast<XXH64_hash_t>(overrideHash)
-                                   : XXH64(&newTransform, sizeof(newTransform), 0);
+                                   : (precomputedMatrixHash != 0)
+                                     ? precomputedMatrixHash
+                                     : XXH64(&newTransform, sizeof(newTransform), 0);
 
       if (oldTransformHash != transformHash) {
         // NV-DXVK [SpatialMove]: log when the erase+insert path fires. With
@@ -222,9 +265,9 @@ namespace dxvk {
 
     void rebuild(float cellSize) {
       m_cells.clear();
-      for (auto pair : m_cache) {
-        m_cells[getCellPos(pair.second.centroid)].emplace_back(pair.second);
-      }
+      m_cache.forEach([this](XXH64_hash_t, const Entry& entry) {
+        m_cells[getCellPos(entry.centroid)].emplace_back(entry);
+      });
     }
 
     // NV-DXVK DIAGNOSTIC: squared distance from `centroid` to the closest
@@ -243,16 +286,16 @@ namespace dxvk {
     float debugClosestCachedDistSqr(const Vector3& centroid, Vector3& outCentroid,
                                     const T** outData = nullptr) const {
       float best = FLT_MAX;
-      for (const auto& kv : m_cache) {
-        const float d = lengthSqr(kv.second.centroid - centroid);
+      m_cache.forEach([&](XXH64_hash_t, const Entry& entry) {
+        const float d = lengthSqr(entry.centroid - centroid);
         if (d < best) {
           best = d;
-          outCentroid = kv.second.centroid;
+          outCentroid = entry.centroid;
           if (outData != nullptr) {
-            *outData = kv.second.data;
+            *outData = entry.data;
           }
         }
-      }
+      });
       return best;
     }
 
@@ -265,9 +308,9 @@ namespace dxvk {
     // O(size) — probe only, never on the hot path.
     template <typename Fn>
     void debugForEachEntry(Fn&& fn) const {
-      for (const auto& kv : m_cache) {
-        fn(kv.first, kv.second.centroid, kv.second.data);
-      }
+      m_cache.forEach([&](XXH64_hash_t key, const Entry& entry) {
+        fn(key, entry.centroid, entry.data);
+      });
     }
 
     // The cell a position maps to — the SAME arithmetic getNearestData uses,
@@ -327,7 +370,10 @@ namespace dxvk {
     }
 
     float m_cellSize;
+    // NV-DXVK [perf] handoff v7 sec 4b: m_cells is deliberately NOT flattened.
+    // Only the ~370 lookups/frame that miss the exact stage ever reach it, so it
+    // is not the cost, and it is keyed on Vector3i rather than a hash.
     fast_spatial_cache<std::vector<Entry>> m_cells;
-    fast_unordered_cache<Entry> m_cache;
+    Cache m_cache;
   };
 }

@@ -43,6 +43,49 @@ class ResourceCache;
 class CameraManager;
 class DrawCallCache;
 
+// NV-DXVK [perf] handoff v7 sec 4a: a SpatialMap key that has already been paid
+// for this frame, carried from the lookup that computed it to the write that
+// would otherwise compute it again.
+//
+// THE REDUNDANCY. findSimilarInstance hashes the composed object-to-world matrix
+// to do its exact lookup. A few hundred lines later the same instance reaches
+// onTransformChanged, which hashes a matrix again to decide whether its spatial
+// cache entry has to be re-filed. [MapGate] measures 15,447 of those writes per
+// frame against 15,488 lookups, and for a static prop -- 97% of the population --
+// the two matrices are the same 64 bytes. That is ~15,400 redundant XXH64s a
+// frame, on the thread that owns the frame.
+//
+// WHY THE MATRIX POINTER IS HERE TOO, and why this is not just an XXH64_hash_t.
+// The precondition for reusing the hash is that the bytes hashed are the bytes
+// that would have been hashed, and that is NOT structurally guaranteed:
+//
+//   - the lookup keys on drawCall.getTransformData().calcFirstInstanceObjectToWorld(),
+//     which checks instancesToObject->empty(); RtInstance::calcFirstInstanceObjectToWorld
+//     does not, so the two can compose differently
+//   - updateInstance mutates its local copy of objectToWorld for WorldMatte
+//     instances (rtx.worldSpaceUiBackgroundOffset) after the lookup has run
+//   - a split placement, a replacement root and an ordinary draw each reach the
+//     write through a different transform
+//
+// So the consumer memcmps `matrix` against the matrix it is actually about to
+// hash and falls back to hashing when they differ. A 64-byte memcmp is a couple
+// of SIMD compares; XXH64 over the same 64 bytes is several times that, and the
+// compare is what makes the reuse provable instead of assumed.
+//
+// A default-constructed hint (hash == 0) means "nothing precomputed" and
+// restores the original behaviour exactly -- which is also what an instance that
+// never went through findSimilarInstance gets.
+struct SpatialKeyHint {
+  // The matrix `hash` was computed over. Must outlive the call it is passed to;
+  // in practice it is a local of the caller further up the same stack.
+  const Matrix4* matrix = nullptr;
+  // XXH64 of *matrix, or 0 when unavailable. Never a propId override key --
+  // see getDataAtTransform's outMatrixHash contract.
+  XXH64_hash_t hash = 0;
+
+  bool isUsable() const { return hash != 0 && matrix != nullptr; }
+};
+
 // RtInstance defines a SceneObjects placement/parameterization within the current scene.
 class RtInstance {
 public:
@@ -103,9 +146,10 @@ public:
   void teleportWithHistory(const Matrix4& oldToNew);
   
   // Move to the new transform and retain previous transforms as history (call the first time a transform changes per frame)
-  bool move(const Matrix4& objectToWorld);
+  // keyHint: see SpatialKeyHint. Purely an optimisation; omitting it is correct.
+  bool move(const Matrix4& objectToWorld, const SpatialKeyHint& keyHint = SpatialKeyHint());
   // Move to the new transform without changing history (call if the transform is changed multiple times per frame)
-  bool moveAgain(const Matrix4& objectToWorld);
+  bool moveAgain(const Matrix4& objectToWorld, const SpatialKeyHint& keyHint = SpatialKeyHint());
 
   void setFrameCreated(const uint32_t frameIndex);
   // Returns if this is the first occurence in a given frame
@@ -255,7 +299,8 @@ private:
   // transpose + 48-byte memcpy into m_vkInstance.transform. move()/moveAgain()
   // compute exactly that memcmp for their own return value, so the test is free.
   // Defaults true: a caller that cannot prove it gets the old behaviour.
-  void onTransformChanged(bool objectToWorldChanged = true);
+  void onTransformChanged(bool objectToWorldChanged = true,
+                          const SpatialKeyHint& keyHint = SpatialKeyHint());
   friend class InstanceManager;
 
   // Unique ID of the RtInstance.
@@ -571,7 +616,11 @@ private:
   // a SECOND exact-stage key when the current transform misses, which resolves a
   // moved object to the instance it was filed under last frame without involving
   // the nearest-neighbour search at all. Null preserves the original behaviour.
-  RtInstance* findSimilarInstance(BlasEntry& blas, const MaterialData& material, const Matrix4& firstInstanceObjectToWorld, CameraType::Enum cameraType, const RayPortalManager& rayPortalManager, uint64_t stablePropId = 0, DrawCallCache* drawCallCache = nullptr, const Matrix4* prevObjectToWorld = nullptr);
+  // outQueryMatrixHash: if non-null, receives XXH64(firstInstanceObjectToWorld)
+  // as computed by the exact stage -- or 0 when that stage keyed on stablePropId
+  // instead and no matrix hash was taken. Written on every path, hit or miss, so
+  // the caller can feed it to SpatialKeyHint regardless of the outcome.
+  RtInstance* findSimilarInstance(BlasEntry& blas, const MaterialData& material, const Matrix4& firstInstanceObjectToWorld, CameraType::Enum cameraType, const RayPortalManager& rayPortalManager, uint64_t stablePropId = 0, DrawCallCache* drawCallCache = nullptr, const Matrix4* prevObjectToWorld = nullptr, XXH64_hash_t* outQueryMatrixHash = nullptr);
 
   // Shared body of processSceneObject / processSceneObjectFanout. split is null
   // for an ordinary draw and non-null for one placement of a split fanout batch.
@@ -586,7 +635,7 @@ private:
   void updateInstance(
     RtInstance& currentInstance, const CameraManager& cameraManager,
     const BlasEntry& blas, const DrawCallState& drawCall, MaterialData& materialData,
-    const FanoutSplit* split = nullptr);
+    const FanoutSplit* split = nullptr, const SpatialKeyHint& keyHint = SpatialKeyHint());
 
   void removeInstance(RtInstance* instance);
 

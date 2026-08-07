@@ -774,7 +774,7 @@ namespace dxvk {
     }
   }
 
-  void RtInstance::onTransformChanged(const bool objectToWorldChanged) {
+  void RtInstance::onTransformChanged(const bool objectToWorldChanged, const SpatialKeyHint& keyHint) {
     // NV-DXVK [MapGate]: account BEFORE the m_isCreatedByRenderer branch, which
     // is the whole point - inside it, this call would be as invisible as
     // [MapWrite] already is.
@@ -842,6 +842,22 @@ namespace dxvk {
       const Matrix4 firstInstanceObjectToWorld = calcFirstInstanceObjectToWorld();
       const Vector3 newPos = getBlas()->input.getGeometryData().boundingBox.getTransformedCentroid(firstInstanceObjectToWorld);
 
+      // NV-DXVK [perf] handoff v7 sec 4a: discharge the precondition on the
+      // caller's precomputed key. The hint carries the matrix it was hashed
+      // over; this is the first point where the matrix that will actually be
+      // hashed exists, so this is where the two get compared. Byte-identical
+      // means XXH64 would return the hint's value, so passing it through is
+      // observationally equivalent -- including for a collision-bumped entry,
+      // whose stored key is hash+N while move() compares against the unbumped
+      // hash exactly as before. Any mismatch (a WorldMatte offset, a differently
+      // composed instancesToObject) falls through to hashing, which is the old
+      // path with a memcmp in front of it.
+      const XXH64_hash_t precomputedMatrixHash =
+        (keyHint.isUsable()
+         && memcmp(keyHint.matrix->data, firstInstanceObjectToWorld.data, sizeof(Matrix4)) == 0)
+        ? keyHint.hash
+        : 0;
+
       // NV-DXVK [Otc2904]: pre-move state for VS_2904d2 instances. If we
       // see m_spatialCacheHash != m_stablePropId here, this move() will
       // erase the propId slot and re-insert at a new slot — that's how an
@@ -896,7 +912,8 @@ namespace dxvk {
       // [MapWrite] proves a writer outside these two sites.
       const XXH64_hash_t oldKey = m_spatialCacheHash;
       m_spatialCacheHash = m_linkedBlas->getSpatialMap().move(
-          m_spatialCacheHash, newPos, firstInstanceObjectToWorld, this, m_stablePropId);
+          m_spatialCacheHash, newPos, firstInstanceObjectToWorld, this, m_stablePropId,
+          precomputedMatrixHash);
       // NV-DXVK [MapGate] write-side proof; [MapWrite] below is denylisted in
       // log.cpp so the counter is the only signal that survives to the log.
       mapWriteAccount(/*isInsert*/ false, static_cast<uint32_t>(m_linkedBlas->getSpatialMap().size()));
@@ -1066,7 +1083,7 @@ namespace dxvk {
   // path still runs every frame: its key is XXH64(calcFirstInstanceObjectToWorld
   // ()), which composes objectToWorld with (*instancesToObject)[0], and this
   // memcmp says nothing about the latter.
-  bool RtInstance::move(const Matrix4& objectToWorld) {
+  bool RtInstance::move(const Matrix4& objectToWorld, const SpatialKeyHint& keyHint) {
     // See the note below on why this comparison moved above the recompute.
     // The transform has changed even a tiny bit: the result feeds the 'isStatic'
     // surface flag, which the GPU uses to skip motion vector calculation. We need
@@ -1084,12 +1101,12 @@ namespace dxvk {
     if (transformChanged) {
       surface.normalObjectToWorld = transpose(inverse(Matrix3(objectToWorld)));
     }
-    onTransformChanged(transformChanged);
+    onTransformChanged(transformChanged, keyHint);
 
     return transformChanged;
   }
 
-  bool RtInstance::moveAgain(const Matrix4& objectToWorld) {
+  bool RtInstance::moveAgain(const Matrix4& objectToWorld, const SpatialKeyHint& keyHint) {
     // Note the two comparisons are against DIFFERENT references and both are
     // needed. The normal matrix depends on whether objectToWorld itself changed;
     // the return value is whether it differs from the frame's PREVIOUS transform,
@@ -1104,7 +1121,7 @@ namespace dxvk {
     // Note this is objectToWorldChanged, NOT the return value below. The vk
     // transform tracks surface.objectToWorld, which is what this compare covers;
     // the return value asks a different question (against prevObjectToWorld).
-    onTransformChanged(objectToWorldChanged);
+    onTransformChanged(objectToWorldChanged, keyHint);
 
     // See comment in move()
     return memcmp(surface.prevObjectToWorld.data, surface.objectToWorld.data, sizeof(Matrix4)) != 0;
@@ -3860,6 +3877,13 @@ namespace dxvk {
     // If we already know which instance to use, just use that.
     RtInstance* currentInstance = existingInstance;
 
+    // NV-DXVK [perf] handoff v7 sec 4a: XXH64(firstInstanceObjectToWorld) as
+    // computed by findSimilarInstance's exact stage, forwarded to updateInstance
+    // so the spatial-map write does not hash the same bytes again. Stays 0 when
+    // the caller already knew the instance (no lookup ran) or when the lookup
+    // keyed on a stablePropId, and 0 means "recompute", i.e. the old behaviour.
+    XXH64_hash_t queryMatrixHash = 0;
+
     // Search for an existing instance matching our input
     if (currentInstance == nullptr) {
       // NV-DXVK [fanout prev-transform identity]: hand the engine's history down
@@ -3868,7 +3892,7 @@ namespace dxvk {
       const Matrix4* prevO2W = (split != nullptr && split->hasPrevObjectToWorld)
         ? &split->prevObjectToWorld
         : nullptr;
-      currentInstance = findSimilarInstance(blas, materialData, firstInstanceObjectToWorld, drawCall.cameraType, rayPortalManager, lookupStablePropId, drawCallCache, prevO2W);
+      currentInstance = findSimilarInstance(blas, materialData, firstInstanceObjectToWorld, drawCall.cameraType, rayPortalManager, lookupStablePropId, drawCallCache, prevO2W, &queryMatrixHash);
     }
 
     psoSplit.markFind();   // NV-DXVK [Perf.SceneObj]: end of `find`
@@ -4246,7 +4270,11 @@ namespace dxvk {
 
     psoSplit.markAdd();   // NV-DXVK [Perf.SceneObj]: end of `add`
 
-    updateInstance(*currentInstance, cameraManager, blas, drawCall, materialData, split);
+    // NV-DXVK [perf] handoff v7 sec 4a: firstInstanceObjectToWorld is a local of
+    // this function and is never reassigned after the lookup, so the hint's
+    // pointer stays valid for the whole of updateInstance.
+    const SpatialKeyHint keyHint{ &firstInstanceObjectToWorld, queryMatrixHash };
+    updateInstance(*currentInstance, cameraManager, blas, drawCall, materialData, split, keyHint);
 
     psoSplit.markUpdate();   // NV-DXVK [Perf.SceneObj]: end of `update`
 
@@ -4708,7 +4736,14 @@ namespace dxvk {
     // NOTE: In the future we could extend this with heuristics as needed...
   }
 
-  RtInstance* InstanceManager::findSimilarInstance(BlasEntry& blas, const MaterialData& material, const Matrix4& firstInstanceObjectToWorld, CameraType::Enum cameraType, const RayPortalManager& rayPortalManager, uint64_t stablePropId, DrawCallCache* drawCallCache, const Matrix4* prevObjectToWorld) {
+  RtInstance* InstanceManager::findSimilarInstance(BlasEntry& blas, const MaterialData& material, const Matrix4& firstInstanceObjectToWorld, CameraType::Enum cameraType, const RayPortalManager& rayPortalManager, uint64_t stablePropId, DrawCallCache* drawCallCache, const Matrix4* prevObjectToWorld, XXH64_hash_t* outQueryMatrixHash) {
+    // NV-DXVK [perf] handoff v7 sec 4a: cleared up front so every early return
+    // below leaves it defined. The exact stage overwrites it unconditionally a
+    // few dozen lines down, before any of them can be taken; 0 is the safe value
+    // for the paths that bypass it entirely, since 0 means "hash it yourself".
+    if (outQueryMatrixHash != nullptr) {
+      *outQueryMatrixHash = 0;
+    }
 
     // Disable temporal correlation between instances so that duplicate instances are not created
     // should a developer option change instance enough for it not to match anymore
@@ -4740,6 +4775,47 @@ namespace dxvk {
     Vector3 worldPosition;
 
     const float uniqueObjectDistanceSqr = RtxOptions::getUniqueObjectDistanceSqr();
+
+    // NV-DXVK [FindStage] 2026-08-07: per-frame census of how each lookup resolved.
+    //
+    // WHY THIS EXISTS. The standing claim about `find` is that some shaders'
+    // stablePropId round-robins across frames, so the exact stage cannot match the
+    // key its instance was filed under and those lookups fall through to the
+    // nearest-neighbour search. That claim has never been MEASURED -- every probe
+    // in this function is per-VS, throttled, and on the logDenyTags list, so none
+    // of them can report a population. This can: three integer increments per call
+    // and one line per frame, no timers, no sampling, nothing to floor out.
+    //
+    // READ IT LIKE THIS:
+    //   propIdMiss ~ 0            -> the round-robin is not happening in this
+    //                                scene. The lead is dead; do not force propIds
+    //                                to 0 via rtx.suppressStablePropIdVsHashes,
+    //                                and look elsewhere in find.
+    //   propIdMiss large          -> confirmed. Every one of those pays the nearest
+    //                                search AND skips the engine-history retry,
+    //                                which is deliberately gated on propId == 0.
+    //                                Fix belongs at the propId producer.
+    //   withPropId ~ 0            -> nothing in this scene keys on prop identity at
+    //                                all, so the round-robin cannot be the cost
+    //                                whatever else is true.
+    struct FindStageAgg {
+      uint32_t frame = 0xFFFFFFFFu;
+      uint32_t calls = 0, exact = 0, withPropId = 0, propIdMiss = 0, noPropIdMiss = 0;
+    };
+    static thread_local FindStageAgg sFindStage;
+    if (sFindStage.frame != currentFrameIdx) {
+      if (sFindStage.frame != 0xFFFFFFFFu && sFindStage.calls > 0u) {
+        Logger::info(str::format(
+          "[FindStage] f=", sFindStage.frame,
+          " calls=", sFindStage.calls,
+          " exact=", sFindStage.exact,
+          " withPropId=", sFindStage.withPropId,
+          " propIdMiss=", sFindStage.propIdMiss,
+          " noPropIdMiss=", sFindStage.noPropIdMiss));
+      }
+      sFindStage = FindStageAgg{};
+      sFindStage.frame = currentFrameIdx;
+    }
 
     RtInstance* pSimilar = nullptr;
     float nearestDistSqr = FLT_MAX;
@@ -4795,8 +4871,29 @@ namespace dxvk {
       // Search for an exact match. stablePropId (passed in from the
       // caller's drawCall.transformData) overrides the matrix-bytes
       // cache key when non-zero — anchors dedup to per-prop identity.
-      result = const_cast<RtInstance*>(blas.getSpatialMap().getDataAtTransform(firstInstanceObjectToWorld, stablePropId));
+      // NV-DXVK [perf] handoff v7 sec 4a: this is the one place the query matrix
+      // is hashed, so it is the one place that can hand the hash onward. Written
+      // whether or not the lookup hits: a nearest-stage or engine-class match
+      // resolves to an instance that will still be re-filed under THIS matrix by
+      // onTransformChanged, so the hash is just as reusable on a miss.
+      result = const_cast<RtInstance*>(blas.getSpatialMap().getDataAtTransform(firstInstanceObjectToWorld, stablePropId, outQueryMatrixHash));
       const bool exactHit = (result != nullptr);
+
+      // NV-DXVK [FindStage]: the whole census, at the one point that decides it.
+      // A non-zero propId that missed here is the round-robin signature: the key
+      // is position-independent, so a stationary prop can only miss if the ID
+      // itself changed since the instance was filed.
+      ++sFindStage.calls;
+      if (stablePropId != 0ull) {
+        ++sFindStage.withPropId;
+      }
+      if (exactHit) {
+        ++sFindStage.exact;
+      } else if (stablePropId != 0ull) {
+        ++sFindStage.propIdMiss;
+      } else {
+        ++sFindStage.noPropIdMiss;
+      }
       if (result != nullptr) {
         if (isProbeVS) {
           thread_local uint32_t sExactProbe = 0;
@@ -5697,7 +5794,8 @@ namespace dxvk {
                                        const BlasEntry& blas,
                                        const DrawCallState& drawCall,
                                        MaterialData& materialData,
-                                       const FanoutSplit* split) {
+                                       const FanoutSplit* split,
+                                       const SpatialKeyHint& keyHint) {
     UpdInstSplitGuard uiSplit(RtxOptions::perfUpdateInstSplit(), m_device->getCurrentFrameId());
     // NV-DXVK [sticky IgnoreAntiCulling]: preserve IgnoreAntiCulling across
     // shader-variant draws that update the same RtInstance within a frame.
@@ -6346,10 +6444,15 @@ namespace dxvk {
           hasTransformChanged = currentInstance.teleport(objectToWorld);
           mtnMovePath = 0;
         } else if (isFirstUpdateThisFrame) {
-          hasTransformChanged = currentInstance.move(objectToWorld);
+          // NV-DXVK [perf] handoff v7 sec 4a: keyHint carries this frame's
+          // already-computed spatial key. teleport() above is deliberately left
+          // out -- [MapGate] puts it at mapWrInsert=4/frame, so there is nothing
+          // there to save, and insert()'s collision-bump loop would need the same
+          // reasoning applied a second time for no measurable return.
+          hasTransformChanged = currentInstance.move(objectToWorld, keyHint);
           mtnMovePath = 1;
         } else {
-          hasTransformChanged = currentInstance.moveAgain(objectToWorld);
+          hasTransformChanged = currentInstance.moveAgain(objectToWorld, keyHint);
           mtnMovePath = 2;
         }
 

@@ -20,6 +20,7 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include <set>
+#include <vector>
 #include "../../test_utils.h"
 #include "../../../src/util/util_spatial_map.h"
 
@@ -48,6 +49,12 @@ namespace dxvk {
       }
     }
 
+    void expect(bool condition, const std::string& what) {
+      if (!condition) {
+        throw DxvkError(str::format("failed: ", what));
+      }
+    }
+
     struct TestData {
       Vector3 pos;
       int data;
@@ -56,7 +63,107 @@ namespace dxvk {
         transform = translationMatrix(pos);
       }
     };
-    
+
+    // NV-DXVK [perf] handoff v7 sec 4a/4b: the tests above only ever touch
+    // m_cells (getNearestData). Nothing covered m_cache -- the exact-hash
+    // lookup that answers 97.6% of real queries, and the half this change
+    // replaced. A broken exact stage does not crash: it silently misses, dedup
+    // fails, and the symptom is instance churn several layers away.
+    void runExactLookupTests() {
+      SpatialMap<int> map(2.0f);
+
+      const int kCount = 400;
+      std::vector<TestData> data;
+      data.reserve(kCount);
+      for (int i = 0; i < kCount; ++i) {
+        data.emplace_back(Vector3(float(i), float(i * 2), float(-i)), i);
+      }
+
+      // Insert, and check every key is retrievable by its transform.
+      std::vector<XXH64_hash_t> keys(kCount, 0);
+      for (int i = 0; i < kCount; ++i) {
+        keys[i] = map.insert(data[i].pos, data[i].transform, &data[i].data);
+      }
+      expect(map.size() == size_t(kCount), "size after inserts");
+      for (int i = 0; i < kCount; ++i) {
+        const int* found = map.getDataAtTransform(data[i].transform);
+        expect(found != nullptr && *found == i, str::format("exact lookup of ", i));
+      }
+
+      // The out-param must be the key the entry is actually filed under, and
+      // must be reusable as move()'s precomputed hash.
+      for (int i = 0; i < kCount; ++i) {
+        XXH64_hash_t queryHash = 0;
+        const int* found = map.getDataAtTransform(data[i].transform, 0, &queryHash);
+        expect(found != nullptr, str::format("hash out-param lookup of ", i));
+        expect(queryHash == keys[i], str::format("out-param hash matches insert key for ", i));
+        // Same transform: move must be a no-op and return the same key, whether
+        // or not it is told the hash.
+        const XXH64_hash_t movedWith =
+          map.move(keys[i], data[i].pos, data[i].transform, &data[i].data, 0, queryHash);
+        const XXH64_hash_t movedWithout =
+          map.move(keys[i], data[i].pos, data[i].transform, &data[i].data, 0, 0);
+        expect(movedWith == keys[i], str::format("precomputed move is a no-op for ", i));
+        expect(movedWith == movedWithout, str::format("precomputed move agrees with hashed move for ", i));
+      }
+      expect(map.size() == size_t(kCount), "no-op moves did not change the map");
+
+      // An overrideHash key must NOT report a reusable matrix hash.
+      {
+        TestData extra(Vector3(999.f, 999.f, 999.f), 999);
+        const XXH64_hash_t propKey = map.insert(extra.pos, extra.transform, &extra.data, 0x1234ull);
+        expect(propKey == 0x1234ull, "override hash is used verbatim as the key");
+        XXH64_hash_t queryHash = 0xDEADBEEFull;
+        const int* found = map.getDataAtTransform(extra.transform, 0x1234ull, &queryHash);
+        expect(found != nullptr && *found == 999, "override-keyed lookup");
+        expect(queryHash == 0, "override-keyed lookup reports no reusable matrix hash");
+        map.erase(propKey);
+      }
+
+      // A real move to a new transform re-files the entry and retires the old key.
+      {
+        const Vector3 newPos(-500.f, -500.f, -500.f);
+        const Matrix4 newTransform = translationMatrix(newPos);
+        map.move(keys[7], newPos, newTransform, &data[7].data);
+        expect(map.getDataAtTransform(data[7].transform) == nullptr, "old key retired after move");
+        const int* found = map.getDataAtTransform(newTransform);
+        expect(found != nullptr && *found == 7, "entry findable at new transform");
+        keys[7] = XXH64(&newTransform, sizeof(newTransform), 0);
+        data[7].transform = newTransform;
+        data[7].pos = newPos;
+      }
+
+      // Erase every third entry; the survivors must all still be reachable.
+      // This is what breaks first if the probe-run repair after a deletion is
+      // wrong -- an entry stays in the table but stops being findable.
+      for (int i = 0; i < kCount; i += 3) {
+        map.erase(keys[i]);
+      }
+      for (int i = 0; i < kCount; ++i) {
+        const int* found = map.getDataAtTransform(data[i].transform);
+        if (i % 3 == 0) {
+          expect(found == nullptr, str::format("erased entry ", i, " is gone"));
+        } else {
+          expect(found != nullptr && *found == i, str::format("survivor ", i, " still reachable"));
+        }
+      }
+
+      // Re-insert the erased ones; the map must accept them again and hold
+      // exactly the original population.
+      for (int i = 0; i < kCount; i += 3) {
+        keys[i] = map.insert(data[i].pos, data[i].transform, &data[i].data);
+      }
+      expect(map.size() == size_t(kCount), "size after erase + re-insert");
+      for (int i = 0; i < kCount; ++i) {
+        const int* found = map.getDataAtTransform(data[i].transform);
+        expect(found != nullptr && *found == i, str::format("reachable after churn: ", i));
+      }
+
+      // m_cells must not have drifted from m_cache through all of that.
+      expect(map.debugCellEntryCount() == map.size(), "cell grid agrees with cache");
+    }
+
+
     void run() {
       SpatialMap<int> map(2.0f);
       Matrix4 foo;
@@ -82,6 +189,9 @@ namespace dxvk {
       testPoint(map, Vector3(2.5f, 2.5f, 2.51f), 3);
       // far section of next cell
       testPoint(map, Vector3(3.5f, 3.5f, 3.5f), 3);
+
+      runExactLookupTests();
+
       std::cout << "All passed\n";
     }
   };

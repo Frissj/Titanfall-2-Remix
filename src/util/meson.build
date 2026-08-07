@@ -40,7 +40,8 @@ util_src = files([
   'util_fastops.h',
 
   'util_fast_cache.h',
-  
+  'util_flat_cache.h',
+
   'util_filesys.h',
   'util_filesys.cpp',
 

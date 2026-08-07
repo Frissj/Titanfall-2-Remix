@@ -58,6 +58,10 @@ exe = executable('test_spatial_map',  files('test_spatial_map.cpp'), include_dir
 test('test_spatial_map', exe, env: test_env)
 tests += exe
 
+exe = executable('test_flat_cache',  files('test_flat_cache.cpp'), include_directories : remix_api_include_path,  dependencies : test_unit_deps, win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
+test('test_flat_cache', exe, env: test_env)
+tests += exe
+
 exe = executable('test_documentation',  files('test_documentation.cpp'), include_directories : test_include_path, dependencies : [ d3d9_dep, test_unit_deps ], link_with: [ d3d9_dll ] , win_subsystem : 'console', override_options: ['cpp_std='+dxvk_cpp_std])
 test('test_documentation', exe, env: test_env, priority : -50, args: d3d9_dll.full_path())
 tests += exe
