@@ -1190,6 +1190,15 @@ namespace dxvk {
     // block, its timestamps, and the flush after the loop all fall away.
     const bool geomDiagOn = RtxOptions::logGeomDiag();
 
+    // NV-DXVK [perf] 2026-08-08: routing-decision option reads hoisted out of
+    // the per-instance loop below -- they were re-read for each of ~15k
+    // instances per frame. Same pattern (and same reason) as geomDiagOn above.
+    const uint32_t mrgOptMinPrimsDynamic = std::max(RtxOptions::minPrimsInDynamicBLAS(), 100u);
+    const uint32_t mrgOptMaxPrimsMerged  = RtxOptions::maxPrimsInMergedBLAS();
+    const bool     mrgOptPersistStatic   = RtxOptions::persistStaticBlas();
+    const bool     mrgOptMinimizeMerging = RtxOptions::minimizeBlasMerging();
+    const bool     mrgOptForceMergeAll   = RtxOptions::forceMergeAllMeshes();
+
     // NV-DXVK [SceneCull]: Remix-side culling — the replacement for the engine
     // culls that d3d11_rtx.cpp's [CullOff] patches switch off.
     // See the RtxOptions::SceneCull comment for why the cull lives here (BLAS is
@@ -1482,6 +1491,14 @@ namespace dxvk {
       // earlier (e.g. submitDrawState's bufferCache overflow / sky
       // filter / replacement substitution).
       auto logDrop = [&](const char* reason) {
+        // NV-DXVK [perf] 2026-08-08: gate the WORK, not just the line. This ran
+        // for every hidden/mask0 instance every frame -- thousands of process-
+        // global mutex acquires + set lookups per frame on dxvk-cs -- to decide
+        // whether to emit a one-shot diagnostic. Same defect class as the
+        // world-extent census (see rtx.logMapGate's note: the cost is cache-
+        // coherence traffic, not arithmetic). geomDiagOn is the loop-hoisted
+        // read of the same option that gates this probe's consumers.
+        if (!geomDiagOn) return;
         BlasEntry* be = instance->getBlas();
         if (be == nullptr) return;
         const uint64_t vsHash = static_cast<uint64_t>(
@@ -1930,8 +1947,10 @@ namespace dxvk {
         }
       }
 
-      const uint32_t minPrimsInDynamicBLAS = std::max(RtxOptions::minPrimsInDynamicBLAS(), 100u);
-      const uint32_t maxPrimsForMergedBLAS = RtxOptions::maxPrimsInMergedBLAS();
+      // NV-DXVK [perf] 2026-08-08: option reads hoisted out of the per-instance
+      // loop (they were re-read ~15k times/frame; see mrgOpt* above the loop).
+      const uint32_t minPrimsInDynamicBLAS = mrgOptMinPrimsDynamic;
+      const uint32_t maxPrimsForMergedBLAS = mrgOptMaxPrimsMerged;
       const uint32_t blasPrims = blasEntry->modifiedGeometryData.calculatePrimitiveCount();
 
       // NV-DXVK [Layer1 static-BLAS persistence]: a mesh whose geometry did NOT
@@ -1947,7 +1966,7 @@ namespace dxvk {
       // floor so tiny meshes still merge (avoids TLAS bloat from many small BLAS),
       // and excludes skinned / point-instancer geometry (both already routed dynamic
       // above for their own reasons). Behind rtx.persistStaticBlas (default off).
-      const bool persistStaticBlas = RtxOptions::persistStaticBlas()
+      const bool persistStaticBlas = mrgOptPersistStatic
                                   && instance->surface.instancesToObject == nullptr
                                   && blasEntry->input.getSkinningState().numBones == 0
                                   && blasEntry->frameLastUpdated != currentFrame
@@ -1960,11 +1979,11 @@ namespace dxvk {
                                       blasEntry->dynamicBlas != nullptr ||                 // If we already have a dynamic BLAS, keep using it.
                                       blasPrims > maxPrimsForMergedBLAS ||                 // Avoid large meshes ending up in the merged BLAS which is built every frame.  # prims is proportional to build cost.
                                       persistStaticBlas ||                                 // NV-DXVK: static geometry -> persistent reused BLAS (rtx.persistStaticBlas)
-                                      RtxOptions::minimizeBlasMerging();                   // Option to attempt putting as many objects into dynamic BLAS as possible.
+                                      mrgOptMinimizeMerging;                               // Option to attempt putting as many objects into dynamic BLAS as possible.
 
       const bool forceMergedBlas = (blasEntry->buildGeometries.size() > 1 ||                                       // Currently we use multiple build geometries for particle billboards, which we prefer to merge into large BLAS
-                                    (!RtxOptions::minimizeBlasMerging() && blasPrims < minPrimsInDynamicBLAS) ||   // Avoid creating lots of small dynamic BLAS
-                                    RtxOptions::forceMergeAllMeshes()) &&                                          // Setting to force all meshes into the merged BLAS
+                                    (!mrgOptMinimizeMerging && blasPrims < minPrimsInDynamicBLAS) ||               // Avoid creating lots of small dynamic BLAS
+                                    mrgOptForceMergeAll) &&                                                        // Setting to force all meshes into the merged BLAS
                                       instance->surface.instancesToObject == nullptr &&                            // Never merge point instancer geometry
                                       blasEntry->getLinkedInstances().size() <= 1;                                 // NV-DXVK: Don't force merge if BlasEntry has multiple instances (avoids dynamic/merged conflict)
 

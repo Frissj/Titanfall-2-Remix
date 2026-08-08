@@ -8780,6 +8780,29 @@ namespace dxvk {
   static thread_local int64_t s_perfPfsGuardAcc   = 0, s_perfPfsGuardMax   = 0;
   static thread_local int64_t s_perfPfsStudioAcc  = 0, s_perfPfsStudioMax  = 0;
   static thread_local int64_t s_perfPfsDropAcc    = 0, s_perfPfsDropMax    = 0;
+  // NV-DXVK [perf] 2026-08-08: markSub bisection of the four §2.4 replay-tier
+  // candidate buckets (vsAnalysis 0.78 / bonePalette 0.97 / cbc_rawUv 0.88 /
+  // filters 0.91 ms/frame at 14:22). Each parent markStg keeps reporting the
+  // REMAINDER after these, per the markSub contract above. Named leaves decide
+  // which spans get a per-geomKey replay cache and which are already probes.
+  //   va_guards  — vsAnalysis: topology/PS/count/z guards + early UI rejects
+  //   va_sem     — vsAnalysis: input-layout + semantic resolution (pos/tc/bone)
+  //   (vsAnalysis remainder = ShipSrcVB probe + tc1/VGUI capture tail)
+  //   flt_gate   — filters: TLAS-coherence guard + UI/overlay filter
+  //   flt_probes — filters: SubmitAll/SubmitBone/NearIdx/O2wList probe cluster
+  //   (filters remainder = the functional fanout batch/matrix build)
+  //   cru_decode — cbc_rawUv: POSdecode/UVdecode diag + raw VB UV decode head
+  //   (cbc_rawUv remainder = CBufUberStatic UV-transform read + apply)
+  //   bp_capture — bonePalette: t30 SRV resolve + WC staging + palette copy
+  //   bp_hash    — bonePalette: bone-window hash + [BoneWindow] accounting
+  //   (bonePalette remainder = BoneSrc/ZigBone2 probes + debob-timeline)
+  static thread_local int64_t s_perfVaGuardsAcc  = 0, s_perfVaGuardsMax  = 0;
+  static thread_local int64_t s_perfVaSemAcc     = 0, s_perfVaSemMax     = 0;
+  static thread_local int64_t s_perfFltGateAcc   = 0, s_perfFltGateMax   = 0;
+  static thread_local int64_t s_perfFltProbesAcc = 0, s_perfFltProbesMax = 0;
+  static thread_local int64_t s_perfCruDecodeAcc = 0, s_perfCruDecodeMax = 0;
+  static thread_local int64_t s_perfBpCaptureAcc = 0, s_perfBpCaptureMax = 0;
+  static thread_local int64_t s_perfBpHashAcc    = 0, s_perfBpHashMax    = 0;
   // pff_camCat measured 2.28 us/draw â€” 59% of the pf_setup+preFilters span and
   // 15% of the whole draw. But that span holds TWO unrelated things:
   // MaybeEarlyInjectForUITexture() and the CamCatalog probe. Split before fixing:
@@ -24195,6 +24218,8 @@ namespace dxvk {
       return;
     }
 
+    markSub(s_perfVaGuardsAcc, s_perfVaGuardsMax);  // [va_guards] topology/PS/count/z guards
+
     D3D11InputLayout* layout = m_context->m_state.ia.inputLayout.ptr();
     if (!layout) {
       BumpFilter(FilterReason::NoInputLayout);
@@ -24356,6 +24381,8 @@ namespace dxvk {
       m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
       return;
     }
+
+    markSub(s_perfVaSemAcc, s_perfVaSemMax);  // [va_sem] input-layout + semantic resolution
 
     // NV-DXVK [ShipSrcVB]: answer engine-vs-Remix for the hull VS (0x292b) vanish.
     // 0x292b is static_mesh_cb3_owns_transform: the ENGINE source VB is OBJECT space
@@ -28376,6 +28403,8 @@ namespace dxvk {
       }
     }
 
+    markSub(s_perfFltGateAcc, s_perfFltGateMax);  // [flt_gate] TLAS-coherence guard + UI/overlay filter
+
     // NV-DXVK [SubmitAll]: every draw of the probe VS, regardless of path.
     //
     // WHY THIS EXISTS. [SubmitBone] below lives inside
@@ -28974,6 +29003,8 @@ namespace dxvk {
       dcs.transformData.instancesToObject = m_currentInstancesToObject;
       // NV-DXVK: Pass ownership too so it flows into RtInstance via instance_manager.
       dcs.transformData.instancesToObjectOwner = m_currentInstancesToObjectOwner;
+      markSub(s_perfFltProbesAcc, s_perfFltProbesMax);  // [flt_probes] SubmitAll/SubmitBone probe cluster
+
       // NV-DXVK [fanout prev-transform identity]: last frame's position for each
       // placement, gated on the same length agreement and for the same reason —
       // a desynced history is not a weaker identity, it is a confidently wrong
@@ -30329,6 +30360,8 @@ namespace dxvk {
       }
     }
 
+    markSub(s_perfCruDecodeAcc, s_perfCruDecodeMax);  // [cru_decode] POS/UV decode head
+
     {
       if (const auto* psShader = m_context->m_state.ps.shader.ptr()) {
         if (const auto* cs = psShader->GetCommonShader()) {
@@ -31250,6 +31283,8 @@ namespace dxvk {
             const bool needPalette =
               legacySkinningWillRun || (maxBones == 1u) || captureActive;
 
+            markSub(s_perfBpCaptureAcc, s_perfBpCaptureMax);  // [bp_capture] t30 resolve + staging + palette copy
+
             // NV-DXVK [BoneWindow fix]: hash the bones this draw ACTUALLY skins
             // with — the same bytes the GPU consumer reads.
             //
@@ -31580,6 +31615,8 @@ namespace dxvk {
                 // matrices where real bones belong. That is the fault, directly.
                 " palOobReads=", g_bonePaletteOobReads.load(std::memory_order_relaxed)));
             }
+
+            markSub(s_perfBpHashAcc, s_perfBpHashMax);  // [bp_hash] bone-window hash + accounting
 
             // NV-DXVK [BoneSrc]: confirm the bone-palette SOURCE + STALENESS for
             // the garbled skinned mesh UNDER THE CROSSHAIR. The merge into
@@ -33925,21 +33962,36 @@ namespace dxvk {
 
       markStg(s_perfTeCamDiagAcc, s_perfTeCamDiagMax);  // [te_camDiag] sanitize + vsKey + cb diag + MainCamPose
 
-      auto& e = g_tlasDiagByVs[vsKeyDiag];
-      e.drawCount  += 1;
-      e.totalVerts += vertCount;
-      if (wasSkyTagged) e.skyTagCount += 1;
-      if (cbValid) {
-        e.lastCbX = cbX; e.lastCbY = cbY; e.lastCbZ = cbZ; e.lastCbValid = true;
+      // NV-DXVK [perf] 2026-08-08 (te_census, 0.75 ms/frame measured by
+      // RTX_D3D11_SUBMARK): the per-VS census entry is now a GATED POINTER.
+      // The std::string-keyed map lookup plus ~15 accumulation writes ran for
+      // EVERY draw every frame, feeding only the kDiagLogs-gated [TLASFrame]/
+      // [TLASEntry] dumps -- except the worldVert* fields, which the
+      // SubViewSkybox promotion below consumes for SUB-VIEW draws only. So the
+      // entry exists exactly when a consumer does: diagnostics on, or this is
+      // a sub-view draw. Every e-> write below is null-guarded; the functional
+      // paths in this span (objAabb producer, EngineSunCapture, the SubViewSkybox
+      // promotion itself) are NOT gated.
+      TlasDiagEntry* tlasE = (s_d3d11DiagEnabled || dcs.transformData.isSubView)
+        ? &g_tlasDiagByVs[vsKeyDiag]
+        : nullptr;
+      if (tlasE != nullptr) {
+        auto& e = *tlasE;
+        e.drawCount  += 1;
+        e.totalVerts += vertCount;
+        if (wasSkyTagged) e.skyTagCount += 1;
+        if (cbValid) {
+          e.lastCbX = cbX; e.lastCbY = cbY; e.lastCbZ = cbZ; e.lastCbValid = true;
+        }
+        e.lastO2wX = o2wTx; e.lastO2wY = o2wTy; e.lastO2wZ = o2wTz;
+        if (o2wTx < e.minO2wX) e.minO2wX = o2wTx;
+        if (o2wTy < e.minO2wY) e.minO2wY = o2wTy;
+        if (o2wTz < e.minO2wZ) e.minO2wZ = o2wTz;
+        if (o2wTx > e.maxO2wX) e.maxO2wX = o2wTx;
+        if (o2wTy > e.maxO2wY) e.maxO2wY = o2wTy;
+        if (o2wTz > e.maxO2wZ) e.maxO2wZ = o2wTz;
+        e.lastVpW = vpW_d; e.lastVpH = vpH_d; e.lastVpMaxD = vpMaxD_d;
       }
-      e.lastO2wX = o2wTx; e.lastO2wY = o2wTy; e.lastO2wZ = o2wTz;
-      if (o2wTx < e.minO2wX) e.minO2wX = o2wTx;
-      if (o2wTy < e.minO2wY) e.minO2wY = o2wTy;
-      if (o2wTz < e.minO2wZ) e.minO2wZ = o2wTz;
-      if (o2wTx > e.maxO2wX) e.maxO2wX = o2wTx;
-      if (o2wTy > e.maxO2wY) e.maxO2wY = o2wTy;
-      if (o2wTz > e.maxO2wZ) e.maxO2wZ = o2wTz;
-      e.lastVpW = vpW_d; e.lastVpH = vpH_d; e.lastVpMaxD = vpMaxD_d;
 
       // NV-DXVK [Per-frame phantom-source probe]: log the first draw of
       // suspect VSes per frame, capturing both dcs.objectToWorld AND
@@ -34015,9 +34067,9 @@ namespace dxvk {
       // (hasBoneTransform = boneMatrixBuffer.defined() && boneIndexBuffer
       // .defined()).
       const auto& gd = dcs.geometryData;
-      if (gd.boneMatrixBuffer.defined() && gd.boneIndexBuffer.defined()) {
-        e.boneXformDraws += 1;
-        if (gd.bonePerVertex) e.bonePerVertexDraws += 1;
+      if (tlasE != nullptr && gd.boneMatrixBuffer.defined() && gd.boneIndexBuffer.defined()) {
+        tlasE->boneXformDraws += 1;
+        if (gd.bonePerVertex) tlasE->bonePerVertexDraws += 1;
       }
 
       // NV-DXVK [TLASEntry world-AABB]: sample positionBuffer, transform
@@ -34069,10 +34121,13 @@ namespace dxvk {
           isBspPacked ? 8u : (is16F4 ? 8u : 12u);
         const uint32_t stride = posBuf.stride();
         if (!fmtOk || stride < minBytesPerVert || vertCount == 0u) {
-          e.worldVertSkippedFmt += 1;
+          if (tlasE != nullptr) tlasE->worldVertSkippedFmt += 1;
           // One-shot log per format that we DON'T handle, so we know
           // what to add support for next. fmt ID is the raw VkFormat
           // numeric â€” cross-reference with vulkan_core.h.
+          // NV-DXVK [perf] 2026-08-08: gated with the census entry -- the
+          // mutex+set ran for EVERY unhandled-format draw (VGUI etc.) forever.
+          if (tlasE != nullptr) {
           static std::unordered_set<uint32_t> sLoggedFmts;
           static std::mutex sLoggedFmtsMu;
           {
@@ -34085,6 +34140,7 @@ namespace dxvk {
                 " stride=", stride,
                 " vertCount=", vertCount));
             }
+          }
           }
         } else {
           // Resolve a CPU-readable base pointer + length + per-vertex
@@ -34129,11 +34185,14 @@ namespace dxvk {
             }
           }
           if (baseBytes == nullptr) {
-            e.worldVertSkippedMap += 1;
+            if (tlasE != nullptr) tlasE->worldVertSkippedMap += 1;
             // One-shot log per VS so we can tell apart "no mapPtr"
             // (dynamic VB renamed, host pointer transient) from
             // "no immutable shadow" (DEFAULT-usage GPU-only buffer
             // we genuinely can't read on CPU).
+            // NV-DXVK [perf] 2026-08-08: gated with the census entry -- the
+            // mutex + string-set lookup ran for every unmappable draw forever.
+            if (tlasE != nullptr) {
             static std::unordered_set<std::string> sLoggedSkipMap;
             static std::mutex sLoggedSkipMapMu;
             {
@@ -34166,6 +34225,7 @@ namespace dxvk {
                   " â€” both mapPtr and immutable shadow unavailable"));
               }
             }
+            }  // tlasE gate for the one-shot
           } else {
             const size_t bufLen = baseLen;
             const auto& o2wM = dcs.transformData.objectToWorld;
@@ -34220,7 +34280,7 @@ namespace dxvk {
             // itself isSubView-gated). Non-sub-view draws never consume worldVert, so
             // skip the loop for them unless RTX_D3D11_DIAG is on. The black-mountains /
             // SubViewSkybox fix still runs on sub-view draws (the only ones it needs).
-            if (s_d3d11DiagEnabled || dcs.transformData.isSubView)
+            if (tlasE != nullptr)   // same predicate that created the entry
             for (uint32_t vi = 0; vi < vertCount; vi += step) {
               const size_t byteOff = static_cast<size_t>(vi) * sampStride;
               if (byteOff + minBytesPerVert > bufLen) break;
@@ -34252,16 +34312,16 @@ namespace dxvk {
               const float wx = m00*ox + m10*oy + m20*oz + m30;
               const float wy = m01*ox + m11*oy + m21*oz + m31;
               const float wz = m02*ox + m12*oy + m22*oz + m32;
-              if (wx < e.worldVertMinX) e.worldVertMinX = wx;
-              if (wy < e.worldVertMinY) e.worldVertMinY = wy;
-              if (wz < e.worldVertMinZ) e.worldVertMinZ = wz;
-              if (wx > e.worldVertMaxX) e.worldVertMaxX = wx;
-              if (wy > e.worldVertMaxY) e.worldVertMaxY = wy;
-              if (wz > e.worldVertMaxZ) e.worldVertMaxZ = wz;
+              if (wx < tlasE->worldVertMinX) tlasE->worldVertMinX = wx;
+              if (wy < tlasE->worldVertMinY) tlasE->worldVertMinY = wy;
+              if (wz < tlasE->worldVertMinZ) tlasE->worldVertMinZ = wz;
+              if (wx > tlasE->worldVertMaxX) tlasE->worldVertMaxX = wx;
+              if (wy > tlasE->worldVertMaxY) tlasE->worldVertMaxY = wy;
+              if (wz > tlasE->worldVertMaxZ) tlasE->worldVertMaxZ = wz;
               ++taken;
               if (taken >= kSamplesPerDraw) break;
             }
-            e.worldVertSamples += taken;
+            if (tlasE != nullptr) tlasE->worldVertSamples += taken;
 
             // NV-DXVK [object-space AABB for anti-frustum cull]: the
             // world-space accumulation above feeds the per-VS DIAGNOSTIC
@@ -34911,7 +34971,11 @@ namespace dxvk {
             // transformData.isSubViewSkybox=true immediately so the
             // BAKED_ALBEDO_AS_EMISSIVE override applies in the very
             // frame the VS first qualifies.
-            if (e.worldVertSamples > 0u && dcs.transformData.isSubView) {
+            // NV-DXVK [perf] 2026-08-08: tlasE is non-null for every isSubView
+            // draw by construction (the gate that creates the entry includes
+            // isSubView precisely so this promotion keeps its input).
+            if (tlasE != nullptr && tlasE->worldVertSamples > 0u && dcs.transformData.isSubView) {
+              const auto& e = *tlasE;
               const float dxAabb = e.worldVertMaxX - e.worldVertMinX;
               const float dyAabb = e.worldVertMaxY - e.worldVertMinY;
               const float dzAabb = e.worldVertMaxZ - e.worldVertMinZ;
@@ -47880,7 +47944,14 @@ namespace dxvk {
                                  " pff_vmPass=",     s_perfPffVmPassAcc,
                                  " pff_mtn=",        s_perfPffMtnAcc,
                                  " preFilters=",     s_perfSubmitDrawStagePreFiltersAcc,
+                                 " va_guards=",      s_perfVaGuardsAcc,
+                                 " va_sem=",         s_perfVaSemAcc,
                                  " vsAnalysis=",     s_perfSubmitDrawStageVsAnalysisAcc,
+                                 " flt_gate=",       s_perfFltGateAcc,
+                                 " flt_probes=",     s_perfFltProbesAcc,
+                                 " cru_decode=",     s_perfCruDecodeAcc,
+                                 " bp_capture=",     s_perfBpCaptureAcc,
+                                 " bp_hash=",        s_perfBpHashAcc,
                                  " indexSnap=",      s_perfSubmitDrawStageIndexSnapAcc,
                                  " perVertSkin=",    s_perfSubmitDrawStagePerVertSkinAcc,
                                  " bt_skinIf=",      s_perfBtSkinDetectIfAcc,
@@ -49265,6 +49336,13 @@ namespace dxvk {
         s_perfPffVmPassAcc = 0; s_perfPffVmPassMax = 0;
         s_perfPffMtnAcc    = 0; s_perfPffMtnMax    = 0;
         s_perfSubmitDrawStageVsAnalysisAcc    = 0; s_perfSubmitDrawStageVsAnalysisMax    = 0;
+        s_perfVaGuardsAcc  = 0; s_perfVaGuardsMax  = 0;
+        s_perfVaSemAcc     = 0; s_perfVaSemMax     = 0;
+        s_perfFltGateAcc   = 0; s_perfFltGateMax   = 0;
+        s_perfFltProbesAcc = 0; s_perfFltProbesMax = 0;
+        s_perfCruDecodeAcc = 0; s_perfCruDecodeMax = 0;
+        s_perfBpCaptureAcc = 0; s_perfBpCaptureMax = 0;
+        s_perfBpHashAcc    = 0; s_perfBpHashMax    = 0;
         s_perfSubmitDrawStageIndexSnapAcc     = 0; s_perfSubmitDrawStageIndexSnapMax     = 0;
         s_perfSubmitDrawStagePerVertSkinAcc   = 0; s_perfSubmitDrawStagePerVertSkinMax   = 0;
         s_perfSubmitDrawStageBoneTrackAcc     = 0; s_perfSubmitDrawStageBoneTrackMax     = 0;

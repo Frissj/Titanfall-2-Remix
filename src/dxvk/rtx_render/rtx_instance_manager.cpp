@@ -621,7 +621,21 @@ namespace dxvk {
       // seen — which is exactly the false hit this key exists to prevent. The
       // binding half is the dangerous one: the symptom would be a stale material
       // INDEX, i.e. the clone rendering with another surface's textures.
-      static_assert(RtInstanceSize == 824, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+      // 824 -> 832 on 2026-08-08: added uint8_t m_fastDrawBits (rtx.
+      // fastInstanceUpdate — the per-draw flags-stage inputs the instance state
+      // key does not cover: winding, RT-target, sub-view flags, projection
+      // parity; captured at every full update, compared by the fast path).
+      // 1 byte of payload; the rest is alignment padding.
+      // COPY CTOR: DELIBERATELY NOT COPIED, same direction and same reasoning
+      // as m_instStateKey directly above. A clone left at the 0xFF sentinel can
+      // never match any real bit set, so its first updateInstance always runs
+      // the full path and re-derives flags/mask from its own draw. Copying the
+      // bits would assert the clone's retained vkInstance flags are correct for
+      // a draw it has never seen — the exact false hit the byte exists to
+      // prevent. The two members must keep the same policy: the fast path
+      // requires BOTH the key and the bits to match, so an uncopied key already
+      // forces the slow path; the sentinel makes the invariant local.
+      static_assert(RtInstanceSize == 832, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }
