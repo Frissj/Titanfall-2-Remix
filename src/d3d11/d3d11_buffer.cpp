@@ -76,6 +76,33 @@
 // reclaims against a pool whose occupancy it was tuned for, and the two chase
 // each other once a frame.
 // =======================================================================
+//
+// A/B RESULT, 2026-08-07 -- ON, and it is a clean win.
+//
+//                       OFF              ON
+//   wallMs range        51.5-67.8        44.9-55.5
+//   t31_copy            13.3-14.5 us     0.41-0.53 us
+//   t31_copy /window    630-696 ms       23-25 ms
+//   fenceWaitMs         ~21.5            ~22        (unchanged)
+//   OOM failures        0                0
+//
+// ~6.5-7 ms/frame off the whole distribution, and the arithmetic closes: 13.65 us
+// x ~51k calls = 696 ms/window over ~98 frames = 7.1 ms/frame, against 0.25 with
+// it on. The GPU never notices, which is what acquits the PCIe concern above.
+//
+// A "25-second decay" was read into the ON run and it was NOT REAL -- an apparent
+// 44.9 -> 55.5 ramp, and a matching inner_ms 697 -> 791, were scene-driven
+// oscillation. The OFF run swings the same way (66.2 67.8 52.9 51.7 51.5 60.2,
+// inner_ms 801 797 711 695 694 768) and inner_ms occupies the same 694-800 band
+// in both. HANDOFF s7.5 already says it: this game's per-draw cost swings ~2x in
+// a fixed scene, so cross-window ms deltas are noise. Compare DISTRIBUTIONS
+// across a run, never first-window against last.
+//
+// Depends on the host-visible Small-pool fix in dxvk_memory.cpp
+// (HostVisibleSmallPool). Without it this change fragments the allocator until a
+// forced unlimited trim recovers nothing: 8673 MB allocated, 2250 MB unreclaimable
+// slack, 75 allocation failures. With it: 7425 MB stable, zero failures. Do not
+// enable one without the other.
 #define RTX_D3D11_CACHED_DYNAMIC_SRV_BUFFERS true
 #endif
 

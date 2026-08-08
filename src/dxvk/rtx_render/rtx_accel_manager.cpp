@@ -22,6 +22,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cfloat>
+// NV-DXVK [Perf.Report]: [Perf.Merge] is the largest component of the serial
+// once-per-frame chunk on dxvk-cs.
+#include "rtx_perf_report.h"
 #include <cmath>
 #include <mutex>
 #include <thread>
@@ -92,6 +95,29 @@ namespace dxvk {
   static std::unordered_map<uint64_t, BulkPushStat> g_bulkPushTally;
 
   static inline void tallyReorderedPush(RtInstance* instance, const char* site) {
+    // NV-DXVK [perf] 2026-08-07: gated on rtx.logGeomDiag (default off), which
+    // is the same gate the [SpawnGeomDiag.*] family this probe belongs to
+    // already uses, and which mergeInstancesIntoBlas reads once as geomDiagOn.
+    //
+    // It was unconditional, and it is not cheap: m_reorderedSurfaces takes
+    // ~8,305 pushes per frame ([Perf.PrepScene] surf=8305) across three call
+    // sites, and each one does a getBlas() pointer chase plus an
+    // unordered_map lookup-or-insert on g_bulkPushTally. That is ~8.3k hash
+    // operations per frame on dxvk-cs, the thread the frame is sized by.
+    //
+    // AND ITS OUTPUT IS BEING THROWN AWAY. "[BulkPush]" is in the conf's
+    // rtx.logDenyTags list, so log.cpp drops the line the tally exists to
+    // produce -- the exact failure PERF_INSTRUMENTATION_MAP sec 4d warns
+    // about: the code ran and paid for it and nothing was emitted. The dump
+    // fires every frame too, since its threshold is size() > 1000 against
+    // ~8,305 actual pushes.
+    //
+    // The investigation it was built for (HANDOFF_TF2_SUBVIEW_STALE_PARTIAL,
+    // the ~8700 -> ~240 table collapse) is closed. Re-enable with
+    // rtx.logGeomDiag AND remove [BulkPush] from logDenyTags -- both, or it
+    // still prints nothing.
+    if (!RtxOptions::logGeomDiag()) { return; }
+
     uint64_t vsHash = 0;
     uint32_t primCount = 0;
     if (instance != nullptr) {
@@ -1783,7 +1809,26 @@ namespace dxvk {
       //
       // Transform the 8 object-space corners and take the world min/max — the
       // same bound the TLAS builder sees.
-      {
+      // NV-DXVK [perf]: the WHOLE census is gated on rtx.logGeomDiag, not just
+      // the push_backs inside it.
+      //
+      // The gate below at the g_tlasOverlap block already said "both ends move
+      // together", but it only ever wrapped the push_backs. Everything around
+      // them ran on every instance of every frame regardless of the option:
+      // the 8 corner transforms, the four atomic RMWs, and — the expensive one
+      // — the g_worldExtents.topMu lock acquired PER INSTANCE to maintain a
+      // top-3 list. [Perf.World] measures 8375 instances/frame reaching here,
+      // so that is ~67k matrix-vector products and ~8.4k uncontended lock
+      // round trips per frame, on dxvk-cs, which [Perf.CsSplit] shows at
+      // busyPct=98.2 and is the thread the frame is currently sized by.
+      //
+      // This census was written to diagnose pt_gbuffer sitting at ~135 ms/frame
+      // (see the comment below). That is resolved — [Perf.GpuPass] now reports
+      // gb_primaryRays at ~3.2 ms — so the census is answering a closed
+      // question at full per-frame cost. Gating it costs nothing: its only
+      // consumer is the [Perf.World] emit, which is itself a diagnostic, and
+      // turning rtx.logGeomDiag on restores both ends exactly as before.
+      if (geomDiagOn) {
         const auto& objBox = blasEntry->input.getGeometryData().boundingBox;
         if (objBox.isValid()) {
           const Matrix4 o2w = instance->getTransform();
@@ -2438,6 +2483,15 @@ namespace dxvk {
     // not occur in normal play. census = TlasCensus per-instance diagnostic
     // cost within loop.
     if (RtxOptions::logPrepSceneSplit() && (m_device->getCurrentFrameId() % 10u) == 5u) {
+      // NV-DXVK [Perf.Report]: merge is the biggest component of the serial
+      // prepScene chunk, and loop is the biggest component of merge. Per-frame
+      // microseconds on this line, so no frame divisor.
+      perfreport::publish(perfreport::Slot::MergeLoopMs,     double(mrg_loop)        / 1000.0);
+      perfreport::publish(perfreport::Slot::MergeDynBlasMs,  double(mrg_dynBlas)     / 1000.0);
+      perfreport::publish(perfreport::Slot::MergeBuildBlasMs, double(mrg_buildBlases) / 1000.0);
+      perfreport::publish(perfreport::Slot::MergeSetupMs,
+        double(mrg_setup + mrg_tail + mrg_tcFlush) / 1000.0);
+
       Logger::warn(str::format("[Perf.Merge] frame=", m_device->getCurrentFrameId(),
         " setup=", mrg_setup, " loop=", mrg_loop, " (census=", mrg_census / 1000, ")",
         " tcFlush=", mrg_tcFlush,
@@ -8261,9 +8315,16 @@ namespace dxvk {
           // World-space instance extents — the bound the TLAS actually builds
           // from. inflated/nonFinite are the failure signals; the histogram and
           // widest entries name the offenders.
-          {
+          // NV-DXVK [perf]: emit only when the producer actually collected.
+          // The world-extent census in mergeInstancesIntoBlas is gated on
+          // rtx.logGeomDiag; with it off wN is 0 and every field below would
+          // print 0, which reads as "no instances reached the TLAS" — false and
+          // alarming — rather than "not measured". Suppressing the line on an
+          // empty census keeps it honest in both modes. See §4d of
+          // PERF_INSTRUMENTATION_MAP: an absent line means check the gate.
+          const uint64_t wN = g_worldExtents.count.exchange(0, std::memory_order_relaxed);
+          if (wN != 0) {
             std::string wHist;
-            const uint64_t wN = g_worldExtents.count.exchange(0, std::memory_order_relaxed);
             for (uint32_t b = 0; b < 8; ++b) {
               const uint64_t n = g_worldExtents.hist[b].exchange(0, std::memory_order_relaxed);
               if (n != 0)

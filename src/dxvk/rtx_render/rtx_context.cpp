@@ -25,6 +25,9 @@
 #include <array>
 #include <chrono>
 #include <future>
+// NV-DXVK [Perf.Report]: [Perf.GpuPass] and [CommitRT] both emit from this file
+// and are the GPU and dxvk-cs anchors of the assembled breakdown.
+#include "rtx_perf_report.h"
 // NV-DXVK [Perf.Sweep]: std::this_thread::sleep_for, used to let the log drain
 // before TerminateProcess. <future> tends to pull this in, but not guaranteed.
 #include <thread>
@@ -5052,6 +5055,19 @@ namespace dxvk {
       // remainder (entry diagnostics + camera classification). Tells us whether the CS
       // thread is COMPUTING geometry or STALLED waiting on worker threads.
       const int64_t fr = s_commitFrames ? int64_t(s_commitFrames) : 1;
+
+      // NV-DXVK [Perf.Report]: top of the dxvk-cs per-draw chain. Everything
+      // under it ([ProcDCS], [Perf.SceneObj]) is NESTED inside this number and
+      // must never be added to it -- see PERF_INSTRUMENTATION_MAP section 2.
+      perfreport::publishWindow(perfreport::Slot::CommitRtMs,
+        double(s_commitAccNs) / 1.0e6, uint64_t(fr));
+      perfreport::publishWindow(perfreport::Slot::CommitSubmitMs,
+        double(s_commitSubmitNs) / 1.0e6, uint64_t(fr));
+      perfreport::publishWindow(perfreport::Slot::CommitFinalizeMs,
+        double(s_commitFinalizeNs) / 1.0e6, uint64_t(fr));
+      perfreport::publishWindow(perfreport::Slot::HygDrawsCommitted,
+        double(s_commitCount), uint64_t(fr));
+
       Logger::info(str::format(
         "[CommitRT] window draws=", s_commitCount,
         " frames=", s_commitFrames,
@@ -6720,6 +6736,23 @@ namespace dxvk {
         // this file, the label is misassigned and the number belongs to another
         // pass. Read the @line, not the name.
         line += str::format(" ", kStageNames[i - 1], "=", ms, "@", gpuStages.lastMarkLine[i]);
+
+        // NV-DXVK [Perf.Report]: matched by NAME, not by slot index. kStageNames
+        // maps positionally and that mapping has shifted before -- a slot-index
+        // table here would silently relabel every GPU row the next time a mark is
+        // added. The report also carries the ALIGNED flag and refuses to trust
+        // any of these when it is false.
+        {
+          const char* nm = kStageNames[i - 1];
+          const auto is = [nm](const char* s) { return std::strcmp(nm, s) == 0; };
+          if      (is("pt_integrate"))   perfreport::publish(perfreport::Slot::GpuPtIntegrateMs, ms);
+          else if (is("gb_primaryRays")) perfreport::publish(perfreport::Slot::GpuPrimaryRaysMs, ms);
+          else if (is("prepScene"))      perfreport::publish(perfreport::Slot::GpuPrepSceneMs, ms);
+          else if (is("upscaler"))       perfreport::publish(perfreport::Slot::GpuUpscalerMs, ms);
+          else if (is("finalBlit"))      perfreport::publish(perfreport::Slot::GpuFinalBlitMs, ms);
+          else if (is("pt_neeCache"))    perfreport::publish(perfreport::Slot::GpuNeeCacheMs, ms);
+          else if (is("pt_rtxdi"))       perfreport::publish(perfreport::Slot::GpuRtxdiMs, ms);
+        }
         if (gpuStages.samplesAt[i] != gpuStages.samples)
           line += str::format("(n=", gpuStages.samplesAt[i], ")");
         // *SUBMIT(k/m): a submit landed inside this interval on k of m resolved
@@ -6738,6 +6771,16 @@ namespace dxvk {
       constexpr uint32_t kExpectedMarks = kNumNames + 1u;
       const bool marksAligned = (gpuStages.marksMin == kExpectedMarks)
                              && (gpuStages.marksMax == kExpectedMarks);
+
+      // NV-DXVK [Perf.Report]: the GPU is the third pole candidate. Only
+      // totalMs and the ALIGNED flag go across -- deliberately NOT outsideRtMs,
+      // which is GPU-timeline time outside the RT passes and INCLUDES the GPU
+      // sitting idle. Adding it to totalMs and matching the frame wall is an
+      // identity, and reading that identity as "GPU-bound" is a mistake this
+      // repo has made more than once.
+      perfreport::publish(perfreport::Slot::GpuPassTotalMs,
+        gpuStages.accumTotalMs / double(gpuStages.samples));
+      perfreport::publish(perfreport::Slot::GpuAligned, marksAligned ? 1.0 : 0.0);
 
       Logger::warn(str::format(
         "[Perf.GpuPass] perFrame totalMs=", gpuStages.accumTotalMs / double(gpuStages.samples),

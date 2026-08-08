@@ -640,16 +640,65 @@ private:
   //
   // If you add a field here, it must be constant across a draw's placements. The
   // per-placement half of the state key is mixInstStateKey().
+  // NV-DXVK [perf] 2026-08-07: the BLAS buffer binding processInstanceBuffers
+  // copies into RtSurface, resolved once instead of once per placement.
+  //
+  // Every field is a verbatim read of blas.modifiedGeometryData (or, for
+  // texcoordEncoding, a two-line derivation from its texcoord buffer's vertex
+  // format). It is a plain POD so the per-instance side is a struct read
+  // followed by the same ~23 writes it always did -- the writes cannot be
+  // eliminated, only the re-derivation can.
+  //
+  // Membership rule, and it is the load-bearing one: this may only hold values
+  // that are immutable across a draw's placements. That holds because
+  // modifiedGeometryData is written exclusively by SceneManager::
+  // processDrawCallState, which finishes every write before it calls
+  // processSceneObject/processSceneObjectFanout. See rtx.hoistSurfaceBufferBinding
+  // for why the per-BLAS version of this idea is unsafe and this one is not.
+  struct SurfaceBufferBinding {
+    uint32_t positionBufferIndex = kSurfaceInvalidBufferIndex;
+    uint32_t positionOffset = 0;
+    uint32_t positionStride = 0;
+    uint32_t previousPositionBufferIndex = kSurfaceInvalidBufferIndex;
+    uint32_t normalBufferIndex = kSurfaceInvalidBufferIndex;
+    uint32_t normalOffset = 0;
+    uint32_t normalStride = 0;
+    VkFormat normalFormat = VK_FORMAT_UNDEFINED;
+    uint32_t color0BufferIndex = kSurfaceInvalidBufferIndex;
+    uint32_t color0Offset = 0;
+    uint32_t color0Stride = 0;
+    uint32_t texcoordBufferIndex = kSurfaceInvalidBufferIndex;
+    uint32_t texcoordOffset = 0;
+    uint32_t texcoordStride = 0;
+    uint32_t indexBufferIndex = kSurfaceInvalidBufferIndex;
+    uint32_t indexStride = 0;
+    RtSurface::TexcoordEncoding texcoordEncoding = RtSurface::TexcoordEncoding::Float;
+    bool hasLightmap = false;
+    bool isVgui = false;
+    uint32_t vguiOffset = 0;
+    uint16_t vguiFontBoundsBufferIndex = uint16_t(kSurfaceInvalidBufferIndex);
+    uint16_t vguiImgBoundsBufferIndex = uint16_t(kSurfaceInvalidBufferIndex);
+    uint16_t vguiStylesBufferIndex = uint16_t(kSurfaceInvalidBufferIndex);
+  };
+
   struct DrawScopedState {
     RtSurface::AlphaState alphaState {};
     // Digest of every draw-scoped instance-state key input, or kEmptyHash when
     // keyEligible is false.
     XXH64_hash_t stateKey = kEmptyHash;
+    // Resolved once per draw; consumed by processInstanceBuffers. Left at its
+    // defaults when rtx.hoistSurfaceBufferBinding is off, in which case
+    // processInstanceBuffers re-derives per instance and never reads this.
+    SurfaceBufferBinding buffers {};
     // False for eye draws, which never take the surf/tail skip.
     bool keyEligible = false;
   };
 
-  DrawScopedState computeDrawScopedState(const DrawCallState& drawCall,
+  // blas is read for SurfaceBufferBinding only. Both callers already hold the
+  // same BlasEntry reference they later hand to processSceneObjectImpl, so the
+  // binding resolved here is the one every placement of this draw will bind.
+  DrawScopedState computeDrawScopedState(const BlasEntry& blas,
+                                         const DrawCallState& drawCall,
                                          const MaterialData& materialData) const;
 
   // Shared body of processSceneObject / processSceneObjectFanout. split is null
@@ -661,7 +710,19 @@ private:
     DrawCallCache* drawCallCache, const FanoutSplit* split, const DrawScopedState& drawState);
 
   RtInstance* addInstance(BlasEntry& blas);
-  void processInstanceBuffers(const BlasEntry& blas, RtInstance& currentInstance) const;
+  // Binds currentInstance.surface to blas's buffers. blas is still passed
+  // because rtx.hoistSurfaceBufferBinding=false re-derives from it per
+  // instance; on the default path only drawState.buffers is read.
+  void processInstanceBuffers(const BlasEntry& blas, const DrawScopedState& drawState,
+                              RtInstance& currentInstance) const;
+
+  // The whole read side of processInstanceBuffers. Called once per draw from
+  // computeDrawScopedState, or once per instance when the hoist is off.
+  static SurfaceBufferBinding resolveSurfaceBufferBinding(const BlasEntry& blas);
+
+  // The whole write side. Split from the read so the two paths above share one
+  // copy of the ~23 assignments rather than duplicating them.
+  void applySurfaceBufferBinding(const SurfaceBufferBinding& binding, RtInstance& currentInstance) const;
 
   void updateInstance(
     RtInstance& currentInstance, const CameraManager& cameraManager,

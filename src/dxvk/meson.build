@@ -271,6 +271,8 @@ dxvk_src = files([
   'rtx_render/rtx_mipmap.h',
   'rtx_render/rtx_mod_manager.cpp',
   'rtx_render/rtx_mod_manager.h',
+  'rtx_render/rtx_perf_report.cpp',
+  'rtx_render/rtx_perf_report.h',
   'rtx_render/rtx_mod_usd.cpp',
   'rtx_render/rtx_mod_usd.h',
   'rtx_render/rtx_nee_cache.cpp',

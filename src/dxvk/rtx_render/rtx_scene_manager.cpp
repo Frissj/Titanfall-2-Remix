@@ -22,6 +22,9 @@
 #include <mutex>
 #include <thread>
 #include <unordered_set>
+// NV-DXVK [Perf.Report]: [ProcDCS], [Perf.PrepScene] and [MatChurn] all emit
+// from this file and are the dxvk-cs body plus the hygiene gate.
+#include "rtx_perf_report.h"
 #include <vector>
 #include <atomic>
 #include <chrono>
@@ -944,7 +947,13 @@ namespace dxvk {
     // Per-VS, per-window aggregate: how many draws re-skinned vs were skipped,
     // and how often the bone hash actually changed. A skinned VS with
     // hashChanged=0 over a window while the model is visibly moving IS the bug.
-    if (!isNew && drawCallState.getSkinningState().numBones > 0) {
+    //
+    // NV-DXVK [Perf] 2026-08-08: rtx.logReskinProbe leads the conjunction so the
+    // ACCUMULATION is gated, not just the emit. The mutex + unordered_map below
+    // run on every skinned draw (~1,300/frame) to feed a line printed once per 10
+    // frames -- throttling the emit never touched the cost.
+    if (RtxOptions::logReskinProbe()
+        && !isNew && drawCallState.getSkinningState().numBones > 0) {
       const XXH64_hash_t bh = drawCallState.getSkinningState().boneHash;
       const bool hashChanged = (bh != inOutGeometry.lastBoneHash);
       // NV-DXVK: key on transformData.vertexShaderHash, NOT
@@ -1892,6 +1901,17 @@ namespace dxvk {
         if (std::chrono::duration_cast<std::chrono::milliseconds>(tEnd - sLastLog).count() >= 3000) {
           const int64_t d = sDraws ? int64_t(sDraws) : 1;
           const int64_t tot = sEntry + sHash + sMat + sProc;
+
+          // NV-DXVK [Perf.Report]: determineMaterialData, nested under
+          // submitDrawState. sMat is a window total in ns over DRAWS, so frames
+          // come from the report's clock -- dividing by sDraws here would give
+          // per-draw microseconds and silently land in a ms/frame column.
+          {
+            static perfreport::WindowFrames s_wf;
+            perfreport::publishWindow(perfreport::Slot::MatDataMs,
+              double(sMat) / 1.0e6, s_wf.step());
+          }
+
           Logger::info(str::format(
             "[Perf.SubmitState] draws=", sDraws,
             " avgUsPerDraw=", (tot / 1000 / d),
@@ -3430,6 +3450,18 @@ namespace dxvk {
       if (f != s_pdcsLastFid) { s_pdcsLastFid = f; ++s_pdcsFrames; } }
     if (std::chrono::duration_cast<std::chrono::milliseconds>(tPdcs0 - s_pdcsLastLog).count() >= 3000) {
       const int64_t fr = s_pdcsFrames ? int64_t(s_pdcsFrames) : 1;
+
+      // NV-DXVK [Perf.Report]: the middle of the dxvk-cs chain. instMs is the
+      // parent of the four [Perf.SceneObj] stages and the report cross-checks
+      // their sum against it -- the two are the same function, so a gap means a
+      // stage boundary is wrong rather than that work appeared.
+      perfreport::publishWindow(perfreport::Slot::ProcDcsMs,
+        double(s_pdcsTotalNs) / 1.0e6, uint64_t(fr));
+      perfreport::publishWindow(perfreport::Slot::ProcDcsGeomMs,
+        double(s_pdcsGeomNs) / 1.0e6, uint64_t(fr));
+      perfreport::publishWindow(perfreport::Slot::ProcDcsInstMs,
+        double(s_pdcsInstNs) / 1.0e6, uint64_t(fr));
+
       Logger::info(str::format(
         "[ProcDCS] window draws=", s_pdcsCount, " frames=", s_pdcsFrames,
         " perFrameMs=", s_pdcsTotalNs / 1000000 / fr,
@@ -4858,6 +4890,16 @@ namespace dxvk {
     const BindlessResourceManager::TextureTableStats& bl =
       m_bindlessResourceManager.getTextureTableStats();
 
+    // NV-DXVK [Perf.Report]: THE hygiene gate (map section 6). matNew nonzero in
+    // steady state means material identities are being minted for a scene that is
+    // not changing, and every timing number in the report is then incomparable to
+    // any other capture -- so the report prints a loud banner on it rather than
+    // letting a reader assume the table is clean.
+    perfreport::publish(perfreport::Slot::HygMatNew,
+      double(d(cur.matInserts, p.matInserts)));
+    perfreport::publish(perfreport::Slot::HygMatTotal,
+      double(m_surfaceMaterialCache.getTotalCount()));
+
     Logger::info(str::format(
       "[MatChurn] f=", fid,
       // Materials. matNew is the headline: a nonzero steady-state value means
@@ -5386,6 +5428,24 @@ namespace dxvk {
     // show a distribution — the variance is itself the lead, so it has to be
     // sampled densely enough to see which sub-stage carries it.
     if (RtxOptions::logPrepSceneSplit() && (m_device->getCurrentFrameId() % 10u) == 5u) {
+      // NV-DXVK [Perf.Report]: the once-per-frame SERIAL pass -- the largest
+      // indivisible block anywhere in the frame, and nothing overlaps it. Values
+      // here are microseconds for ONE frame (this line is per-frame, not a
+      // window), so they convert straight to ms without a frame divisor.
+      {
+        const double kUsToMs = 1.0 / 1000.0;
+        perfreport::publish(perfreport::Slot::PrepSceneMs,
+          double(ps_gc + ps_setup1 + ps_instSetup + ps_merge + ps_accel
+               + ps_light + ps_surfMat + ps_cull + ps_tlas + ps_tail) * kUsToMs);
+        perfreport::publish(perfreport::Slot::PrepMergeMs,   double(ps_merge)   * kUsToMs);
+        perfreport::publish(perfreport::Slot::PrepGcMs,      double(ps_gc)      * kUsToMs);
+        perfreport::publish(perfreport::Slot::PrepSurfMatMs, double(ps_surfMat) * kUsToMs);
+        perfreport::publish(perfreport::Slot::PrepSetupMs,
+          double(ps_setup1 + ps_instSetup) * kUsToMs);
+        perfreport::publish(perfreport::Slot::PrepTlasMs,
+          double(ps_tlas + ps_accel + ps_light) * kUsToMs);
+      }
+
       Logger::warn(str::format("[Perf.PrepScene] frame=", m_device->getCurrentFrameId(),
         " lightMatch=", ps_lightMatch, " gc=", ps_gc, " setup1=", ps_setup1,
         " instSetup=", ps_instSetup, " merge=", ps_merge,

@@ -25,6 +25,9 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <algorithm>
+// NV-DXVK [Perf.Report]: [Perf.SceneObj]'s four estMsPerFrame values feed the
+// dxvk-cs half of the assembled breakdown.
+#include "rtx_perf_report.h"
 #include <chrono>
 #include <assert.h>
 
@@ -699,11 +702,39 @@ namespace dxvk {
     //     mapWritesExpected == mapWrMove + mapWrInsert + mapSkipInSync
     std::atomic<uint32_t> s_mgSkipInSync  { 0u };
 
+    // NV-DXVK [perf] 2026-08-07: all three accounting helpers are now gated on
+    // rtx.logMapGate (default OFF). They were unconditional.
+    //
+    // WHY, and it is not the instruction count. [MapGate]'s own output measured
+    // onTransformChanged at ~15,441 calls/frame, and each call did 2-4 atomic
+    // RMWs on a handful of shared static counters -- ~30-60k contended
+    // cache-line operations per frame, all on dxvk-cs, the thread the frame is
+    // currently sized by ([Perf.CsSplit] busyPct 93-98).
+    //
+    // The identical shape was measured in rtx_accel_manager's world-extent
+    // census the same day: an unconditional per-instance std::mutex plus
+    // atomics, 8,375x/frame. Gating it took dxvk-cs from 70.5 to ~46 ms/frame
+    // -- roughly 6x the arithmetic it removed -- and sped up UNRELATED
+    // functions on the same thread by 25-30% per call ([Perf.SceneObj] update
+    // 0.827 -> 0.568 us at an identical 15.5k call count, `find` 0.269 ->
+    // 0.203). Instructions do not do that; cache-coherence traffic does.
+    //
+    // A gated read of an RtxOption is a plain inlined load with no lock prefix
+    // and no line ownership transfer, so the OFF path costs a predictable
+    // branch instead of a cross-core round trip.
+    //
+    // The counters remain exact when enabled -- this changes nothing about what
+    // [MapGate] reports, only whether it runs. The write-balance invariant
+    // (mapWritesExpected == mapWrMove + mapWrInsert + mapSkipInSync) still
+    // holds, because all three helpers gate on the SAME option and therefore
+    // switch on and off together. Do not gate them individually.
     void mapSkipAccount() {
+      if (!RtxOptions::logMapGate()) { return; }
       s_mgSkipInSync.fetch_add(1u, std::memory_order_relaxed);
     }
 
     void mapWriteAccount(bool isInsert, uint32_t mapSzAfter) {
+      if (!RtxOptions::logMapGate()) { return; }
       (isInsert ? s_mgWrInsert : s_mgWrMove).fetch_add(1u, std::memory_order_relaxed);
       uint32_t seen = s_mgWrMapSzMax.load(std::memory_order_relaxed);
       while (mapSzAfter > seen &&
@@ -712,6 +743,7 @@ namespace dxvk {
     }
 
     void mapGateAccount(uint32_t frame, bool isTeleport, bool isRenderer, bool blasNull) {
+      if (!RtxOptions::logMapGate()) { return; }
       // kInvalidFrameIndex IS UINT32_MAX - the same value used as the "no frame
       // seen yet" seed for s_mgFrame - and a brand-new instance carries it
       // until its first update. Letting it drive a frame transition would flip
@@ -1594,9 +1626,15 @@ namespace dxvk {
     //     taken with hooks on. Bin within a run, not across that boundary --
     //     hookN on the line below says which side a frame is on.
     {
+      // NV-DXVK [Perf] 2026-08-08: rtx.logCullProbes leads the conjunction so the
+      // ~15,500-iteration classification loop below, not just its two emits, is
+      // what the option gates. Measured context: with the per-draw/per-instance
+      // perf probes on, this frame ran 106 ms; with them off, 48 ms. This probe
+      // is the same shape as the ones that cost that, and it had no switch at all.
       const bool inGameplayPitch =
-        tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u ||
-        m_instances.size() > 256u;
+        RtxOptions::logCullProbes() &&
+        (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u ||
+         m_instances.size() > 256u);
       if (inGameplayPitch) {
         const RtCamera& mainCam =
           m_device->getCommon()->getSceneManager().getCameraManager().getCamera(CameraType::Main);
@@ -3280,7 +3318,7 @@ namespace dxvk {
     // One placement, so "once per draw" and "once per instance" coincide here --
     // this call is not where the 15x lives (see DrawScopedState), but the state
     // has to be built somewhere and processSceneObjectImpl must not build it.
-    const DrawScopedState drawState = computeDrawScopedState(drawCall, materialData);
+    const DrawScopedState drawState = computeDrawScopedState(blas, drawCall, materialData);
     return processSceneObjectImpl(cameraManager, rayPortalManager, blas, drawCall, materialData,
                                   existingInstance, drawCallCache, nullptr, drawState);
   }
@@ -3296,7 +3334,7 @@ namespace dxvk {
     // -- this is the site the 15x lives at. Every placement below used to rebuild
     // both halves of this for itself: calculateAlphaState, and a state-key gather
     // that pointer-chases five draw-scoped objects. See DrawScopedState.
-    const DrawScopedState drawState = computeDrawScopedState(drawCall, materialData);
+    const DrawScopedState drawState = computeDrawScopedState(blas, drawCall, materialData);
 
     const std::vector<Matrix4>* transforms = drawCall.getTransformData().instancesToObject;
     if (transforms == nullptr || transforms->empty()) {
@@ -3863,6 +3901,15 @@ namespace dxvk {
         const double usMid  = double(sMid)  / 1000.0 / smp;
         const double usAdd  = double(sAdd)  / 1000.0 / smp;
         const double usUpd  = double(sUpd)  / 1000.0 / smp;
+
+        // NV-DXVK [Perf.Report]: estMsPerFrame, not usPerCall -- the report is a
+        // ms/frame table and a per-call mean cannot be placed in one without the
+        // call count. These four are NESTED inside [ProcDCS] instMs and the
+        // report's cross-validation checks them against it.
+        perfreport::publish(perfreport::Slot::SceneObjFindMs,   usFind * perFrm / 1000.0);
+        perfreport::publish(perfreport::Slot::SceneObjMidMs,    usMid  * perFrm / 1000.0);
+        perfreport::publish(perfreport::Slot::SceneObjAddMs,    usAdd  * perFrm / 1000.0);
+        perfreport::publish(perfreport::Slot::SceneObjUpdateMs, usUpd  * perFrm / 1000.0);
 
         Logger::info(str::format(
           "[Perf.SceneObj] calls=", sCalls, " frames=", sFrames,
@@ -4851,9 +4898,18 @@ namespace dxvk {
   // a pure function of (drawCall, materialData), and it was being recomputed for
   // every placement so it could be copied wholesale into surface.alphaState.
   InstanceManager::DrawScopedState InstanceManager::computeDrawScopedState(
-      const DrawCallState& drawCall, const MaterialData& materialData) const {
+      const BlasEntry& blas, const DrawCallState& drawCall, const MaterialData& materialData) const {
     DrawScopedState state;
     state.alphaState = calculateAlphaState(drawCall, materialData);
+    // NV-DXVK [perf] 2026-08-07: resolved HERE rather than in every placement's
+    // processInstanceBuffers. Safe because blas.modifiedGeometryData is written
+    // only by SceneManager::processDrawCallState, which completes every write
+    // before it calls into this manager -- so the binding cannot move under the
+    // placement loop and needs no freshness key. Left default when the hoist is
+    // off, and processInstanceBuffers then never reads it.
+    if (RtxOptions::hoistSurfaceBufferBinding()) {
+      state.buffers = resolveSurfaceBufferBinding(blas);
+    }
     // Eye draws never take the skip (see the isEye escape at the consumer), so
     // there is nothing for a key to authorise and no reason to build one.
     state.keyEligible = !drawCall.isEye();
@@ -5558,20 +5614,32 @@ namespace dxvk {
     return newInstance;
   }
 
-  void InstanceManager::processInstanceBuffers(const BlasEntry& blas, RtInstance& currentInstance) const {
-    currentInstance.surface.positionBufferIndex = blas.modifiedGeometryData.positionBufferIndex;
-    currentInstance.surface.positionOffset = blas.modifiedGeometryData.positionBuffer.offsetFromSlice();
-    currentInstance.surface.positionStride = blas.modifiedGeometryData.positionBuffer.stride();
-    currentInstance.surface.normalBufferIndex = blas.modifiedGeometryData.normalBufferIndex;
-    currentInstance.surface.normalOffset = blas.modifiedGeometryData.normalBuffer.offsetFromSlice();
-    currentInstance.surface.normalStride = blas.modifiedGeometryData.normalBuffer.stride();
-    currentInstance.surface.normalFormat = blas.modifiedGeometryData.normalBuffer.vertexFormat();
-    currentInstance.surface.color0BufferIndex = blas.modifiedGeometryData.color0BufferIndex;
-    currentInstance.surface.color0Offset = blas.modifiedGeometryData.color0Buffer.offsetFromSlice();
-    currentInstance.surface.color0Stride = blas.modifiedGeometryData.color0Buffer.stride();
-    currentInstance.surface.texcoordBufferIndex = blas.modifiedGeometryData.texcoordBufferIndex;
-    currentInstance.surface.texcoordOffset = blas.modifiedGeometryData.texcoordBuffer.offsetFromSlice();
-    currentInstance.surface.texcoordStride = blas.modifiedGeometryData.texcoordBuffer.stride();
+  // NV-DXVK [perf] 2026-08-07: THE READ SIDE of processInstanceBuffers, split
+  // out so it can run once per DRAW instead of once per INSTANCE.
+  //
+  // Every value here is a pure read of blas.modifiedGeometryData, so this is a
+  // pure function of the BlasEntry. It is called from computeDrawScopedState
+  // (default) or per instance when rtx.hoistSurfaceBufferBinding is off. See
+  // that option for why per-draw is keyless and safe while a per-BLAS cache
+  // keyed on frameLastUpdated is neither.
+  InstanceManager::SurfaceBufferBinding InstanceManager::resolveSurfaceBufferBinding(const BlasEntry& blas) {
+    SurfaceBufferBinding b;
+    b.positionBufferIndex = blas.modifiedGeometryData.positionBufferIndex;
+    b.positionOffset = blas.modifiedGeometryData.positionBuffer.offsetFromSlice();
+    b.positionStride = blas.modifiedGeometryData.positionBuffer.stride();
+    b.previousPositionBufferIndex = blas.modifiedGeometryData.previousPositionBufferIndex;
+    b.normalBufferIndex = blas.modifiedGeometryData.normalBufferIndex;
+    b.normalOffset = blas.modifiedGeometryData.normalBuffer.offsetFromSlice();
+    b.normalStride = blas.modifiedGeometryData.normalBuffer.stride();
+    b.normalFormat = blas.modifiedGeometryData.normalBuffer.vertexFormat();
+    b.color0BufferIndex = blas.modifiedGeometryData.color0BufferIndex;
+    b.color0Offset = blas.modifiedGeometryData.color0Buffer.offsetFromSlice();
+    b.color0Stride = blas.modifiedGeometryData.color0Buffer.stride();
+    b.texcoordBufferIndex = blas.modifiedGeometryData.texcoordBufferIndex;
+    b.texcoordOffset = blas.modifiedGeometryData.texcoordBuffer.offsetFromSlice();
+    b.texcoordStride = blas.modifiedGeometryData.texcoordBuffer.stride();
+    b.indexBufferIndex = blas.modifiedGeometryData.indexBufferIndex;
+    b.indexStride = blas.modifiedGeometryData.indexBuffer.stride();
     // NV-DXVK: derive texcoordEncoding from the BUFFER's actual vertex
     // format here — the ground truth of how the bytes are stored.
     // Previously the encoding was set later from
@@ -5589,7 +5657,7 @@ namespace dxvk {
     const VkFormat tcFmt = blas.modifiedGeometryData.texcoordBuffer.defined()
         ? blas.modifiedGeometryData.texcoordBuffer.vertexFormat()
         : VK_FORMAT_UNDEFINED;
-    currentInstance.surface.texcoordEncoding =
+    b.texcoordEncoding =
         (tcFmt == VK_FORMAT_R32G32_UINT || tcFmt == VK_FORMAT_R32G32_SINT)
         ? RtSurface::TexcoordEncoding::TF2BspUintPacked
         : RtSurface::TexcoordEncoding::Float;
@@ -5598,27 +5666,97 @@ namespace dxvk {
     // alongside TEXCOORD0. The flag is the single source of truth for
     // both the per-hit interpolation gate and the material code's
     // lightmap-sampler UV lookup.
-    currentInstance.surface.hasLightmap = blas.modifiedGeometryData.hasTexcoord1;
+    b.hasLightmap = blas.modifiedGeometryData.hasTexcoord1;
     // NV-DXVK: TF2 worldspace VGUI extras — the slang VGUI evaluator reads
     // 8 floats per vertex starting at element index vguiOffset. Both fields
     // were stamped by RtxGeometryUtils::processGeometryBuffers (slow path)
     // when input.vguiLayoutEnable was true; a non-VGUI surface sees
     // hasVgui=false and the dispatch in opaque_surface_material_interaction
     // is skipped.
-    currentInstance.surface.isVgui = blas.modifiedGeometryData.hasVgui;
-    currentInstance.surface.vguiOffset = blas.modifiedGeometryData.vguiOffset;
+    b.isVgui = blas.modifiedGeometryData.hasVgui;
+    b.vguiOffset = blas.modifiedGeometryData.vguiOffset;
     // NV-DXVK: 3 VGUI structured-buffer bindless indices. Truncating to
     // uint16_t is safe because BindlessResourceManager::kMaxBindlessResources
     // is 64K (matches uint16_t range). kSurfaceInvalidBufferIndex (UINT32_MAX)
     // truncates to 0xFFFF, which the slang side compares against
     // BINDING_INDEX_INVALID(0xFFFF) — see surface_interaction.slangh:853 for
     // the same convention applied to indexBufferIndex.
-    currentInstance.surface.vguiFontBoundsBufferIndex =
+    b.vguiFontBoundsBufferIndex =
         uint16_t(blas.modifiedGeometryData.vguiFontBoundsBufferIndex);
-    currentInstance.surface.vguiImgBoundsBufferIndex =
+    b.vguiImgBoundsBufferIndex =
         uint16_t(blas.modifiedGeometryData.vguiImgBoundsBufferIndex);
-    currentInstance.surface.vguiStylesBufferIndex =
+    b.vguiStylesBufferIndex =
         uint16_t(blas.modifiedGeometryData.vguiStylesBufferIndex);
+    return b;
+  }
+
+  // NV-DXVK [perf] 2026-08-07: THE WRITE SIDE. Unchanged in count and
+  // destination -- every instance still gets every field written every frame.
+  // Only the DERIVATION of the values moved (see resolveSurfaceBufferBinding).
+  void InstanceManager::applySurfaceBufferBinding(const SurfaceBufferBinding& binding,
+                                                  RtInstance& currentInstance) const {
+    currentInstance.surface.positionBufferIndex = binding.positionBufferIndex;
+    currentInstance.surface.positionOffset = binding.positionOffset;
+    currentInstance.surface.positionStride = binding.positionStride;
+    currentInstance.surface.previousPositionBufferIndex = binding.previousPositionBufferIndex;
+    currentInstance.surface.normalBufferIndex = binding.normalBufferIndex;
+    currentInstance.surface.normalOffset = binding.normalOffset;
+    currentInstance.surface.normalStride = binding.normalStride;
+    currentInstance.surface.normalFormat = binding.normalFormat;
+    currentInstance.surface.color0BufferIndex = binding.color0BufferIndex;
+    currentInstance.surface.color0Offset = binding.color0Offset;
+    currentInstance.surface.color0Stride = binding.color0Stride;
+    currentInstance.surface.texcoordBufferIndex = binding.texcoordBufferIndex;
+    currentInstance.surface.texcoordOffset = binding.texcoordOffset;
+    currentInstance.surface.texcoordStride = binding.texcoordStride;
+    currentInstance.surface.texcoordEncoding = binding.texcoordEncoding;
+    currentInstance.surface.indexBufferIndex = binding.indexBufferIndex;
+    currentInstance.surface.indexStride = binding.indexStride;
+    currentInstance.surface.hasLightmap = binding.hasLightmap;
+    currentInstance.surface.isVgui = binding.isVgui;
+    currentInstance.surface.vguiOffset = binding.vguiOffset;
+    currentInstance.surface.vguiFontBoundsBufferIndex = binding.vguiFontBoundsBufferIndex;
+    currentInstance.surface.vguiImgBoundsBufferIndex = binding.vguiImgBoundsBufferIndex;
+    currentInstance.surface.vguiStylesBufferIndex = binding.vguiStylesBufferIndex;
+  }
+
+  void InstanceManager::processInstanceBuffers(const BlasEntry& blas, const DrawScopedState& drawState,
+                                               RtInstance& currentInstance) const {
+    // REBIND, NEVER SKIPPED. This is not a read the instance state key covers:
+    // buffer identity is not an input to computeDrawStateKey, and
+    // Map(WRITE_DISCARD) renames the slice on ~94% of draws, so geometry that
+    // hashes identically lives in a different allocation every frame. See the
+    // call site in updateInstance.
+    if (RtxOptions::hoistSurfaceBufferBinding()) {
+      applySurfaceBufferBinding(drawState.buffers, currentInstance);
+    } else {
+      applySurfaceBufferBinding(resolveSurfaceBufferBinding(blas), currentInstance);
+    }
+
+    // NV-DXVK [perf] 2026-08-07: THE THREE BLOCKS BELOW ARE GATED, AND TWO OF
+    // THEM WERE NOT.
+    //
+    // They are first-sighting censuses: each keeps a static set of tuples it
+    // has already logged and emits one line per new one. They saturate within
+    // the first second of a run and then spend the rest of it re-proving that
+    // they have nothing to say -- but the SET OPERATION runs regardless, once
+    // per instance, ~15,500 times a frame on dxvk-cs. [TC1Surface] additionally
+    // took a std::mutex on every one of those.
+    //
+    // That is the same shape as the accel manager's world-extent census
+    // (unconditional per-instance std::mutex, 8,375x/frame), which cost ~4 ms.
+    // It is NOT the shape of the relaxed-atomic counters gated the same day,
+    // which returned zero -- see rtx.logSurfaceGeomDiag for why the two are
+    // different by two orders of magnitude and must not be reasoned about
+    // together.
+    //
+    // The gate wraps KEY CONSTRUCTION, MUTEX AND CONTAINER, not just the emit.
+    // Gating only the Logger::info leaves the entire cost in place; that was
+    // the defect in the world-extent census's own gate.
+    if (!RtxOptions::logSurfaceGeomDiag()) {
+      return;
+    }
+
     {
       static std::unordered_set<uint64_t> sLoggedVguiSurfaceKeys;
       static std::mutex sLoggedVguiSurfaceMu;
@@ -5671,10 +5809,6 @@ namespace dxvk {
           " — lightmap UV (when set) read at element index (texOffset/4 + 2)"));
       }
     }
-    currentInstance.surface.previousPositionBufferIndex = blas.modifiedGeometryData.previousPositionBufferIndex;
-    currentInstance.surface.indexBufferIndex = blas.modifiedGeometryData.indexBufferIndex;
-    currentInstance.surface.indexStride = blas.modifiedGeometryData.indexBuffer.stride();
-
     // NV-DXVK: per-instance buffer-layout dump for diagnosing the BSP-wall
     // degenerate-UV bug (probes confirmed t1==t2 in UV-space on a real-area
     // world triangle). If two adjacent triangles on the SAME instance show
@@ -5688,8 +5822,24 @@ namespace dxvk {
         | ((uint32_t(currentInstance.surface.texcoordStride) & 0xFFu) << 12)
         | ((uint32_t(currentInstance.surface.texcoordOffset) & 0xFFu) << 20)
         | ((uint32_t(currentInstance.surface.indexStride) & 0xFu) << 28);
+      // NV-DXVK 2026-08-07: this set had NO lock while the two above it did,
+      // even though all three run on the same call path. That path IS
+      // multi-threaded -- InstanceManager::m_fanoutPrevHitCount is atomic
+      // precisely because "findSimilarInstance is reachable from the scene-
+      // manager's draw-processing threads", and SceneManager::
+      // processDrawCallState keeps its fanout scratch thread_local for the
+      // same reason. An unsynchronised unordered_set::insert from two threads
+      // corrupts the container, so this was a latent crash that only the
+      // census's own rarity kept quiet. Locked now; it costs nothing, because
+      // the whole block is behind rtx.logSurfaceGeomDiag.
       static std::unordered_set<uint32_t> seenBlasGeom;
-      if (seenBlasGeom.insert(key).second) {
+      static std::mutex seenBlasGeomMu;
+      bool firstSeen = false;
+      {
+        std::lock_guard<std::mutex> lk(seenBlasGeomMu);
+        firstSeen = seenBlasGeom.insert(key).second;
+      }
+      if (firstSeen) {
         Logger::info(str::format(
           "[BlasGeom] texBufIdx=", uint32_t(currentInstance.surface.texcoordBufferIndex),
           " texStride=", uint32_t(currentInstance.surface.texcoordStride),
@@ -6170,17 +6320,66 @@ namespace dxvk {
     if (isFirstUpdateThisFrame || overridePreviousCameraUpdate) {
 
       if (isFirstUpdateThisFrame) {
-        processInstanceBuffers(blas, currentInstance);
+        // NV-DXVK [perf] 2026-08-07 (v4): THE KEY TEST IS HOISTED ABOVE THIS
+        // PREAMBLE. It used to sit ~55 lines below, so everything here ran on
+        // every instance even when the guard then decided nothing had changed.
+        //
+        // WHY v1-v3 ALL FAILED (see the block below, kept intact): each tried to
+        // make the KEY cheaper. The key is already down to a 16-byte hash of two
+        // registers -- ~10 ns, ~0.15 ms/frame over 15.5k instances -- so it was
+        // never the cost. [Perf.UpdInst] 18:37 measures `surf` at ~4.0 ms/frame
+        // (probe-corrected) with surfSkip=99%, and that 4 ms is THIS preamble:
+        // processInstanceBuffers plus four hash getters, on 99% of instances
+        // (first=99%). matChg=0% in every capture ever taken, so the two
+        // material hashes are recomputed 15.5k times a frame to produce a value
+        // that has never once differed. The guard was simply a dozen lines too
+        // late.
+        //
+        // SAFETY. Every read below is an input to computeDrawStateKey, so a
+        // matching key proves each would reproduce its current value -- skipping
+        // preserves the last-written m_materialHash / m_materialDataHash /
+        // m_texcoordHash / m_indexHash rather than leaving them stale, because a
+        // change in any of them changes the key and therefore cannot be skipped.
+        //
+        // hasMaterialChanged is the ONE exception and is NOT a pure function of
+        // the key: it is an edge signal (old != new), so a frame that legitimately
+        // set it true is followed by frames whose key matches. Leaving it latched
+        // would report a material change every frame forever after. It is cleared
+        // explicitly on the skip path. That asymmetry is why this is written as
+        // if/else rather than an early-out around the block.
+        const bool instKeyEligible = drawState.keyEligible;
+        const XXH64_hash_t instStateKey = instKeyEligible
+          ? mixInstStateKey(drawState.stateKey, currentInstance.m_categoryFlags)
+          : kEmptyHash;
+        instStateUnchanged = instKeyEligible && (instStateKey == currentInstance.m_instStateKey);
+        currentInstance.m_instStateKey = instStateKey;
+
+        // NEVER SKIPPED -- 2026-08-07, this froze the game when it was inside the
+        // else below. processInstanceBuffers is not a read the key covers: it
+        // REBINDS the instance to blas's buffers, and buffer identity is not an
+        // input to computeDrawStateKey. Geometry hashes identically while living
+        // in a different allocation every frame -- Map(WRITE_DISCARD) renames the
+        // slice on ~94% of draws (see HANDOFF_T31_RESOLVED sec 2). Skipping it
+        // left instances bound to the previous frame's freed slices.
+        // The "every skipped read is a key input" argument does not reach this
+        // call, and it must stay outside the guard.
+        processInstanceBuffers(blas, drawState, currentInstance);
 
         currentInstance.m_materialType = materialData.getType();
 
-        const XXH64_hash_t materialInstanceHash = materialData.getHash();
-        currentInstance.m_materialDataHash = drawCall.getMaterialData().getHash();
-        currentInstance.surface.hasMaterialChanged = currentInstance.m_materialHash != kEmptyHash && currentInstance.m_materialHash != materialInstanceHash;
-        currentInstance.m_materialHash = materialInstanceHash;
+        if (instStateUnchanged) {
+          // Edge signal, not state -- see the note above. Must not latch.
+          currentInstance.surface.hasMaterialChanged = false;
+        } else {
 
-        currentInstance.m_texcoordHash = drawCall.getGeometryData().hashes[HashComponents::VertexTexcoord];
-        currentInstance.m_indexHash = drawCall.getGeometryData().hashes[HashComponents::Indices];
+          const XXH64_hash_t materialInstanceHash = materialData.getHash();
+          currentInstance.m_materialDataHash = drawCall.getMaterialData().getHash();
+          currentInstance.surface.hasMaterialChanged = currentInstance.m_materialHash != kEmptyHash && currentInstance.m_materialHash != materialInstanceHash;
+          currentInstance.m_materialHash = materialInstanceHash;
+
+          currentInstance.m_texcoordHash = drawCall.getGeometryData().hashes[HashComponents::VertexTexcoord];
+          currentInstance.m_indexHash = drawCall.getGeometryData().hashes[HashComponents::Indices];
+        }
 
         // NV-DXVK [perf] handoff v5 sec 4c: THE `surf` SKIP.
         //
@@ -6226,19 +6425,20 @@ namespace dxvk {
         // is a 16-byte hash of two registers. See computeDrawStateKey for why the
         // split is sound -- every input except m_categoryFlags is draw-, material-
         // or frame-scoped, and m_categoryFlags is exactly what gets mixed in here.
-        const bool instKeyEligible = drawState.keyEligible;
-        const XXH64_hash_t instStateKey = instKeyEligible
-          ? mixInstStateKey(drawState.stateKey, currentInstance.m_categoryFlags)
-          : kEmptyHash;
-
-        // Decided ONCE here, consumed twice: by this block and by the event-fanout
-        // gate at the bottom of the function. The key covers the union of both
-        // blocks' inputs, so one match authorises both skips -- and the fanout adds
-        // its own escapes (transform change, billboards, RayPortal) on top, which
-        // are only known later, after the xform stage has run.
-        instStateUnchanged = instKeyEligible && (instStateKey == currentInstance.m_instStateKey);
-        currentInstance.m_instStateKey = instStateKey;
-
+        // NV-DXVK [perf] 2026-08-07 (v4): the key computation and the
+        // instStateUnchanged decision that used to sit HERE are now hoisted to
+        // the top of this `if (isFirstUpdateThisFrame)` block, above the
+        // material/geometry-hash preamble they were always meant to guard. See
+        // the long note up there for why. instKeyEligible / instStateKey /
+        // instStateUnchanged are all still in scope at this point -- the hoist
+        // moved them within the same block, it did not narrow their scope.
+        //
+        // Decided ONCE above, consumed twice: by this block and by the
+        // event-fanout gate at the bottom of the function. The key covers the
+        // union of both blocks' inputs, so one match authorises both skips --
+        // and the fanout adds its own escapes (transform change, billboards,
+        // RayPortal) on top, which are only known later, after the xform stage
+        // has run.
         if (instStateUnchanged) {
           uiSplit.surfSkipped();
         } else {

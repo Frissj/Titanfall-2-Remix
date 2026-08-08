@@ -15,6 +15,9 @@
 #include <algorithm>
 #include "../util/util_string.h"
 #include "../util/log/log.h"
+// NV-DXVK [Perf.Report]: this thread is one of the two pole candidates, so the
+// assembler cannot render a verdict without what [Perf.CsSplit] already knows.
+#include "rtx_render/rtx_perf_report.h"
 
 namespace dxvk {
 
@@ -223,6 +226,11 @@ namespace dxvk {
     uint64_t csTotalNs = 0, csChunks = 0, csMaxNs = 0, csIdleNs = 0;
     auto     csLastReport = std::chrono::steady_clock::now();
     auto     csWaitStart  = csLastReport;
+    // NV-DXVK [Perf.Report]: frame ordinal at the previous report, so this
+    // thread can normalise its window totals to ms/FRAME. csChunks is a chunk
+    // count, not a frame count -- dividing by it was the "billed per draw,
+    // measured per instance" mistake in another costume.
+    uint32_t csLastReportFrame = perfreport::currentFrame();
 
     try {
       while (!m_stopped.load()) {
@@ -291,6 +299,26 @@ namespace dxvk {
               static constexpr const char* kBucketNames[kCsBuckets] = {
                 "<10us", "<100us", "<1ms", "<10ms", ">=10ms"
               };
+              // NV-DXVK [Perf.Report]: dxvk-cs is the second pole candidate, and
+              // the >=10ms bucket is the once-per-frame serial Remix pass -- the
+              // largest indivisible block anywhere in the frame. Normalised to
+              // ms/frame by the report's own frame counter rather than this
+              // thread's chunk count, which is not a frame count.
+              {
+                const uint32_t rframes = perfreport::currentFrame() - csLastReportFrame;
+                csLastReportFrame = perfreport::currentFrame();
+                if (rframes > 0u) {
+                  perfreport::publishWindow(perfreport::Slot::CsExecMs,
+                    double(csTotalNs) / 1.0e6, rframes);
+                  perfreport::publishWindow(perfreport::Slot::CsIdleMs,
+                    double(csIdleNs) / 1.0e6, rframes);
+                  perfreport::publishWindow(perfreport::Slot::CsFatChunkMs,
+                    double(csBucketNs[kCsBuckets - 1]) / 1.0e6, rframes);
+                }
+                perfreport::publish(perfreport::Slot::CsBusyPct,
+                  (winMs > 0.0 ? (double(csTotalNs) / 1.0e6) * 100.0 / winMs : 0.0));
+              }
+
               std::string line = str::format(
                 "[Perf.CsSplit] window=", winMs, "ms chunks=", csChunks,
                 " execMs=", double(csTotalNs) / 1e6,

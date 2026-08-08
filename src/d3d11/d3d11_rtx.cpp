@@ -21,6 +21,9 @@
 // report emitted next to [Perf.WcCopy]. Reaches here transitively through
 // util_string.h, but included explicitly like util_cond_diag.h above.
 #include "../util/util_fmt_diag.h"
+// NV-DXVK [Perf.Report]: most frame-thread instruments emit from this file, so
+// most publish() calls live here too.
+#include "../dxvk/rtx_render/rtx_perf_report.h"
 #include "../dxbc/dxbc_util.h"
 #include "../dxbc/dxbc_common.h"
 // NV-DXVK [SubViewSkyTexDump]: AssetExporter::dumpImageToFile is called
@@ -369,8 +372,93 @@ namespace {
     uint64_t    gen = ~0ull;
     std::vector<uint8_t> bytes;
   };
-  constexpr size_t   kCbStageEntries  = 8;
-  constexpr size_t   kCbStageMaxBytes = 64 * 1024;  // don't stage giant buffers
+  // NV-DXVK [Perf.CbStage] 2026-08-07: the ring is now sized at RUNTIME.
+  // kCbStageEntriesMax is the storage; rtx.cbStageEntries picks how many of
+  // those slots are searched and filled, so the "8 -> 32 and re-read the
+  // counter" experiment is a console sweep inside ONE process rather than a
+  // rebuild -- which also removes the between-run spread that has mis-sized
+  // two measurements in this file already.
+  //
+  // Growing or shrinking the live count mid-run is safe: slots past the count
+  // are simply not searched, a slot is only ever READ through a (buf, gen)
+  // match, and the round-robin cursor is re-clamped before each insert.
+  constexpr size_t      kCbStageEntriesMax = 32;
+  std::atomic<uint32_t> g_cbStageEntries { 8 };     // refreshed once per report window
+  constexpr size_t      kCbStageMaxBytes  = 64 * 1024;  // don't stage giant buffers
+
+  // NV-DXVK [Perf.CbStage] 2026-08-07: WHY is the hit rate ~0?
+  //
+  // [Perf.WcCopy] measured one frame-thread call site moving 6.31 KB on
+  // essentially every call -- ~3.4 MB/frame, 91% of all write-combined reads
+  // on the pole thread -- which is the shape of the whole-buffer staging copy
+  // below running on EVERY call, i.e. a cache that never hits. Three mechanisms
+  // fit that, they need OPPOSITE fixes, and guessing between them has already
+  // cost one reverted change, so count the thing that separates them:
+  //
+  //   missGen HIGH -> the buffer is still resident but its generation moved
+  //                   since we staged it. Map(WRITE_DISCARD) renames the slice
+  //                   on ~94% of draws and DiscardSlice() bumps m_contentGen,
+  //                   so the key can never repeat within a frame. The cache is
+  //                   then UNFIXABLE as keyed, widening the ring does nothing,
+  //                   and the fix is to stage only the bytes each consumer
+  //                   actually reads. Same defect shape as the t31 buffer and
+  //                   blasSizeCacheKey.
+  //   missCap HIGH -> the buffer was evicted before it was asked for again.
+  //                   Round-robin over 8 slots with 10+ call sites and several
+  //                   distinct CBs thrashes. The fix is one constant:
+  //                   rtx.cbStageEntries.
+  //   missLen HIGH -> right buffer, right generation, stored copy too short.
+  //                   A sizing bug, not a cache-policy question.
+  //
+  // dupSlots is the control on missCap: the insert path is round-robin with NO
+  // dedupe, so one hot buffer can occupy several slots at once and shrink the
+  // effective capacity below the nominal count. missCap high AND dupSlots high
+  // means deduping the insert buys more than widening does.
+  //
+  // stagedMB is the other half and the one to read FIRST: if it lands near the
+  // ~3.4 MB/frame that [Perf.WcCopy] bills to d3d11+0x35be35, then that address
+  // IS this function -- the attribution the handoff flagged as inferred is then
+  // settled by mechanism, with no symbol lookup.
+  struct CbStageStat {
+    uint64_t calls = 0, hits = 0;
+    uint64_t missGen = 0, missCap = 0, missLen = 0;
+    uint64_t bytesStaged = 0, bytesServed = 0;
+    uint64_t dupSlots = 0, maxLen = 0;
+  };
+  thread_local CbStageStat t_cbStageStat {};
+
+  // Per-caller split. Same table shape as wcNote (128-slot direct map, probe 4,
+  // evict the smallest so the heavy hitters stay stable) and the SAME caveat:
+  // if stagedCbBytes gets inlined into a call site, _ReturnAddress() names that
+  // site's caller instead. Read it as "which region", not as a line number --
+  // its job is to say which of the 30-odd call sites is worth narrowing, not to
+  // pin a statement.
+  constexpr size_t kCbSiteEntries = 64;
+  constexpr size_t kCbSiteProbe   = 4;
+  struct CbSite { const void* ret = nullptr; uint64_t calls = 0; uint64_t hits = 0; uint64_t staged = 0; };
+  thread_local CbSite t_cbSites[kCbSiteEntries] {};
+
+  inline void cbNote(const void* ret, size_t staged, bool hit) {
+    const uintptr_t h    = reinterpret_cast<uintptr_t>(ret);
+    const size_t    home = size_t((h ^ (h >> 7)) & (kCbSiteEntries - 1u));
+
+    size_t   victim  = home;
+    uint64_t leastBy = ~0ull;
+
+    for (size_t k = 0; k < kCbSiteProbe; ++k) {
+      CbSite& c = t_cbSites[(home + k) & (kCbSiteEntries - 1u)];
+      if (c.ret == ret) {
+        c.calls += 1; c.hits += hit ? 1u : 0u; c.staged += staged; return;
+      }
+      if (c.ret == nullptr) {
+        c.ret = ret; c.calls = 1; c.hits = hit ? 1u : 0u; c.staged = staged; return;
+      }
+      if (c.staged < leastBy) { leastBy = c.staged; victim = (home + k) & (kCbSiteEntries - 1u); }
+    }
+
+    CbSite& e = t_cbSites[victim];
+    e.ret = ret; e.calls = 1; e.hits = hit ? 1u : 0u; e.staged = staged;
+  }
 }
 
 // Forward decl â€” memcpyFromWC is defined above this block's first use.
@@ -395,24 +483,70 @@ static const uint8_t* stagedCbBytes(D3D11BufferT* buffer, size_t& lenOut) {
   }
   const uint64_t gen = buffer->GetContentGeneration();
 
-  static thread_local std::array<CbStageEntry, kCbStageEntries> s_cbStage;
+  static thread_local std::array<CbStageEntry, kCbStageEntriesMax> s_cbStage;
   static thread_local size_t s_cbStageNext = 0;
 
-  for (CbStageEntry& e : s_cbStage) {
-    if (e.buf == buffer && e.gen == gen && e.bytes.size() >= len) {
+  // Live window into the fixed storage. Clamped here rather than at the store
+  // so a bad rtx.cbStageEntries can never index past the array.
+  size_t ways = size_t(g_cbStageEntries.load(std::memory_order_relaxed));
+  if (ways == 0)                  ways = 1;
+  if (ways > kCbStageEntriesMax)  ways = kCbStageEntriesMax;
+
+  CbStageStat& st = t_cbStageStat;
+  st.calls += 1;
+  if (len > st.maxLen) {
+    st.maxLen = len;
+  }
+
+  // Classify the miss WHILE scanning, so one pass answers both "did we have
+  // this buffer at all" (capacity) and "did its content move" (generation).
+  // Scanning past a same-buffer/different-generation entry is what the original
+  // loop did too -- the ring is not deduped, so a later slot can still hold the
+  // current generation.
+  bool     sawBuf = false;
+  bool     sawGen = false;
+  uint32_t copies = 0;
+
+  for (size_t i = 0; i < ways; ++i) {
+    CbStageEntry& e = s_cbStage[i];
+    if (e.buf != buffer) {
+      continue;
+    }
+    sawBuf = true;
+    ++copies;
+    if (e.gen != gen) {
+      continue;
+    }
+    sawGen = true;
+    if (e.bytes.size() >= len) {
+      st.hits += 1;
+      st.bytesServed += len;
+      cbNote(_ReturnAddress(), 0, true);
       lenOut = len;
       return e.bytes.data();
     }
   }
 
+  if (copies > 1) {
+    st.dupSlots += copies - 1;
+  }
+  if      (sawGen) st.missLen += 1;   // right content, stored copy too short
+  else if (sawBuf) st.missGen += 1;   // resident, but the generation moved
+  else             st.missCap += 1;   // not resident at all -- evicted or new
+  st.bytesStaged += len;
+
+  if (s_cbStageNext >= ways) {        // rtx.cbStageEntries may have shrunk
+    s_cbStageNext = 0;
+  }
   CbStageEntry& e = s_cbStage[s_cbStageNext];
-  s_cbStageNext = (s_cbStageNext + 1) % kCbStageEntries;
+  s_cbStageNext = (s_cbStageNext + 1) % ways;
   e.buf = buffer;
   e.gen = gen;
   if (e.bytes.size() < len) {
     e.bytes.resize(len);
   }
   memcpyFromWC(e.bytes.data(), mapped.mapPtr, len);
+  cbNote(_ReturnAddress(), len, false);
   lenOut = len;
   return e.bytes.data();
 }
@@ -10129,6 +10263,48 @@ namespace dxvk {
                         memcpyFromWC(m_camCbStage.data(), p, cbBytes);
                         p = m_camCbStage.data();
                       }
+                      // NV-DXVK 2026-08-07: A SPAN-LIMITED VERSION OF THIS COPY WAS
+                      // TRIED AND REVERTED -- it made co_cbRead WORSE, 6.19 ->
+                      // 9.4-10.8 us/call. The conclusion originally recorded here
+                      // named stagedCbBytes() as the 6.31 KB/call site that made
+                      // the narrow copy "pure addition". THAT WAS WRONG, and it is
+                      // corrected below rather than deleted, because acting on it
+                      // is what a third attempt would do.
+                      //
+                      // CORRECTED 2026-08-07 by [Perf.CbStage], which counts
+                      // stagedCbBytes() from the inside. Two exact identities in
+                      // every report window settle both attributions:
+                      //   stagedCbBytes  == d3d11+0x2ae4d8 -- [Perf.CbStage]
+                      //     stagedMB and (missGen+missCap) equal that entry's MB
+                      //     and call count to the digit (10.09 MB/42267,
+                      //     9.38 MB/39296, 5.16 MB/21626). It moves 239 B/call,
+                      //     never stages more than 576 bytes (maxLen), already
+                      //     hits 92%, and is 3% of frame-thread WC bytes.
+                      //   the 6.2 KB/call site == the t31 bulk copy -- its
+                      //     [Perf.WcCopy] entry equals [Perf.T31Cache] copiedMB and
+                      //     misses exactly (155.105 MB/24925 vs 155.11/24925), and
+                      //     it is 86% of all frame-thread WC bytes.
+                      //
+                      // So the 6.31 KB was never on this path at all and this
+                      // site's narrowing was never competing with it.
+                      //
+                      // THE REAL REASON THERE IS NOTHING HERE: this copy does not
+                      // even reach the top 5 of [Perf.WcCopy], i.e. under 4.45 MB
+                      // of a 332 MB window -- below 1.3% of frame-thread WC bytes.
+                      // The premise in the comment above ("up to 64 KB, ~8 KB
+                      // typical") was never checked against Desc()->ByteWidth. A
+                      // byte-shaving fix at this site cannot pay no matter how
+                      // correct its span maths is, and the span maths WAS correct
+                      // (it measured the intended 152 B/call).
+                      //
+                      // AND co_cbRead IS STILL REAL: 5.36-6.04 us/call, 132-263 ms
+                      // per window, ~3-6 ms/frame. At 576 bytes the copy is under
+                      // 0.2 us of that, and rdefMemo hits 95.6%, so neither the
+                      // copy nor the RDEF lookup is the cost. Over 95% of this
+                      // span has never been attributed. DO NOT edit anything in
+                      // 10200..10405 until a marker bisect says which part of it
+                      // holds the 5 us -- both previous attempts optimised inside
+                      // this bucket without ever establishing what is in it.
                     }
                     if (!p) {
                       failReason = "mapPtr_null";
@@ -40119,6 +40295,13 @@ namespace dxvk {
     // here. The OnDraw* accumulators (s_perfSubmitDraw*) cover the per-draw cost separately.
     const auto tEndFrameStart = std::chrono::steady_clock::now();
 
+    // NV-DXVK [Perf.Report]: the report's frame clock and its emit trigger.
+    // Placed at the very top of EndFrame on the frame thread, which is the one
+    // place in the codebase guaranteed to run exactly once per presented frame.
+    // Cost when rtx.perfReportFrames is 0 (the default): one relaxed increment
+    // and one option read.
+    perfreport::onFrameEnd(0u);
+
     // NV-DXVK [perf]: mark this as the frame-owning thread so vanish_diag's
     // ScopedCall only times entry points reached from here. Most of those live
     // in the templated common context and are also hit by the game's deferred
@@ -40209,7 +40392,12 @@ namespace dxvk {
       // burning 1315 lines per menu session in the captured log. Same gate
       // used by rtx_instance_manager.cpp:648 / rtx_scene_manager.cpp:207.
       {
+        // NV-DXVK [Perf] 2026-08-08: gated on rtx.logEngineCamFrame. The 6000-line
+        // self-cap bounds the LOG size, not the per-frame cost -- until the cap is
+        // reached this formats ~14 floats and writes a line on the frame thread
+        // every single frame, and there was no way to stop it short of a rebuild.
         const bool inGameplayEcf =
+          RtxOptions::logEngineCamFrame() &&
           tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
         static uint32_t s_ecfCount        = 0;
         static uint32_t s_ecfLastEngFrame = 0xFFFFFFFFu;
@@ -44960,6 +45148,19 @@ namespace dxvk {
                   " textures=",   cur.getCtr(DxvkStatCounter::RtxTextureCount),
                   " texInFlight=", cur.getCtr(DxvkStatCounter::RtxTexturesInFlight),
                   " presentFrames=", frames));
+
+                // NV-DXVK [Perf.Report]: gpuIdleMs is the ONLY field here that
+                // can decide GPU-bound. csSync/gpuSync are this thread blocking,
+                // and [Perf.Gpu]'s three states sum to the frame by construction
+                // (PERF_INSTRUMENTATION_MAP section 5) so they cannot.
+                perfreport::publish(perfreport::Slot::GpuIdleMs,
+                  double(d.getCtr(DxvkStatCounter::GpuIdleTicks)) / 1000.0 / double(frames));
+                perfreport::publish(perfreport::Slot::HygInstances,
+                  double(cur.getCtr(DxvkStatCounter::RtxInstanceCount)));
+                perfreport::publish(perfreport::Slot::HygUniqueBlas,
+                  double(cur.getCtr(DxvkStatCounter::RtxBlasCount)));
+                perfreport::publish(perfreport::Slot::HygTexTotal,
+                  double(cur.getCtr(DxvkStatCounter::RtxTextureCount)));
               }
 
               s_prevCounters      = cur;
@@ -45007,6 +45208,16 @@ namespace dxvk {
                   " cpuMs=", cpuMsPerFrame,
                   " busyPct=", (wallMsPerFrame > 0.0 ? (cpuMsPerFrame * 100.0 / wallMsPerFrame) : 0.0),
                   " blockedMs=", (wallMsPerFrame - cpuMsPerFrame)));
+
+                // NV-DXVK [Perf.Report]: hand the assembler the four values just
+                // computed. This is the frame wall and the first pole candidate,
+                // so without it the report has nothing to anchor on.
+                perfreport::publish(perfreport::Slot::FrameWallMs, wallMsPerFrame);
+                perfreport::publish(perfreport::Slot::FrameThreadCpuMs, cpuMsPerFrame);
+                perfreport::publish(perfreport::Slot::FrameThreadBusyPct,
+                  (wallMsPerFrame > 0.0 ? (cpuMsPerFrame * 100.0 / wallMsPerFrame) : 0.0));
+                perfreport::publish(perfreport::Slot::FrameThreadBlockedMs,
+                  (wallMsPerFrame - cpuMsPerFrame));
               }
 
               s_prevCpu100ns = cpu100ns;
@@ -45138,6 +45349,29 @@ namespace dxvk {
               Logger::warn(str::format(
                 "[Perf.Entry] perFrame totalMs=", totalMs,
                 " (immediate ctx only, name=ms/calls):", entLine));
+
+              // NV-DXVK [Perf.Report]: half of the frame-thread closure check.
+              // The other half is [Perf.Gap] below; Entry+Gap must sum to wall
+              // or the thread is not fully accounted for.
+              //
+              // The three draw entry points are broken out because they are where
+              // Remix's injection lives; everything else is billed as
+              // state-setting so the four add back up to totalMs exactly.
+              {
+                const double sf = double(s_frameTimeSamples);
+                const double msDrawIdxInst = double(entNs[vanish_diag::DrawIdxInst])  / 1.0e6 / sf;
+                const double msDrawIndexed = double(entNs[vanish_diag::DrawIndexed])  / 1.0e6 / sf;
+                const double msDraw        = double(entNs[vanish_diag::Draw])         / 1.0e6 / sf;
+                perfreport::publish(perfreport::Slot::EntryTotalMs, totalMs);
+                perfreport::publish(perfreport::Slot::EntryDrawIdxInstMs, msDrawIdxInst);
+                perfreport::publish(perfreport::Slot::EntryDrawIndexedMs, msDrawIndexed);
+                perfreport::publish(perfreport::Slot::EntryDrawMs, msDraw);
+                perfreport::publish(perfreport::Slot::EntryStateMs,
+                  std::max(0.0, totalMs - msDrawIdxInst - msDrawIndexed - msDraw));
+                perfreport::publish(perfreport::Slot::HygDrawsSubmitted,
+                  double(entN[vanish_diag::DrawIdxInst] + entN[vanish_diag::DrawIndexed]
+                       + entN[vanish_diag::Draw]) / sf);
+              }
             }
           }
 
@@ -45181,10 +45415,19 @@ namespace dxvk {
               }
 
               Logger::warn(str::format(
+                // NV-DXVK [Perf.Report]: published just below -- the other half
+                // of the frame-thread closure check against the wall.
                 "[Perf.Gap] perFrame totalMs=", totalMs,
                 " maxMs=", double(gapMaxNs) / 1.0e6,
                 " maxAfter=", vanish_diag::kNames[gapMaxCall],
                 " (time BETWEEN entry points, name=ms/gaps):", gapLine));
+
+              // NV-DXVK [Perf.Report]: afterQueryEnd is broken out because it is
+              // the frame-boundary gap -- a handful of gaps per frame carrying
+              // most of the engine's own time, and NOT ours to optimise.
+              perfreport::publish(perfreport::Slot::GapTotalMs, totalMs);
+              perfreport::publish(perfreport::Slot::GapAfterQueryEndMs,
+                double(gapNs[vanish_diag::QueryEnd]) / 1.0e6 / double(s_frameTimeSamples));
 
               // QueryEnd split by D3D11_QUERY type. The flat bucket above is an
               // average over ~6 gaps/frame that are different events; only ~0.9
@@ -45227,6 +45470,13 @@ namespace dxvk {
                     " postMsMax=", double(bPostM) / 1.0e6,
                     " noPresentInGap=", bNoP,
                     "  (pre = TS_DISJOINT End -> Present entry; post = Present exit -> next D3D11 call)"));
+
+                  // NV-DXVK [Perf.Report]: post is already a per-gap average and
+                  // there is one TS_DISJOINT gap per frame, so it is per-frame as
+                  // it stands. This is the engine's own frame-boundary code and
+                  // the report labels it as not ours to optimise.
+                  perfreport::publish(perfreport::Slot::BoundaryPostMs,
+                    (double(bPost) / 1.0e6) / bSafe);
                 }
               }
             }
@@ -45263,6 +45513,17 @@ namespace dxvk {
                   double(dg.getCtr(DxvkStatCounter::GpuIdleTicks)) / 1000.0 / f,
                 " cmdLists=",
                   double(dg.getCtr(DxvkStatCounter::GpuReapCount)) / f));
+
+              // NV-DXVK [Perf.Report]: reported for completeness ONLY. These
+              // three are the dxvk-queue loop's three states and sum to the frame
+              // in every window by construction (map section 5), so the verdict
+              // never reads them -- it uses [Perf.Block] gpuIdleMs instead.
+              perfreport::publish(perfreport::Slot::GpuFenceWaitMs,
+                double(dg.getCtr(DxvkStatCounter::GpuFenceWaitTicks)) / 1000.0 / f);
+              perfreport::publish(perfreport::Slot::GpuReapMs,
+                double(dg.getCtr(DxvkStatCounter::GpuReapTicks)) / 1000.0 / f);
+              perfreport::publish(perfreport::Slot::GpuCmdLists,
+                double(dg.getCtr(DxvkStatCounter::GpuReapCount)) / f);
             }
 
             s_prevGpu      = curGpu;
@@ -47111,6 +47372,9 @@ namespace dxvk {
           std::string sdLine = "[Perf.SdThreads] count=" + std::to_string(g_sdThreadReg.size());
           std::string stallLine = "[Perf.SdStall] x64-extrapolated wallMs/cpuMs per window";
           bool haveStall = false;
+          // NV-DXVK [Perf.Report]: per-stage totals summed over every thread in
+          // the loop below, published once afterwards.
+          double sdSegAcc[SdThreadStat::kStallSegs] = {};
           static constexpr const char* kSegNames[SdThreadStat::kStallSegs] = {
             "head", "vsIdx", "skinCull", "xform", "commit", "capture", "emit", "rest"
           };
@@ -47134,6 +47398,11 @@ namespace dxvk {
               for (int s = 0; s < SdThreadStat::kStallSegs; ++s) {
                 const double wallMs = double(st->segWallUs[s]) * 64.0 / 1000.0;
                 const double cpuMs  = double(st->segCyc[s]) * 64.0 / (double(cyclesPerUs) * 1000.0);
+                // NV-DXVK [Perf.Report]: summed ACROSS threads, published once
+                // after the loop. SubmitDraw is normally one thread, but
+                // [Perf.SdThreads] exists precisely because that is not
+                // guaranteed, and the report wants the stage's whole cost.
+                sdSegAcc[s] += wallMs;
                 char seg[96];
                 snprintf(seg, sizeof(seg), " %s=%.1f/%.1f", kSegNames[s], wallMs, cpuMs);
                 stallLine += seg;
@@ -47148,6 +47417,21 @@ namespace dxvk {
           Logger::info(sdLine);
           if (haveStall) {
             Logger::info(stallLine);
+
+            // NV-DXVK [Perf.Report]: publish the 8 SubmitDraw stages once, after
+            // every thread has contributed. These are the top of the frame-thread
+            // work queue once the fanout is accounted for separately.
+            static perfreport::WindowFrames s_sdWf;
+            static constexpr perfreport::Slot kSegSlots[SdThreadStat::kStallSegs] = {
+              perfreport::Slot::SdHeadMs,     perfreport::Slot::SdVsIdxMs,
+              perfreport::Slot::SdSkinCullMs, perfreport::Slot::SdXformMs,
+              perfreport::Slot::SdCommitMs,   perfreport::Slot::SdCaptureMs,
+              perfreport::Slot::SdEmitMs,     perfreport::Slot::SdRestMs
+            };
+            const uint32_t nf = s_sdWf.step();
+            for (int s = 0; s < SdThreadStat::kStallSegs; ++s) {
+              perfreport::publishWindow(kSegSlots[s], sdSegAcc[s], nf);
+            }
           }
         }
 
@@ -47157,6 +47441,39 @@ namespace dxvk {
         // *_ns / *Ns fields always were. Exceptions, identifiable by name:
         // wallUs is microseconds, cpuCycles is CPU cycles, and anything ending
         // in N or named *Hits / *Miss is a COUNT.
+        // NV-DXVK [Perf.Report]: the named leaves. ALL of these are ns window
+        // totals (see the units note above -- the exceptions are wallUs,
+        // cpuCycles and the *N / *Hits / *Miss counts, none of which are
+        // published), so they normalise identically.
+        //
+        // ATTRIBUTION DIRECTION MATTERS HERE: markStg ADVANCES the marker, so a
+        // parent bucket already reports the remainder after its subdivisions.
+        // tail_emit is the remainder and te_census/te_camDiag/te_propId are its
+        // children -- the report marks them (nested) and does not add them into
+        // tail_emit, because parent + children = the original bucket.
+        {
+          static perfreport::WindowFrames s_wf;
+          const uint32_t nf = s_wf.step();
+          const auto pubNs = [nf](const perfreport::Slot slot, const auto acc) {
+            perfreport::publishWindow(slot, double(acc) / 1.0e6, nf);
+          };
+          pubNs(perfreport::Slot::AccExtractXfMs,   s_perfBtExtractXformAcc);
+          pubNs(perfreport::Slot::AccTailEmitMs,    s_perfSubmitDrawStageTailEmitAcc);
+          pubNs(perfreport::Slot::AccTeCensusMs,    s_perfTeCensusAcc);
+          pubNs(perfreport::Slot::AccTeCamDiagMs,   s_perfTeCamDiagAcc);
+          pubNs(perfreport::Slot::AccTePropIdMs,    s_perfTePropIdAcc);
+          pubNs(perfreport::Slot::AccW2vwCb3Ms,     s_perfXtW2vwCb3Acc);
+          pubNs(perfreport::Slot::AccSkyClassifyMs, s_perfSubmitDrawStageSkyClassifyAcc);
+          pubNs(perfreport::Slot::AccPfsGuardMs,    s_perfPfsGuardAcc);
+          pubNs(perfreport::Slot::AccFiltersMs,     s_perfSubmitDrawStageFiltersAcc);
+          pubNs(perfreport::Slot::AccCbcRawUvMs,    s_perfSubmitDrawStageCbcRawUvAcc);
+          pubNs(perfreport::Slot::AccBonePaletteMs, s_perfSubmitDrawStageBonePaletteAcc);
+          pubNs(perfreport::Slot::AccTailCaptureMs, s_perfSubmitDrawStageTailCaptureAcc);
+          pubNs(perfreport::Slot::AccVsAnalysisMs,  s_perfSubmitDrawStageVsAnalysisAcc);
+          pubNs(perfreport::Slot::AccO2wT31Ms,      s_perfO2wT31Acc);
+          pubNs(perfreport::Slot::AccCullVtxMs,     s_perfBtCullVtxCountAcc);
+        }
+
         Logger::info(str::format("[Perf.SubmitDraw.acc] units=ns"
                                  " pfs_guard=",      s_perfPfsGuardAcc,
                                  " pfs_studio=",     s_perfPfsStudioAcc,
@@ -47321,6 +47638,19 @@ namespace dxvk {
             deCount ? double(deLockNs) / 1e3 / double(deCount) : 0.0,
             deCount ? double(deDrawNs) / 1e3 / double(deCount) : 0.0);
           Logger::info(deBuf);
+
+          // NV-DXVK [Perf.Report]: deOnDraw is Remix's whole injection hook and
+          // is usually the single biggest item on the frame thread; deLock is the
+          // only instrument that can acquit the device lock. Both are window
+          // totals over DRAWS, so they are normalised by frames, not by deCount.
+          {
+            static perfreport::WindowFrames s_wf;
+            const uint32_t nf = s_wf.step();
+            perfreport::publishWindow(perfreport::Slot::DrawEntryOnDrawMs,
+              double(deDrawNs) / 1.0e6, nf);
+            perfreport::publishWindow(perfreport::Slot::DrawEntryLockMs,
+              double(deLockNs) / 1.0e6, nf);
+          }
         }
 
         // NV-DXVK [Perf.InstDraw]: aggregate of the instanced fanout â€” the span
@@ -47332,6 +47662,69 @@ namespace dxvk {
         {
           const double instN = double(s_perfInstCount ? s_perfInstCount : 1u);
           const double instI = double(s_perfInstInstancesAcc ? s_perfInstInstancesAcc : 1);
+
+          // NV-DXVK [Perf.Report]: THE TRAP THIS EXISTS TO CLOSE. The fanout
+          // BUILD sits OUTSIDE [Perf.SubmitDraw] wallUs -- only these counters
+          // see it, and on an instanced-heavy scene it is a large slice of the
+          // frame thread that is invisible in every [Perf.SubmitDraw] field
+          // (PERF_INSTRUMENTATION_MAP section 2). residual is setupPost minus its
+          // two named children and is routinely the largest UNATTRIBUTED block
+          // anywhere in the frame, which is why it gets its own slot and leads
+          // the target ranking.
+          {
+            static perfreport::WindowFrames s_wf;
+            const uint32_t nf = s_wf.step();
+
+            // NV-DXVK [Perf.Report] 2026-08-07: RESIDUAL NOW SUBTRACTS EVERY
+            // KNOWN CHILD, not just two of them.
+            //
+            // The old formula was setupPost - (semScan + prep), which made
+            // "UNATTRIBUTED residual" the largest single item on the frame
+            // thread at ~5.3 ms/frame. It was not unattributed: [Perf.MapCut]
+            // and [Perf.CamCut] were already bisecting the same span, and
+            // co_cbRead alone was 62% of it. Eight accumulators were being
+            // filled two lines below this one and none of them were in the
+            // subtraction.
+            //
+            // camOrigin is coCbRead + coVpScan + camOrig(the publish remainder);
+            // subtracting all three is correct and does NOT double-count,
+            // because [Perf.MapCut] deliberately reports only camOrigRest and
+            // says so on its own line.
+            const double knownChildrenMs =
+                double(s_perfInstSemScanNsAcc  + s_perfInstPrepNsAcc
+                     + s_perfInstPrepResNsAcc  + s_perfInstMapChainNsAcc
+                     + s_perfInstT31MapNsAcc   + s_perfInstDbgTrackNsAcc
+                     + s_perfInstMtnProbeNsAcc + s_perfInstCamOrigNsAcc
+                     + s_perfInstCoCbReadNsAcc + s_perfInstCoVpScanNsAcc) / 1e6;
+            const double residualMs =
+              double(s_perfInstSetupPostAcc) / 1e3 - knownChildrenMs;
+
+            perfreport::publishWindow(perfreport::Slot::InstCamOriginMs,
+              double(s_perfInstCoCbReadNsAcc + s_perfInstCoVpScanNsAcc
+                   + s_perfInstCamOrigNsAcc) / 1e6, nf);
+            perfreport::publishWindow(perfreport::Slot::InstCbReadMs,
+              double(s_perfInstCoCbReadNsAcc) / 1e6, nf);
+            perfreport::publishWindow(perfreport::Slot::InstVpScanMs,
+              double(s_perfInstCoVpScanNsAcc) / 1e6, nf);
+            perfreport::publishWindow(perfreport::Slot::InstDbgTrackMs,
+              double(s_perfInstDbgTrackNsAcc) / 1e6, nf);
+            perfreport::publishWindow(perfreport::Slot::InstTotalMs,
+              double(s_perfInstTotalAcc) / 1e3, nf);
+            perfreport::publishWindow(perfreport::Slot::InstInnerMs,
+              double(s_perfInstInnerAcc) / 1e3, nf);
+            perfreport::publishWindow(perfreport::Slot::InstBuildMs,
+              double(s_perfInstTotalAcc - s_perfInstInnerAcc) / 1e3, nf);
+            perfreport::publishWindow(perfreport::Slot::InstLoopMs,
+              double(s_perfInstLoopAcc) / 1e3, nf);
+            perfreport::publishWindow(perfreport::Slot::InstSetupPostMs,
+              double(s_perfInstSetupPostAcc) / 1e3, nf);
+            perfreport::publishWindow(perfreport::Slot::InstResidualMs, residualMs, nf);
+            perfreport::publishWindow(perfreport::Slot::InstInstances,
+              double(s_perfInstInstancesAcc), nf);
+            perfreport::publishWindow(perfreport::Slot::InstCalls,
+              double(s_perfInstCount), nf);
+          }
+
           char inBuf[512];
           std::snprintf(inBuf, sizeof(inBuf),
             "[Perf.InstDraw] calls=%u fanoutCalls=%u instances=%lld"
@@ -47560,6 +47953,99 @@ namespace dxvk {
                 t_wcSites[i] = WcSite {};
             }
 
+            // NV-DXVK [Perf.CbStage] 2026-08-07: does the CB staging cache ever
+            // hit, and if not, WHY. Read stagedMB first and compare it against
+            // the d3d11+0x35be35 entry on the [Perf.WcCopy] line immediately
+            // above -- if they agree, that call site is stagedCbBytes and the
+            // handoff's inferred attribution is confirmed by mechanism.
+            //
+            // Then read the miss split. missGen / missCap / missLen select
+            // between three DIFFERENT fixes and only one of them is "raise the
+            // ring" -- see the CbStageStat comment next to stagedCbBytes.
+            //
+            // Frame-thread table only, like [Perf.WcCopy] above and for a
+            // stronger reason: s_cbStage is itself thread_local, so pooling the
+            // counters across threads would mix caches that can never see one
+            // another's entries and the hit rate would mean nothing.
+            {
+              // Own base/size: the [Perf.WcCopy] block above scoped its pair
+              // inside its own braces.
+              const uint64_t base = reinterpret_cast<uint64_t>(GetModuleHandleA("d3d11.dll"));
+              uint64_t size = 0;
+              if (base) {
+                const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+                if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+                  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+                  if (nt->Signature == IMAGE_NT_SIGNATURE)
+                    size = nt->OptionalHeader.SizeOfImage;
+                }
+              }
+
+              // Pick up rtx.cbStageEntries once per window rather than per call
+              // -- the sweep is a human turning a knob, not a hot path.
+              uint32_t wantWays = RtxOptions::cbStageEntries();
+              if (wantWays == 0)                          wantWays = 1;
+              if (wantWays > uint32_t(kCbStageEntriesMax)) wantWays = uint32_t(kCbStageEntriesMax);
+              g_cbStageEntries.store(wantWays, std::memory_order_relaxed);
+
+              const CbStageStat cs = t_cbStageStat;
+              t_cbStageStat = CbStageStat {};
+
+              if (cs.calls != 0) {
+                const uint64_t misses = cs.missGen + cs.missCap + cs.missLen;
+                char cbBuf[448];
+                std::snprintf(cbBuf, sizeof(cbBuf),
+                  "[Perf.CbStage] calls=%llu hits=%llu hitPct=%.1f"
+                  " missGen=%llu missCap=%llu missLen=%llu dupSlots=%llu"
+                  " stagedMB=%.2f servedMB=%.2f avgStage_KB=%.2f maxLen=%llu ways=%u",
+                  (unsigned long long) cs.calls,
+                  (unsigned long long) cs.hits,
+                  cs.calls ? 100.0 * double(cs.hits) / double(cs.calls) : 0.0,
+                  (unsigned long long) cs.missGen,
+                  (unsigned long long) cs.missCap,
+                  (unsigned long long) cs.missLen,
+                  (unsigned long long) cs.dupSlots,
+                  double(cs.bytesStaged) / (1024.0 * 1024.0),
+                  double(cs.bytesServed) / (1024.0 * 1024.0),
+                  misses ? double(cs.bytesStaged) / 1024.0 / double(misses) : 0.0,
+                  (unsigned long long) cs.maxLen,
+                  wantWays);
+                Logger::info(cbBuf);
+              }
+
+              // Which callers own the staged bytes -- i.e. which of the ~30
+              // stagedCbBytes() call sites is worth narrowing to the window it
+              // actually reads. Ranked by staged bytes, because a site that
+              // always hits costs nothing however often it is called.
+              size_t cbOrder[kCbSiteEntries];
+              size_t cbN = 0;
+              for (size_t i = 0; i < kCbSiteEntries; ++i) {
+                if (t_cbSites[i].calls != 0)
+                  cbOrder[cbN++] = i;
+              }
+              std::sort(cbOrder, cbOrder + cbN, [](size_t a, size_t b) {
+                return t_cbSites[a].staged > t_cbSites[b].staged;
+              });
+
+              if (cbN != 0) {
+                std::string cbs = "[Perf.CbStage.Site] staged bytes by caller:";
+                for (size_t i = 0; i < cbN && i < 6; ++i) {
+                  const CbSite& s4 = t_cbSites[cbOrder[i]];
+                  const uint64_t a = reinterpret_cast<uint64_t>(s4.ret);
+                  cbs += (size && a >= base && a < base + size)
+                    ? str::format(" d3d11+0x", std::hex, (a - base), std::dec)
+                    : str::format(" ?@0x", std::hex, a, std::dec);
+                  cbs += str::format("=", double(s4.staged) / (1024.0 * 1024.0),
+                                     "MB/", s4.calls, "calls/hit",
+                                     s4.calls ? (100u * s4.hits / s4.calls) : 0ull, "%");
+                }
+                Logger::info(cbs);
+              }
+
+              for (size_t i = 0; i < kCbSiteEntries; ++i)
+                t_cbSites[i] = CbSite {};
+            }
+
             // NV-DXVK [Perf.FmtSite]: who converts floats to text, and where.
             // Unlike [Perf.WcCopy] above this is POOLED ACROSS THREADS, because
             // the thread in question is dxvk-cs while this drain runs on the
@@ -47698,6 +48184,19 @@ namespace dxvk {
                 double(s_perfInstT31CopyNsAcc)   / 1e6,
                 double(s_perfInstLoopBodyNsAcc)  / 1e6);
               Logger::info(lcBuf);
+
+              // NV-DXVK [Perf.Report]: the cut of the fanout's loop. lcN is a
+              // CALL count, so frames come from the report's clock instead.
+              {
+                static perfreport::WindowFrames s_wf;
+                const uint32_t nf = s_wf.step();
+                perfreport::publishWindow(perfreport::Slot::InstT31GatherMs,
+                  double(s_perfInstT31GatherNsAcc) / 1.0e6, nf);
+                perfreport::publishWindow(perfreport::Slot::InstT31CopyMs,
+                  double(s_perfInstT31CopyNsAcc) / 1.0e6, nf);
+                perfreport::publishWindow(perfreport::Slot::InstInstLoopMs,
+                  double(s_perfInstLoopBodyNsAcc) / 1.0e6, nf);
+              }
 
               // NV-DXVK [Perf.T31Src]: the discriminator. Emitted here, BEFORE the
               // reset below, because usPerPage/usPerKB need t31_copy from the same
