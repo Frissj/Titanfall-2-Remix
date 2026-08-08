@@ -669,6 +669,14 @@ namespace dxvk {
     instanceEvents.onInstanceAddedCallback = [this](const RtInstance& instance) { onInstanceAdded(instance); };
     instanceEvents.onInstanceUpdatedCallback = [this](const RtInstance& instance, const DrawCallState& drawCall, const MaterialData& material, bool hasTransformChanged, bool hasVerticesChanged, bool isFirstUpdateThisFrame) { onInstanceUpdated(instance, drawCall, material, hasTransformChanged, hasVerticesChanged, isFirstUpdateThisFrame); };
     instanceEvents.onInstanceDestroyedCallback = [this](const RtInstance& instance) { onInstanceDestroyed(instance); };
+    // NV-DXVK [perf] 2026-08-08 (handoff d §3): declare the fast-path contract.
+    // For a binding-unchanged instance with frameAge != 0, onInstanceUpdated's
+    // body is: memory early-out, staging arm dead (requires frameAge == 0),
+    // then `if (needsToCalculateNumTexelsPerMicroTriangle) calculate()`. The
+    // fast path reads that flag straight off the RtInstance and only pays the
+    // dispatch when it is set — keep this in sync with onInstanceUpdated: if
+    // that function ever grows work not gated on the flag, clear this bool.
+    instanceEvents.skippableWhenNoPendingOmmWork = true;
     return instanceEvents;
   }
 

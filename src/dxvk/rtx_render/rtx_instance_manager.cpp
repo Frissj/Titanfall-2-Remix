@@ -6206,6 +6206,11 @@ namespace dxvk {
     };
     std::atomic<uint64_t> s_fastInstHit { 0 };
     std::atomic<uint64_t> s_fastInstSlow[kFastReasonCount] = {};
+    // NV-DXVK (2026-08-08d §3): fast-path commits whose non-skippable handler
+    // dispatch was elided via skippableWhenNoPendingOmmWork. Healthy steady
+    // state tracks `fast` almost exactly; a large gap means instances carry a
+    // pending OMM flag forever (a starvation bug worth investigating).
+    std::atomic<uint64_t> s_fastInstOmmSkips { 0 };
     std::atomic<uint32_t> s_fastInstLastLog { 0 };
 
     inline void fastInstEmit(uint32_t frameId) {
@@ -6223,8 +6228,10 @@ namespace dxvk {
       for (uint32_t i = 0; i < kFastReasonCount; ++i) {
         slow[i] = double(s_fastInstSlow[i].exchange(0, std::memory_order_relaxed)) / frames;
       }
+      const double ommSkip = double(s_fastInstOmmSkips.exchange(0, std::memory_order_relaxed)) / frames;
       Logger::warn(str::format(
         "[Perf.FastInst] perFrame: fast=", hit,
+        " ommSkip=", ommSkip,
         " | slow: notAllowed=", slow[kFastNotAllowed],
         " keyMiss=", slow[kFastKeyMiss],
         " created=", slow[kFastCreated],
@@ -6641,8 +6648,27 @@ namespace dxvk {
 
             // Same per-handler granularity as the tail gate below: only handlers
             // that opted in to being skippable are dropped; OMM's stays live.
-            for (auto& event : m_eventHandlers) {
-              if (!event.skippableWhenBindingUnchanged) {
+            // NV-DXVK [perf] 2026-08-08 (handoff d §3, fast-path floor): OMM's
+            // non-skippable handler reduced, for THIS population (binding
+            // unchanged + frameAge != 0 -- kFastCreated rejected new
+            // instances above), to `if (needsToCalculateNumTexelsPerMicro-
+            // Triangle) calculate()`. That flag lives on the RtInstance, so
+            // handlers that declared the skippableWhenNoPendingOmmWork
+            // contract are skipped on a member load instead of paying the
+            // std::function dispatch + profile zone ~14k times a frame.
+            // The flag-set case still dispatches, so pending OMM work is
+            // picked up on exactly the frame it would have been before.
+            {
+              const bool ommPendingWork = currentInstance
+                .getOpacityMicromapInstanceData().hasPendingNumTexelsCalculation();
+              for (auto& event : m_eventHandlers) {
+                if (event.skippableWhenBindingUnchanged) {
+                  continue;
+                }
+                if (event.skippableWhenNoPendingOmmWork && !ommPendingWork) {
+                  s_fastInstOmmSkips.fetch_add(1, std::memory_order_relaxed);
+                  continue;
+                }
                 event.onInstanceUpdatedCallback(currentInstance, drawCall, materialData,
                                                 /*hasTransformChanged*/ false,
                                                 /*hasPreviousPositions*/ false,

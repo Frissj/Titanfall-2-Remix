@@ -1103,24 +1103,35 @@ namespace dxvk {
     //
     // Cost: O(N log N) per frame for N ~ a few thousand instances —
     // negligible vs the TLAS build that follows.
-    std::vector<RtInstance*> sortedInstances;
-    sortedInstances.reserve(instances.size());
+    // NV-DXVK [perf] 2026-08-08 (handoff d §3, merge loop): the ordering the
+    // stable_sort produced is exactly [propId-tagged, sorted by propId,
+    // ties in original order] ++ [untagged, original order] — and the tagged
+    // population is ~63 instances of ~15.5k ([FindStage] withPropId). A full
+    // stable_sort paid O(N log N) compares PLUS a temporary-buffer
+    // allocation over all 15.5k pointers every frame to order 63 of them.
+    // Replaced with a stable partition (one O(N) pass into two member
+    // vectors, preserving relative order in each) and a sort of only the
+    // tagged block. Byte-identical output order by construction; the
+    // [SurfaceIndexStability] contract above is unchanged.
+    m_mergeSortScratch.clear();      // becomes the final ordered list
+    m_mergeUntaggedScratch.clear();
+    m_mergeSortScratch.reserve(instances.size());
+    m_mergeUntaggedScratch.reserve(instances.size());
     for (RtInstance* inst : instances) {
-      sortedInstances.push_back(inst);
+      const uint64_t pid = (inst != nullptr) ? inst->getStablePropId() : 0ull;
+      if (pid != 0ull) m_mergeSortScratch.push_back(inst);
+      else             m_mergeUntaggedScratch.push_back(inst);
     }
-    std::stable_sort(sortedInstances.begin(), sortedInstances.end(),
+    // stable_sort keeps equal-propId entries in arrival order, matching the
+    // old comparator's tie behavior. ~63 elements — cost is noise.
+    std::stable_sort(m_mergeSortScratch.begin(), m_mergeSortScratch.end(),
       [](const RtInstance* a, const RtInstance* b) {
-        const uint64_t aPid = (a != nullptr) ? a->getStablePropId() : 0ull;
-        const uint64_t bPid = (b != nullptr) ? b->getStablePropId() : 0ull;
-        // Both tagged: sort by propId.
-        if (aPid != 0ull && bPid != 0ull) return aPid < bPid;
-        // a tagged, b not: a comes first.
-        if (aPid != 0ull) return true;
-        if (bPid != 0ull) return false;
-        // Neither tagged: preserve insertion order (return false keeps
-        // stable_sort happy without imposing any artificial ordering).
-        return false;
+        return a->getStablePropId() < b->getStablePropId();
       });
+    m_mergeSortScratch.insert(m_mergeSortScratch.end(),
+                              m_mergeUntaggedScratch.begin(),
+                              m_mergeUntaggedScratch.end());
+    std::vector<RtInstance*>& sortedInstances = m_mergeSortScratch;
 
     // NV-DXVK [TlasCensus]: COMPLETE per-frame inventory of every instance that
     // reaches TLAS build — including point-instancer / fanout / sub-view content

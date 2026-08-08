@@ -344,6 +344,14 @@ namespace dxvk {
     friend class OpacityMicromapManager;
   public:
     OpacityMicromapInstanceData();
+
+    // NV-DXVK [perf] 2026-08-08 (handoff d §3): read-only view of the pending
+    // -work flag for InstanceManager's fast path — the
+    // skippableWhenNoPendingOmmWork contract (rtx_instance_manager.h) elides
+    // the handler dispatch when this is clear. Writes stay OMM-private.
+    bool hasPendingNumTexelsCalculation() const {
+      return needsToCalculateNumTexelsPerMicroTriangle;
+    }
   private:
     XXH64_hash_t ommSrcHash = kEmptyHash;
     bool usesOMM : 1;

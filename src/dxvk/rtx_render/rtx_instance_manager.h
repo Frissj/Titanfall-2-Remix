@@ -431,6 +431,24 @@ struct InstanceEventHandler {
   // silently not running.
   bool skippableWhenBindingUnchanged = false;
 
+  // NV-DXVK [perf] 2026-08-08 (handoff d §3): may this handler's
+  // onInstanceUpdated ALSO be skipped on the fastInstanceUpdate commit path
+  // (instance provably binding-unchanged AND frameAge != 0) when the
+  // instance's OMM pending-work flag
+  // (getOpacityMicromapInstanceData().hasPendingNumTexelsCalculation())
+  // is clear?
+  //
+  // CONTRACT, set by the registrar: `true` asserts that for such an instance
+  // the callback's entire body is a no-op unless that flag is set. OMM's
+  // handler is exactly this shape: its first-sight staging arm requires
+  // frameAge == 0 (impossible on the fast path -- kFastCreated rejects those),
+  // leaving only the flag-gated numTexelsPerMicroTriangle calculation, and
+  // the flag lives on the RtInstance where the fast path can read it for the
+  // cost of a member load instead of a std::function dispatch + profile zone.
+  // ~14k fast-path instances/frame make that indirection the fast path's
+  // floor (handoff §3). Same default-false reasoning as the field above.
+  bool skippableWhenNoPendingOmmWork = false;
+
   InstanceEventHandler() = delete;
   InstanceEventHandler(void* _eventHandlerOwnerAddress) : eventHandlerOwnerAddress(_eventHandlerOwnerAddress) { }
 };

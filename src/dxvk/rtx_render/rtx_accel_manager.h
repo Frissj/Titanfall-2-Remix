@@ -213,6 +213,11 @@ private:
 
   std::vector<RtInstance*> m_reorderedSurfaces;
   std::vector<uint32_t> m_reorderedSurfacesFirstIndexOffset;
+  // NV-DXVK [perf] 2026-08-08 (handoff d §3, merge loop): scratch for the
+  // stable-partition ordering in mergeInstancesIntoBlas — members so their
+  // ~15.5k-pointer capacity survives across frames instead of reallocating.
+  std::vector<RtInstance*> m_mergeSortScratch;
+  std::vector<RtInstance*> m_mergeUntaggedScratch;
   // NV-DXVK [CamProbe prevSurf]: see getProbePrevSurfaceSlots().
   std::vector<uint32_t> m_probePrevSurfaceSlot;
   std::vector<uint32_t> m_reorderedSurfacesPrimitiveIDPrefixSum;              // Exclusive prefix sum for this frame's surface primitive count array
