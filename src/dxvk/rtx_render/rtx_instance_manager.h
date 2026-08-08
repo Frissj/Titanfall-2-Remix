@@ -368,6 +368,13 @@ private:
   // instance through both full paths regardless of what the incoming draw hashes
   // to. Eye draws also park kEmptyHash here, so they never skip.
   XXH64_hash_t m_instStateKey = kEmptyHash;
+  // NV-DXVK [perf] fastInstanceUpdate: the per-draw inputs the fast path cannot
+  // key (winding, projection parity, RT-target, sub-view flags), captured at the
+  // last FULL update. DrawScopedState::fastDrawBits must match this byte before
+  // the fast path may retain m_vkInstance.flags / m_geometryFlags / mask.
+  // 0xFF never matches a real bit set (only the low 5 bits are used), so a fresh
+  // instance always takes the full path at least once.
+  uint8_t m_fastDrawBits = 0xFF;
   VkAccelerationStructureInstanceKHR m_vkInstance;
   VkGeometryFlagsKHR m_geometryFlags = 0;
   uint32_t m_firstBillboard = 0;
@@ -611,6 +618,19 @@ private:
 
   std::vector<InstanceEventHandler> m_eventHandlers;
 
+  // NV-DXVK [perf] fastInstanceUpdate: once-per-frame digest of every runtime
+  // option the fast path's skipped region reads. If the digest differs from the
+  // previous frame's, the fast path is disabled for THIS frame, so every
+  // instance re-derives its state under the new option values (self-healing on
+  // option flips, zero per-instance cost). Mutable because it is maintained
+  // lazily from const computeDrawScopedState; the mutex is only touched on the
+  // first draw of each frame (and by racing threads at that boundary).
+  mutable std::mutex m_fastOptMutex;
+  mutable std::atomic<uint32_t> m_fastOptFrame { kInvalidFrameIndex };
+  mutable uint64_t m_fastOptDigest = 0;
+  mutable bool m_fastOptStable = false;
+  bool fastPathOptionsStable() const;
+
   // Handles the case of when two (or more) identical geometries+textures draw calls have been submitted in a single frame (typically used for two-pass rendering in FF)
   void mergeInstanceHeuristics(RtInstance& instanceToModify, const DrawCallState& drawCall, const RtSurface::AlphaState& alphaState) const;
 
@@ -692,6 +712,15 @@ private:
     SurfaceBufferBinding buffers {};
     // False for eye draws, which never take the surf/tail skip.
     bool keyEligible = false;
+    // NV-DXVK [perf] fastInstanceUpdate: may placements of this draw take the
+    // updateInstance fast path at all this frame. Folds in the option itself,
+    // keyEligible, and the once-per-frame option-digest stability check (see
+    // fastPathOptionsStable) so a runtime option flip forces one full frame.
+    bool fastPathAllowed = false;
+    // Per-draw inputs the fast path checks against RtInstance::m_fastDrawBits:
+    // bit0 drawClockwise, bit1 isUsingRaytracedRenderTarget, bit2 isSubView,
+    // bit3 isSubViewSkybox, bit4 tf2StableBackfaceCull projection parity.
+    uint8_t fastDrawBits = 0;
   };
 
   // blas is read for SurfaceBufferBinding only. Both callers already hold the

@@ -4854,7 +4854,15 @@ namespace dxvk {
                          // tracks the instance flag or is pinned true. The flag is
                          // written outside the guard, but the MODE still selects
                          // which of the two the block would write.
-                         | (RtxOptions::AntiCulling::isObjectAntiCullingEnabled() ? 1u << 26 : 0u);
+                         | (RtxOptions::AntiCulling::isObjectAntiCullingEnabled() ? 1u << 26 : 0u)
+                         // NV-DXVK [perf] fastInstanceUpdate: the camera type was
+                         // never keyed -- the Sky-camera hide and the ViewModel
+                         // handling read it outside the surf guard every frame.
+                         // The fast path retains those outcomes, so a camera-type
+                         // change must break the key. Per instance the camera is
+                         // stable frame-over-frame, so this does not reduce the
+                         // existing surf/tail skip rates measurably.
+                         | ((static_cast<uint32_t>(drawCall.cameraType) & 0xFu) << 27);
 
     return XXH3_64bits(&kd, sizeof(kd));
   }
@@ -4897,6 +4905,57 @@ namespace dxvk {
   // alphaState is in here for the same reason as the key: calculateAlphaState is
   // a pure function of (drawCall, materialData), and it was being recomputed for
   // every placement so it could be copied wholesale into surface.alphaState.
+  // NV-DXVK [perf] fastInstanceUpdate: FNV digest of every runtime option that
+  // the fast path's SKIPPED region reads. The fast path retains last frame's
+  // derived state (vkInstance flags, mask, hidden/fog outcomes, dev options),
+  // which is only sound while these options hold the values that derived it.
+  // Comparing the digest across frames turns "an option changed" into "one full
+  // slow frame", with zero per-instance cost. If you add an option read to any
+  // region the fast path skips (the surf switch, the xform block, the flags/mask
+  // block, applyDeveloperOptions), it MUST be added here or be covered by the
+  // instance state key.
+  static uint64_t computeFastPathOptionsDigest() {
+    uint64_t d = 0xcbf29ce484222325ull;
+    auto mix = [&d](uint64_t v) {
+      d = (d ^ v) * 0x100000001b3ull;
+    };
+    mix(RtxOptions::enableCulling() ? 1u : 0u);
+    mix(RtxOptions::tf2StableBackfaceCull() ? 1u : 0u);
+    mix(RtxOptions::enableTf2SkyboxCloudFog() ? 1u : 0u);
+    mix(RtxOptions::enableSeparateUnorderedApproximations() ? 1u : 0u);
+    mix(RtxOptions::getEnableOpacityMicromap() ? 1u : 0u);
+    mix(RtxOptions::enableInstanceDebuggingTools() ? 1u : 0u);
+    mix(RtxOptions::flipSubViewSkyboxNormals() ? 1u : 0u);
+    mix(RtxOptions::AntiCulling::isObjectAntiCullingEnabled() ? 1u : 0u);
+    {
+      const float off = RtxOptions::worldSpaceUiBackgroundOffset();
+      uint32_t bits;
+      std::memcpy(&bits, &off, sizeof(bits));
+      mix(bits);
+    }
+    return d;
+  }
+
+  bool InstanceManager::fastPathOptionsStable() const {
+    const uint32_t fid = m_device->getCurrentFrameId();
+    if (m_fastOptFrame.load(std::memory_order_acquire) != fid) {
+      std::lock_guard<std::mutex> g(m_fastOptMutex);
+      if (m_fastOptFrame.load(std::memory_order_relaxed) != fid) {
+        const uint64_t d = computeFastPathOptionsDigest();
+        // Stable only when this frame's digest equals the previous frame's --
+        // the first frame after any change (including the very first frame)
+        // runs fully slow, which re-derives everything under the new values.
+        m_fastOptStable = (d == m_fastOptDigest) && (m_fastOptDigest != 0);
+        m_fastOptDigest = d;
+        m_fastOptFrame.store(fid, std::memory_order_release);
+      }
+    }
+    // m_fastOptStable was written before the release-store the acquire above
+    // synchronised with; racing threads at the frame boundary that lose the
+    // lock race simply read the freshly published value.
+    return m_fastOptStable;
+  }
+
   InstanceManager::DrawScopedState InstanceManager::computeDrawScopedState(
       const BlasEntry& blas, const DrawCallState& drawCall, const MaterialData& materialData) const {
     DrawScopedState state;
@@ -4917,6 +4976,42 @@ namespace dxvk {
       ? computeDrawStateKey(drawCall, materialData, state.alphaState,
                             vsDebugIdIsConsumed(), m_pResourceCache->getBindingEpoch())
       : kEmptyHash;
+
+    // NV-DXVK [perf] fastInstanceUpdate: the draw-scoped inputs of the skipped
+    // flags/mask stage that the state key does not cover. Compared against
+    // RtInstance::m_fastDrawBits (stored at the last full update); any
+    // difference forces the full path so determineInstanceFlags re-runs.
+    {
+      const auto& td = drawCall.getTransformData();
+      uint8_t bits = 0;
+      if (drawCall.getGeometryData().frontFace == VkFrontFace::VK_FRONT_FACE_CLOCKWISE) {
+        bits |= 1u;
+      }
+      if (drawCall.isUsingRaytracedRenderTarget) {
+        bits |= 2u;
+      }
+      if (td.isSubView) {
+        bits |= 4u;
+      }
+      if (td.isSubViewSkybox) {
+        bits |= 8u;
+      }
+      // Projection winding parity, only an input when tf2StableBackfaceCull is
+      // on. det(v2p * w2v) sign == det(v2p) sign XOR det(w2v) sign, so the two
+      // cheap 3x3 tests replace the 4x4 multiply determineInstanceFlags pays.
+      // Used strictly as a change detector, so exact agreement with the flags
+      // stage's own computation is not required -- only faithfulness to its
+      // inputs, which sign-multiplicativity provides.
+      if (RtxOptions::tf2StableBackfaceCull()
+          && (isMirrorTransform(td.viewToProjection) != isMirrorTransform(td.worldToView))) {
+        bits |= 16u;
+      }
+      state.fastDrawBits = bits;
+    }
+    state.fastPathAllowed = state.keyEligible
+      && RtxOptions::fastInstanceUpdate()
+      && !RtxOptions::enableInstanceDebuggingTools()
+      && fastPathOptionsStable();
     return state;
   }
 
@@ -6079,6 +6174,54 @@ namespace dxvk {
     };
   }
 
+  // NV-DXVK [Perf.FastInst]: exact counters for the rtx.fastInstanceUpdate path.
+  // Relaxed atomics only -- the shape measured at ~zero cost, NOT the per-instance
+  // mutex shape rtx.logMapGate's note documents at multiple ms. One warn line
+  // every 300 frames, from whichever thread wins the CAS.
+  namespace {
+    enum FastInstReason : uint32_t {
+      kFastNotAllowed  = 0,  // drawState.fastPathAllowed false (option off / eye / option-flip frame)
+      kFastKeyMiss     = 1,  // instance state key mismatch (genuine state change or fresh instance)
+      kFastCreated     = 2,  // first frame after creation (teleport path)
+      kFastPop         = 3,  // excluded population (viewmodel/player/unordered/decal/skinned/portal/gun)
+      kFastBitsMiss    = 4,  // per-draw fast bits changed (winding/parity/subview/rt-target)
+      kFastXformMiss   = 5,  // objectToWorld bytes changed
+      kFastSpatialMiss = 6,  // SpatialMap not provably in sync
+      kFastMaskMiss    = 7,  // mask unreconstructable (was hidden, now visible)
+      kFastReasonCount = 8
+    };
+    std::atomic<uint64_t> s_fastInstHit { 0 };
+    std::atomic<uint64_t> s_fastInstSlow[kFastReasonCount] = {};
+    std::atomic<uint32_t> s_fastInstLastLog { 0 };
+
+    inline void fastInstEmit(uint32_t frameId) {
+      const uint32_t last = s_fastInstLastLog.load(std::memory_order_relaxed);
+      if (frameId - last < 300u) {
+        return;
+      }
+      uint32_t expected = last;
+      if (!s_fastInstLastLog.compare_exchange_strong(expected, frameId, std::memory_order_relaxed)) {
+        return;
+      }
+      const double frames = double(frameId - last);
+      const double hit = double(s_fastInstHit.exchange(0, std::memory_order_relaxed)) / frames;
+      double slow[kFastReasonCount];
+      for (uint32_t i = 0; i < kFastReasonCount; ++i) {
+        slow[i] = double(s_fastInstSlow[i].exchange(0, std::memory_order_relaxed)) / frames;
+      }
+      Logger::warn(str::format(
+        "[Perf.FastInst] perFrame: fast=", hit,
+        " | slow: notAllowed=", slow[kFastNotAllowed],
+        " keyMiss=", slow[kFastKeyMiss],
+        " created=", slow[kFastCreated],
+        " pop=", slow[kFastPop],
+        " bitsMiss=", slow[kFastBitsMiss],
+        " xformMiss=", slow[kFastXformMiss],
+        " spatialMiss=", slow[kFastSpatialMiss],
+        " maskMiss=", slow[kFastMaskMiss]));
+    }
+  }
+
   void InstanceManager::updateInstance(RtInstance& currentInstance,
                                        const CameraManager& cameraManager,
                                        const BlasEntry& blas,
@@ -6353,6 +6496,160 @@ namespace dxvk {
           : kEmptyHash;
         instStateUnchanged = instKeyEligible && (instStateKey == currentInstance.m_instStateKey);
         currentInstance.m_instStateKey = instStateKey;
+
+        // NV-DXVK [perf] fastInstanceUpdate -- THE DIRTY-LIST REALISATION of the
+        // [Perf.UpdInst] REDUNDANT=97% finding (rtx.conf ~1690-1950). The visits
+        // themselves cannot be avoided (the game re-draws everything), but a
+        // visit whose EVERY input is provably unchanged can exit after the
+        // handful of writes that are genuinely per-frame, instead of walking the
+        // remaining ~600 lines of derivations, probe gates and flag routing to
+        // rewrite identical bytes. The recorded stage baseline this attacks:
+        // tail 4.0 + xform 3.7 + surf-residual + flags + entry probes.
+        //
+        // WHAT PROVES "UNCHANGED": the same m_instStateKey digest that already
+        // authorises the surf/tail skips (now also carrying cameraType), PLUS
+        // m_fastDrawBits for the unkeyed flags-stage inputs, PLUS a byte-compare
+        // of the incoming objectToWorld, PLUS the SpatialMap sync proof (the
+        // m_stablePropId caveat recorded in rtx.conf: a propId that moved while
+        // the transform did not leaves the map on a stale key -- caught here
+        // because entry's mirror already updated m_stablePropId, so the
+        // cacheHash==propId test fails and the full path re-files). Runtime
+        // option flips are handled by fastPathOptionsStable() forcing one full
+        // frame. Populations with genuine per-frame side effects (viewmodel
+        // candidate list, player-model list, billboard/beam regeneration, decal
+        // sort order, skinned prev-positions, RayPortal, the [ZigGun] probe tag)
+        // never take it.
+        //
+        // WHAT THE FAST PATH STILL DOES: everything the guards' own notes name
+        // as per-frame -- the buffer rebind (slice renaming), liveness/camera
+        // (already done in entry), picking value, isInsideFrustum, prev-transform
+        // advance, textureTransform/clipPlane copies (present in no key), the
+        // m_isHidden promotions (entry resets the flag every frame, so they must
+        // re-apply), and the NON-skippable event handlers (OMM bookkeeping).
+        if (drawState.fastPathAllowed) {
+          const uint32_t fastFid = m_device->getCurrentFrameId();
+          uint32_t fastReject = kFastReasonCount;   // sentinel: eligible so far
+          if (!instStateUnchanged) {
+            fastReject = kFastKeyMiss;
+          } else if (currentInstance.isCreatedThisFrame(fastFid)) {
+            fastReject = kFastCreated;
+          } else if (drawCall.cameraType == CameraType::ViewModel
+                     || currentInstance.m_isPlayerModel
+                     || currentInstance.m_isUnordered
+                     || currentInstance.surface.alphaState.isDecal
+                     || materialData.getType() == MaterialDataType::RayPortal
+                     || blas.modifiedGeometryData.previousPositionBuffer.defined()
+                     // the [ZigGun] diagnostic re-tags its instance every frame
+                     || drawCall.getTransformData().vertexShaderHash == 0x292b6ba0d1854f28ull) {
+            fastReject = kFastPop;
+          } else if (drawState.fastDrawBits != currentInstance.m_fastDrawBits) {
+            fastReject = kFastBitsMiss;
+          } else {
+            const Matrix4& fastO2W = split != nullptr
+              ? split->objectToWorld
+              : drawCall.getTransformData().objectToWorld;
+            if (memcmp(fastO2W.data, currentInstance.surface.objectToWorld.data, sizeof(Matrix4)) != 0) {
+              // Also naturally catches the WorldMatte background-offset case:
+              // the stored matrix carries the offset, the incoming one does not.
+              fastReject = kFastXformMiss;
+            } else {
+              const bool spatialInSync = currentInstance.m_isCreatedByRenderer
+                || (currentInstance.m_stablePropId != 0
+                      ? currentInstance.m_spatialCacheHash == static_cast<XXH64_hash_t>(currentInstance.m_stablePropId)
+                      // keyHint.hash is XXH64 of THIS frame's composed
+                      // first-instance matrix (findSimilarInstance's exact
+                      // stage), so equality with the stored cache key proves the
+                      // map entry matches this frame's key -- including the
+                      // instancesToObject[0] contents the base-matrix memcmp
+                      // above cannot see. Collision-bumped entries never match
+                      // and simply stay on the full path.
+                      : (keyHint.isUsable() && keyHint.hash == currentInstance.m_spatialCacheHash));
+              if (!spatialInSync) {
+                fastReject = kFastSpatialMiss;
+              }
+            }
+          }
+
+          if (fastReject == kFastReasonCount) {
+            // Re-derive the per-frame m_isHidden promotions. Entry already reset
+            // the flag from the Hidden category and applied the Sky-camera hide;
+            // the material-driven promotions live in the (skipped) switch below
+            // and only ever promote to true, so re-running them here is exactly
+            // the slow path's net effect. All writes in this block are values the
+            // slow path would derive identically, so falling through to the full
+            // path afterwards (the mask case below) is harmless.
+            currentInstance.m_materialType = materialData.getType();
+            bool fastHidden = currentInstance.m_isHidden;
+            if (currentInstance.m_materialType == MaterialDataType::Opaque) {
+              const auto& fastOmd = materialData.getOpaqueMaterialData();
+              if (fastOmd.getIsUnlitOutput()) {
+                currentInstance.surface.isMatte = true;
+              }
+              const bool fastIgnoreAC = currentInstance.testCategoryFlags(InstanceCategories::IgnoreAntiCulling);
+              const bool fastTf2Fog = fastOmd.getTf2SkyboxFog();
+              const bool fastFogEnabled = RtxOptions::enableTf2SkyboxCloudFog();
+              currentInstance.surface.isTf2SkyboxFog = fastIgnoreAC && fastTf2Fog && fastFogEnabled;
+              if (fastTf2Fog && !fastFogEnabled) {
+                fastHidden = true;
+              }
+              if (drawCall.getMaterialData().sourcePsWritesCoverageMask) {
+                fastHidden = true;
+              }
+              currentInstance.m_isSubsurface = fastOmd.getSubsurfaceDiffusionProfile();
+            }
+            if (fastHidden) {
+              currentInstance.m_isHidden = true;
+              currentInstance.m_vkInstance.mask = 0;
+            } else if (currentInstance.m_vkInstance.mask == 0) {
+              // Was hidden (or never masked), now visible: the mask bits must be
+              // re-derived by the full routing chain -- retention cannot
+              // reconstruct them from 0.
+              fastReject = kFastMaskMiss;
+            }
+          }
+
+          if (fastReject == kFastReasonCount) {
+            // COMMIT the fast update: only the genuinely per-frame writes.
+            processInstanceBuffers(blas, drawState, currentInstance);
+            currentInstance.surface.hasMaterialChanged = false;
+            currentInstance.surface.isInsideFrustum =
+              RtxOptions::AntiCulling::isObjectAntiCullingEnabled() ? currentInstance.m_isInsideFrustum : true;
+            currentInstance.surface.objectPickingValue = drawCall.drawCallID;
+            // Advance transform history: cur is byte-identical to the incoming
+            // matrix, so prev := cur is what move() would have produced, and the
+            // vkInstance transform / normal matrix / mirror parity all retain.
+            currentInstance.surface.prevObjectToWorld = currentInstance.surface.objectToWorld;
+            currentInstance.surface.isStatic = true;   // !(xfChg || prevPos), both provably false
+            currentInstance.surface.textureTransform = drawCall.getTransformData().textureTransform;
+            currentInstance.surface.isClipPlaneEnabled = drawCall.getTransformData().enableClipPlane;
+            currentInstance.surface.clipPlane = drawCall.getTransformData().clipPlane;
+            currentInstance.m_billboardCount = 0;
+
+            // Same per-handler granularity as the tail gate below: only handlers
+            // that opted in to being skippable are dropped; OMM's stays live.
+            for (auto& event : m_eventHandlers) {
+              if (!event.skippableWhenBindingUnchanged) {
+                event.onInstanceUpdatedCallback(currentInstance, drawCall, materialData,
+                                                /*hasTransformChanged*/ false,
+                                                /*hasPreviousPositions*/ false,
+                                                /*isFirstUpdateThisFrame*/ true);
+              }
+            }
+
+            uiSplit.surfSkipped();
+            uiSplit.tailSkipped();
+            uiSplit.counts(/*first*/ true, /*xfChg*/ false, /*matChg*/ false,
+                           /*prevPos*/ false, /*isStatic*/ true);
+            s_fastInstHit.fetch_add(1, std::memory_order_relaxed);
+            fastInstEmit(fastFid);
+            return;
+          }
+
+          s_fastInstSlow[fastReject].fetch_add(1, std::memory_order_relaxed);
+          fastInstEmit(fastFid);
+        } else {
+          s_fastInstSlow[kFastNotAllowed].fetch_add(1, std::memory_order_relaxed);
+        }
 
         // NEVER SKIPPED -- 2026-08-07, this froze the game when it was inside the
         // else below. processInstanceBuffers is not a read the key covers: it
@@ -7668,6 +7965,13 @@ namespace dxvk {
     }
 
     uiSplit.mark(8);   // NV-DXVK [Perf.UpdInst]: end of `tail` (the event-handler fanout)
+
+    // NV-DXVK [perf] fastInstanceUpdate: this full update derived flags/mask
+    // from THIS draw's unkeyed inputs -- record them so next frame's fast check
+    // can prove they have not moved. Written on every full path so the baseline
+    // can never go stale.
+    currentInstance.m_fastDrawBits = drawState.fastDrawBits;
+
     // NV-DXVK [Perf.UpdInst]: exact per-instance counters, taken from the values
     // this function already computed. REDUNDANT (no transform change, no material
     // change, no previous positions) is the one that answers sec 4c's open

@@ -418,6 +418,16 @@ namespace {
   std::atomic<uint32_t> g_cbStageEntries { 8 };     // refreshed once per report window
   constexpr size_t      kCbStageMaxBytes  = 64 * 1024;  // don't stage giant buffers
 
+  // NV-DXVK [CbStage] 2026-08-08: the ring storage, factored out of
+  // stagedCbBytes so the hit-only probe (stagedCbBytesIfHit below) scans the
+  // SAME per-thread entries the stager fills -- a thread_local static declared
+  // inside each function would be two distinct rings and the probe would never
+  // hit.
+  inline std::array<CbStageEntry, kCbStageEntriesMax>& cbStageRing() {
+    static thread_local std::array<CbStageEntry, kCbStageEntriesMax> s_cbStage;
+    return s_cbStage;
+  }
+
   // NV-DXVK [Perf.CbStage] 2026-08-07: WHY is the hit rate ~0?
   //
   // [Perf.WcCopy] measured one frame-thread call site moving 6.31 KB on
@@ -515,7 +525,7 @@ static const uint8_t* stagedCbBytes(D3D11BufferT* buffer, size_t& lenOut) {
   }
   const uint64_t gen = buffer->GetContentGeneration();
 
-  static thread_local std::array<CbStageEntry, kCbStageEntriesMax> s_cbStage;
+  auto& s_cbStage = cbStageRing();
   static thread_local size_t s_cbStageNext = 0;
 
   // Live window into the fixed storage. Clamped here rather than at the store
@@ -581,6 +591,52 @@ static const uint8_t* stagedCbBytes(D3D11BufferT* buffer, size_t& lenOut) {
   cbNote(_ReturnAddress(), len, false);
   lenOut = len;
   return e.bytes.data();
+}
+
+// NV-DXVK [CbStage] 2026-08-08: HIT-ONLY probe of the staging ring. Returns the
+// staged bytes when (buffer, generation) is already resident, and NEVER stages
+// on a miss. Exists for consumers of per-draw-DISCARD cbuffers (cb3): their
+// generation moves every draw, so the keyed cache above can never hit for them
+// and its miss path is a WHOLE-BUFFER WC copy -- the exact shape [Perf.WcCopy]
+// measured at 6.31 KB/call, ~3.4 MB/frame, 91% of pole-thread WC bytes -- paid
+// to serve a 48-byte read. Such callers should probe here and fall back to a
+// RANGED memcpyFromWC of only the bytes they read. (The CbStage miss-class
+// counters are deliberately not touched: this function never stages, so its
+// misses would pollute the missGen/missCap attribution the note above depends
+// on.)
+template<typename D3D11BufferT>
+static const uint8_t* stagedCbBytesIfHit(D3D11BufferT* buffer, size_t& lenOut) {
+  lenOut = 0;
+  if (buffer == nullptr) {
+    return nullptr;
+  }
+  const auto mapped = buffer->GetMappedSlice();
+  if (mapped.mapPtr == nullptr) {
+    return nullptr;
+  }
+  const size_t len = std::min<size_t>(mapped.length, buffer->Desc()->ByteWidth);
+  if (len == 0 || len > kCbStageMaxBytes) {
+    return nullptr;
+  }
+  const uint64_t gen = buffer->GetContentGeneration();
+
+  // Same ring the stager fills -- declared function-local there, so re-open it
+  // the same way; thread_local statics with identical declarations in two
+  // functions are distinct objects, hence the ring is factored into a getter.
+  auto& ring = cbStageRing();
+  size_t ways = size_t(g_cbStageEntries.load(std::memory_order_relaxed));
+  if (ways == 0)                  ways = 1;
+  if (ways > kCbStageEntriesMax)  ways = kCbStageEntriesMax;
+  for (size_t i = 0; i < ways; ++i) {
+    CbStageEntry& e = ring[i];
+    if (e.buf == buffer && e.gen == gen && e.bytes.size() >= len) {
+      t_cbStageStat.hits += 1;
+      t_cbStageStat.bytesServed += len;
+      lenOut = len;
+      return e.bytes.data();
+    }
+  }
+  return nullptr;
 }
 
 // NV-DXVK [RdefCache]: single-entry per-thread memos for the hottest RDEF
@@ -16610,44 +16666,46 @@ namespace dxvk {
     // NV-DXVK: For R32G32_UINT draws, read cb3 directly from its mapped memory.
     // cb3 is updated via Map/WRITE_DISCARD (not UpdateSubresource).
     // GetMappedSlice() returns the CPU-mapped pointer with current data.
-    if (m_skipViewMatrixScan) {
+    // NV-DXVK [perf] 2026-08-08 (w2vw_cb3, 1.82 ms/frame): REORDERED + RANGED.
+    // Two measured defects fixed together:
+    //  (1) the cb3 read ran BEFORE the m_lastO2wPathId gate, so every t31/bone
+    //      draw (pathId != 0) paid the read and then discarded it;
+    //  (2) cb3 is Map(WRITE_DISCARD)ed per draw, so its content generation
+    //      moves every draw and stagedCbBytes could never hit here -- its miss
+    //      path is a WHOLE-BUFFER WC staging copy (~6.3 KB/call; [Perf.WcCopy]
+    //      billed ~3.4 MB/frame, 91% of pole-thread WC bytes, to this shape)
+    //      to serve a 48-byte read. The CbStage note's own recorded fix
+    //      direction: "stage only the bytes each consumer actually reads."
+    // Now: probe the staging ring hit-only (free when another site already
+    // staged this generation), else copy exactly the 48 bytes this block
+    // reads. The 10-shot [D3D11Rtx] CB3-read diag that lived here is deleted
+    // (answered long ago; it forced an unconditional GetMappedSlice).
+    // The m_lastO2wPathId == 0 gate keeps its original meaning: only run
+    // CB3->O2W when no upstream path (t31, legacy t30 bone) already set
+    // objectToWorld -- see the clobber history in the git log.
+    if (m_skipViewMatrixScan && m_lastO2wPathId == 0) {
       const auto& vsCbs = m_context->m_state.vs.constantBuffers;
       const auto& cb3 = vsCbs[3];
       const float* bm = nullptr;
+      alignas(16) float bmLocal[12];
       if (cb3.buffer != nullptr) {
-        // NV-DXVK [CbStage]: cb3 discards per draw, so this is one staging
-        // copy per draw replacing the scattered WC float reads below
-        // (w2vw_cb3 bucket). Falls back to the raw mapping when unstaged.
+        const size_t cb3Off = static_cast<size_t>(cb3.constantOffset) * 16;
         size_t cb3Len = 0;
-        const uint8_t* cb3Bytes = stagedCbBytes(cb3.buffer.ptr(), cb3Len);
-        const auto mapped = cb3.buffer->GetMappedSlice();
-        if (cb3Bytes == nullptr && mapped.mapPtr != nullptr) {
-          cb3Bytes = static_cast<const uint8_t*>(mapped.mapPtr);
-          cb3Len = mapped.length;
-        }
-        if (cb3Bytes && cb3Len >= static_cast<size_t>(cb3.constantOffset) * 16 + 48) {
-          bm = reinterpret_cast<const float*>(
-            cb3Bytes + static_cast<size_t>(cb3.constantOffset) * 16);
-        }
-        static uint32_t sCb3Diag = 0;
-        if (sCb3Diag < 10) {
-          ++sCb3Diag;
-          Logger::info(str::format(
-            "[D3D11Rtx] CB3 read: mapPtr=", mapped.mapPtr != nullptr ? 1 : 0,
-            " mapMode=", uint32_t(cb3.buffer->GetMapMode()),
-            " usage=", uint32_t(cb3.buffer->Desc()->Usage),
-            " size=", cb3.buffer->Desc()->ByteWidth,
-            " off=", cb3.constantOffset,
-            " bm=", bm != nullptr ? 1 : 0));
+        const uint8_t* cb3Bytes = stagedCbBytesIfHit(cb3.buffer.ptr(), cb3Len);
+        if (cb3Bytes != nullptr && cb3Len >= cb3Off + 48) {
+          bm = reinterpret_cast<const float*>(cb3Bytes + cb3Off);
+        } else {
+          const auto mapped = cb3.buffer->GetMappedSlice();
+          if (mapped.mapPtr != nullptr
+              && std::min<size_t>(mapped.length, cb3.buffer->Desc()->ByteWidth) >= cb3Off + 48) {
+            memcpyFromWC(bmLocal,
+                         static_cast<const uint8_t*>(mapped.mapPtr) + cb3Off,
+                         sizeof(bmLocal));
+            bm = bmLocal;
+          }
         }
       }
-      // NV-DXVK: only run CB3â†’O2W if no upstream path (t31 at line 2342,
-      // or legacy t30 bone paths at 2551/2604) already set objectToWorld.
-      // Without this gate, CB3â†’O2W clobbers the t31-derived o2w with a
-      // stale cb3 read for every R32G32_UINT draw â€” the histogram showed
-      // cb3=32 commits per frame and t31=0 despite t31 firing successfully
-      // thousands of times.
-      if (bm && m_lastO2wPathId == 0) {
+      if (bm) {
         Matrix4 cb3Mat(
           Vector4(bm[0], bm[1], bm[2],  0.0f),
           Vector4(bm[4], bm[5], bm[6],  0.0f),
@@ -28961,56 +29019,19 @@ namespace dxvk {
         const uint64_t propId = MakeBoneStablePropId(&firstInst);
         if (propId != 0) {
           dcs.transformData.stablePropId = propId;
-          static std::mutex sLogMu;
-          static std::unordered_set<uint64_t> sLogged;
-          bool first = false;
-          {
-            std::lock_guard<std::mutex> g(sLogMu);
-            first = sLogged.insert(propId).second;
-          }
-          if (first) {
-            // NV-DXVK [fanout batch identity] 2026-08-05. MEASURED: one object
-            // (mat=0x21edeedd7e974f08 v=32) was reaped 96 times carrying 65
-            // distinct propIds, and those 65 ids resolve to 65 DIFFERENT
-            // firstInstT positions kilometres apart. So this propId does not
-            // identify the object — it identifies whichever prop is element [0]
-            // of this frame's fanout batch, and that rotates every frame.
-            //
-            // nInst + setDigest decide what to do about it, and they are the
-            // only two numbers that can:
-            //   setDigest STABLE while firstInstT rolls  -> the batch holds the
-            //     same props and only the ORDER rotates. Fix is to key the
-            //     identity on the digest (order-independent) instead of [0].
-            //   setDigest ALSO rolls                     -> batch MEMBERSHIP
-            //     genuinely changes; no ordering fix helps and the identity has
-            //     to come from something that is not the batch.
-            //
-            // The digest is a SUM of per-instance position hashes, so it is
-            // commutative by construction — reordering cannot change it. Built
-            // from the same rounded translation the propId already uses, so the
-            // two are directly comparable. Rounding to 1u matches
-            // MakeBoneStablePropId and absorbs sub-unit engine jitter.
-            uint64_t setDigest = 0;
-            const uint32_t nInst =
-              static_cast<uint32_t>(m_currentInstancesToObject->size());
-            for (uint32_t i = 0; i < nInst; ++i) {
-              const Matrix4& mi = (*m_currentInstancesToObject)[i];
-              const int32_t ri[3] = {
-                static_cast<int32_t>(std::round(float(mi[3][0]))),
-                static_cast<int32_t>(std::round(float(mi[3][1]))),
-                static_cast<int32_t>(std::round(float(mi[3][2]))) };
-              setDigest += static_cast<uint64_t>(XXH64(ri, sizeof(ri), 0xA11CEBABEull));
-            }
-            Logger::info(str::format(
-              "[BonePropId path10-fanout] vs=", m_currentVsHashCache.substr(0, 19),
-              " propId=0x", std::hex, propId, std::dec,
-              " nInst=", nInst,
-              " setDigest=0x", std::hex, setDigest, std::dec,
-              " firstInstT=(", float(firstInst[3][0]), ",",
-                               float(firstInst[3][1]), ",",
-                               float(firstInst[3][2]), ")",
-              " â€” fanout bones anchored to buffer-ptr + i2o[0].T identity"));
-          }
+          // NV-DXVK [perf] 2026-08-08: the [BonePropId path10-fanout] diagnostic
+          // that lived here is DELETED, answer recorded 2026-08-05: this propId
+          // names whichever prop is element [0] of the batch and ROTATES every
+          // frame (65 distinct ids for one object, kilometres apart), and the
+          // commutative setDigest rolled too, so batch MEMBERSHIP genuinely
+          // changes -- no ordering fix helps; identity must come from something
+          // that is not the batch (the matsys-Bind hook route, see the razor
+          // work). BECAUSE the ids rotate, the "one-shot per propId" gate here
+          // was defeated by construction: ~30-60 NEW ids per frame meant a
+          // process-global mutex + an UNBOUNDED growing unordered_set + up to 60
+          // XXH64 rounds + a ~250-char str::format + logger IO, every frame, on
+          // the frame thread -- the pole. Deleting beats guarding (v6 process
+          // note 2); the propId assignment above is the only functional part.
         }
       }
 
@@ -35609,6 +35630,133 @@ namespace dxvk {
     }
 
     markSub(s_perfTeMemoDupAcc, s_perfTeMemoDupMax);  // [te_memoDup] MemoCeiling + DupPass probes
+
+    // NV-DXVK [DupFilter] 2026-08-08: skip the commit of within-frame draws that
+    // are BYTE-REDUNDANT with an earlier draw of this frame. Sized by [DupPass]
+    // (2026-08-07, recorded in rtx.conf): 14.6% of commits are exact duplicates
+    // costing ~4.5-5.8 ms/frame of dxvk-cs. The identity here is DELIBERATELY
+    // STRICTER than [DupPass]'s classifier -- see the rtx.filterDupSameDraws
+    // option doc for the key fields and the safety argument. v1 scope guards:
+    // fanout draws (per-instance transform arrays) and blending-enabled draws
+    // are never filtered. An early return here is safe by construction: pins
+    // pending in the batch arena are released by resetPending() at the next
+    // SubmitDraw entry (that is that function's documented contract for draws
+    // rejected before the commit point).
+    if (RtxOptions::filterDupSameDraws()) {
+      const auto& itoDf = dcs.transformData.instancesToObject;
+      const bool dfFanout = (itoDf != nullptr) && !itoDf->empty();
+      // NV-DXVK [DupFilter] 2026-08-08 SCOPE FIX: bone-transformed draws are
+      // NEVER filtered. The v1 key proved too weak for them in play: the
+      // viewmodel (gun + gauntlet hands) re-draws the same geometry with the
+      // same objectToWorld and the same textures but a DIFFERENT bone palette
+      // per pass -- byte-identical under this key, visually different. The
+      // skipped alternate-pose commits made the viewmodel flicker (temporal
+      // accumulation reads it as translucency). Bones live in skinningData /
+      // the bone buffers, which the key deliberately does not hash (12KB+ per
+      // draw), so exclusion is the correct scope, mirroring the fanout guard.
+      // Same tri-source check the host-side hasBoneTransform wiring uses.
+      const bool dfSkinned = m_currentDrawIsBoneTransformed
+        || dcs.skinningData.numBones > 0u
+        || (dcs.geometryData.boneMatrixBuffer.defined()
+            && dcs.geometryData.boneIndexBuffer.defined());
+      if (!dfFanout && !dfSkinned) {
+        bool dfBlendOn = false;
+        uint8_t dfWriteMask = 0x0F;
+        const D3D11BlendState* dfBsPtr = m_context->m_state.om.cbState;
+        if (D3D11BlendState* bsDf = m_context->m_state.om.cbState) {
+          struct DfBlendBits { uint8_t mask; uint8_t enable; };
+          static thread_local std::unordered_map<const D3D11BlendState*, DfBlendBits> sDfBlendCache;
+          auto itB = sDfBlendCache.find(bsDf);
+          if (itB == sDfBlendCache.end()) {
+            D3D11_BLEND_DESC1 bdDf = {};
+            bsDf->GetDesc1(&bdDf);
+            const DfBlendBits bits {
+              uint8_t(bdDf.RenderTarget[0].RenderTargetWriteMask),
+              uint8_t(bdDf.RenderTarget[0].BlendEnable ? 1u : 0u) };
+            if (sDfBlendCache.size() >= 2048) sDfBlendCache.clear();
+            itB = sDfBlendCache.emplace(bsDf, bits).first;
+          }
+          dfWriteMask = itB->second.mask;
+          dfBlendOn = itB->second.enable != 0;
+        }
+        if (!dfBlendOn) {
+          const auto& iaDf = m_context->m_state.ia;
+          uint64_t dfVbPtr = 0; uint32_t dfVbOff = 0, dfVbStr = 0;
+          if (!iaDf.vertexBuffers.empty() && iaDf.vertexBuffers[0].buffer != nullptr) {
+            dfVbPtr = reinterpret_cast<uint64_t>(iaDf.vertexBuffers[0].buffer.ptr());
+            dfVbOff = iaDf.vertexBuffers[0].offset;
+            dfVbStr = iaDf.vertexBuffers[0].stride;
+          }
+          const uint64_t dfIbPtr = (iaDf.indexBuffer.buffer != nullptr)
+            ? reinterpret_cast<uint64_t>(iaDf.indexBuffer.buffer.ptr()) : 0ull;
+          const uint32_t dfIbOff = (iaDf.indexBuffer.buffer != nullptr) ? iaDf.indexBuffer.offset : 0u;
+
+          struct DfId {
+            uint64_t vs, ps, vbPtr, ibPtr, bsPtr;
+            uint32_t vbOff, vbStr, ibOff, vtx, idx, camType;
+            uint32_t writeMask, pad;
+          } dfId {
+            static_cast<uint64_t>(dcs.transformData.vertexShaderHash),
+            static_cast<uint64_t>(dcs.transformData.pixelShaderHash),
+            dfVbPtr, dfIbPtr, reinterpret_cast<uint64_t>(dfBsPtr),
+            dfVbOff, dfVbStr, dfIbOff,
+            dcs.geometryData.vertexCount, dcs.geometryData.indexCount,
+            static_cast<uint32_t>(dcs.cameraType), uint32_t(dfWriteMask), 0u
+          };
+          static_assert(sizeof(DfId) % 8 == 0, "DfId must have no trailing padding");
+          uint64_t dfKey = XXH64(&dfId, sizeof(dfId), 0xD07F117Eull);
+          // Draw ranges: same VB/IB with a different sub-range is a different
+          // mesh, not a duplicate. params carries firstIndex/vertexOffset/counts.
+          dfKey = XXH64(&params, sizeof(params), dfKey);
+          // Full object transform: the same mesh at two positions is two
+          // INSTANCES. Byte-hash so only bit-identical placements alias.
+          dfKey = XXH64(&dcs.transformData.objectToWorld,
+                        sizeof(dcs.transformData.objectToWorld), dfKey);
+          // Material identity: bound PS SRVs (texture set). Different textures
+          // with the same PS = multi-material pass -- not a duplicate.
+          {
+            const auto& dfSrvs = m_context->m_state.ps.shaderResources.views;
+            uint64_t srvPtrs[8];
+            for (uint32_t s = 0; s < 8u; ++s) {
+              srvPtrs[s] = (s < dfSrvs.size())
+                ? reinterpret_cast<uint64_t>(dfSrvs[s].ptr()) : 0ull;
+            }
+            dfKey = XXH64(srvPtrs, sizeof(srvPtrs), dfKey);
+          }
+
+          static thread_local uint32_t sDfFrame = UINT32_MAX;
+          static thread_local std::unordered_set<uint64_t> sDfSeen;
+          static thread_local uint32_t sDfChecked = 0, sDfSkipped = 0;
+          static thread_local uint32_t sDfEmitCountdown = 0;
+          const uint32_t dfFid = m_context->m_device->getCurrentFrameId();
+          if (dfFid != sDfFrame) {
+            // Emit the JUST-FINISHED frame's tally every ~64 frames -- enough to
+            // verify the filter's population against [Perf.Report] HYGIENE
+            // drawsCommit without spamming.
+            if (sDfFrame != UINT32_MAX && sDfEmitCountdown == 0u) {
+              sDfEmitCountdown = 64u;
+              Logger::info(str::format(
+                "[DupFilter] frame=", sDfFrame, " checked=", sDfChecked,
+                " skipped=", sDfSkipped, " uniq=", sDfSeen.size()));
+            }
+            if (sDfEmitCountdown > 0u) { --sDfEmitCountdown; }
+            sDfSeen.clear();
+            sDfChecked = 0; sDfSkipped = 0;
+            sDfFrame = dfFid;
+          }
+          ++sDfChecked;
+          if (!sDfSeen.insert(dfKey).second) {
+            // Exact duplicate of a commit already made this frame: the instance
+            // manager would fold it into the same RtInstance and re-write
+            // identical state. Skip the commit outright.
+            ++sDfSkipped;
+            m_meshTraceReported = true;
+            m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit: DupFilter
+            return;
+          }
+        }
+      }
+    }
 
     // ================================================================
     // NV-DXVK [Phase2]: GPU-driven-injection per-draw capture.
