@@ -807,8 +807,7 @@ namespace dxvk {
       }
 
       // NV-DXVK [buffered log]: flush policy —
-      //   * Warn/Error: immediately. These are the lines that matter when
-      //     the process dies unexpectedly, and they are low-volume.
+      //   * Error: immediately. Genuinely rare and genuinely last-words.
       //   * Buffer over 64 KB: bound memory and write in efficient chunks.
       //   * Older than 100 ms: bound how stale the on-disk log can be, so
       //     tail -f behavior and TDR forensics stay usable.
@@ -816,10 +815,44 @@ namespace dxvk {
       // Everything else stays buffered. The UnhandledExceptionFilter in
       // d3d11_main.cpp calls Logger::flush() on crash, which drains this
       // buffer, and ~Logger drains it on graceful exit.
+      //
+      // NV-DXVK 2026-08-08: WARN NO LONGER FORCES A FLUSH, and that is the
+      // whole point of this block now.
+      //
+      // The policy above used to read `level >= LogLevel::Warn`, justified by
+      // "they are low-volume". That was true of upstream DXVK. It is not true
+      // of this fork: the entire diagnostic layer emits at warn --
+      // [Perf.Report], [Perf.Block], [SceneCull], [OccProbe], [PitchProbe],
+      // [EngineCamFrame], [ReskinProbe], [Perf.BuildBlas] and more. Measured
+      // 2026-08-08: ~40 warn lines PER FRAME during TF2 gameplay (46,977 lines
+      // over ~1,170 frames), i.e. ~800 flushes/second.
+      //
+      // Each one did m_fileStream.write() + m_fileStream.flush() -- a
+      // synchronous OS-level flush -- WHILE HOLDING m_mutex, on whichever
+      // thread emitted it, which for these probes is the frame thread and the
+      // CS thread. That is precisely the defect the batch buffer above was
+      // added to remove (see the note at the m_lineBuffer.append: per-line
+      // flushing "at the measured 570-860 lines/s ... serialised the CS thread
+      // and the D3D11 submit thread against each other"). The fix buffered
+      // info and left warn on the old path, so in this fork it removed almost
+      // nothing.
+      //
+      // WHY THIS IS SAFE, i.e. why warn lines still reach disk:
+      //   * the 100 ms staleness rule below still bounds how far behind the
+      //     file can be, so tail -f and post-hoc reading are unchanged in
+      //     practice (100 ms is ~2 frames at this build's framerate);
+      //   * Logger::flush() from d3d11_main.cpp's UnhandledExceptionFilter
+      //     drains the buffer on crash;
+      //   * ~Logger drains it on graceful exit;
+      //   * Error still flushes per line, so a real fatal still lands even if
+      //     the crash handler itself is what failed.
+      // The exposure is up to 100 ms of warn lines on a hard kill that runs
+      // no handler at all (task-manager terminate). Set RTX_LOG_UNBUFFERED=1
+      // for a run where that matters and every line flushes as before.
       constexpr size_t kFlushSizeThreshold = 64 * 1024;
       const bool flushNow =
            m_flushEveryLine
-        || level >= LogLevel::Warn
+        || level >= LogLevel::Error
         || m_lineBuffer.size() >= kFlushSizeThreshold
         || (std::chrono::steady_clock::now() - m_lastFlushTime) >= std::chrono::milliseconds(100);
       if (flushNow) {

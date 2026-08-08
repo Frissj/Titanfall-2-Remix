@@ -1363,6 +1363,13 @@ namespace dxvk {
       });
     } else {
       slice = pDstBuffer->GetMappedSlice();
+      // NV-DXVK [T31Cache]/[Perf.FanoutCamCache] 2026-08-08: this is a CPU
+      // write window onto the mapped bytes (UpdateSubresource NO_OVERWRITE
+      // writes in place below), so it must bump the map generation like the
+      // Map(WRITE_NO_OVERWRITE) path already does -- GetMapGeneration()'s
+      // contract is "same (buf, mapGen) implies same bytes", and mapGen-keyed
+      // caches would otherwise serve stale data after this write.
+      pDstBuffer->NoteMapForWrite();
     }
 
     std::memcpy(reinterpret_cast<char*>(slice.mapPtr) + Offset, pSrcData, Length);

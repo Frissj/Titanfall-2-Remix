@@ -169,6 +169,38 @@ static void memcpyFromWC(void* dst, const void* src, size_t len) {
   }
 }
 
+// NV-DXVK [Perf.InstLoop] 2026-08-08: vectorized validity checks for the fanout
+// per-instance transform build. The loop body ran 24 scalar std::isfinite calls
+// and up to 16 scalar ==0.0f compares per instance, ~23.7k instances/frame
+// ([Perf.InstDraw]) -- a large slice of the 0.21 us/instance inst_loop cost.
+// EXACT same semantics as the scalar loops they replace:
+//   finite(x)  <=> (bits & 0x7f800000) != 0x7f800000  (exponent not all-ones;
+//                  this is the IEEE definition std::isfinite tests)
+//   x == 0.0f  is an FP compare: -0.0f counts as zero, NaN does not.
+// Used by BOTH the serial and parallel fanout loops, so the two stay
+// bit-identical in behavior (the [ParFanout] contract).
+static inline bool fanoutAllFinite12(const float* m) {
+  const __m128i expMask = _mm_set1_epi32(0x7f800000);
+  __m128i bad = _mm_cmpeq_epi32(
+      _mm_and_si128(_mm_castps_si128(_mm_loadu_ps(m + 0)), expMask), expMask);
+  bad = _mm_or_si128(bad, _mm_cmpeq_epi32(
+      _mm_and_si128(_mm_castps_si128(_mm_loadu_ps(m + 4)), expMask), expMask));
+  bad = _mm_or_si128(bad, _mm_cmpeq_epi32(
+      _mm_and_si128(_mm_castps_si128(_mm_loadu_ps(m + 8)), expMask), expMask));
+  return _mm_movemask_epi8(bad) == 0;
+}
+static inline bool fanoutAllZero12(const float* m) {
+  const __m128 z = _mm_setzero_ps();
+  const __m128 eq = _mm_and_ps(
+      _mm_and_ps(_mm_cmpeq_ps(_mm_loadu_ps(m + 0), z),
+                 _mm_cmpeq_ps(_mm_loadu_ps(m + 4), z)),
+      _mm_cmpeq_ps(_mm_loadu_ps(m + 8), z));
+  return _mm_movemask_ps(eq) == 0xF;
+}
+static inline bool fanoutZeroRow4(const float* m) {
+  return _mm_movemask_ps(_mm_cmpeq_ps(_mm_loadu_ps(m), _mm_setzero_ps())) == 0xF;
+}
+
 // NV-DXVK [WC fused max-scan]: return max(index) read DIRECTLY out of
 // write-combined mapped memory, with no staging copy.
 //
@@ -8678,10 +8710,15 @@ namespace dxvk {
   // bisect has landed â€” flip this default back to false at that point, since
   // the ~0.33 us/draw these cost is larger than several of the buckets they
   // report.
+  // NV-DXVK [perf] 2026-08-08: bisect landed (leaves named in the 03:05 3/3-PASS
+  // capture; see HANDOFF_PERF_2026-08-08 Â§4). DEFAULT BACK OFF as the comment
+  // above requires. The [Perf.SdStall] stage buckets (xform/emit/commit/...)
+  // stay live for regression tracking; RTX_D3D11_SUBMARK=1 re-enables the leaf
+  // splits without a rebuild when the next bisection is needed.
   static const bool s_submitDrawSubMarkers = []() {
     const char* v = std::getenv("RTX_D3D11_SUBMARK");
     if (v == nullptr || v[0] == '\0')
-      return true;          // default ON
+      return false;         // default OFF (leaf bisect landed 2026-08-08)
     return v[0] != '0';     // RTX_D3D11_SUBMARK=0 disables, no rebuild needed
   }();
   static thread_local int64_t s_perfPfsGuardAcc   = 0, s_perfPfsGuardMax   = 0;
@@ -9682,6 +9719,44 @@ namespace dxvk {
   static thread_local int64_t  s_perfInstRegSumTot  = 0;  // ns
   static thread_local int64_t  s_perfInstRegSumITot = 0;  // instances * ns
 
+  // NV-DXVK [Perf.FanoutCamCache] 2026-08-08: cache of the fanout camOrigin CB
+  // read, keyed on (buffer identity, map generation, cb offset, field offset).
+  //
+  // WHY. [Perf.CamCut] pinned co_cbRead at 4.9-5.4 us/call, ~533 calls/frame,
+  // 2.87 ms/frame -- the #5 frame-thread target -- and >95% of that span is
+  // UNATTRIBUTED after three probe rounds (the copy, the RDEF memo and the map
+  // chain each measured under 0.2 us). Rather than a fourth bisect, skip the
+  // entire span: the camera CB's bytes only change when the engine re-maps it
+  // (a handful of view passes per frame), while the fanout re-reads it on every
+  // instanced draw. Same key contract as [T31Cache]: GetMapGeneration() moves
+  // on DiscardSlice AND on every CPU write window (Map NO_OVERWRITE +
+  // UpdateSubresource NO_OVERWRITE -- the latter bump added this session),
+  // so same (buf, mapGen) implies same bytes.
+  //
+  // The cache stores the staged CB copy, NOT just camOrigin: the publish block
+  // (isMainViewport / viewmodel / near-axis / tryReadVP) is per-draw state and
+  // MUST keep running on every draw -- it reads the staged bytes at +16/+96.
+  // Only SUCCESSFUL, fully-staged reads are cached; every failure path re-runs
+  // the slow path unchanged.
+  //
+  // Regression visibility: hit/miss counters ride the existing [Perf.CamCut]
+  // line. A healthy steady state is hits ~= calls minus a few per frame; a
+  // hit rate near zero means the engine remaps the CB per draw and this cache
+  // is inert (correct either way, just not profitable).
+  struct FanoutCamEntry {
+    const void* buf      = nullptr;   // D3D11Buffer identity, never dereferenced
+    uint64_t    mapGen   = 0;
+    uint32_t    cbOff    = 0;         // cb.constantOffset (D3D11.1 offsets)
+    uint32_t    fieldOff = 0;         // camLoc->offset inside the CB
+    bool        camValid = false;     // false while (re)staging / after a failed read
+    float       cam[3]   = {};
+    std::vector<uint8_t> stage;       // staged copy of the whole CB
+  };
+  static constexpr size_t kFanoutCamWays = 4;
+  static thread_local FanoutCamEntry s_fanoutCamCache[kFanoutCamWays];
+  static thread_local uint32_t s_fanoutCamVictim = 0;
+  static thread_local uint64_t s_fanoutCamHits = 0, s_fanoutCamMisses = 0;
+
   void D3D11Rtx::SubmitInstancedDraw(bool indexed, UINT count, UINT start, INT base,
                                       UINT instanceCount, UINT startInstance) {
     try {
@@ -10230,9 +10305,42 @@ namespace dxvk {
                   if (cb.buffer == nullptr) {
                     failReason = "cb_buffer_null";
                   } else {
-                    const auto mapped = cb.buffer->GetMappedSlice();
-                    const uint8_t* p = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
                     const size_t base = static_cast<size_t>(cb.constantOffset) * 16 + camLoc->offset;
+                    // NV-DXVK [Perf.FanoutCamCache] 2026-08-08: staged-CB cache
+                    // lookup -- see the FanoutCamEntry block above this function.
+                    // Same (buffer, mapGen, offsets) -> same bytes, so a hit
+                    // skips the map/stage/read span ([Perf.CamCut] co_cbRead,
+                    // ~5 us/call x ~533 calls/frame) entirely. The publish block
+                    // below still runs per draw on both paths.
+                    const void*    camBufKey = cb.buffer.ptr();
+                    const uint64_t camMapGen = cb.buffer->GetMapGeneration();
+                    const uint8_t* p = nullptr;
+                    FanoutCamEntry* camEnt = nullptr;
+                    for (size_t w = 0; w < kFanoutCamWays; ++w) {
+                      FanoutCamEntry& e = s_fanoutCamCache[w];
+                      if (e.buf == camBufKey && e.cbOff == cb.constantOffset
+                          && e.fieldOff == camLoc->offset) {
+                        camEnt = &e;
+                        break;
+                      }
+                    }
+                    if (camEnt != nullptr && camEnt->camValid
+                        && camEnt->mapGen == camMapGen) {
+                      // HIT: bytes unchanged since they were staged. Serve the
+                      // cached origin and the cached staged copy.
+                      ++s_fanoutCamHits;
+                      p = camEnt->stage.data();
+                      camOrigin[0] = camEnt->cam[0];
+                      camOrigin[1] = camEnt->cam[1];
+                      camOrigin[2] = camEnt->cam[2];
+                      haveCamOrigin = true;
+                      markInst(instCoCbReadNs);
+                    } else {
+                    // MISS: the original read path, verbatim except that the
+                    // staging target is the cache entry instead of m_camCbStage.
+                    ++s_fanoutCamMisses;
+                    const auto mapped = cb.buffer->GetMappedSlice();
+                    const uint8_t* wcP = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
 
                     // NV-DXVK [CbStage] 2026-07-28: stage the mapped CB into cached
                     // memory before reading scalars out of it.
@@ -10256,12 +10364,30 @@ namespace dxvk {
                     // Bounded: constant buffers are <=64KB by D3D11 rule, and the
                     // capacity is retained across draws so this does not allocate
                     // at steady state. Same bytes -> no behaviour change.
-                    if (p != nullptr) {
+                    if (wcP != nullptr) {
                       const size_t cbBytes = cb.buffer->Desc()->ByteWidth;
                       if (cbBytes > 0 && cbBytes <= (64u * 1024u)) {
-                        if (m_camCbStage.size() < cbBytes) m_camCbStage.resize(cbBytes);
-                        memcpyFromWC(m_camCbStage.data(), p, cbBytes);
-                        p = m_camCbStage.data();
+                        // NV-DXVK [Perf.FanoutCamCache]: stage into the cache
+                        // entry so the copy is reusable across draws. Entry is
+                        // claimed round-robin; camValid stays false until the
+                        // read below succeeds, so a failed read can never be
+                        // served as a hit.
+                        if (camEnt == nullptr) {
+                          camEnt = &s_fanoutCamCache[s_fanoutCamVictim];
+                          s_fanoutCamVictim = (s_fanoutCamVictim + 1u) % uint32_t(kFanoutCamWays);
+                          camEnt->buf      = camBufKey;
+                          camEnt->cbOff    = cb.constantOffset;
+                          camEnt->fieldOff = camLoc->offset;
+                        }
+                        camEnt->camValid = false;
+                        camEnt->mapGen   = camMapGen;
+                        if (camEnt->stage.size() < cbBytes) camEnt->stage.resize(cbBytes);
+                        memcpyFromWC(camEnt->stage.data(), wcP, cbBytes);
+                        p = camEnt->stage.data();
+                      } else {
+                        // Oversized/zero CB: unstaged and uncached -- identical
+                        // to the pre-cache behavior (downstream reads hit WC).
+                        p = wcP;
                       }
                       // NV-DXVK 2026-08-07: A SPAN-LIMITED VERSION OF THIS COPY WAS
                       // TRIED AND REVERTED -- it made co_cbRead WORSE, 6.19 ->
@@ -10305,6 +10431,15 @@ namespace dxvk {
                       // 10200..10405 until a marker bisect says which part of it
                       // holds the 5 us -- both previous attempts optimised inside
                       // this bucket without ever establishing what is in it.
+                      //
+                      // NV-DXVK 2026-08-08 [Perf.FanoutCamCache]: the rule above
+                      // forbids optimising INSIDE the span on a guess, and both
+                      // failed attempts did exactly that. The cache added this
+                      // session does neither: it leaves this miss path verbatim
+                      // and skips the WHOLE span on (buf, mapGen) identity, so
+                      // it pays regardless of which line holds the 5 us. If
+                      // [Perf.CamCut] hit/miss shows ~zero hits, the engine
+                      // remaps the CB per draw and the bisect is back on.
                     }
                     if (!p) {
                       failReason = "mapPtr_null";
@@ -10317,6 +10452,14 @@ namespace dxvk {
                       } else {
                         camOrigin[0] = fp[0]; camOrigin[1] = fp[1]; camOrigin[2] = fp[2];
                         haveCamOrigin = true;
+                        // NV-DXVK [Perf.FanoutCamCache]: read succeeded from the
+                        // staged copy -> the entry may now serve hits.
+                        if (camEnt != nullptr && p == camEnt->stage.data()) {
+                          camEnt->cam[0]   = fp[0];
+                          camEnt->cam[1]   = fp[1];
+                          camEnt->cam[2]   = fp[2];
+                          camEnt->camValid = true;
+                        }
                         // NV-DXVK [diag]: log RAW cb read on EVERY value change
                         // (also first read of session). Now includes VS hash so
                         // we can see if multiple VS passes are alternating
@@ -10398,7 +10541,17 @@ namespace dxvk {
                         // [fanoutCBRead] change-detect block. Both fixes landed
                         // here and camOrigin did NOT drop, so the cost is below.
                         markInst(instCoCbReadNs);
+                      }
+                    }
+                    } // NV-DXVK [Perf.FanoutCamCache]: end of MISS branch
 
+                    // NV-DXVK [Perf.FanoutCamCache]: the publish block runs on
+                    // BOTH hit and miss paths -- it is per-draw state (viewport
+                    // gates, viewmodel detect, sky slots) and must see every
+                    // draw. fp points at the STAGED bytes (or the raw mapped
+                    // pointer for oversized uncached CBs, as before).
+                    if (haveCamOrigin) {
+                        const float* fp = reinterpret_cast<const float*>(p + base);
                         // NV-DXVK: publish to m_lastFanoutCamOrigin ONLY if
                         // this draw is from the MAIN gameplay camera pass, not
                         // a shadow cascade / reflection probe / cubemap etc.
@@ -10775,8 +10928,7 @@ namespace dxvk {
                               " cam=(", fp[0], ",", fp[1], ",", fp[2], ")"));
                           }
                         }
-                      }
-                    }
+                    } // NV-DXVK [Perf.FanoutCamCache]: end of publish (haveCamOrigin)
                   }
                 }
               }
@@ -11611,10 +11763,10 @@ namespace dxvk {
                   float lm[12];
                   std::memcpy(lm, t31Read + t31Off, 48);
                   const float* m = lm;
-                  bool allFinite = true;
-                  for (int f = 0; f < 12; ++f) if (!std::isfinite(m[f])) { allFinite = false; break; }
-                  if (!allFinite) { s.status = 2; continue; }
-                  if (m[0] == 0.f && m[1] == 0.f && m[2] == 0.f && m[3] == 0.f) { s.status = 3; continue; }
+                  // NV-DXVK [Perf.InstLoop]: vectorized, exact-same-verdict checks
+                  // (see fanoutAllFinite12 at the top of the file).
+                  if (!fanoutAllFinite12(m)) { s.status = 2; continue; }
+                  if (fanoutZeroRow4(m)) { s.status = 3; continue; }
 
                   const float adjTx = haveCamOrigin ? (m[3]  + camOrigin[0]) : m[3];
                   const float adjTy = haveCamOrigin ? (m[7]  + camOrigin[1]) : m[7];
@@ -11629,15 +11781,9 @@ namespace dxvk {
                   if (havePrevCamOrigin && t31Off + 96 <= t31ReadLen) {
                     float pm[12];
                     std::memcpy(pm, t31Read + t31Off + 48, 48);
-                    bool prevAllZero = true;
-                    for (int f = 0; f < 12; ++f) {
-                      if (pm[f] != 0.0f) { prevAllZero = false; break; }
-                    }
-                    bool prevFinite = true;
-                    for (int f = 0; f < 12; ++f) {
-                      if (!std::isfinite(pm[f])) { prevFinite = false; break; }
-                    }
-                    if (!prevAllZero && prevFinite) {
+                    // NV-DXVK [Perf.InstLoop]: vectorized, exact-same-verdict
+                    // checks (see fanoutAllZero12 / fanoutAllFinite12).
+                    if (!fanoutAllZero12(pm) && fanoutAllFinite12(pm)) {
                       const float pTx = pm[3]  + prevCamOrigin[0];
                       const float pTy = pm[7]  + prevCamOrigin[1];
                       const float pTz = pm[11] + prevCamOrigin[2];
@@ -11790,13 +11936,13 @@ namespace dxvk {
               float lm[12];
               std::memcpy(lm, t31Read + t31Off, 48);
               const float* m = lm;
-              bool allFinite = true;
-              for (int f = 0; f < 12; ++f) if (!std::isfinite(m[f])) { allFinite = false; break; }
-              if (!allFinite) {
+              // NV-DXVK [Perf.InstLoop]: vectorized, exact-same-verdict checks
+              // (see fanoutAllFinite12 at the top of the file).
+              if (!fanoutAllFinite12(m)) {
                 ++m_geomDiagFanoutInstBadFinite;
                 continue;
               }
-              if (m[0] == 0.f && m[1] == 0.f && m[2] == 0.f && m[3] == 0.f) {
+              if (fanoutZeroRow4(m)) {
                 ++m_geomDiagFanoutInstZeroRow0;
                 continue;
               }
@@ -11894,15 +12040,9 @@ namespace dxvk {
               if (havePrevCamOrigin && t31Off + 96 <= t31ReadLen) {
                 float pm[12];
                 std::memcpy(pm, t31Read + t31Off + 48, 48);
-                bool prevAllZero = true;
-                for (int f = 0; f < 12; ++f) {
-                  if (pm[f] != 0.0f) { prevAllZero = false; break; }
-                }
-                bool prevFinite = true;
-                for (int f = 0; f < 12; ++f) {
-                  if (!std::isfinite(pm[f])) { prevFinite = false; break; }
-                }
-                if (!prevAllZero && prevFinite) {
+                // NV-DXVK [Perf.InstLoop]: vectorized, exact-same-verdict
+                // checks (see fanoutAllZero12 / fanoutAllFinite12).
+                if (!fanoutAllZero12(pm) && fanoutAllFinite12(pm)) {
                   // Identical arithmetic to the current block above — same order,
                   // same operands — so a static prop reproduces last frame's
                   // absolute matrix bit-for-bit rather than merely closely.
@@ -22754,7 +22894,13 @@ namespace dxvk {
     static thread_local uint64_t s_sdStallLastCyc = 0;
     static thread_local std::chrono::steady_clock::time_point s_sdStallLastWall {};
 
-    s_sdStallSampleActive = ((++s_sdStallDrawCounter & 63u) == 0u);
+    // NV-DXVK [Perf] 2026-08-08: same rtx.perfSubmitCpuCycles gate as
+    // SubmitCpuGuard. The 1-in-64 sampling already bounded this to ~0.125
+    // QTCT/draw, but the whole wall-vs-cycle split is one feature and it should
+    // go dark as one -- a half-sampled segCyc with no ctor/dtor pair to bound it
+    // reads as a stall that isn't there.
+    s_sdStallSampleActive = RtxOptions::perfSubmitCpuCycles()
+                         && ((++s_sdStallDrawCounter & 63u) == 0u);
     if (s_sdStallSampleActive) {
       ++s_sdStat.stallSamples;
       QueryThreadCycleTime(GetCurrentThread(), &s_sdStallLastCyc);
@@ -22780,14 +22926,29 @@ namespace dxvk {
       int64_t& cycAcc;
       int64_t& wallAcc;
       SdThreadStat& stat;
+      // NV-DXVK [Perf] 2026-08-08: the QTCT pair is gated on
+      // rtx.perfSubmitCpuCycles (default OFF); the steady_clock pair is not.
+      // QueryThreadCycleTime measures ~0.44 us/call in this tree -- the number a
+      // per-stage QTCT experiment was already refuted and reverted on -- and this
+      // guard called it twice on EVERY draw with no gate at all. At ~1,080
+      // draws/frame that is ~0.95 ms/frame spent measuring, on the frame thread,
+      // which is the pole. steady_clock::now() is ~41 ns and stays unconditional,
+      // so wallUs and every markStg bucket are unaffected; only cpuCycles and the
+      // [SdStall] cycle-vs-wall split go dark when this is off.
+      bool cycOn;
       SubmitCpuGuard(int64_t& c, int64_t& w, SdThreadStat& s) : cyc0(0), cycAcc(c), wallAcc(w), stat(s) {
-        QueryThreadCycleTime(GetCurrentThread(), &cyc0);
+        cycOn = RtxOptions::perfSubmitCpuCycles();
+        if (cycOn) {
+          QueryThreadCycleTime(GetCurrentThread(), &cyc0);
+        }
         wall0 = std::chrono::steady_clock::now();
       }
       ~SubmitCpuGuard() {
         uint64_t cyc1 = 0;
-        QueryThreadCycleTime(GetCurrentThread(), &cyc1);
-        const int64_t dCyc = int64_t(cyc1 - cyc0);
+        if (cycOn) {
+          QueryThreadCycleTime(GetCurrentThread(), &cyc1);
+        }
+        const int64_t dCyc = cycOn ? int64_t(cyc1 - cyc0) : 0;
         const int64_t dWall = std::chrono::duration_cast<std::chrono::microseconds>(
                      std::chrono::steady_clock::now() - wall0).count();
         cycAcc  += dCyc;
@@ -22800,7 +22961,9 @@ namespace dxvk {
         // to whatever segments they actually passed plus this remainder.
         if (s_sdStallSampleActive) {
           const int lastSeg = SdThreadStat::kStallSegs - 1;
-          stat.segCyc[lastSeg] += int64_t(cyc1 - s_sdStallLastCyc);
+          // cyc1 is only read when the QTCT pair above actually ran; otherwise it
+          // is 0 and (cyc1 - s_sdStallLastCyc) would underflow into segCyc.
+          stat.segCyc[lastSeg] += cycOn ? int64_t(cyc1 - s_sdStallLastCyc) : 0;
           stat.segWallUs[lastSeg] += std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - s_sdStallLastWall).count();
           s_sdStallSampleActive = false;
@@ -35228,6 +35391,17 @@ namespace dxvk {
       // (the common transform source in TF2) are mapped; device-local ones can't be
       // read, so fold their ptr+size instead (catches rebinds, not in-place rewrites).
       uint64_t fullKey = geomKey;
+      // NV-DXVK [MemoCeiling.Slot] 2026-08-08: fullStable measured an EXACT 0%
+      // against geomStable=70-81% (conf record, 2026-08-07 17:57) -- one field
+      // in this fold changes on EVERY draw, and this probe as written cannot
+      // say which. Extended to (a) hash each cb slot separately and count, for
+      // geom-stable draws, which slot's bytes moved since last frame, and
+      // (b) byte-diff ONE tracked exemplar draw's cbuffers frame-over-frame
+      // and log the exact differing offset ranges. Same gate, same cost class;
+      // one capture with rtx.logMemoCeiling names the field, then it goes off.
+      uint64_t slotHashMc[4] = { 0, 0, 0, 0 };
+      const uint8_t* slotPtrMc[4] = { nullptr, nullptr, nullptr, nullptr };
+      size_t slotLenMc[4] = { 0, 0, 0, 0 };
       const auto& vsCbsMc = m_context->m_state.vs.constantBuffers;
       for (uint32_t sl = 0; sl < 4u; ++sl) {
         const auto& cb = vsCbsMc[sl];
@@ -35237,16 +35411,31 @@ namespace dxvk {
         const auto mappedMc = cb.buffer->GetMappedSlice();
         if (mappedMc.mapPtr != nullptr && base < byteWidth) {
           const size_t len = std::min<size_t>(512u, byteWidth - base);
-          fullKey = XXH64(reinterpret_cast<const uint8_t*>(mappedMc.mapPtr) + base, len, fullKey);
+          const uint8_t* p = reinterpret_cast<const uint8_t*>(mappedMc.mapPtr) + base;
+          fullKey = XXH64(p, len, fullKey);
+          slotHashMc[sl] = XXH64(p, len, 0x51075EEDull);
+          slotPtrMc[sl] = p;
+          slotLenMc[sl] = len;
         } else {
           const uint64_t m[2] = { reinterpret_cast<uint64_t>(cb.buffer.ptr()), uint64_t(byteWidth) };
           fullKey = XXH64(m, sizeof(m), fullKey);
+          slotHashMc[sl] = XXH64(m, sizeof(m), 0x51075EEDull);
         }
       }
 
       static thread_local uint32_t sMcFrame = UINT32_MAX;
       static thread_local std::unordered_set<uint64_t> sMcGeomPrev, sMcGeomCur, sMcFullPrev, sMcFullCur;
       static thread_local uint32_t sMcTot = 0, sMcGeomHit = 0, sMcFullHit = 0, sMcNoKey = 0;
+      // [MemoCeiling.Slot] per-slot change attribution across geom-stable draws.
+      struct McSlots { uint64_t h[4]; };
+      static thread_local std::unordered_map<uint64_t, McSlots> sMcSlotPrev, sMcSlotCur;
+      static thread_local uint32_t sMcSlotChg[4] = { 0, 0, 0, 0 };
+      static thread_local uint32_t sMcSlotMulti = 0, sMcSlotNone = 0;
+      // [MemoCeiling.Diff] one tracked exemplar: full byte copies of its slots.
+      static thread_local uint64_t sMcTrackKey = 0;
+      static thread_local std::vector<uint8_t> sMcTrackBytes[4];
+      static thread_local size_t sMcTrackLen[4] = { 0, 0, 0, 0 };
+      static thread_local uint32_t sMcDiffLogged = 0;
 
       const uint32_t fidMc = m_context->m_device->getCurrentFrameId();
       if (fidMc != sMcFrame) {
@@ -35255,10 +35444,15 @@ namespace dxvk {
             "[MemoCeiling] frame=", sMcFrame, " draws=", sMcTot,
             " geomStable=", sMcGeomHit, " (", (sMcGeomHit * 100u / sMcTot), "%)",
             " fullStable=", sMcFullHit, " (", (sMcFullHit * 100u / sMcTot), "%)",
-            " noKey=", sMcNoKey, " uniqGeom=", sMcGeomCur.size(), " uniqFull=", sMcFullCur.size()));
+            " noKey=", sMcNoKey, " uniqGeom=", sMcGeomCur.size(), " uniqFull=", sMcFullCur.size(),
+            " slotChg=[", sMcSlotChg[0], ",", sMcSlotChg[1], ",", sMcSlotChg[2], ",", sMcSlotChg[3], "]",
+            " multi=", sMcSlotMulti, " none=", sMcSlotNone));
         }
         sMcGeomPrev.swap(sMcGeomCur); sMcGeomCur.clear();
         sMcFullPrev.swap(sMcFullCur); sMcFullCur.clear();
+        sMcSlotPrev.swap(sMcSlotCur); sMcSlotCur.clear();
+        sMcSlotChg[0] = sMcSlotChg[1] = sMcSlotChg[2] = sMcSlotChg[3] = 0;
+        sMcSlotMulti = sMcSlotNone = 0;
         sMcTot = sMcGeomHit = sMcFullHit = sMcNoKey = 0;
         sMcFrame = fidMc;
       }
@@ -35266,10 +35460,63 @@ namespace dxvk {
       if (vbPtrMc == 0 && ibPtrMc == 0) {
         ++sMcNoKey;
       } else {
-        if (sMcGeomPrev.count(geomKey)) { ++sMcGeomHit; }
+        const bool geomHitMc = sMcGeomPrev.count(geomKey) != 0;
+        if (geomHitMc) { ++sMcGeomHit; }
         if (sMcFullPrev.count(fullKey)) { ++sMcFullHit; }
         sMcGeomCur.insert(geomKey);
         sMcFullCur.insert(fullKey);
+
+        // [MemoCeiling.Slot] which slot moved, for geometry seen last frame.
+        if (geomHitMc) {
+          auto itSl = sMcSlotPrev.find(geomKey);
+          if (itSl != sMcSlotPrev.end()) {
+            int chgCount = 0, chgSlot = -1;
+            for (int sl = 0; sl < 4; ++sl) {
+              if (itSl->second.h[sl] != slotHashMc[sl]) { ++chgCount; chgSlot = sl; }
+            }
+            if (chgCount == 0)      ++sMcSlotNone;
+            else if (chgCount == 1) ++sMcSlotChg[chgSlot];
+            else                    ++sMcSlotMulti;
+          }
+        }
+        McSlots cur; cur.h[0] = slotHashMc[0]; cur.h[1] = slotHashMc[1];
+        cur.h[2] = slotHashMc[2]; cur.h[3] = slotHashMc[3];
+        sMcSlotCur.emplace(geomKey, cur);
+
+        // [MemoCeiling.Diff] byte-diff the tracked exemplar (first geom-stable
+        // draw adopted; ~16 log lines total, then silent).
+        if (sMcTrackKey == 0 && geomHitMc) { sMcTrackKey = geomKey; }
+        if (geomKey == sMcTrackKey && sMcDiffLogged < 16u) {
+          for (int sl = 0; sl < 4; ++sl) {
+            const uint8_t* p = slotPtrMc[sl];
+            const size_t len = slotLenMc[sl];
+            if (p == nullptr || len == 0) { continue; }
+            if (sMcTrackLen[sl] == len && !sMcTrackBytes[sl].empty()) {
+              // Find first and last differing byte, and log the first differing
+              // 16-byte register with old/new float values -- that names the field.
+              size_t firstD = SIZE_MAX, lastD = 0;
+              for (size_t b = 0; b < len; ++b) {
+                if (sMcTrackBytes[sl][b] != p[b]) { if (firstD == SIZE_MAX) firstD = b; lastD = b; }
+              }
+              if (firstD != SIZE_MAX) {
+                ++sMcDiffLogged;
+                const size_t reg = firstD / 16u;
+                const float* oldF = reinterpret_cast<const float*>(sMcTrackBytes[sl].data() + reg * 16u);
+                const float* newF = reinterpret_cast<const float*>(p + reg * 16u);
+                Logger::info(str::format(
+                  "[MemoCeiling.Diff] frame=", fidMc, " slot=", sl,
+                  " vs=0x", std::hex, uint64_t(dcs.transformData.vertexShaderHash), std::dec,
+                  " bytes[", firstD, "..", lastD, "] of ", len,
+                  " firstReg=c", reg,
+                  " old=(", oldF[0], ",", oldF[1], ",", oldF[2], ",", oldF[3], ")",
+                  " new=(", newF[0], ",", newF[1], ",", newF[2], ",", newF[3], ")"));
+              }
+            }
+            if (sMcTrackBytes[sl].size() < len) { sMcTrackBytes[sl].resize(len); }
+            std::memcpy(sMcTrackBytes[sl].data(), p, len);
+            sMcTrackLen[sl] = len;
+          }
+        }
       }
     }
 
@@ -48672,10 +48919,16 @@ namespace dxvk {
             const double coTotalNs  = coRestNs
                                     + double(s_perfInstCoCbReadNsAcc)
                                     + double(s_perfInstCoVpScanNsAcc);
-            char ccBuf[288];
+            // NV-DXVK [Perf.FanoutCamCache]: hit/miss ride this line so the
+            // cache's health is visible in every window. Healthy steady state:
+            // camHit ~= calls, camMiss = a few per frame (one per engine remap
+            // of the camera CB). camHit ~ 0 means the engine remaps per draw
+            // and the cache is inert -- co_cbRead then reads as before.
+            char ccBuf[384];
             std::snprintf(ccBuf, sizeof(ccBuf),
               "[Perf.CamCut] perCall_us: co_cbRead=%.2f co_vpScan=%.2f co_publish=%.2f"
-              " coTotal=%.2f | ms: cbRead=%.1f vpScan=%.1f publish=%.1f total=%.1f",
+              " coTotal=%.2f | ms: cbRead=%.1f vpScan=%.1f publish=%.1f total=%.1f"
+              " | camHit=%llu camMiss=%llu",
               double(s_perfInstCoCbReadNsAcc) / 1e3 / nC,
               double(s_perfInstCoVpScanNsAcc) / 1e3 / nC,
               coRestNs / 1e3 / nC,
@@ -48683,8 +48936,11 @@ namespace dxvk {
               double(s_perfInstCoCbReadNsAcc) / 1e6,
               double(s_perfInstCoVpScanNsAcc) / 1e6,
               coRestNs / 1e6,
-              coTotalNs / 1e6);
+              coTotalNs / 1e6,
+              static_cast<unsigned long long>(s_fanoutCamHits),
+              static_cast<unsigned long long>(s_fanoutCamMisses));
             Logger::info(ccBuf);
+            s_fanoutCamHits = 0; s_fanoutCamMisses = 0;
           }
 
           s_perfInstTotalAcc = 0; s_perfInstInnerAcc = 0; s_perfInstLoopAcc = 0;
