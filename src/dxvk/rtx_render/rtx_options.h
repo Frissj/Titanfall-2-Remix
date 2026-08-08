@@ -686,6 +686,15 @@ namespace dxvk {
                "THE COUNTERS ARE THE POINT, not the timings. first/xfChg/matChg/prevPos/static are read from values the function ALREADY computes, and REDUNDANT = !xfChg && !matChg && !prevPos is the answer to sec 4c's open question: why does a scene with addedPct=0 and bBuild=3 re-update 16,000 instances every frame? A high REDUNDANT% means most of this work is rebuilding state that did not change, and skipping or incrementalising it is worth far more than micro-optimising the stages.\n"
                "COST ~0.2 ms/frame total. Turn it off before taking any frame-time number.");
 
+    RTX_OPTION("rtx", bool, replayExtractTransforms, true,
+               "[Perf.Replay] Stage-1 of the cross-frame replay tier (HANDOFF_PERF_2026-08-08e sec 2): intra-frame route replay for ExtractTransforms. F7 toggles live for A/B.\n"
+               "v6.2 overhead fix: the first warm F7 A/B measured v6.1 at NET +2-2.5 ms/frame -- bit-correct but the per-draw two-pass linear scan over fat records plus the per-frame re-capture of never-hitting streams cost more than the ~390 replayed draws saved. v6.2 adds MRU record probes (scan only on stream transitions) and capture dormancy (8 no-hit captures -> bookkeeping touch instead of a ~1 KB rebuild). RE-MEASURE with F7 at a warm heavy spot; if ON still reads slower than OFF, that number decides the default, not this comment.\n"
+               "MECHANISM. The first draw of each (VS, input-layout, cb-binding-shape, cb2-content-generation) combination each frame runs the FULL discovery path and snapshots its outputs (all camera-side matrices + every member the function writes) plus its resolved routes. Subsequent draws with an IDENTICAL key skip the whole discovery tangle and re-execute ONLY the per-draw content read: cb3 -> objectToWorld via the recorded route (path 13 camera-relative or identity). cb2 is DISCARD-mapped once per camera per frame, so its content generation in the key proves the camera-side inputs are byte-identical to the record -- the reuse is exact by construction, not heuristic.\n"
+               "POPULATION. Only draws whose record shows: real projection resolved, no fallback/UI, not bone-transformed, o2w route 13 (cb3+camOrigin) or 0/identity, axis votes settled. Everything else (instanced t31 fanout, skinned, fallback, unstable-layout VSes) takes the full path unchanged. Per-VS quarantine: any draw that fails the sampled verify (see rtx.replayExtractVerify) permanently disqualifies its VS this session.\n"
+               "REGRESSION LINES. [Perf.Replay] every 300 frames: hit/full/keyMiss/inelig/quarantined/verifyFail/o2wReadFail. verifyFail MUST stay 0; bt_extractXf on [Perf.SubmitDraw.acc] is the payoff metric. Zero visual change is the contract -- any mismatch quarantines rather than renders.");
+    RTX_OPTION("rtx", bool, replayExtractVerify, true,
+               "Sampled self-check for rtx.replayExtractTransforms. DEFAULT ON.\n"
+               "On the first 16 replays per VS and 1-in-256 thereafter, the draw runs the FULL path anyway and the replay result is compared bit-exactly (matrices memcmp + every routed flag). A mismatch quarantines the VS from replay for the session and bumps [Perf.Replay] verifyFail. The verified draw uses the FULL path's result, so a broken replay can only ever cost the time it saved, never correctness. Cost: ~2-6% of the replay savings while warm.");
     RTX_OPTION("rtx", bool, perfMaterialSplit, false,
                "[Perf.MatData] -- split SceneManager::determineMaterialData into repl / portal / convert. DEFAULT OFF.\n"
                "Measured at 8us/draw = ~9 ms/frame = 12% of the frame ([Perf.SubmitState] material stage). The function is only ~45 lines, so 8us is suspicious on its face.\n"
@@ -825,6 +834,23 @@ namespace dxvk {
                "this value, so they are invisible to rays. 0 = disabled. Used to "
                "measure how much of the primary-ray cost is TLAS fan-out over "
                "map-spanning instances. Makes geometry disappear.");
+    RTX_OPTION("rtx", bool, mergePersistentBuckets, true,
+               "PERF ([Perf.MergeP]): persist the merged-BLAS buckets across frames. "
+               "When this frame's merged-instance sequence (pointers + per-instance "
+               "fingerprints of every bucket-shaping input) is identical to the one "
+               "the buckets were built from, the per-frame re-derivation (geometry "
+               "fill, bucket append, transform-address rewrite) is skipped for the "
+               "whole merged population; only transform contents and resource "
+               "tracking refresh. Any change - membership, order, geometry address, "
+               "mask/flags, routing options, transform-buffer realloc - rebuilds "
+               "everything exactly like the legacy path. Kill switch: set False.");
+    RTX_OPTION("rtx", bool, mergePersistentBucketsVerify, true,
+               "SAFETY for rtx.mergePersistentBuckets: every 64th reuse frame, run "
+               "the legacy bucket derivation anyway and bit-compare it against the "
+               "persistent buckets (geometries/ranges/instances/offsets/compat "
+               "fields). A mismatch uses the fresh result, disables persistence for "
+               "the session, and logs [Perf.MergeP] VERIFY-FAIL. Near-free (fires "
+               "on 1/64 of reuse frames).");
     // NV-DXVK [perf]: the primary ray is cast with RAY_FLAG_FORCE_OPAQUE (see
     // geometryResolver in geometry_resolver.slangh), so a non-opaque instance
     // costs nothing during traversal - it costs a whole EXTRA TraceRayInline.

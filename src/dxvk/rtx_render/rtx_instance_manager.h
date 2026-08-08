@@ -105,6 +105,22 @@ public:
   // for the handover; nulled by the stamp site, GC-safe.
   Rc<PooledBlas> m_prevBlasKeepAlive;
 
+  // NV-DXVK [Perf.CullAabbCache] 2026-08-08g: cached world AABB for
+  // AccelManager's SceneCull. The world box is a pure function of
+  // (vkInstance.transform bits, object-space box); the cull re-derived it
+  // with 8 Matrix4*Vector4 corner transforms per instance per frame
+  // (~8.9k tested instances -> ~71k transforms/frame in the merge loop)
+  // even though most instances are static. Keyed on the RAW 48-byte
+  // transform bits, so a hit also skips getTransform()'s per-call
+  // transpose. Written and read only by the SceneCull block (CS thread).
+  struct CullAabbCache {
+    float   xform[3][4];      // VkTransformMatrixKHR bits at capture
+    Vector3 boxMin, boxMax;   // object box at capture
+    Vector3 lo, hi;           // cached world AABB
+    bool    valid = false;
+  };
+  CullAabbCache cullAabbCache;
+
   RtInstance() = delete;
   RtInstance(const uint64_t id, uint32_t instanceVectorId);
   RtInstance(const RtInstance& src, uint64_t id, uint32_t instanceVectorId);

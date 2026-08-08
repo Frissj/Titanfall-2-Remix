@@ -218,6 +218,27 @@ private:
   // ~15.5k-pointer capacity survives across frames instead of reallocating.
   std::vector<RtInstance*> m_mergeSortScratch;
   std::vector<RtInstance*> m_mergeUntaggedScratch;
+  // NV-DXVK [Perf.MergeP] 2026-08-08f: persistent-bucket cache. The buckets
+  // themselves persist in m_persistBuckets (aliased as `blasBuckets` inside
+  // mergeInstancesIntoBlas); m_persistMembers is the ordered merged-instance
+  // sequence (+ per-instance fingerprint of every bucket-shaping input) they
+  // were built from. A frame whose sequence matches reuses the buckets
+  // verbatim; any difference rebuilds them exactly like the legacy path.
+  // See the [Perf.MergeP] block in mergeInstancesIntoBlas for the contract.
+  struct MergePersistMember {
+    RtInstance* inst = nullptr;
+    BlasEntry* blas = nullptr;
+    uint64_t fp = 0;
+  };
+  std::vector<std::unique_ptr<BlasBucket>> m_persistBuckets;
+  std::vector<MergePersistMember> m_persistMembers;
+  std::vector<MergePersistMember> m_persistScratch;
+  uint64_t m_persistEpoch = 0;        // option/global fingerprint at capture
+  bool m_persistValid = false;
+  bool m_persistQuarantined = false;  // verify failure: off for the session
+  uint32_t m_persistReuseN = 0, m_persistRebuildN = 0;
+  uint32_t m_persistWhyCount = 0, m_persistWhySeq = 0, m_persistWhyEpoch = 0;
+  uint32_t m_persistVerifyN = 0, m_persistVerifyFailN = 0;
   // NV-DXVK [CamProbe prevSurf]: see getProbePrevSurfaceSlots().
   std::vector<uint32_t> m_probePrevSurfaceSlot;
   std::vector<uint32_t> m_reorderedSurfacesPrimitiveIDPrefixSum;              // Exclusive prefix sum for this frame's surface primitive count array

@@ -3643,15 +3643,22 @@ namespace dxvk {
     // vs the visible non-instanced hull (same studio name, marker 0). If the two
     // translations match the bug is geometry-space; if they diverge it's an override.
     {
+      // NV-DXVK [perf] 2026-08-08e: skip the whole probe -- including the two
+      // per-draw strstr scans over studioModelName, which ran for EVERY studio
+      // draw on the CS thread -- once both of this frame's log slots are
+      // consumed. The output (one instanced + one non-instanced line per
+      // frame) is unchanged; only the per-draw name scan after the first two
+      // matches of a frame is gone.
+      const uint32_t rff = m_device->getCurrentFrameId();
+      static uint32_t s_rfInst = UINT32_MAX, s_rfNon = UINT32_MAX;
+      if (s_rfInst != rff || s_rfNon != rff) {
       const char* sn = drawCallState.studioModelName;
       const bool isHullName = sn[0] != '\0' &&
         (std::strstr(sn, "widow") != nullptr || std::strstr(sn, "Crow_dropship") != nullptr);
       const bool isInstancedHull = drawCallState.getRigidBakeBoneIndex() != 0;
       if (isHullName || isInstancedHull) {
         const auto& o = drawCallState.getTransformData().objectToWorld;
-        const uint32_t rff = m_device->getCurrentFrameId();
         // one instanced + one non-instanced line per frame
-        static uint32_t s_rfInst = UINT32_MAX, s_rfNon = UINT32_MAX;
         uint32_t& slot = isInstancedHull ? s_rfInst : s_rfNon;
         if (slot != rff) {
           slot = rff;
@@ -3662,6 +3669,7 @@ namespace dxvk {
             " verts=", drawCallState.getGeometryData().vertexCount));
         }
       }
+      }  // frame-slot fast skip
     }
 
     // NV-DXVK [MeshTrace] funnel stage 3: a BlasEntry exists for this draw.

@@ -507,6 +507,11 @@ namespace dxvk {
     //   9 = per-instance override in SubmitDraw(instanceTransform)
     //  10 = bone-instanced: o2w=identity (instancesToObject handles it)
     uint32_t                             m_lastO2wPathId = 0;
+    // NV-DXVK [Perf.Replay] v6 path-5/6 widening: the RDEF CBufModelInstance
+    // bind slot the rdef o2w site read this draw (paths 5/6/7). Captured into
+    // the replay record so the replay can re-read the same 48 bytes and
+    // re-evaluate the cb3IsZero mode per draw. UINT32_MAX = not an rdef draw.
+    uint32_t                             m_lastModelCbSlot = UINT32_MAX;
 
     // NV-DXVK: the canonical gameplay camera origin, populated by the
     // bone-fanout RDEF lookup at line ~593. Different VS permutations have

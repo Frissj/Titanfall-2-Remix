@@ -635,7 +635,20 @@ namespace dxvk {
       // prevent. The two members must keep the same policy: the fast path
       // requires BOTH the key and the bits to match, so an uncopied key already
       // forces the slow path; the sentinel makes the invariant local.
-      static_assert(RtInstanceSize == 832, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+      // 832 -> 936 on 2026-08-08: added CullAabbCache cullAabbCache
+      // ([Perf.CullAabbCache] — cached world AABB for AccelManager's
+      // SceneCull, keyed on the raw 48-byte vkInstance.transform bits + the
+      // object-space box; a hit skips getTransform()'s transpose and the 8
+      // corner transforms per instance per frame). 104 bytes: 48 transform
+      // + 4x12 vectors + bool + padding.
+      // COPY CTOR: DELIBERATELY NOT COPIED (default-initialized, valid=false).
+      // The cache is purely derived state and its key is re-verified against
+      // the live transform/box on every read, so copying it would also be
+      // correct — but a clone defaulting to invalid simply recomputes on its
+      // first cull, which is the same "first use runs the full path" policy
+      // as m_instStateKey/m_fastDrawBits above and costs 8 corner transforms
+      // once per clone.
+      static_assert(RtInstanceSize == 936, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }
@@ -3489,11 +3502,27 @@ namespace dxvk {
     static thread_local std::vector<Matrix4> sPlacedO2w;
     sPlacedO2w.clear();
 
+    // NV-DXVK [perf] 2026-08-08e (CS pole, fanout wrapper): hoist the identity
+    // test the composition comment below already documents. drawObjectToWorld
+    // is identity on the path-10 fanout route, yet the loop paid a full
+    // Matrix4 multiply per placement -- and a SECOND one per placement when
+    // the engine history is present -- ~14.6k-29k 64-float multiplies per
+    // frame on the dxvk-cs thread to multiply by one. Identity => the product
+    // IS the placement matrix, bit-for-bit (copy, not recompute), so the
+    // SpatialMap key contract ("reproduces last frame's composed matrix
+    // bit-for-bit") is preserved exactly. A non-identity base (if that path
+    // ever appears) takes the original multiply unchanged.
+    const bool fanoutBaseIsIdentity = isIdentityExact(drawObjectToWorld);
+
     for (size_t placement = 0; placement < transforms->size(); ++placement) {
       FanoutSplit split;
       // Same composition RtSurface::writeGPUData applies for point-instancer slot
       // i, so the prop renders exactly where it did before the split.
-      split.objectToWorld = drawObjectToWorld * (*transforms)[placement];
+      if (fanoutBaseIsIdentity) {
+        split.objectToWorld = (*transforms)[placement];
+      } else {
+        split.objectToWorld = drawObjectToWorld * (*transforms)[placement];
+      }
 
       // Composed through the SAME drawObjectToWorld as the current transform, so
       // that for a stationary prop the product reproduces last frame's composed
@@ -3502,7 +3531,11 @@ namespace dxvk {
       // path-10 site in d3d11_rtx — but composing it explicitly keeps the two
       // matrices in the same space if that ever changes.)
       if (prevTransforms != nullptr) {
-        split.prevObjectToWorld = drawObjectToWorld * (*prevTransforms)[placement];
+        if (fanoutBaseIsIdentity) {
+          split.prevObjectToWorld = (*prevTransforms)[placement];
+        } else {
+          split.prevObjectToWorld = drawObjectToWorld * (*prevTransforms)[placement];
+        }
         split.hasPrevObjectToWorld = true;
       }
 
@@ -6274,7 +6307,15 @@ namespace dxvk {
     // all. If incomingIgnAC=0 here despite PropIdTrace firing for the same
     // logical shader, something between d3d11_rtx and processSceneObject
     // is clearing the bit (replacement path, anonymous dcs copy, etc).
-    if (blas.input.getTransformData().vertexShaderHash == 0x2904d2163ef31a17ull) {
+    // NV-DXVK [perf] 2026-08-08e ([Perf.UpdInst] entry=1.66 ms, the largest
+    // stage left in updateInstance): option gate FIRST. The hash compare
+    // itself is one deref chain into blas.input -- a cold line of a large
+    // BlasEntry -- paid by all ~15.6k instances every frame for a probe whose
+    // investigation (VS_2904 sky reproject tagging) is resolved. logGeomDiag
+    // is a static option read; the cold deref now happens only when the
+    // diagnostics are actually wanted.
+    if (RtxOptions::logGeomDiag()
+        && blas.input.getTransformData().vertexShaderHash == 0x2904d2163ef31a17ull) {
       thread_local uint32_t sUpdProbe = 0;
       if (sUpdProbe < 16 || (sUpdProbe & 0x3FF) == 0) {
         const auto incomingFlags = drawCall.getCategoryFlags();

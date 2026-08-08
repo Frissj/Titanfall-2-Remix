@@ -149,6 +149,12 @@ namespace dxvk {
 
   void AccelManager::clear() {
     m_blasPool.clear();
+    // NV-DXVK [Perf.MergeP]: the persistent buckets hold RtInstance*/device
+    // addresses from the torn-down scene -- never let a post-clear frame
+    // sequence-match against them.
+    m_persistBuckets.clear();
+    m_persistMembers.clear();
+    m_persistValid = false;
   }
 
   void AccelManager::garbageCollection() {
@@ -1055,8 +1061,11 @@ namespace dxvk {
       opacityMicromapManager->onFrameStart(ctx);
     }
 
-    std::vector<std::unique_ptr<BlasBucket>> blasBuckets;
-    blasBuckets.reserve(instances.size());
+    // NV-DXVK [Perf.MergeP]: the buckets are now the PERSISTENT member --
+    // on reuse frames they carry over untouched; on rebuild frames they are
+    // cleared and repopulated exactly like the old per-frame local.
+    std::vector<std::unique_ptr<BlasBucket>>& blasBuckets = m_persistBuckets;
+    m_persistScratch.clear();
 
     size_t totalScratchMemory = 0;
 
@@ -1209,6 +1218,10 @@ namespace dxvk {
     const bool     mrgOptPersistStatic   = RtxOptions::persistStaticBlas();
     const bool     mrgOptMinimizeMerging = RtxOptions::minimizeBlasMerging();
     const bool     mrgOptForceMergeAll   = RtxOptions::forceMergeAllMeshes();
+    // NV-DXVK [perf] 2026-08-08e: same hoist, one straggler the 2026-08-08
+    // pass missed -- this one was still re-read inside the loop for each of
+    // ~15k instances per frame (the perfCullInstancesLargerThan block below).
+    const float    mrgOptCullLargerThan  = RtxOptions::perfCullInstancesLargerThan();
 
     // NV-DXVK [SceneCull]: Remix-side culling — the replacement for the engine
     // culls that d3d11_rtx.cpp's [CullOff] patches switch off.
@@ -1271,6 +1284,7 @@ namespace dxvk {
       std::vector<Vector3> lightPoints;    // positioned lights only, for the exemption
       uint32_t tested = 0, culled = 0, culledSmall = 0;
       uint32_t keptFrustum = 0, keptRadius = 0, keptLight = 0, keptSkinned = 0;
+      uint32_t aabbCacheHits = 0;   // [Perf.CullAabbCache]
     } sceneCull;
     if (RtxOptions::SceneCull::enable()) {
       const RtCamera& scCam = cameraManager.getMainCamera();
@@ -1574,7 +1588,7 @@ namespace dxvk {
       // Geometry visibly disappears while this is set. Measurement knob, not a
       // fix — 0 disables it.
       {
-        const float cullAbove = RtxOptions::perfCullInstancesLargerThan();
+        const float cullAbove = mrgOptCullLargerThan;
         const BlasEntry* cullBlas = (cullAbove > 0.0f) ? instance->getBlas() : nullptr;
         if (cullBlas != nullptr) {
           const auto& cullBox = cullBlas->input.getGeometryData().boundingBox;
@@ -1620,7 +1634,23 @@ namespace dxvk {
           (scBlas != nullptr) ? &scBlas->input.getGeometryData().boundingBox : nullptr;
         if (scBox != nullptr && scBox->isValid()) {
           ++sceneCull.tested;
-          const Matrix4 scO2w = instance->getTransform();
+          // NV-DXVK [Perf.CullAabbCache] 2026-08-08g: the world AABB is a pure
+          // function of (transform bits, object box) -- serve it from the
+          // per-instance cache when neither changed, skipping getTransform()'s
+          // transpose and the 8 corner transforms. The corners themselves are
+          // only rebuilt lazily for the few instances whose outcode pass
+          // actually runs (small-reject candidates / open-keep frames).
+          const auto& scXf = instance->getVkInstance().transform;
+          RtInstance::CullAabbCache& scCache = instance->cullAabbCache;
+          const bool scCacheHit = scCache.valid
+            && std::memcmp(scCache.xform, scXf.matrix, sizeof(scCache.xform)) == 0
+            && scCache.boxMin.x == scBox->minPos.x
+            && scCache.boxMin.y == scBox->minPos.y
+            && scCache.boxMin.z == scBox->minPos.z
+            && scCache.boxMax.x == scBox->maxPos.x
+            && scCache.boxMax.y == scBox->maxPos.y
+            && scCache.boxMax.z == scBox->maxPos.z;
+          if (scCacheHit) ++sceneCull.aabbCacheHits;
 
           // World AABB of the 8 transformed corners, plus the clip-space outcode
           // AND, in one pass. The outcode convention is D3D clip space
@@ -1631,20 +1661,90 @@ namespace dxvk {
           // side planes (the comparison flips), so they contribute no side bits.
           Vector3 scLo {  FLT_MAX,  FLT_MAX,  FLT_MAX };
           Vector3 scHi { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+          bool scCornersValid = false;   // [Perf.CullAabbCache] corners lazily rebuilt on hits
           uint32_t scOutcodeAnd = 0x1Fu;   // L,R,T,B,near
-          for (uint32_t c = 0; c < 8; ++c) {
-            const Vector3 corner {
-              (c & 1u) ? scBox->maxPos.x : scBox->minPos.x,
-              (c & 2u) ? scBox->maxPos.y : scBox->minPos.y,
-              (c & 4u) ? scBox->maxPos.z : scBox->minPos.z,
-            };
-            const Vector4 w4 = scO2w * Vector4(corner.x, corner.y, corner.z, 1.0f);
-            scLo.x = std::min(scLo.x, w4.x); scHi.x = std::max(scHi.x, w4.x);
-            scLo.y = std::min(scLo.y, w4.y); scHi.y = std::max(scHi.y, w4.y);
-            scLo.z = std::min(scLo.z, w4.z); scHi.z = std::max(scHi.z, w4.z);
-
-            if (sceneCull.frustumOn) {
-              const Vector4 clip = sceneCull.worldToProj * Vector4(w4.x, w4.y, w4.z, 1.0f);
+          // NV-DXVK [perf] 2026-08-08e (merge loop, [SceneCull] evidence):
+          // every capture on this level reads lightAllKeep=1 (no lights known)
+          // and culled=0 -- the light keep covers EVERY instance, so the
+          // KEEP verdict is decided before any corner math runs. In that
+          // state the clip-space half of the corner pass (a worldToProj 4x4
+          // multiply per corner, 8 per instance, ~8.9k tested instances per
+          // frame) contributes nothing to the keep decision; its ONLY
+          // remaining consumer is the solid-angle small-reject's on-screen
+          // exemption, which applies to just ~600 small instances per frame.
+          // So: world-AABB pass always (both consumers need it), clip pass
+          // LAZY -- run it only when the keep decision is genuinely open, or
+          // when this instance is a small-reject candidate (decided from the
+          // AABB afterwards). MASK OUTCOMES ARE BIT-IDENTICAL by construction;
+          // only the keptFrustum/keptLight diagnostic attribution shifts
+          // (all-keep frames report keptLight instead of keptFrustum).
+          const bool scAllKept = sceneCull.lightOn && sceneCull.lightAllKeep;
+          float scWorldCorners[8][3];
+          if (scCacheHit) {
+            scLo = scCache.lo;
+            scHi = scCache.hi;
+          } else {
+            const Matrix4 scO2w = instance->getTransform();
+            for (uint32_t c = 0; c < 8; ++c) {
+              const Vector3 corner {
+                (c & 1u) ? scBox->maxPos.x : scBox->minPos.x,
+                (c & 2u) ? scBox->maxPos.y : scBox->minPos.y,
+                (c & 4u) ? scBox->maxPos.z : scBox->minPos.z,
+              };
+              const Vector4 w4 = scO2w * Vector4(corner.x, corner.y, corner.z, 1.0f);
+              scWorldCorners[c][0] = w4.x;
+              scWorldCorners[c][1] = w4.y;
+              scWorldCorners[c][2] = w4.z;
+              scLo.x = std::min(scLo.x, w4.x); scHi.x = std::max(scHi.x, w4.x);
+              scLo.y = std::min(scLo.y, w4.y); scHi.y = std::max(scHi.y, w4.y);
+              scLo.z = std::min(scLo.z, w4.z); scHi.z = std::max(scHi.z, w4.z);
+            }
+            scCornersValid = true;
+            std::memcpy(scCache.xform, scXf.matrix, sizeof(scCache.xform));
+            scCache.boxMin = scBox->minPos;
+            scCache.boxMax = scBox->maxPos;
+            scCache.lo = scLo;
+            scCache.hi = scHi;
+            scCache.valid = true;
+          }
+          // Decide whether the clip pass is needed at all this instance.
+          bool scNeedOutcode = sceneCull.frustumOn && !scAllKept;
+          if (sceneCull.frustumOn && scAllKept && sceneCull.solidAngleOn) {
+            // Small-reject candidacy from the AABB alone -- same math the
+            // reject itself uses below; only candidates need the on-screen
+            // exemption, which is what the outcode feeds.
+            const float scMaxExtPre = std::max(scHi.x - scLo.x,
+                                      std::max(scHi.y - scLo.y, scHi.z - scLo.z));
+            const float pdx = std::max(0.0f, std::max(scLo.x - sceneCull.camPos.x, sceneCull.camPos.x - scHi.x));
+            const float pdy = std::max(0.0f, std::max(scLo.y - sceneCull.camPos.y, sceneCull.camPos.y - scHi.y));
+            const float pdz = std::max(0.0f, std::max(scLo.z - sceneCull.camPos.z, sceneCull.camPos.z - scHi.z));
+            const float scDistSqPre = pdx * pdx + pdy * pdy + pdz * pdz;
+            scNeedOutcode = std::isfinite(scDistSqPre) && scDistSqPre > 0.0f
+              && std::isfinite(scMaxExtPre)
+              && scMaxExtPre * scMaxExtPre < sceneCull.solidAngleMinSq * scDistSqPre;
+          }
+          if (scNeedOutcode) {
+            // [Perf.CullAabbCache]: a cache hit skipped the corner build;
+            // rebuild the 8 corners here for the few instances whose outcode
+            // pass actually runs. Same math as the miss path.
+            if (!scCornersValid) {
+              const Matrix4 scO2wLate = instance->getTransform();
+              for (uint32_t c = 0; c < 8; ++c) {
+                const Vector3 corner {
+                  (c & 1u) ? scBox->maxPos.x : scBox->minPos.x,
+                  (c & 2u) ? scBox->maxPos.y : scBox->minPos.y,
+                  (c & 4u) ? scBox->maxPos.z : scBox->minPos.z,
+                };
+                const Vector4 w4 = scO2wLate * Vector4(corner.x, corner.y, corner.z, 1.0f);
+                scWorldCorners[c][0] = w4.x;
+                scWorldCorners[c][1] = w4.y;
+                scWorldCorners[c][2] = w4.z;
+              }
+              scCornersValid = true;
+            }
+            for (uint32_t c = 0; c < 8; ++c) {
+              const Vector4 clip = sceneCull.worldToProj
+                * Vector4(scWorldCorners[c][0], scWorldCorners[c][1], scWorldCorners[c][2], 1.0f);
               uint32_t oc = 0u;
               if (clip.w > 0.0f) {
                 const float lim = clip.w * sceneCull.sideScale;
@@ -1662,6 +1762,16 @@ namespace dxvk {
               if (clip.z < 0.0f) oc |= 0x10u;
               scOutcodeAnd &= oc;
             }
+          } else if (!sceneCull.frustumOn) {
+            // Frustum term disabled: the pre-existing semantics -- outcodeAnd
+            // stays 0x1F and the frustum keep below never fires.
+          } else {
+            // Clip pass skipped on an all-keep frame for a non-candidate:
+            // report "not frustum-proven" so the keep chain falls through to
+            // the light term (which covers it) and the small-reject below
+            // never runs (candidacy already failed). scOutcodeAnd != 0 is the
+            // only reading either consumer performs in this state.
+            scOutcodeAnd = 0x1Fu;
           }
 
           // Union of keeps: kept the moment any term covers the instance, culled
@@ -1817,7 +1927,15 @@ namespace dxvk {
       BlasEntry* blasEntry = instance->getBlas();
       assert(blasEntry);
 
-      fillGeometryInfoFromBlasEntry(*blasEntry, *instance, opacityMicromapManager);
+      // NV-DXVK [Perf.MergeP]: fillGeometryInfoFromBlasEntry used to run HERE
+      // for every instance, before routing. It moved into the routing
+      // branches: dynamic instances fill immediately (the dynBlas loop needs
+      // buildGeometries this frame); merged instances fill in the deferred
+      // [Perf.MergeP] pass after this loop -- and not at all on reuse frames,
+      // where last frame's identical fill persists on the BlasEntry. The one
+      // routing input that read the fill's output (buildGeometries.size() in
+      // forceMergedBlas) is re-derived from the fill's own branch condition
+      // below (mrgGeomCount), so routing is decided from the same facts.
 
       // NV-DXVK [perf]: WORLD-space instance extent census.
       //
@@ -1964,6 +2082,18 @@ namespace dxvk {
       const uint32_t maxPrimsForMergedBLAS = mrgOptMaxPrimsMerged;
       const uint32_t blasPrims = blasEntry->modifiedGeometryData.calculatePrimitiveCount();
 
+      // NV-DXVK [Perf.MergeP]: the geometry count fillGeometryInfoFromBlasEntry
+      // WOULD produce, derived from its own branch condition -- billboard-split
+      // OMM instances get one geometry per billboard, everything else one.
+      // Replaces the read of buildGeometries.size() in forceMergedBlas (the
+      // fill no longer runs before routing) with the same fact.
+      const bool mrgWillSplitBb = blasEntry->modifiedGeometryData.usesIndices()
+          && opacityMicromapManager
+          && opacityMicromapManager->isActive()
+          && OpacityMicromapManager::usesOpacityMicromap(*instance)
+          && OpacityMicromapManager::usesSplitBillboardOpacityMicromap(*instance);
+      const uint32_t mrgGeomCount = mrgWillSplitBb ? instance->getBillboardCount() : 1u;
+
       // NV-DXVK [Layer1 static-BLAS persistence]: a mesh whose geometry did NOT
       // change this frame gains nothing from the per-frame-rebuilt merged BLAS —
       // route it to its own dynamic BLAS so the existing reuse path builds it once
@@ -1992,7 +2122,7 @@ namespace dxvk {
                                       persistStaticBlas ||                                 // NV-DXVK: static geometry -> persistent reused BLAS (rtx.persistStaticBlas)
                                       mrgOptMinimizeMerging;                               // Option to attempt putting as many objects into dynamic BLAS as possible.
 
-      const bool forceMergedBlas = (blasEntry->buildGeometries.size() > 1 ||                                       // Currently we use multiple build geometries for particle billboards, which we prefer to merge into large BLAS
+      const bool forceMergedBlas = (mrgGeomCount > 1 ||                                                            // Currently we use multiple build geometries for particle billboards, which we prefer to merge into large BLAS (NV-DXVK [Perf.MergeP]: same fact as the old buildGeometries.size() read, derived pre-fill)
                                     (!mrgOptMinimizeMerging && blasPrims < minPrimsInDynamicBLAS) ||               // Avoid creating lots of small dynamic BLAS
                                     mrgOptForceMergeAll) &&                                                        // Setting to force all meshes into the merged BLAS
                                       instance->surface.instancesToObject == nullptr &&                            // Never merge point instancer geometry
@@ -2001,6 +2131,12 @@ namespace dxvk {
       if (requestDynamicBlas && !forceMergedBlas) {
         ++s.routedDynamic;
         if (persistStaticBlas) ++s.routedStaticPersist;  // NV-DXVK: how many static meshes the persistStaticBlas gate kept out of the merged BLAS
+        // NV-DXVK [Perf.MergeP]: dynamic instances fill here (moved from the
+        // unconditional pre-routing site) -- the dynBlas loop below consumes
+        // buildGeometries/buildRanges this frame. Same per-instance call the
+        // old site made, so shared-BlasEntry linked instances refill exactly
+        // as before.
+        fillGeometryInfoFromBlasEntry(*blasEntry, *instance, opacityMicromapManager);
         // Since this loop is iterating over instances, and instances can share BLAS, we will build these later after identifying unique ones.
         uniqueBlas[blasEntry].push_back(instance);
       } else {
@@ -2052,46 +2188,235 @@ namespace dxvk {
           blasEntry->dynamicBlas = nullptr;
         }
 
-        // Calculate the device address for the current instance's transform and write the transform data
-        // TODO: only do this for non-identity transforms
-        VkDeviceAddress transformDeviceAddress = m_transformBuffer->getDeviceAddress() + instanceTransforms.size() * sizeof(VkTransformMatrixKHR);
-
-        // NV-DXVK (TF2 BSP fix): Source-engine BSP world vertex buffers are in
-        // camera-relative space (world - cameraOrigin). The fanout path at
-        // d3d11_rtx.cpp adds camOrigin to the per-instance translation to shift
-        // to absolute world; non-fanout BSP draws that reach this merged-bucket
-        // path end up with objectToWorld=identity because the upstream didn't
-        // detect them. We fix that here: if the source instance transform is
-        // exactly identity (the tell-tale for a cam-relative BSP draw), replace
-        // it with translate-by-camOrigin. Non-identity transforms (small props
-        // with their own placement) are left alone so their placement is
-        // preserved.
-        instanceTransforms.push_back(instance->getVkInstance().transform);
-
-        for (auto& geometry : blasEntry->buildGeometries) {
-          geometry.geometry.triangles.transformData.deviceAddress = transformDeviceAddress;
+        // NV-DXVK [Perf.MergeP]: the per-frame merged work (geometry fill,
+        // transform-slot address write, bucket append, resource tracking)
+        // moved to the deferred pass right after this loop, where it is
+        // SKIPPED wholesale when the sequence captured here matches the one
+        // the persistent buckets were built from. The fingerprint hashes
+        // every input that shapes this instance's bucket entry; any change
+        // forces the full legacy re-derivation.
+        {
+          auto fpMix = [](uint64_t h, uint64_t v) -> uint64_t {
+            h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+            return h;
+          };
+          const auto& mpVk = instance->getVkInstance();
+          const auto& mpMg = blasEntry->modifiedGeometryData;
+          uint64_t mpFp = 0x243f6a8885a308d3ull;
+          // Bucket-compat fields (tryAddInstance's accept criteria).
+          mpFp = fpMix(mpFp, mpVk.mask);
+          mpFp = fpMix(mpFp, mpVk.flags);
+          mpFp = fpMix(mpFp, mpVk.instanceShaderBindingTableRecordOffset);
+          mpFp = fpMix(mpFp, mpVk.instanceCustomIndex & ~uint32_t(CUSTOM_INDEX_SURFACE_MASK));
+          mpFp = fpMix(mpFp, instance->usesUnorderedApproximations() ? 1u : 0u);
+          mpFp = fpMix(mpFp, instance->isSubsurface() ? 1u : 0u);
+          // fillGeometryInfoFromBlasEntry's inputs (geometry shape + addresses).
+          mpFp = fpMix(mpFp, (uint64_t) instance->getGeometryFlags());
+          mpFp = fpMix(mpFp, mrgWillSplitBb ? 1u : 0u);
+          mpFp = fpMix(mpFp, mrgGeomCount);
+          mpFp = fpMix(mpFp, instance->getBillboardCount());
+          const bool mpUsesIdx = mpMg.usesIndices();
+          mpFp = fpMix(mpFp, mpUsesIdx ? 1u : 0u);
+          if (mpUsesIdx) {
+            mpFp = fpMix(mpFp, (uint64_t) mpMg.indexBuffer.getDeviceAddress());
+            mpFp = fpMix(mpFp, (uint64_t) mpMg.indexBuffer.indexType());
+            mpFp = fpMix(mpFp, (uint64_t) mpMg.indexBuffer.stride());
+          }
+          mpFp = fpMix(mpFp, mpMg.indexCount);
+          mpFp = fpMix(mpFp, (uint64_t) mpMg.positionBuffer.getDeviceAddress()
+                             + mpMg.positionBuffer.offsetFromSlice());
+          mpFp = fpMix(mpFp, (uint64_t) mpMg.positionBuffer.stride());
+          mpFp = fpMix(mpFp, (uint64_t) mpMg.positionBuffer.vertexFormat());
+          mpFp = fpMix(mpFp, mpMg.vertexCount);
+          mpFp = fpMix(mpFp, blasPrims);
+          m_persistScratch.push_back(MergePersistMember { instance, blasEntry, mpFp });
         }
+      }
+    }
 
-        // Try to merge the instance into one of the blasBuckets
-        bool merged = false;
-        for (auto& bucket : blasBuckets) {
-          if (bucket->tryAddInstance(instance)) {
-            merged = true;
+    // ================================================================
+    // NV-DXVK [Perf.MergeP] 2026-08-08f: PERSISTENT-BUCKET MERGE.
+    // The merged population's bucket entries are a pure function of frozen
+    // per-instance state: the BLAS-input caches are written once and then
+    // held by kUpdateInstance, the vk-instance compat fields are stable,
+    // and the transform-slot device address depends only on the member's
+    // ordinal and the transform buffer -- both invariant while the sequence
+    // is invariant. Legacy behavior re-derived and re-appended all of it
+    // (~14k geometry structs into fresh buckets) every frame. Now:
+    //   REUSE  -- this frame's merged sequence (inst ptr, blas ptr, fp) is
+    //             identical to the captured one AND the epoch (routing
+    //             options, OMM active, transform-buffer address) matches:
+    //             keep the buckets; per-frame work = push fresh transform
+    //             CONTENTS (the addresses baked into the persistent
+    //             geometry copies still point at the same slots) + resource
+    //             lifetime tracking + resetting the per-frame OMM binding
+    //             state (buildBlases re-binds pNext every frame and does
+    //             NOT clear a stale one -- a dangling pNext after OMM LRU
+    //             eviction is the crash this reset prevents).
+    //   REBUILD -- anything differs: clear and repopulate exactly like the
+    //             legacy path, then capture the new sequence.
+    // [SurfaceIndexStability]: on reuse frames the bucket-concat below
+    // appends the SAME originalInstances arrays in the same order --
+    // byte-identical surface order by construction. Sampled verify
+    // (rtx.mergePersistentBucketsVerify) re-derives fresh buckets on every
+    // 64th reuse frame and bit-compares; a mismatch adopts the fresh
+    // result, disables persistence for the session, and logs VERIFY-FAIL.
+    // Kill switch: rtx.mergePersistentBuckets=False.
+    // ================================================================
+    {
+      auto epMix = [](uint64_t h, uint64_t v) -> uint64_t {
+        h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        return h;
+      };
+      uint64_t mpEpoch = 0x452821e638d01377ull;
+      mpEpoch = epMix(mpEpoch, mrgOptMinPrimsDynamic);
+      mpEpoch = epMix(mpEpoch, mrgOptMaxPrimsMerged);
+      mpEpoch = epMix(mpEpoch, mrgOptPersistStatic ? 1u : 0u);
+      mpEpoch = epMix(mpEpoch, mrgOptMinimizeMerging ? 1u : 0u);
+      mpEpoch = epMix(mpEpoch, mrgOptForceMergeAll ? 1u : 0u);
+      mpEpoch = epMix(mpEpoch, (opacityMicromapManager && opacityMicromapManager->isActive()) ? 1u : 0u);
+      mpEpoch = epMix(mpEpoch, (uint64_t) m_transformBuffer->getDeviceAddress());
+
+      const bool mpOn = RtxOptions::mergePersistentBuckets() && !m_persistQuarantined;
+      bool mpReuse = mpOn && m_persistValid;
+      if (mpReuse && mpEpoch != m_persistEpoch) {
+        mpReuse = false;
+        ++m_persistWhyEpoch;
+      }
+      if (mpReuse && m_persistScratch.size() != m_persistMembers.size()) {
+        mpReuse = false;
+        ++m_persistWhyCount;
+      }
+      if (mpReuse) {
+        for (size_t i = 0; i < m_persistScratch.size(); ++i) {
+          const MergePersistMember& a = m_persistScratch[i];
+          const MergePersistMember& b = m_persistMembers[i];
+          if (a.inst != b.inst || a.blas != b.blas || a.fp != b.fp) {
+            mpReuse = false;
+            ++m_persistWhySeq;
             break;
           }
         }
+      }
 
-        // The instance couldn't be merged into any bucket - make a new one
-        if (!merged) {
-          auto newBucket = std::make_unique<BlasBucket>();
-          merged = newBucket->tryAddInstance(instance);
-          assert(merged);
-
-          blasBuckets.push_back(std::move(newBucket));
+      if (mpReuse) {
+        ++m_persistReuseN;
+        for (const MergePersistMember& m : m_persistScratch) {
+          instanceTransforms.push_back(m.inst->getVkInstance().transform);
+          trackBlasBuildResources(ctx, execBarriers, m.blas);
+        }
+        // Per-frame OMM binding state back to fresh-built shape (see header
+        // comment: buildBlases writes pNext but never clears it).
+        for (auto& mpB : blasBuckets) {
+          mpB->hasOmmInstances = false;
+          for (auto& mpG : mpB->geometries) {
+            mpG.geometry.triangles.pNext = nullptr;
+          }
         }
 
-        // Track the lifetime and states of the source geometry buffers
-        trackBlasBuildResources(ctx, execBarriers, blasEntry);
+        // Sampled verify: every 64th reuse frame, derive fresh buckets the
+        // legacy way and bit-compare against the persistent state.
+        if (RtxOptions::mergePersistentBucketsVerify() && (m_persistReuseN & 63u) == 0u) {
+          ++m_persistVerifyN;
+          std::vector<std::unique_ptr<BlasBucket>> vBuckets;
+          vBuckets.reserve(blasBuckets.size());
+          const VkDeviceAddress vBase = m_transformBuffer->getDeviceAddress();
+          size_t vOrd = 0;
+          for (const MergePersistMember& m : m_persistScratch) {
+            fillGeometryInfoFromBlasEntry(*m.blas, *m.inst, opacityMicromapManager);
+            const VkDeviceAddress vAddr = vBase + (vOrd++) * sizeof(VkTransformMatrixKHR);
+            for (auto& vG : m.blas->buildGeometries) {
+              vG.geometry.triangles.transformData.deviceAddress = vAddr;
+            }
+            bool vMerged = false;
+            for (auto& vB : vBuckets) {
+              if (vB->tryAddInstance(m.inst)) { vMerged = true; break; }
+            }
+            if (!vMerged) {
+              auto vNew = std::make_unique<BlasBucket>();
+              vNew->tryAddInstance(m.inst);
+              vBuckets.push_back(std::move(vNew));
+            }
+          }
+          auto vEq = [](const BlasBucket& a, const BlasBucket& b) -> bool {
+            return a.geometries.size() == b.geometries.size()
+                && (a.geometries.empty()
+                    || std::memcmp(a.geometries.data(), b.geometries.data(),
+                                   a.geometries.size() * sizeof(VkAccelerationStructureGeometryKHR)) == 0)
+                && a.ranges.size() == b.ranges.size()
+                && (a.ranges.empty()
+                    || std::memcmp(a.ranges.data(), b.ranges.data(),
+                                   a.ranges.size() * sizeof(VkAccelerationStructureBuildRangeInfoKHR)) == 0)
+                && a.originalInstances == b.originalInstances
+                && a.primitiveCounts == b.primitiveCounts
+                && a.instanceBillboardIndices == b.instanceBillboardIndices
+                && a.indexOffsets == b.indexOffsets
+                && a.instanceMask == b.instanceMask
+                && a.instanceShaderBindingTableRecordOffset == b.instanceShaderBindingTableRecordOffset
+                && a.customIndexFlags == b.customIndexFlags
+                && a.instanceFlags == b.instanceFlags
+                && a.usesUnorderedApproximations == b.usesUnorderedApproximations
+                && a.hasSssInstances == b.hasSssInstances;
+          };
+          bool vFail = (vBuckets.size() != blasBuckets.size());
+          if (!vFail) {
+            for (size_t i = 0; i < vBuckets.size(); ++i) {
+              if (!vEq(*vBuckets[i], *blasBuckets[i])) { vFail = true; break; }
+            }
+          }
+          if (vFail) {
+            ++m_persistVerifyFailN;
+            m_persistQuarantined = true;
+            m_persistValid = false;
+            Logger::warn(str::format(
+              "[Perf.MergeP] VERIFY-FAIL f=", currentFrame,
+              " buckets=", (uint32_t) blasBuckets.size(), "/", (uint32_t) vBuckets.size(),
+              " members=", (uint32_t) m_persistScratch.size(),
+              " -- persistent buckets disabled this session; fresh derivation adopted"));
+            // The fresh derivation is authoritative for this frame.
+            blasBuckets = std::move(vBuckets);
+          }
+        }
+      } else {
+        ++m_persistRebuildN;
+        blasBuckets.clear();
+        blasBuckets.reserve(m_persistScratch.size());
+        const VkDeviceAddress mpBase = m_transformBuffer->getDeviceAddress();
+        for (const MergePersistMember& m : m_persistScratch) {
+          fillGeometryInfoFromBlasEntry(*m.blas, *m.inst, opacityMicromapManager);
+
+          // Calculate the device address for the current instance's transform and write the transform data
+          // TODO: only do this for non-identity transforms
+          const VkDeviceAddress transformDeviceAddress =
+            mpBase + instanceTransforms.size() * sizeof(VkTransformMatrixKHR);
+          instanceTransforms.push_back(m.inst->getVkInstance().transform);
+          for (auto& geometry : m.blas->buildGeometries) {
+            geometry.geometry.triangles.transformData.deviceAddress = transformDeviceAddress;
+          }
+
+          // Try to merge the instance into one of the blasBuckets
+          bool merged = false;
+          for (auto& bucket : blasBuckets) {
+            if (bucket->tryAddInstance(m.inst)) {
+              merged = true;
+              break;
+            }
+          }
+          // The instance couldn't be merged into any bucket - make a new one
+          if (!merged) {
+            auto newBucket = std::make_unique<BlasBucket>();
+            merged = newBucket->tryAddInstance(m.inst);
+            assert(merged);
+            blasBuckets.push_back(std::move(newBucket));
+          }
+
+          // Track the lifetime and states of the source geometry buffers
+          trackBlasBuildResources(ctx, execBarriers, m.blas);
+        }
+        // Capture the sequence the buckets were just built from.
+        m_persistMembers.swap(m_persistScratch);
+        m_persistEpoch = mpEpoch;
+        m_persistValid = true;
       }
     }
     markMrg(mrg_loop);
@@ -2113,6 +2438,7 @@ namespace dxvk {
           " keptRadius=", sceneCull.keptRadius,
           " keptLight=", sceneCull.keptLight,
           " keptSkinned=", sceneCull.keptSkinned,
+          " aabbHit=", sceneCull.aabbCacheHits,
           " culled=", sceneCull.culled,
           " culledSmall=", sceneCull.culledSmall,
           " lights=", sceneCull.lightSegs.size(),
@@ -2529,6 +2855,13 @@ namespace dxvk {
         " inst=", instances.size(), " uniqueBlas=", uniqueBlas.size(),
         " buckets=", blasBuckets.size(),
         " bBuild=", mrgN_build, " bUpdate=", mrgN_update, " bReuse=", mrgN_reuse,
+        // [Perf.MergeP]: cumulative persistent-bucket health. mpReuse should
+        // dominate mpRebuild at steady state; why{n,seq,ep} attribute the
+        // rebuilds (membership count / sequence-or-fp / epoch-options);
+        // vFAIL must stay 0.
+        " mpReuse=", m_persistReuseN, " mpRebuild=", m_persistRebuildN,
+        " why{n=", m_persistWhyCount, " seq=", m_persistWhySeq, " ep=", m_persistWhyEpoch, "}",
+        " v=", m_persistVerifyN, "/FAIL=", m_persistVerifyFailN,
         " staticPersist=", (normStats.routedStaticPersist + piStats.routedStaticPersist),
         " →dyn=", (normStats.routedDynamic + piStats.routedDynamic),
         " →merged=", (normStats.routedMerged + piStats.routedMerged)));
