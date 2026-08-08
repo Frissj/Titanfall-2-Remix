@@ -91,10 +91,21 @@ namespace dxvk {
     };
     static thread_local std::unordered_map<MemoKey, D3D11VsClassification, MemoKeyHash> sMemo;
     const MemoKey memoKey{ commonShader, &semantics };
+    // NV-DXVK PERF (2026-08-08d, xt_cls): single-entry front cache ahead of
+    // the map. Draws batch by (VS, layout), so two pointer compares serve
+    // almost every call and the map only backs shader switches. The front
+    // entry never outlives the map entry it mirrors (same key contract).
+    static thread_local MemoKey sMemoFrontKey{ nullptr, nullptr };
+    static thread_local D3D11VsClassification sMemoFrontVal;
+    if (memoKey == sMemoFrontKey && sMemoFrontKey.shader != nullptr)
+      return sMemoFrontVal;
     {
       auto it = sMemo.find(memoKey);
-      if (it != sMemo.end())
+      if (it != sMemo.end()) {
+        sMemoFrontKey = memoKey;
+        sMemoFrontVal = it->second;
         return it->second;
+      }
     }
 
     D3D11VsClassification result = [&]() -> D3D11VsClassification {
@@ -180,8 +191,16 @@ namespace dxvk {
     return out;
     }();  // end uncached classify body (IIFE)
 
-    if (sMemo.size() >= 4096) sMemo.clear();
+    if (sMemo.size() >= 4096) {
+      sMemo.clear();
+      // Keep the front cache subordinate to the map: the cap-clear exists to
+      // survive pointer reuse, so a surviving front entry would reintroduce
+      // exactly the staleness the clear is for.
+      sMemoFrontKey = MemoKey{ nullptr, nullptr };
+    }
     sMemo.emplace(memoKey, result);
+    sMemoFrontKey = memoKey;
+    sMemoFrontVal = result;
     return result;
   }
 

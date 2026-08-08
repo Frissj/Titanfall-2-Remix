@@ -9836,6 +9836,83 @@ namespace dxvk {
   static thread_local uint32_t s_fanoutCamVictim = 0;
   static thread_local uint64_t s_fanoutCamHits = 0, s_fanoutCamMisses = 0;
 
+  // NV-DXVK [Perf.UvXformCache] 2026-08-08 (d-handoff §1, cbc_rawUv 0.89 ms):
+  // VALUE cache for the CBufUberStatic UV-transform extraction. The RDEF
+  // lookups were already memoized per-PS; what remained per allowlisted draw
+  // was GetMappedSlice + three 8-byte reads from WRITE-COMBINED memory plus
+  // the identity/finite/det validation and Matrix4 build. Those are a pure
+  // function of (shader RDEF layout, cb bytes), so the FanoutCamCache key
+  // contract applies verbatim:
+  //   (D3D11CommonShader*, D3D11Buffer*, GetContentGeneration(), constantOffset)
+  // GetContentGeneration() is bumped on EVERY CPU write path (Map/DISCARD,
+  // Map/NO_OVERWRITE, UpdateSubresource — see d3d11_buffer.h:130), so same
+  // (buf, gen) implies same bytes; the shader pointer carries the epoch-guard
+  // caveat (recycled allocations alias — g_shaderEpoch clears the set).
+  // Failure paths (unmapped cb, OOB) are NOT cached and re-run the slow path,
+  // matching the FanoutCamCache rule. install=false verdicts ARE cached —
+  // identical bytes always re-derive the identical verdict.
+  struct UvXformValEntry {
+    const void* cs    = nullptr;  // D3D11CommonShader identity, never dereferenced
+    const void* buf   = nullptr;  // D3D11Buffer identity, never dereferenced
+    uint64_t    gen   = 0;
+    uint32_t    cbOff = 0;
+    bool        install = false;
+    Matrix4     m;
+  };
+  static constexpr size_t kUvXformValWays = 4;
+  static thread_local UvXformValEntry s_uvXformValCache[kUvXformValWays];
+  static thread_local uint32_t s_uvXformValVictim = 0;
+  static thread_local uint64_t s_uvXformValEpoch = 0;
+  static thread_local uint64_t s_uvXformValHits = 0, s_uvXformValMisses = 0;
+
+  // NV-DXVK [Perf.TformPool] 2026-08-08 (§2 inst_loop): recycling pool for the
+  // per-fanout-call tforms/prevTforms vectors. Every SubmitInstancedDraw built
+  // two fresh std::make_shared<std::vector<Matrix4>> and reserve()d ~44*64 B
+  // each — ~2 allocations + cold pages, ~490 calls/frame (the "dbgTrack" span
+  // in [Perf.MapCut] brackets exactly these). The consumer (DrawCallState →
+  // CS thread) drops the last shared_ptr ref after commit, so a custom deleter
+  // can return the vector — with its grown capacity — to a freelist instead of
+  // freeing it. Reuse is safe by construction: a vector re-enters the pool
+  // only when no consumer holds a reference.
+  //   - mutex + pool are heap-allocated and deliberately leaked: the deleter
+  //     runs on whatever thread drops the last ref, including during static
+  //     destruction at shutdown — locking a destroyed mutex is UB, a leaked
+  //     one is not (same reasoning as dxvk's other never-destroyed singletons).
+  //   - pool capped so a pathological frame cannot grow it without bound.
+  //   - counters ride the [Perf.SrvCache]-window emit; steady state is
+  //     hit ~= 2x fanout calls, miss ~= 0 after warmup.
+  static std::mutex& tformPoolMutex() {
+    static std::mutex* m = new std::mutex();
+    return *m;
+  }
+  static std::vector<std::vector<Matrix4>*>& tformPool() {
+    static std::vector<std::vector<Matrix4>*>* p = new std::vector<std::vector<Matrix4>*>();
+    return *p;
+  }
+  static std::atomic<uint64_t> g_tformPoolHits { 0 };
+  static std::atomic<uint64_t> g_tformPoolMisses { 0 };
+  static std::shared_ptr<std::vector<Matrix4>> acquirePooledTformVec() {
+    std::vector<Matrix4>* raw = nullptr;
+    {
+      std::lock_guard<std::mutex> lk(tformPoolMutex());
+      auto& pool = tformPool();
+      if (!pool.empty()) { raw = pool.back(); pool.pop_back(); }
+    }
+    if (raw != nullptr) {
+      raw->clear();   // size 0, capacity retained — the whole point
+      g_tformPoolHits.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      raw = new std::vector<Matrix4>();
+      g_tformPoolMisses.fetch_add(1, std::memory_order_relaxed);
+    }
+    return std::shared_ptr<std::vector<Matrix4>>(raw, [](std::vector<Matrix4>* p) {
+      std::lock_guard<std::mutex> lk(tformPoolMutex());
+      auto& pool = tformPool();
+      if (pool.size() < 4096) pool.push_back(p);
+      else                    delete p;
+    });
+  }
+
   void D3D11Rtx::SubmitInstancedDraw(bool indexed, UINT count, UINT start, INT base,
                                       UINT instanceCount, UINT startInstance) {
     try {
@@ -10135,9 +10212,10 @@ namespace dxvk {
 
         if (boneIdxSem && boneSrv) {
           // Get the bone matrix buffer
-          Com<ID3D11Resource> boneRes;
-          boneSrv->GetResource(&boneRes);
-          auto* boneBuf = static_cast<D3D11Buffer*>(boneRes.ptr());
+          // NV-DXVK PERF (2026-08-08d): [Perf.SrvCache] probe instead of
+          // GetResource — ran per fanout call; lifetime anchored by the
+          // live t30/t31 binding, same contract as the other probe users.
+          auto* boneBuf = probeSrvCached(boneSrv).buf;
           DxvkBufferSlice boneBufSlice = boneBuf ? boneBuf->GetBufferSlice() : DxvkBufferSlice();
           const uint8_t* bonePtr = boneBufSlice.defined() ?
             reinterpret_cast<const uint8_t*>(boneBufSlice.mapPtr(0)) : nullptr;
@@ -11172,12 +11250,13 @@ namespace dxvk {
 
             // ONE SubmitDraw per batch = matches original game's draw count.
             // Scene manager expands to N TLAS instances via instancesToObject.
-            auto tforms = std::make_shared<std::vector<Matrix4>>();
+            // NV-DXVK [Perf.TformPool]: pooled — see acquirePooledTformVec.
+            auto tforms = acquirePooledTformVec();
             tforms->reserve(maxInstances);
             // NV-DXVK [fanout prev-transform identity]: where each accepted
             // placement stood LAST frame, absolutised with LAST frame's
             // camOrigin, index-parallel to tforms and pushed at the same site.
-            auto prevTforms = std::make_shared<std::vector<Matrix4>>();
+            auto prevTforms = acquirePooledTformVec();
             prevTforms->reserve(maxInstances);
 
             const uint8_t* instData = m_instBufCache.data();
@@ -11881,8 +11960,21 @@ namespace dxvk {
               // Same chunking idiom as flushGeometryBatch: scheduling is O(threads)
               // not O(instances), the tail range runs on this thread so it is not idle
               // across the join, and a full worker queue falls back to inline.
+              // NV-DXVK [ParFanout granularity] 2026-08-08: chunks was
+              // min(workers, maxInstances), which spread the AVERAGE 44-instance
+              // draw across every worker as ~6-instance crumbs — each chunk's
+              // decode (~1-2us) costs less than its Schedule+wake+join latency,
+              // so the loop timer paid the join, not the work. Measured: lowering
+              // minInstances 64→32 made per-instance loop cost WORSE (0.34→0.50
+              // us/inst), which is the signature of join-dominated chunks.
+              // Rule: a chunk must carry at least kParMinInst instances. Small
+              // eligible draws collapse to chunks=1 = the inline tail (no
+              // futures, no join); big draws still fan out wide. Verify on
+              // [Perf.InstDraw]: loop_ms falls while instPerCall/calls hold.
               const uint32_t workers = std::max<uint32_t>(1u, m_pGeometryWorkers->numThreads());
-              const uint32_t chunks  = std::min(workers, maxInstances);
+              const uint32_t chunksByWork =
+                std::max<uint32_t>(1u, maxInstances / std::max<uint32_t>(1u, kParMinInst));
+              const uint32_t chunks  = std::min(std::min(workers, maxInstances), chunksByWork);
               const uint32_t chunkSz = (maxInstances + chunks - 1u) / chunks;
               std::vector<Future<void>> parFuts;
               parFuts.reserve(chunks);
@@ -13538,7 +13630,10 @@ namespace dxvk {
     // or copies it explicitly, so no aliasing hazard.
     auto getVsHashShort = [this]() -> const std::string& {
       static thread_local std::string sNoVs = "<novs>";
-      auto vsPtr = m_context->m_state.vs.shader;
+      // NV-DXVK PERF (2026-08-08d, xt_setup): reference, not Com copy — this
+      // helper runs ~10-25x per draw and the copy paid an atomic
+      // AddRef/Release pair per call even on the memo-hit path.
+      const auto& vsPtr = m_context->m_state.vs.shader;
       if (vsPtr == nullptr || vsPtr->GetCommonShader() == nullptr) return sNoVs;
       auto& s = vsPtr->GetCommonShader()->GetShader();
       if (s == nullptr) return sNoVs;
@@ -15861,7 +15956,11 @@ namespace dxvk {
             if (cb3OwnsTransform) {
               gotBoneTransform = true;
             }
+            // NV-DXVK PERF (2026-08-08d §1 o2w_t31): the once-per-VS throttle
+            // still paid a string hash + set lookup PER DRAW on every cb3-owned
+            // draw. Routing question is answered; RTX_D3D11_DIAG=1 revives it.
             static std::unordered_set<std::string> sT31SkipLogged;
+            if (s_xtDiagEnabled) {
             const std::string& vkeyMiss = getVsHashShort();
             if (sT31SkipLogged.insert(vkeyMiss).second) {
               Logger::info(str::format(
@@ -15869,6 +15968,7 @@ namespace dxvk {
                 " reason=no_rdef_g_modelInst_and_no_perinstance_uint4_idx",
                 " cb3OwnsTransform=", cb3OwnsTransform ? 1 : 0,
                 " (cb3 CBufModelInstance RDEF path owns this draw)"));
+            }
             }
           }
           // NV-DXVK: skinned-character discrimination. TF2 has TWO shader
@@ -15891,23 +15991,31 @@ namespace dxvk {
           if (hasBlendIndices) {
             t31SkipReason = "has_blendindices_skinned_character";
             // NV-DXVK: throttle to one line per unique VS â€” per-draw warn.
+            // NV-DXVK PERF (2026-08-08d §1 o2w_t31): string hash + set lookup
+            // ran per skinned draw; diag-gated with the sibling probes.
             static std::unordered_set<std::string> sT31BiWarn;
-            const std::string& vkeyBi = getVsHashShort();
-            if (sT31BiWarn.insert(vkeyBi).second)
-            Logger::warn(str::format(
-              "[D3D11Rtx.o2w.t31.skip] vs=", vkeyBi,
-              " drawID=", m_drawCallID,
-              " reason=", t31SkipReason,
-              " (routing to legacy skinning path)"));
+            if (s_xtDiagEnabled) {
+              const std::string& vkeyBi = getVsHashShort();
+              if (sT31BiWarn.insert(vkeyBi).second)
+              Logger::warn(str::format(
+                "[D3D11Rtx.o2w.t31.skip] vs=", vkeyBi,
+                " drawID=", m_drawCallID,
+                " reason=", t31SkipReason,
+                " (routing to legacy skinning path)"));
+            }
             // Fall through to legacy t30 bone path below.
             modelInstSrv = nullptr;
           }
           if (!modelInstSrv) {
             if (!t31SkipReason) t31SkipReason = "no_srv_bound_at_slot";
           } else {
-            Com<ID3D11Resource> t31Res;
-            modelInstSrv->GetResource(&t31Res);
-            auto* t31Buf = static_cast<D3D11Buffer*>(t31Res.ptr());
+            // NV-DXVK PERF (2026-08-08d §1 o2w_t31): resolve the SRV's buffer
+            // via the [Perf.SrvCache] probe instead of a raw GetResource —
+            // that was a COM AddRef/Release + two virtual calls PER DRAW for
+            // an immutable SRV→buffer mapping. Lifetime is anchored by the
+            // live binding (m_state.vs.shaderResources holds the SRV, the SRV
+            // holds the resource), same contract as the other probe users.
+            auto* t31Buf = probeSrvCached(modelInstSrv).buf;
             const uint8_t* t31Data = nullptr;
             size_t t31Len = 0;
             if (t31Buf) {
@@ -16018,7 +16126,9 @@ namespace dxvk {
                 // One-shot dump of the full t31 buffer contents the first time
                 // each unique VS hits this path. Helps us see whether a shader
                 // variant actually uses multiple entries or always idx 0.
-                {
+                // NV-DXVK PERF (2026-08-08d §1 o2w_t31): question answered;
+                // the set probe ran per successful t31 draw. Diag-gated.
+                if (s_xtDiagEnabled) {
                   static std::unordered_set<std::string> sT31Dumped;
                   const std::string& vkey = getVsHashShort();
                   if (sT31Dumped.insert(vkey).second) {
@@ -16042,7 +16152,7 @@ namespace dxvk {
                 // thousands of draws/frame â€” the dominant log-storm source
                 // dragging the game to ~5 fps. One line per shader is enough
                 // to see which VS variants take this path.
-                {
+                if (s_xtDiagEnabled) {
                   static std::unordered_set<std::string> sT31OkLog;
                   const std::string& vkeyOk = getVsHashShort();
                   if (sT31OkLog.insert(vkeyOk).second) {
@@ -16065,8 +16175,9 @@ namespace dxvk {
                 }
               }
             }
-            if (t31SkipReason) {
+            if (t31SkipReason && s_xtDiagEnabled) {
               // NV-DXVK: throttle to one line per unique VS â€” per-draw warn.
+              // NV-DXVK PERF (2026-08-08d §1 o2w_t31): diag-gated set probe.
               static std::unordered_set<std::string> sT31SkipWarn;
               const std::string& vkeySkip = getVsHashShort();
               if (sT31SkipWarn.insert(vkeySkip).second) {
@@ -16082,8 +16193,9 @@ namespace dxvk {
               }
             }
           }
-          if (t31SkipReason && !strstr(t31SkipReason, "t31Data") && !modelInstSrv) {
+          if (t31SkipReason && s_xtDiagEnabled && !strstr(t31SkipReason, "t31Data") && !modelInstSrv) {
             // NV-DXVK: throttle to one line per unique VS â€” per-draw warn.
+            // NV-DXVK PERF (2026-08-08d §1 o2w_t31): diag-gated set probe.
             static std::unordered_set<std::string> sT31NosrvWarn;
             const std::string& vkeyNosrv = getVsHashShort();
             if (sT31NosrvWarn.insert(vkeyNosrv).second) {
@@ -16120,7 +16232,9 @@ namespace dxvk {
           if (!t30PathEligible && sfHasBlendIndices)  // fused IL scan above
             t30PathEligible = true;
         }
-        if (!t30PathEligible && !gotBoneTransform) {
+        // NV-DXVK PERF (2026-08-08d, xt_bone): string hash + set probe ran on
+        // every static-mesh draw (largest population). Answered; diag-gated.
+        if (!t30PathEligible && !gotBoneTransform && s_xtDiagEnabled) {
           static std::unordered_set<std::string> sT30GateLogged;
           const std::string& vkey = getVsHashShort();
           if (sT30GateLogged.insert(vkey).second) {
@@ -16137,9 +16251,10 @@ namespace dxvk {
             boneSrv = m_context->m_state.vs.shaderResources.views[kBoneSrvSlot].ptr();
           if (boneSrv) {
             // Get bone matrix buffer
-            Com<ID3D11Resource> boneRes;
-            boneSrv->GetResource(&boneRes);
-            auto* boneBuf = static_cast<D3D11Buffer*>(boneRes.ptr());
+            // NV-DXVK PERF (2026-08-08d, xt_bone): [Perf.SrvCache] probe
+            // instead of GetResource — same substitution as the t31 path;
+            // lifetime anchored by the live t30 binding.
+            auto* boneBuf = probeSrvCached(boneSrv).buf;
             DxvkBufferSlice boneBufSlice = boneBuf ? boneBuf->GetBufferSlice() : DxvkBufferSlice();
             const uint8_t* bonePtr = boneBufSlice.defined() ?
               reinterpret_cast<const uint8_t*>(boneBufSlice.mapPtr(0)) : nullptr;
@@ -17232,7 +17347,8 @@ namespace dxvk {
       // heuristics. Only guessing is replaced; legacy path retained below as a
       // fallback for shaders that stripped RDEF.
       const D3D11CommonShader* commonVS = nullptr;
-      auto vsPtr = m_context->m_state.vs.shader;
+      // NV-DXVK PERF (2026-08-08d, xt_bone): reference, not Com copy.
+      const auto& vsPtr = m_context->m_state.vs.shader;
       if (vsPtr != nullptr) commonVS = vsPtr->GetCommonShader();
 
       auto rdefReadFloats = [&](const D3D11ConstantBufferBindings& cbs,
@@ -17268,7 +17384,23 @@ namespace dxvk {
         // bound shader) is alive, i.e. for the duration of this draw, so use it
         // immediately and re-resolve next draw. (findCamOriginLoc can cache because
         // it copies out a CBFieldLoc VALUE, not a pointer.)
-        auto modelCb = commonVS->FindCBuffer("CBufModelInstance");
+        // NV-DXVK PERF (2026-08-08d, xt_bone): FindCBuffer is a string-keyed
+        // map lookup (std::string temp + hash) that ran on EVERY draw reaching
+        // here. Cache the bindSlot VALUE per (shader ptr, epoch) — exactly the
+        // pointer-vs-value rule the comment above states. The diag dump below
+        // re-resolves its own pointer under the diag gate.
+        static thread_local const void* sModelCbCommon = nullptr;
+        static thread_local uint64_t    sModelCbEpoch  = ~0ull;
+        static thread_local uint32_t    sModelCbSlot   = UINT32_MAX;
+        {
+          const uint64_t mcEp = g_shaderEpoch.load(std::memory_order_relaxed);
+          if (static_cast<const void*>(commonVS) != sModelCbCommon || mcEp != sModelCbEpoch) {
+            const auto* mcFresh = commonVS->FindCBuffer("CBufModelInstance");
+            sModelCbSlot   = (mcFresh != nullptr) ? mcFresh->bindSlot : UINT32_MAX;
+            sModelCbCommon = commonVS;
+            sModelCbEpoch  = mcEp;
+          }
+        }
 
         // NV-DXVK DIAG: PIX confirmed VS 0x298e12b3d5bcd082 (merged[Opaque][0]
         // warped-mesh VS, SHA1 6e3e6f28...) binds a valid 3x4 row-major
@@ -17295,8 +17427,8 @@ namespace dxvk {
                 "[D3D11Rtx.o2w.warpedMesh.rdefDump] vs=", vsKeyDiag,
                 " cbufferCount=", names.size(),
                 " cbuffers={ ", cbList, "}",
-                " modelCbFound=", (modelCb != nullptr) ? 1 : 0,
-                " modelCbSlot=", modelCb ? modelCb->bindSlot : UINT32_MAX));
+                " modelCbFound=", (sModelCbSlot != UINT32_MAX) ? 1 : 0,
+                " modelCbSlot=", sModelCbSlot));
 
               // Dump raw cb3 bytes as 12 floats (the objectToCameraRelative we
               // know PIX has for this draw). Bypasses RDEF to confirm the raw
@@ -17340,9 +17472,9 @@ namespace dxvk {
           }
         }
 
-        if (modelCb && modelCb->bindSlot != UINT32_MAX) {
+        if (sModelCbSlot != UINT32_MAX) {
           float m[12];
-          if (rdefReadFloats(vsCbs, modelCb->bindSlot, 0, 48, m)) {
+          if (rdefReadFloats(vsCbs, sModelCbSlot, 0, 48, m)) {
             bool ok = true;
             for (int k = 0; k < 12 && ok; ++k)
               if (!std::isfinite(m[k])) ok = false;
@@ -17491,16 +17623,17 @@ namespace dxvk {
                     }
                   }
                 }
-                {
-                  // NV-DXVK: throttle to one line per unique VS â€” this is
-                  // the main RDEF extraction path and was logging per draw.
+                // NV-DXVK PERF (2026-08-08d, xt_bone): the once-per-VS throttle
+                // paid a string hash + set lookup on EVERY cb3-owned draw (the
+                // largest draw population). Diag-gated like its siblings.
+                if (s_xtDiagEnabled) {
                   static std::unordered_set<std::string> sRdefO2wLog;
                   const std::string& vkeyRdef = getVsHashShort();
                   if (sRdefO2wLog.insert(vkeyRdef).second)
                   Logger::info(str::format(
                     "[D3D11Rtx.o2w.rdef] vs=", vkeyRdef,
                     " drawID=", m_drawCallID,
-                    " slot=", modelCb->bindSlot,
+                    " slot=", sModelCbSlot,
                     " r0=(", m[0], ",", m[1], ",", m[2], ") Tx=", m[3],
                     " r1=(", m[4], ",", m[5], ",", m[6], ") Ty=", m[7],
                     " r2=(", m[8], ",", m[9], ",", m[10], ") Tz=", m[11],
@@ -17934,7 +18067,10 @@ namespace dxvk {
     // objectToWorld. If a legacy path set a different o2w earlier in this
     // function, the override replaces it.
     {
-      auto vsPtrV2 = m_context->m_state.vs.shader;
+      // NV-DXVK PERF (2026-08-08d, xt_cls): reference, not Com copy — the copy
+      // paid an atomic AddRef/Release pair on EVERY draw. The binding cannot
+      // change under us inside this draw's SubmitDraw.
+      const auto& vsPtrV2 = m_context->m_state.vs.shader;
       const D3D11CommonShader* commonV2 =
         (vsPtrV2 != nullptr) ? vsPtrV2->GetCommonShader() : nullptr;
       const auto* ilV2 = m_context->m_state.ia.inputLayout.ptr();
@@ -18139,7 +18275,13 @@ namespace dxvk {
           const uint64_t recogKey =
               static_cast<uint64_t>(reinterpret_cast<uintptr_t>(commonV2))
             ^ (static_cast<uint64_t>(clsV2.kind) << 56);
-          if (sV2LogRecognized.insert(recogKey).second) {
+          // NV-DXVK PERF (2026-08-08d, xt_cls): last-key memo in front of the
+          // set — this is the hottest classifier case, and the set insert
+          // (hash + probe) still ran per draw. Draws batch by VS, so one
+          // compare skips it; the set stays authoritative on VS switches.
+          static thread_local uint64_t sV2LastRecogKey = ~0ull;
+          if (recogKey != sV2LastRecogKey
+              && (sV2LastRecogKey = recogKey, sV2LogRecognized.insert(recogKey).second)) {
             Logger::info(str::format(
               "[VsClass.v2.", D3D11VsClassifier::kindName(clsV2.kind),
               "] vs=", getVsHashShort(),
@@ -23688,11 +23830,29 @@ namespace dxvk {
     }
     const D3D11CommonShader* commonVsForLog = nullptr;
     {
-      auto vsShader = m_context->m_state.vs.shader;
+      // NV-DXVK PERF (2026-08-08d, pff_vmPass): reference not Com copy (atomic
+      // AddRef/Release per draw), and getShaderKeyStr() heap-built a fresh
+      // ~40-char hex string EVERY draw. Memo the string per DxvkShader pointer
+      // (epoch-guarded against allocator reuse); assign() copies into
+      // m_currentVsHashCache's retained capacity — clear() at entry does not
+      // release it — so the steady-state cost is a pointer compare + a small
+      // copy with no allocation.
+      const auto& vsShader = m_context->m_state.vs.shader;
       if (vsShader != nullptr && vsShader->GetCommonShader() != nullptr) {
         commonVsForLog = vsShader->GetCommonShader();
         auto& s = commonVsForLog->GetShader();
-        if (s != nullptr) m_currentVsHashCache = s->getShaderKeyStr();
+        if (s != nullptr) {
+          static thread_local const void* sVsKeyStrPtr = nullptr;
+          static thread_local uint64_t    sVsKeyStrEpoch = ~0ull;
+          static thread_local std::string sVsKeyStr;
+          const uint64_t vkEp = g_shaderEpoch.load(std::memory_order_relaxed);
+          if (static_cast<const void*>(s.ptr()) != sVsKeyStrPtr || vkEp != sVsKeyStrEpoch) {
+            sVsKeyStr = s->getShaderKeyStr();
+            sVsKeyStrPtr = s.ptr();
+            sVsKeyStrEpoch = vkEp;
+          }
+          m_currentVsHashCache.assign(sVsKeyStr);
+        }
       }
     }
 
@@ -24409,12 +24569,19 @@ namespace dxvk {
       // model (m_curDrawIsWidow) instead of vsHash 0x292b + count>5000 (which
       // also caught world/sky and missed smaller Widow meshes). Requires
       // rtx.tf2DetectWidow (or tf2HideWidow/tf2IsolateWidow).
-      static uint32_t sShipSrcFrame = 0xffffffffu;
-      static uint32_t sShipSrcCount = 0;
-      const uint32_t shipSrcFid = m_context->m_device->getCurrentFrameId();
-      if (shipSrcFid != sShipSrcFrame) { sShipSrcFrame = shipSrcFid; sShipSrcCount = 0; }
       // NV-DXVK [perf]: "[Ship" is in emitMsg's kFilteredTags â€” 16 discarded lines
       // per frame, each attempting a vertex-buffer map. Gate on the diag channel.
+      // NV-DXVK PERF (2026-08-08d §1): diag gate hoisted OUTSIDE the per-frame
+      // statics — getCurrentFrameId() ran per draw to maintain a counter only
+      // the gated probe reads. Vanish chain is answered (vanishing-floor =
+      // studio model); RTX_D3D11_DIAG=1 revives all of it unchanged.
+      static uint32_t sShipSrcFrame = 0xffffffffu;
+      static uint32_t sShipSrcCount = 0;
+      uint32_t shipSrcFid = 0;
+      if (s_d3d11DiagEnabled) {
+        shipSrcFid = m_context->m_device->getCurrentFrameId();
+        if (shipSrcFid != sShipSrcFrame) { sShipSrcFrame = shipSrcFid; sShipSrcCount = 0; }
+      }
       if (s_d3d11DiagEnabled && m_curDrawIsWidow && sShipSrcCount < 16u
           && posSem->inputSlot < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) {
         ++sShipSrcCount;
@@ -27924,6 +28091,15 @@ namespace dxvk {
     // sometimes overwrites WorldToView with identity (depending on
     // freeCameraViewRelative()), but getPosition() always returns a valid
     // world position derived from the original view-to-world.
+    // NV-DXVK PERF (2026-08-08d §1 flt_gate): the TLAS-coherence comparison
+    // below is OBSERVER-ONLY — its rejection was disabled long ago (see the
+    // "rejection DISABLED" comment inside: rejecting pre-classification froze
+    // Main). What remained per draw was a full 4x4 inverse(worldToView),
+    // scene/camera-manager chasing, getPosition() and counter upkeep, feeding
+    // capped [TLAS-FILTER] logs. Audit: drawCamPos and every local/static in
+    // the block are consumed nowhere else. Gate the WORK on the diag channel;
+    // RTX_D3D11_DIAG=1 restores the observer unchanged.
+    if (s_d3d11DiagEnabled) {
     Vector3 drawCamPos;
     {
       const Matrix4 v2w = inverse(dcs.transformData.worldToView);
@@ -28034,6 +28210,7 @@ namespace dxvk {
         ++s_tlasNoMain;
       }
     }
+    } // NV-DXVK PERF (2026-08-08d §1 flt_gate): end diag-gated TLAS observer
 
     // NV-DXVK: scene dump for cbuffer-based BSP draws (non-fanout). The
     // bone-instance fanout dump above only catches g_modelInst-style draws.
@@ -30593,6 +30770,33 @@ namespace dxvk {
               && rsx->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
             const auto& cb = m_context->m_state.ps.constantBuffers[rsx->slot];
             if (cb.buffer != nullptr) {
+              // NV-DXVK [Perf.UvXformCache]: probe before touching the WC
+              // mapping. Key contract documented at the cache decl (~9840).
+              const uint64_t uvEpochNow = g_shaderEpoch.load(std::memory_order_relaxed);
+              if (uvEpochNow != s_uvXformValEpoch) {
+                for (size_t i = 0; i < kUvXformValWays; ++i)
+                  s_uvXformValCache[i].cs = nullptr;
+                s_uvXformValEpoch = uvEpochNow;
+              }
+              const void*    uvCsKey  = static_cast<const void*>(cs);
+              const void*    uvBufKey = static_cast<const void*>(cb.buffer.ptr());
+              const uint64_t uvGen    = cb.buffer->GetContentGeneration();
+              const uint32_t uvCbOff  = cb.constantOffset;
+              int uvHitIdx = -1;
+              for (size_t i = 0; i < kUvXformValWays; ++i) {
+                const auto& e = s_uvXformValCache[i];
+                if (e.cs == uvCsKey && e.buf == uvBufKey
+                    && e.gen == uvGen && e.cbOff == uvCbOff) {
+                  uvHitIdx = int(i);
+                  break;
+                }
+              }
+              if (uvHitIdx >= 0) {
+                ++s_uvXformValHits;
+                if (s_uvXformValCache[uvHitIdx].install)
+                  dcs.transformData.textureTransform = s_uvXformValCache[uvHitIdx].m;
+              } else {
+              ++s_uvXformValMisses;
               const auto mapped = cb.buffer->GetMappedSlice();
               const uint8_t* base = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
               const size_t bufLen = cb.buffer->Desc()->ByteWidth;
@@ -30694,8 +30898,26 @@ namespace dxvk {
                       "RSY=(", rsyV[0], ",", rsyV[1], ") "
                       "T=(",   trV[0],  ",", trV[1],  ")"));
                   }
+
+                  // NV-DXVK [Perf.UvXformCache]: stage the install verdict +
+                  // matrix. Only reached when the read fully completed.
+                  auto& veI = s_uvXformValCache[s_uvXformValVictim];
+                  s_uvXformValVictim = (s_uvXformValVictim + 1u) % kUvXformValWays;
+                  veI.cs = uvCsKey; veI.buf = uvBufKey;
+                  veI.gen = uvGen;  veI.cbOff = uvCbOff;
+                  veI.install = true; veI.m = uvXform;
+                } else {
+                  // NV-DXVK [Perf.UvXformCache]: identity / degenerate bytes —
+                  // cache the no-install verdict so the WC re-read is skipped
+                  // until the cb content generation moves.
+                  auto& veN = s_uvXformValCache[s_uvXformValVictim];
+                  s_uvXformValVictim = (s_uvXformValVictim + 1u) % kUvXformValWays;
+                  veN.cs = uvCsKey; veN.buf = uvBufKey;
+                  veN.gen = uvGen;  veN.cbOff = uvCbOff;
+                  veN.install = false;
                 }
               }
+              } // NV-DXVK [Perf.UvXformCache]: end of MISS branch
             }
           }
         }
@@ -30850,9 +31072,9 @@ namespace dxvk {
         boneSrv = m_context->m_state.vs.shaderResources.views[kBoneSrvSlot].ptr();
 
       if (boneSrv) {
-        Com<ID3D11Resource> boneRes;
-        boneSrv->GetResource(&boneRes);
-        auto* boneBuf = static_cast<D3D11Buffer*>(boneRes.ptr());
+        // NV-DXVK PERF (2026-08-08d): [Perf.SrvCache] probe instead of
+        // GetResource — ran per skinned draw; binding anchors lifetime.
+        auto* boneBuf = probeSrvCached(boneSrv).buf;
 
         if (boneBuf) {
           // Try multiple paths to access bone data (buffer may be GPU-only)
@@ -31628,7 +31850,13 @@ namespace dxvk {
             // paletteChanged=0 on held frames while the game moves => stale;
             // per-slot translations show which slots are parked near origin
             // (stale) vs placed at the ship. Aim at the ship, hold steady.
-            if (dcs.transformData.vertexShaderHash != 0
+            // NV-DXVK PERF (2026-08-08d §1): bonePalette-remainder gate. The
+            // razor chain is CLOSED (razor-is-jack) — this probe answered it.
+            // The atomic load + compare ran per skinned draw; the FNV hash over
+            // the whole palette ran per pick-match. Gate the WORK, keep the
+            // detector one env flip away (RTX_D3D11_DIAG=1).
+            if (s_d3d11DiagEnabled
+                && dcs.transformData.vertexShaderHash != 0
                 && static_cast<uint64_t>(dcs.transformData.vertexShaderHash)
                      == dxvk::tf2::g_pickCenterVsHash.load(std::memory_order_relaxed)) {
               // (was a bonePtr identity compare â€” invalid after the
@@ -31672,7 +31900,11 @@ namespace dxvk {
             // (viewport MaxDepth <= 0.08) to see if the bones wobble frame-to-
             // frame. Fires only if this path actually skins the gun (if it never
             // logs, the viewmodel uses the interleaver instead).
-            {
+            // NV-DXVK PERF (2026-08-08d §1): zig-zag chain is RESOLVED (frame
+            // -delay fix); this probe never fired in TF2 anyway (viewmodel uses
+            // the interleaver). Gate the viewport read + inner hash with the
+            // same diag env the sibling probes use.
+            if (s_d3d11DiagEnabled) {
               float vpMaxD = 1.0f;
               if (m_context->m_state.rs.numViewports > 0)
                 vpMaxD = m_context->m_state.rs.viewports[0].MaxDepth;
@@ -31782,7 +32014,10 @@ namespace dxvk {
 
     // === PER-DRAW TRANSFORM + VERTEX DIAGNOSTIC ===
     // Log every draw for the first 5 in-game frames (m_drawCallID-based gate).
-    {
+    // NV-DXVK PERF (2026-08-08d §1): the frame-counting statics ran on EVERY
+    // draw to feed a kDiagLogs-only log; kDiagLogs is constexpr so this whole
+    // block now compiles out with it.
+    if (kDiagLogs) {
       static uint32_t s_submitLogFrame = 0;
       static uint32_t s_submitPrevID   = UINT32_MAX;
       if (dcs.drawCallID == 0 || dcs.drawCallID < s_submitPrevID)
@@ -33249,7 +33484,8 @@ namespace dxvk {
       // is pure overhead in shipping configs.
       const auto tTcVsHash0 = std::chrono::steady_clock::now();
       uint64_t vsXxhRt = 0;
-      const auto vsPtrRt = m_context->m_state.vs.shader;
+      // NV-DXVK PERF (2026-08-08d): reference, not Com copy — per-draw AddRef.
+      const auto& vsPtrRt = m_context->m_state.vs.shader;
       if (vsPtrRt != nullptr && vsPtrRt->GetCommonShader() != nullptr) {
         auto& shRt = vsPtrRt->GetCommonShader()->GetShader();
         if (shRt != nullptr) vsXxhRt = static_cast<uint64_t>(shRt->getHash());
@@ -36438,7 +36674,8 @@ namespace dxvk {
     // restore the old "ships OR mountains, never both" behavior.
 
     // Read c_cameraOrigin from the bound VS's cb2 by RDEF-resolved address.
-    const auto vsPtr = m_context->m_state.vs.shader;
+    // NV-DXVK PERF (2026-08-08d): reference, not Com copy — per-draw AddRef.
+    const auto& vsPtr = m_context->m_state.vs.shader;
     if (vsPtr == nullptr || vsPtr->GetCommonShader() == nullptr) {
       return false;
     }
@@ -49203,6 +49440,36 @@ namespace dxvk {
                                  " hitPct=", fmHitPct));
         s_perfFillMatCacheHits = 0;
         s_perfFillMatCacheMisses = 0;
+
+        // NV-DXVK [Perf.UvXformCache] regression detector, same shape as
+        // Perf.SrvCache. Healthy steady state: hit rate near 100% (the cb
+        // content generation moves a handful of times per frame). hitPct ~0
+        // means the engine rewrites the CB per draw and the cache is inert
+        // (cbc_rawUv then reads as before the cache — correct, not profitable).
+        {
+          const uint64_t uvTotal = s_uvXformValHits + s_uvXformValMisses;
+          const uint32_t uvHitPct = uvTotal ? uint32_t((s_uvXformValHits * 100u) / uvTotal) : 0u;
+          Logger::info(str::format("[Perf.UvXformCache]"
+                                   " hits=", s_uvXformValHits,
+                                   " misses=", s_uvXformValMisses,
+                                   " hitPct=", uvHitPct));
+          s_uvXformValHits = 0;
+          s_uvXformValMisses = 0;
+        }
+
+        // NV-DXVK [Perf.TformPool] regression detector. Steady state: hits
+        // ~= 2x fanout calls/window, misses ~0 after warmup. Misses climbing
+        // forever means vectors are leaking past the pool cap (or a consumer
+        // holds refs across frames) — investigate before trusting frame time.
+        {
+          const uint64_t tpH = g_tformPoolHits.exchange(0, std::memory_order_relaxed);
+          const uint64_t tpM = g_tformPoolMisses.exchange(0, std::memory_order_relaxed);
+          const uint64_t tpT = tpH + tpM;
+          Logger::info(str::format("[Perf.TformPool]"
+                                   " hits=", tpH,
+                                   " misses=", tpM,
+                                   " hitPct=", tpT ? uint32_t((tpH * 100u) / tpT) : 0u));
+        }
 
         // NV-DXVK [Stage0 pipeline probe]: where the game thread stalls at the
         // frame boundary while the CS thread runs injectRTX. Divide the ns totals
