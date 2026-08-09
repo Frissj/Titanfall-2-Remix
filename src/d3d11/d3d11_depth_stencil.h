@@ -26,7 +26,14 @@ namespace dxvk {
     
     void STDMETHODCALLTYPE GetDesc(
             D3D11_DEPTH_STENCIL_DESC* pDesc) final;
-    
+
+    // NV-DXVK [perf]: direct const access to the immutable desc. State
+    // objects never change after creation, so hot paths (SubmitDraw runs
+    // per draw) read this instead of paying a struct copy via GetDesc.
+    const D3D11_DEPTH_STENCIL_DESC* Desc() const {
+      return &m_desc;
+    }
+
     void BindToContext(
       const Rc<DxvkContext>&  ctx);
     static HRESULT NormalizeDesc(

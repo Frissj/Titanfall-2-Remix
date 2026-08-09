@@ -539,12 +539,10 @@ namespace dxvk {
     bool derivePath3WorldToView(const Vector3& cam, Matrix4& outW2v,
                                 bool& outFromCb2, int& outSlotPicked,
                                 float& outSlotD2, bool requireLiveRot);
-    bool                                 m_lastWtvP3FromCb2 = false;
-    // Where path 3 got camXYZ this draw. 'R' (RDEF-resolved) and 'H'
-    // (hardcoded cb2@4) are cb2 reads and provable; 'F' (fanout cache) is
-    // mutable member state and is not. UINT32_MAX slot = not provable.
-    uint32_t                             m_lastWtvP3CamSlot = UINT32_MAX;
-    uint32_t                             m_lastWtvP3CamOff  = 0;
+    // (m_lastWtvP3FromCb2 / m_lastWtvP3CamSlot / m_lastWtvP3CamOff deleted with
+    //  the v6.4 wtvPath-3 carry proof. They recorded where path 3 read camXYZ
+    //  so the proof could decide whether it was provable cb2 content; with the
+    //  proof gone they were written every draw and never read.)
     Vector3                              m_lastO2wCamOrigin{ 0.0f, 0.0f, 0.0f };
     bool                                 m_lastO2wCamValid = false;
     bool                                 m_lastO2wCamFromFanout = false;

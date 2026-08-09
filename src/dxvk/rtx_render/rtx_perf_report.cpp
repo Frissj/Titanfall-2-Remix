@@ -5,10 +5,24 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
+
+// NV-DXVK [Perf.SessionState]: GetCurrentProcessorNumber / GetThreadPriority /
+// Get{Process,Thread}Information for the session-state probe. Kept out of the
+// header on purpose -- windows.h stays local to this one TU.
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace dxvk {
 
@@ -41,6 +55,88 @@ namespace dxvk {
         return;
       }
       publish(slot, windowTotal / double(frames), frameId);
+    }
+
+    // [Perf.SessionState] -- contract and motivation at the declaration.
+    // Field guide for reading the line:
+    //   spinNs  wall ns for 50k iterations of a dependent mul/xor/shift chain.
+    //           No memory traffic, not vectorisable -- inflates only when the
+    //           core itself runs slower (EcoQoS, E-core, clock throttle).
+    //   xMin    spinNs / this thread's session-best spinNs. ~1.0x healthy.
+    //           The degraded sessions should read ~3x here on both threads.
+    //   clkNs   ns per steady_clock::now(). ~15-30 on rdtsc-backed QPC;
+    //           hundreds+ means an HPET fallback taxed every instrument.
+    //   core    processor number at probe time -- a sample, not a census, but
+    //           repeated E-core numbers across windows name a placement issue.
+    //   ecoP/T  EXPLICIT process/thread EcoQoS flags. Windows can impose QoS
+    //           without setting these, so 0 does not acquit QoS -- spinNs is
+    //           the ground truth; 1 here names the mechanism. -1 = no API.
+    void sessionStateProbe(const char* who) {
+#ifdef _WIN32
+      volatile uint64_t sink = 0x9E3779B97F4A7C15ull;
+      uint64_t v = sink;
+      const auto t0 = std::chrono::steady_clock::now();
+      for (uint32_t i = 0; i < 50000u; ++i) {
+        v = v * 6364136223846793005ull + 1442695040888963407ull;
+        v ^= v >> 29;
+      }
+      const auto t1 = std::chrono::steady_clock::now();
+      sink = v;
+      (void) sink;
+      const uint64_t spinNs = (uint64_t) std::chrono::duration_cast<
+        std::chrono::nanoseconds>(t1 - t0).count();
+
+      auto cp = t1;
+      for (uint32_t i = 0; i < 1000u; ++i)
+        cp = std::chrono::steady_clock::now();
+      const uint64_t clkNs = (uint64_t) std::chrono::duration_cast<
+        std::chrono::nanoseconds>(cp - t1).count() / 1000u;
+
+      static thread_local uint64_t s_spinMin = UINT64_MAX;
+      if (spinNs < s_spinMin)
+        s_spinMin = spinNs;
+      const double xMin = (s_spinMin != 0ull && s_spinMin != UINT64_MAX)
+        ? double(spinNs) / double(s_spinMin) : 0.0;
+
+      int ecoP = -1;
+      int ecoT = -1;
+#ifdef PROCESS_POWER_THROTTLING_CURRENT_VERSION
+      {
+        PROCESS_POWER_THROTTLING_STATE ps = {};
+        ps.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        if (GetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
+                                  &ps, sizeof(ps))) {
+          ecoP = ((ps.ControlMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) != 0
+               && (ps.StateMask   & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) != 0) ? 1 : 0;
+        }
+      }
+#endif
+#ifdef THREAD_POWER_THROTTLING_CURRENT_VERSION
+      {
+        THREAD_POWER_THROTTLING_STATE ts = {};
+        ts.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
+        if (GetThreadInformation(GetCurrentThread(), ThreadPowerThrottling,
+                                 &ts, sizeof(ts))) {
+          ecoT = ((ts.ControlMask & THREAD_POWER_THROTTLING_EXECUTION_SPEED) != 0
+               && (ts.StateMask   & THREAD_POWER_THROTTLING_EXECUTION_SPEED) != 0) ? 1 : 0;
+        }
+      }
+#endif
+      char xbuf[32];
+      std::snprintf(xbuf, sizeof(xbuf), "%.2f", xMin);
+      Logger::warn(str::format(
+        "[Perf.SessionState] who=", who,
+        " spinNs=", spinNs,
+        " xMin=", xbuf,
+        " clkNs=", clkNs,
+        " core=", (uint32_t) GetCurrentProcessorNumber(),
+        " thrPrio=", GetThreadPriority(GetCurrentThread()),
+        " prioClass=", (uint32_t) GetPriorityClass(GetCurrentProcess()),
+        " ecoP=", ecoP,
+        " ecoT=", ecoT));
+#else
+      (void) who;
+#endif
     }
 
     namespace {
@@ -242,6 +338,93 @@ namespace dxvk {
       };
       emitRows(kSdRows, sizeof(kSdRows) / sizeof(kSdRows[0]), now, wall);
 
+      // NV-DXVK [Perf.Report] v6.9g: STAGE ATTRIBUTION -- how much of each
+      // stage its own named leaves actually account for. This is the check
+      // that keeps finding real defects: the same "parent vs sum of children"
+      // test on bt_extractXf exposed a 25.5% hole that had been silently
+      // inflating xs_pre and had corrupted the replay tier's whole cost model.
+      // Doing it by hand from the log got the mapping wrong twice, which is
+      // why it lives here now.
+      // READ IT: a stage at <10% unattributed is well understood and further
+      // splitting will find nothing -- go after what its leaves are NAMED as
+      // instead. A stage above ~25% has something real hiding in it.
+      // seg7 "rest" has no marks at all, so it is 100% by construction.
+      {
+        Logger::warn("[Perf.Report]   -- stage attribution (wall - named leaves = residual) --");
+        struct SA { const char* name; Slot wallSlot; Slot leafSlot; };
+        static const SA kSa[] = {
+          { "head",     Slot::SdHeadMs,     Slot::SdHeadLeavesMs     },
+          { "vsIdx",    Slot::SdVsIdxMs,    Slot::SdVsIdxLeavesMs    },
+          { "skinCull", Slot::SdSkinCullMs, Slot::SdSkinCullLeavesMs },
+          { "xform",    Slot::SdXformMs,    Slot::SdXformLeavesMs    },
+          { "commit",   Slot::SdCommitMs,   Slot::SdCommitLeavesMs   },
+          { "capture",  Slot::SdCaptureMs,  Slot::SdCaptureLeavesMs  },
+          { "emit",     Slot::SdEmitMs,     Slot::SdEmitLeavesMs     },
+        };
+        double residSum = 0.0;
+        bool   anySeen  = false;
+        for (const SA& sa : kSa) {
+          const Read w = read(sa.wallSlot, now);
+          const Read l = read(sa.leafSlot, now);
+          if (!w.seen || !l.seen) {
+            Logger::warn(str::format("[Perf.Report]     ", sa.name,
+                                     "  (source not published -- probe gated off?)"));
+            continue;
+          }
+          anySeen = true;
+          const double resid = w.v - l.v;
+          const double pct   = (w.v > 1e-9) ? (100.0 * resid / w.v) : 0.0;
+          residSum += resid;
+          char buf[192];
+          snprintf(buf, sizeof(buf),
+                   "[Perf.Report]     %-9s %6.2f ms  named %6.2f  residual %6.2f  (%3.0f%% unattributed)",
+                   sa.name, w.v, l.v, resid, pct);
+          Logger::warn(buf);
+        }
+        // "rest" carries no marks, so all of it is residual by construction.
+        const Read rest = read(Slot::SdRestMs, now);
+        if (rest.seen) {
+          residSum += rest.v;
+          char buf[192];
+          snprintf(buf, sizeof(buf),
+                   "[Perf.Report]     %-9s %6.2f ms  named %6.2f  residual %6.2f  (100%% by construction -- no marks)",
+                   "rest", rest.v, 0.0, rest.v);
+          Logger::warn(buf);
+        }
+        if (anySeen) {
+          char buf[160];
+          snprintf(buf, sizeof(buf),
+                   "[Perf.Report]     %-9s                              %6.2f ms unattributed across SubmitDraw",
+                   "TOTAL", residSum);
+          Logger::warn(buf);
+        }
+      }
+
+      // NV-DXVK [Perf.Report] v6.9g: THE REPLAY TIER, IN ONE PLACE.
+      // These are all children of bt_extractXf. They are broken out because the
+      // tier's cost was assembled by hand out of the raw acc line for weeks,
+      // each field with a different denominator, and two of the six did not
+      // exist at all -- rp_selMiss and xt_cap were 1.67 ms/frame charged to no
+      // bucket. That is what allowed a model to predict the tier saved 3.6
+      // ms/frame while a direct F7 A/B measured it costing 1.18.
+      // READ IT AS: "tier tax TOTAL" is what the tier spends. What it saves is
+      // (full-path cost - replay cost) x hits, which is NOT on this report --
+      // so a total approaching bt_extractXf means the tier is paying for
+      // itself only if nearly every draw hits.
+      // rp_o2w is listed but NOT in the total: both paths pay it.
+      Logger::warn("[Perf.Report]   -- replay tier (children of bt_extractXf) --");
+      static const Row kRpRows[] = {
+        { 1, "rp_key    (all draws)",        Slot::AccRpKeyMs,     RowKind::kTotal },
+        { 1, "rp_sel    (hits)",             Slot::AccRpSelMs,     RowKind::kTotal },
+        { 1, "rp_selMiss(searched, missed)", Slot::AccRpSelMissMs, RowKind::kTotal },
+        { 1, "rp_proof  (route gates)",      Slot::AccRpProofMs,   RowKind::kTotal },
+        { 1, "rp_commit (member restore)",   Slot::AccRpCommitMs,  RowKind::kTotal },
+        { 1, "xt_cap    (record capture)",   Slot::AccXtCapMs,     RowKind::kTotal },
+        { 0, "TIER TAX total",               Slot::RpTierTotalMs,  RowKind::kTotal },
+        { 1, "rp_o2w  (BOTH paths, not tax)", Slot::AccRpO2wMs,    RowKind::kAltView },
+      };
+      emitRows(kRpRows, sizeof(kRpRows) / sizeof(kRpRows[0]), now, wall);
+
       Logger::warn("[Perf.Report]   -- named leaves ([Perf.SubmitDraw.acc]; parent+children = bucket) --");
       static const Row kAccRows[] = {
         { 1, "bt_extractXf",   Slot::AccExtractXfMs,    RowKind::kTotal },
@@ -442,6 +625,13 @@ namespace dxvk {
             { "fanout setupPost residual (UNATTRIBUTED)", Slot::InstResidualMs,   true  },
             { "fanout dbgTrack (diagnostic?)",            Slot::InstDbgTrackMs,   true  },
             { "bt_extractXf",                             Slot::AccExtractXfMs,   true  },
+            // v6.9g: NESTED INSIDE bt_extractXf above -- do not add the two
+            // together. Listed separately because it is the only entry here
+            // that can be removed outright rather than optimised: an F7 A/B on
+            // 2026-08-09 measured bt_extractXf at 6.12 ms with the tier ON and
+            // 4.95 ms with it OFF (n=57/53, sd 0.39/0.30), so this tax is not
+            // currently bought back by what the tier saves.
+            { "  replay tier tax (INSIDE bt_extractXf)",  Slot::RpTierTotalMs,    true  },
             { "SubmitDraw emit stage",                    Slot::SdEmitMs,         true  },
             { "SubmitDraw xform stage",                   Slot::SdXformMs,        true  },
             { "SubmitDraw commit stage",                  Slot::SdCommitMs,       true  },

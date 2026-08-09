@@ -70,6 +70,21 @@ namespace dxvk {
       SdHeadMs, SdVsIdxMs, SdSkinCullMs, SdXformMs,
       SdCommitMs, SdCaptureMs, SdEmitMs, SdRestMs,
 
+      // Sum of the NAMED leaves that fall inside each stage, so the report can
+      // print stage - leaves = residual instead of that being reconstructed by
+      // hand. Added 2026-08-09 after doing it by hand and getting it wrong
+      // twice in a row: the first pass filed flt_gate/flt_probes under vsIdx
+      // (they are in xform) and treated the nine te_* accumulators as children
+      // of tail_emit rather than siblings inside emit. That produced a phantom
+      // "emit is 42% unattributed, 2.7 ms/frame" which survived until the
+      // mapping was derived from the actual markStg line numbers -- the true
+      // figure is 8% and 0.51 ms/frame.
+      // The mapping belongs HERE, next to the marks, not in whatever script
+      // happens to be reading the log. A leaf added to a stage without being
+      // added to its sum shows up as residual, which is the safe direction.
+      SdHeadLeavesMs, SdVsIdxLeavesMs, SdSkinCullLeavesMs, SdXformLeavesMs,
+      SdCommitLeavesMs, SdCaptureLeavesMs, SdEmitLeavesMs,
+
       // ---- frame thread: the fanout, which lives OUTSIDE SubmitDraw ----
       InstTotalMs, InstInnerMs, InstBuildMs, InstLoopMs,
       InstSetupPostMs, InstResidualMs,
@@ -87,6 +102,20 @@ namespace dxvk {
       AccTePropIdMs, AccW2vwCb3Ms, AccSkyClassifyMs, AccPfsGuardMs,
       AccFiltersMs, AccCbcRawUvMs, AccBonePaletteMs, AccTailCaptureMs,
       AccVsAnalysisMs, AccO2wT31Ms, AccCullVtxMs,
+
+      // ---- the replay tier, in one place (v6.9f/g) ----
+      // These are children of AccExtractXfMs. They were invisible to this
+      // report while the tier's whole cost model was being built on them, and
+      // two of them did not exist as counters at all: rp_selMiss and xt_cap
+      // together were 1.67 ms/frame charged to nothing, which is what let a
+      // model predict the tier SAVED 3.6 ms/frame while an F7 A/B measured it
+      // COSTING 1.18. Everything the tier spends is now on one screen, and
+      // RpTierTotalMs is the number to hold against what it saves.
+      // rp_o2w is deliberately OUTSIDE the total: it is paid on both the replay
+      // and full paths, so it is not tier tax and must never be counted as a
+      // saving (that mistake is the other half of the same wrong model).
+      AccRpKeyMs, AccRpSelMs, AccRpSelMissMs, AccRpProofMs,
+      AccRpCommitMs, AccXtCapMs, AccRpO2wMs, RpTierTotalMs,
 
       // ---- dxvk-cs: the per-draw chain (NESTED — see kNested) ----
       CommitRtMs, CommitSubmitMs, CommitFinalizeMs,
@@ -166,6 +195,23 @@ namespace dxvk {
         return d;
       }
     };
+
+    // NV-DXVK [Perf.SessionState] -- "how fast is a millisecond right now".
+    // Every instrument in this codebase measures execution TIME and silently
+    // assumes execution SPEED is constant. Whole sessions have violated that
+    // assumption (08-08: 39 vs 57 ms at one camera spot; 08-09: 45 vs ~150 ms,
+    // every CPU slice on BOTH threads uniformly 3-4x, GPU pass identical,
+    // draw/instance counts identical, staging hit rates identical, cleared by
+    // a game restart) and the cause was unattributable because nothing
+    // measured the millisecond itself. This does: a fixed dependent integer
+    // spin (core speed), the cost of one clock read (QPC health), the current
+    // processor number (E-core placement sample), and the explicit EcoQoS
+    // state. Call it once per emit window ON the thread being measured --
+    // ~50-80us per call, never per draw. The xMin field (spin vs this
+    // thread's session-best) is the comparability verdict: a window with
+    // xMin well above ~1.1 is not comparable to a healthy one, exactly like
+    // the matNew rule.
+    void sessionStateProbe(const char* who);
 
     // Called once per frame from the frame thread (D3D11Rtx::EndFrame). Emits the
     // assembled report every rtx.perfReportFrames frames. Cost when the option is

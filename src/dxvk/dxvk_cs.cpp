@@ -331,6 +331,13 @@ namespace dxvk {
               }
               Logger::warn(line);
 
+              // NV-DXVK [Perf.SessionState]: measure THIS thread's execution
+              // speed once per window -- the uniform 3-4x whole-session CPU
+              // slowdowns (08-08, 08-09) were unattributable because every
+              // instrument assumed a constant millisecond. Contract at the
+              // declaration in rtx_perf_report.h.
+              perfreport::sessionStateProbe("dxvk-cs");
+
               for (uint32_t i = 0; i < kCsBuckets; ++i) {
                 csBucketNs[i] = 0;
                 csBucketN[i]  = 0;

@@ -8916,16 +8916,62 @@ namespace dxvk {
   //
   // These close that gap so cost per draw can be compared directly:
   //   rp_key   key build (8 mixes, GetContentGeneration, 2 RDEF slot memos)
-  //   rp_sel   map lookup + MRU probes + linear scan  <- the "search" the
-  //            tier exists to skip; compare against the full path's
+  //   rp_sel   map lookup + MRU probes + linear scan, on draws that went on to
+  //            attempt a replay <- the "search" the tier exists to skip;
+  //            compare against the full path's
   //            xt_setup + pv_validate + w2v_scan + xt_projScan1
+  //   rp_selMiss  the SAME search on draws that then fell through to the full
+  //            path anyway (quarantined / first sighting / keyMiss / inelig /
+  //            genMiss). See the v6.9f note below -- this is pure tier tax with
+  //            nothing bought, and it used to be invisible.
   //   rp_proof the three v6.9 route gates
   //   rp_o2w   per-draw objectToWorld re-read (paid on BOTH paths, so it is
   //            NOT a saving -- broken out so it stops being counted as one)
-  static thread_local int64_t s_perfRpKeyAcc   = 0, s_perfRpKeyMax   = 0;
-  static thread_local int64_t s_perfRpSelAcc   = 0, s_perfRpSelMax   = 0;
+  //
+  // v6.9f ATTRIBUTION FIX. rp_sel's mark sat on the replay-attempt branch
+  // alone, so a draw that searched and found nothing never advanced tXt --
+  // and markXt is a CURSOR, so that search time was silently absorbed by
+  // whichever bucket marked next on the full path, i.e. xs_pre. Three
+  // consequences, all of which had reached the handoff as fact:
+  //   1. rp_sel undercounted, and it undercounted precisely the EXPENSIVE
+  //      draws -- a miss is the case that walks the whole set instead of
+  //      stopping at an MRU probe.
+  //   2. rpWcNs (all draws) over rp_sel (hits only) is not a ratio. It read
+  //      101.2 ms over 91.4 ms = "WC is 83% of selection" while actually
+  //      exceeding 100%, which is what exposed this.
+  //   3. xs_pre was inflated by borrowed miss-search time, and was about to
+  //      be split on the strength of that number.
+  // The fix is that EVERY draw entering the tier now closes the bucket on
+  // exactly one of the two accumulators, so rp_sel + rp_selMiss is the tier's
+  // whole search cost and is a legal denominator.
+  static thread_local int64_t s_perfRpKeyAcc     = 0, s_perfRpKeyMax     = 0;
+  static thread_local int64_t s_perfRpSelAcc     = 0, s_perfRpSelMax     = 0;
+  static thread_local int64_t s_perfRpSelMissAcc = 0, s_perfRpSelMissMax = 0;
+  static thread_local uint64_t s_perfRpSelMissN  = 0;  // draws in that bucket
   static thread_local int64_t s_perfRpProofAcc = 0, s_perfRpProofMax = 0;
   static thread_local int64_t s_perfRpO2wAcc   = 0, s_perfRpO2wMax   = 0;
+  // v6.9f EXIT BUCKETS. bt_extractXf is timed by the CALLER (markStg around
+  // `dcs.transformData = ExtractTransforms()`), but the tXt cursor lives inside
+  // the function -- so whatever runs after the LAST mark on a given return path
+  // is inside the parent and outside every child. Measured 2026-08-09: the 30
+  // named children summed to 556.2 ms against a 746.4 ms parent, leaving 25.5%
+  // (~1.66 ms/frame) claimed by nothing.
+  //
+  // The header comment at ExtractTransforms still said "a single
+  // `return transforms;` at its tail (verified)". True when written; the replay
+  // tier added a second exit and the capture tail a third:
+  //   rp_commit  after rp_o2w, before `return rt;` -- the ~35 member restores
+  //              plus the m_lastGoodTransforms mutex, on every replay HIT.
+  //   xt_cap     after xt_tail, before both `return transforms;` -- the replay
+  //              tier's WRITE side: verify adjudication (4x Matrix4 memcmp),
+  //              record build/append, eviction scan, quarantine. ~570 lines
+  //              that have never been measured, while the tier's READ side
+  //              (rp_key/rp_sel/rp_selMiss/rp_proof) now is.
+  // Add both to the child sum when checking parent coverage.
+  static thread_local int64_t s_perfRpCommitAcc = 0, s_perfRpCommitMax = 0;
+  static thread_local uint64_t s_perfRpCommitN  = 0;
+  static thread_local int64_t s_perfXtCapAcc    = 0, s_perfXtCapMax    = 0;
+  static thread_local uint64_t s_perfXtCapN     = 0;
   // Records examined during selection, and how many of those reads had to fall
   // back to memcpyFromWC. WC reads bypass cache and run ~100x slower than a
   // normal load -- a handful per draw would account for the entire measured
@@ -8933,6 +8979,42 @@ namespace dxvk {
   // traffic during SELECTION rather than bookkeeping. rpWcRead is the test.
   static thread_local uint64_t s_perfRpScanIters = 0;
   static thread_local uint64_t s_perfRpWcReads   = 0;
+  // v6.9e: the WC read's actual COST, not just its count. rpWcRead=0.82/draw
+  // was measured but "~1-2 us each" was a guess, and the "1024 ns" revision
+  // after it was derived by dividing by rp_sel while rp_sel was still the
+  // hits-only bucket, so it was never sound either.
+  //
+  // DO NOT quote a single figure for this. Measured 2026-08-09 across two
+  // runs: 2192 / 2333 ns in one, and 1192 / 1312 / 1533 ns in the next, rising
+  // WITHIN each run. A 2x spread run-to-run means the cost tracks something
+  // this counter does not capture (upload pressure / which heap the buffer
+  // landed in), so any saving estimated from one window's value is worth about
+  // a factor of two. Two steady_clock reads bracket the memcpy at ~41 ns each,
+  // ~2-3% of the figure, so the variance is not timer overhead. If this ever
+  // needs to be exact, bin it -- do not average it.
+  //
+  // v6.9f: split by OUTCOME. The read happens inside matchRec, before the draw's
+  // fate is known, so it accumulates into a per-draw local that is folded into
+  // one of these at the same exit that closes rp_sel / rp_selMiss. Without this
+  // the fixed denominator would still lump a successful replay's one read
+  // together with a failed search's, which is the same conjunction error that
+  // produced the 83% number. No extra clock reads -- two uint64 adds.
+  static thread_local int64_t  s_perfRpWcNs      = 0;
+  static thread_local int64_t  s_perfRpWcNsHit   = 0;
+  static thread_local int64_t  s_perfRpWcNsMiss  = 0;
+  // v6.9e batch cache: draws that reused the previous draw's selected record
+  // instead of running the map lookup, the MRU probes and the scan.
+  static thread_local uint64_t s_perfRpBatchHit  = 0;
+  // (The batch cache's own state lives next to s_xtReplayMap -- it holds
+  //  XtReplayRec*/XtReplayRecSet*, which are not declared until further down.)
+  // xt_setup split (v6.9e). xt_setup measured 6.1 us/draw -- the single largest
+  // item in ExtractTransforms and completely unsplit, so "the full path is
+  // expensive" had no mechanism attached to it. The span is dominated by one
+  // suspect: the cb2 deterministic-VP fast path, which does a staged read plus
+  // classifyPerspective TWICE (cb2@16 then cb2@96) on every draw that reaches
+  // it. xs_cb2fast isolates exactly that; xs_pre is everything before it.
+  static thread_local int64_t s_perfXsPreAcc     = 0, s_perfXsPreMax     = 0;
+  static thread_local int64_t s_perfXsCb2FastAcc = 0, s_perfXsCb2FastMax = 0;
   // Consecutive draws whose key is unchanged from the previous draw. Sizes the
   // batch-caching idea: if runs are long, the key build and the whole selection
   // can be hoisted to once per batch instead of once per draw.
@@ -10188,19 +10270,10 @@ namespace dxvk {
     //   1=!skipViewScan 2=!identityW2v 4=!projSrcValid
     //   8=camOriginSet 16=wroteLastGood 32=applySmooth
     uint32_t crossWhy = 0;
-    // v6.4 genMiss fix. The gm counters proved genMiss is 100% the
-    // "non-identity worldToView" clause and 0% moved bytes -- i.e. the carry
-    // tier never even ran on this population. For wtvPath 3 that clause is
-    // over-strict: its w2v is a closed form over TWO cb2 ranges (the VP
-    // rotation at cb2@16 and camXYZ at cb2@wtvCamOff), so proving those bytes
-    // proves the whole matrix. No re-derivation -- if the bytes match, the
-    // RECORDED worldToView is already bit-identical.
-    bool     wtvP3Provable = false;
-    float    wtvRotSrc[12] = {};      // cb2[16,64) VP rotation at capture
-    bool     wtvRotValid = false;
-    float    wtvCamSrc[3] = {};       // cb2[camOff,+12) camXYZ at capture
-    uint32_t wtvCamOff = 0;
-    bool     wtvCamValid = false;
+    // v6.4's wtvPath-3 carry-proof fields (wtvP3Provable, wtvRotSrc[12],
+    // wtvRotValid, wtvCamSrc[3], wtvCamOff, wtvCamValid) were DELETED here --
+    // ~68 bytes off every record. They were never read: carry{try=0} in every
+    // window of every capture. See the deleted-block note in the carry tier.
     float    projSrc[16] = {};        // proj source bytes at capture
     uint32_t projSrcOff = 0;          // m_projOffset (relative to constantOffset*16)
     bool     projSrcValid = false;
@@ -10356,18 +10429,21 @@ namespace dxvk {
     // v6.4: which wtv derivation the blocked records used -- decides whether
     // the path-3 carry covers the population or another path dominates.
     uint64_t gmWtv[16] = {};
-    // v6.4 carry outcome on wtvP3 records. carryTry = the extra memcmp ran;
-    // carryHit = cb2's camera bytes were unchanged so the recorded w2v is
-    // exact (a converted genMiss); carryBytesFail = camera genuinely moved.
-    // If carryHit dominates, the fix paid; if carryBytesFail does, cb2
-    // content really does change per rewrite and the tier needs a live
-    // recompose instead of a proof.
-    uint64_t carryTry = 0, carryHit = 0, carryBytesFail = 0;
+    // (v6.4's carryTry/carryHit/carryBytesFail deleted with the proof they
+    //  measured. They answered their question -- try=0 in every window means
+    //  the proof never ran, so there was nothing to tune.)
     // v6.5 REFRESH: genMiss records whose worldToView was rebuilt live from
     // the shared path-3 helpers instead of falling to the full path.
     // refreshOk = converted; refreshFail = inputs unavailable this draw;
     // refreshSkip = record not a refresh candidate (wtv path or o2w path).
     uint64_t refreshOk = 0, refreshFail = 0, refreshSkip = 0;
+    // v6.9h: refreshOk split by o2wPathId. Added because the question "what did
+    // excluding path 13 cost" was UNANSWERABLE from a full session's log --
+    // refreshOk was one number over a conjunction of six routes, which is the
+    // same un-split-counter trap as the original `mats` and `routeMiss`.
+    // Paths 1-4 are the v6.5 population; 5/6 are the v6.9h extension; 13 is
+    // excluded on correctness grounds and must read 0.
+    uint64_t refreshPath[16] = {};
     // v6.6: where the path-1 o2w replay bails. Indices per the comment at the
     // branch: 0 noIl 1 noFanoutCam 2 ilFacts 3 noSrv 4 noData 5 noIdx
     // 6 oob 7 nonFinite 8 zeroRow.
@@ -10426,12 +10502,69 @@ namespace dxvk {
   //     the new mechanism is bit-checked per camera before running free.
   struct XtReplayRecSet {
     std::vector<XtReplayRec> recs;
+    // ---- v6.9g HOT LANE ----
+    // rp_sel + rp_selMiss measured 1.36 ms/frame at 13 scan iterations per
+    // draw. An XtReplayRec is ~600 bytes (DrawCallTransforms t dominates and
+    // is never touched while scanning), so walking 39 of them strides ~23 KB
+    // to read the ~40 bytes per record that actually decide the match.
+    //
+    // SAFE BY CONSTRUCTION -- this is a PREFILTER, never an authority. A hot
+    // entry can only cause the scan to SKIP a record; anything it lets through
+    // is re-decided in full against the fat record by the original predicate.
+    // So a stale or desynced entry costs a missed replay (-> full path, which
+    // is correct output, just slower) and can never select the wrong route.
+    // Every read is bounds-checked against hot.size(), so a size desync
+    // degrades to "no prefiltering" rather than reading out of bounds. That
+    // matters because the sync points are spread across capture AND the carry
+    // path, and a silent wrong-record selection is the exact failure class
+    // this tier has burned entire sessions on.
+    struct Hot {
+      uint64_t    key      = 0;
+      uint64_t    cb2gen   = 0;
+      uint64_t    projHash = 0;
+      const void* cb2Buf   = nullptr;
+      uint32_t    cb2Off   = 0;
+      uint32_t    projSrcOff = 0;
+      uint32_t    projSlot = 0xFFFFFFFFu;
+      uint8_t     flags    = 0;   // 1 = eligible, 2 = projSrcValid
+      uint8_t     pad[3]   = {};
+    };
+    static constexpr uint8_t kHotEligible = 1u;
+    static constexpr uint8_t kHotProjValid = 2u;
+    std::vector<Hot> hot;   // parallel to recs, same indices
+    // Republish one record's scan fields. Call after ANY write that changes
+    // key / cb2 witness / proj identity -- capture, and the carry path's
+    // witness adoption.
+    void syncHot(size_t idx, const XtReplayRec& r) {
+      if (idx >= hot.size()) hot.resize(recs.size());
+      if (idx >= hot.size()) return;
+      Hot& h = hot[idx];
+      h.key        = r.key;
+      h.cb2gen     = r.cb2gen;
+      h.projHash   = r.projHash;
+      h.cb2Buf     = r.cb2Buf;
+      h.cb2Off     = r.cb2Off;
+      h.projSrcOff = r.projSrcOff;
+      h.projSlot   = r.projSlot;
+      h.flags      = (uint8_t) ((r.eligible ? kHotEligible : 0u)
+                              | (r.projSrcValid ? kHotProjValid : 0u));
+    }
     // v6.2 MRU probes (the F7 A/B measured the tier at NET +2 ms: the cost
     // was the per-draw linear scan over up to ~96 fat records x2 passes,
     // ~5 MB/frame of strided reads -- not the store's existence). Draws
     // batch by (VS, camera, variant), so the last few matched indices catch
     // nearly every draw; the scan only runs on stream transitions.
     uint32_t mru[4] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
+    // v6.9e: bumped ONLY on a STRUCTURAL change -- an append or an LRU eviction,
+    // i.e. anything that can move the vector's storage or repoint a slot at a
+    // different stream. The batch cache below holds a raw XtReplayRec* across
+    // draws and this is what makes that safe.
+    // Deliberately NOT bumped by a same-stream content refresh: that rewrites
+    // the record in place with fresher values for the SAME key, so a cached
+    // pointer stays valid and simply sees the newer data. Bumping there would
+    // invalidate the batch on every genMiss capture (168/frame) and destroy the
+    // whole win.
+    uint32_t gen = 0;
     void pushMru(uint32_t idx) {
       if (mru[0] == idx) return;
       mru[3] = mru[2]; mru[2] = mru[1]; mru[1] = mru[0]; mru[0] = idx;
@@ -10507,6 +10640,35 @@ namespace dxvk {
   }
 
   static thread_local std::unordered_map<const void*, XtReplayRecSet> s_xtReplayMap;
+
+  // v6.9e BATCH CACHE. rpKeySame measured 56.4% of draws carrying the previous
+  // draw's key -- TF2 batches by (VS, camera, variant) -- yet every one of them
+  // repeated the full map lookup, up to 4 MRU probes and a scan that
+  // rpScanIters showed touching 14 records per draw on average. When the key,
+  // the VS, the cb2 witness triple and the set's structural gen are all
+  // unchanged, the record this draw would select is the record the last draw
+  // selected. Reuse the pointer and skip selection entirely.
+  //
+  // WHAT MAKES IT SOUND. On a reuse, projPreOk is forced FALSE, so the
+  // downstream projOk block re-verifies the record's 64 proj bytes against the
+  // live buffer exactly as it would after a normal selection. Nothing is
+  // trusted across draws except the pointer itself:
+  //   - cb2 content: guarded by the witness triple compare (buffer/off/gen).
+  //   - non-cb2 proj content (slot != 2): re-memcmp'd by projOk.
+  //   - route inputs: the three v6.9 gates still run per draw, untouched.
+  //   - record identity: setGen catches append/evict, and rec->key is
+  //     re-compared in case the slot was rewritten by another stream.
+  // Declared HERE rather than with the other rp_* perf counters because these
+  // name XtReplayRec / XtReplayRecSet, which are defined just above.
+  static thread_local const void*     s_rpBatchVs     = nullptr;
+  static thread_local uint64_t        s_rpBatchKey    = 0;
+  static thread_local const void*     s_rpBatchCb2Buf = nullptr;
+  static thread_local uint32_t        s_rpBatchCb2Off = 0;
+  static thread_local uint64_t        s_rpBatchCb2Gen = 0;
+  static thread_local XtReplayRecSet* s_rpBatchSet    = nullptr;
+  static thread_local uint32_t        s_rpBatchSetGen = 0;
+  static thread_local XtReplayRec*    s_rpBatchRec    = nullptr;
+
   // NV-DXVK [Perf.Replay] QUARANTINE GRANULARITY -- per VS, and it stays that
   // way. v6.8 tried per (VS, key) on the theory that a failure convicts one
   // route rather than the whole shader. MEASURED AND REVERTED: quarantined
@@ -14229,9 +14391,18 @@ namespace dxvk {
 
     // [Perf.SubmitDraw] internal subdivision of ExtractTransforms â€” see the
     // s_perfXt* declarations near the top of this file for what each bucket
-    // covers. The function has a single `return transforms;` at its tail
-    // (verified) so markers placed at top-level phase boundaries cover the
-    // whole control flow. The goto skipViewScan (line ~5363 â†’ ~5556) jumps
+    // covers.
+    //
+    // v6.9f CORRECTION. This used to read "the function has a single
+    // `return transforms;` at its tail (verified) so markers placed at
+    // top-level phase boundaries cover the whole control flow". That has not
+    // been true for several versions: there are THREE exits (`return rt;` on a
+    // replay commit, and two `return transforms;` in the capture tail), and
+    // top-level phase markers do NOT cover the code after the last mark on any
+    // of them. That gap measured 25.5% of bt_extractXf. Each exit now closes a
+    // bucket -- rp_commit or xt_cap -- so the children cover the parent.
+    // ANY new `return` added to this function must close one of them, or the
+    // hole silently reopens. The goto skipViewScan (line ~5363 â†’ ~5556) jumps
     // ENTIRELY inside the w2vExtract phase so it self-contains; that phase
     // just sees a small total on skip-true draws.
     // NV-DXVK [FallbackCost]: gated per-draw ExtractTransforms wall timer, split
@@ -14317,12 +14488,32 @@ namespace dxvk {
     m_lastO2wCamValid = false;
     m_lastO2wCamFromFanout = false;
     m_lastO2wCamOff = 0;
-    // [Perf.Replay] v6.4: path-3 provenance, cleared per draw.
-    m_lastWtvP3FromCb2 = false;
-    m_lastWtvP3CamSlot = UINT32_MAX;
-    m_lastWtvP3CamOff  = 0;
+    // (v6.4 path-3 provenance reset removed -- the three members existed only
+    //  to feed the deleted carry proof and were write-only afterwards.)
     m_skipViewMatrixScan = false;
     s_xtCb3StashValid = false;  // [Perf.Replay] cb3 single-read share, per-draw
+
+    // NV-DXVK [perf]: the CBufCommonPerCamera.c_cameraOrigin field location is a
+    // pure function of the bound VS, but FindCBField("CBufCommonPerCamera",
+    // "c_cameraOrigin") was called at several per-draw sites -- each allocating two
+    // std::string temps to hash the RDEF maps. Every site in a single draw queries
+    // the SAME bound VS, and draws are batched by VS, so cache (vs common ptr ->
+    // loc): the RDEF lookup runs once per VS instead of per draw/per site.
+    // thread_local => per-context, no locking. (Same proven memo idea as the
+    // classify() cache; routed at the hot ungated sites only.)
+    // v7.0: DEFINITION MOVED above the replay tier -- the path-13 live gate
+    // mirror below needs it; body unchanged.
+    auto findCamOriginLoc = [](const D3D11CommonShader* common)
+        -> std::optional<D3D11CommonShader::CBFieldLoc> {
+      if (common == nullptr) return std::nullopt;
+      static thread_local const D3D11CommonShader* sCachedCommon = nullptr;
+      static thread_local std::optional<D3D11CommonShader::CBFieldLoc> sCachedLoc;
+      if (common != sCachedCommon) {
+        sCachedLoc = common->FindCBField("CBufCommonPerCamera", "c_cameraOrigin");
+        sCachedCommon = common;
+      }
+      return sCachedLoc;
+    };
 
     // ================================================================
     // NV-DXVK [Perf.Replay] 2026-08-08e: Stage 0 (observer) + Stage 1
@@ -14341,6 +14532,17 @@ namespace dxvk {
       uint64_t    cb2gen = 0;
       const void* vsKey = nullptr;
       uint64_t    lastGoodN0 = 0;
+      // v7.0 (capture economy): proj-source bytes selection already read
+      // this draw. freshProj publishes them here; the capture tail reuses
+      // them for the SAME (slot, offset) instead of issuing a second read
+      // of the same range -- whose miss path is the write-combined copy
+      // the xt_cap note names as the tier's largest single cost. Bytes
+      // cannot change between selection and the tail: both run inside one
+      // draw on one thread, and cb rewrites only happen on API calls.
+      bool        pjCacheValid = false;
+      uint32_t    pjCacheSlot = 0xFFFFFFFFu;
+      uint32_t    pjCacheOff = 0;
+      alignas(16) float pjCache[16] = {};
     } xtCtl;
     s_xtReplayPending.active = false;
     {
@@ -14419,12 +14621,25 @@ namespace dxvk {
             " camOrigin=", s_xtReplayStats.gmWhy[3],
             " lastGood=", s_xtReplayStats.gmWhy[4],
             " smooth=", s_xtReplayStats.gmWhy[5], "}",
-            " carry{try=", s_xtReplayStats.carryTry,
-            " hit=", s_xtReplayStats.carryHit,
-            " bytesFail=", s_xtReplayStats.carryBytesFail, "}",
+            // (carry{try hit bytesFail} removed with the v6.4 proof it
+            //  reported on -- it printed 0/0/0 in every window ever captured.)
             " refresh{ok=", s_xtReplayStats.refreshOk,
             " fail=", s_xtReplayStats.refreshFail,
-            " skip=", s_xtReplayStats.refreshSkip, "}"));
+            " skip=", s_xtReplayStats.refreshSkip, "}",
+            // v6.9h: refreshOk BY o2w PATH. p1-p4 = the v6.5 population,
+            // p5/p6 = the v6.9h extension. v7.0: p13 re-admitted behind the
+            // LIVE mirror of its site gate (see the p13LiveOk block) -- the
+            // 2026-08-09 rpath run measured p5=p6=0 and genMiss 8.4 -> 162
+            // per frame with 13 excluded, i.e. the entire v6.9h coverage win
+            // WAS path 13. p13 > 0 is now the expected reading; p13 == 0
+            // with genMiss high means the mirror gate is not firing.
+            " rpath{p1=", s_xtReplayStats.refreshPath[1],
+            " p2=",  s_xtReplayStats.refreshPath[2],
+            " p3=",  s_xtReplayStats.refreshPath[3],
+            " p4=",  s_xtReplayStats.refreshPath[4],
+            " p5=",  s_xtReplayStats.refreshPath[5],
+            " p6=",  s_xtReplayStats.refreshPath[6],
+            " p13=", s_xtReplayStats.refreshPath[13], "}"));
           {
             static const char* const kOrf[10] = {
               "noIl", "noFanoutCam", "ilFacts", "noSrv", "noData",
@@ -14495,6 +14710,10 @@ namespace dxvk {
           s_xtReplayQuarantine.clear();
           s_xtReplayLastVs = nullptr;
           s_xtReplayLastRec = nullptr;
+          // v6.9e: the batch cache holds a raw record pointer into a set that
+          // just died with the map.
+          s_rpBatchRec = nullptr;
+          s_rpBatchSet = nullptr;
         }
         const auto& vsRp = m_context->m_state.vs.shader;
         const D3D11CommonShader* commonRp =
@@ -14511,7 +14730,13 @@ namespace dxvk {
           // identical either way -- full path, no capture -- so this is pure
           // cost removal on a population the 08-09 capture measured at 81
           // draws/frame.
-          const bool quarRp = s_xtReplayQuarantine.count(commonRp) != 0;
+          // v6.9g: short-circuit on empty. The quarantine holds a VS only after
+          // a verify failure, and quarSize has been 0 for the whole session --
+          // but an unordered_set::count still hashes the pointer and probes a
+          // bucket, once per draw, to answer "no" every time. This is inside
+          // rp_key, which measures 359-518 ns/draw.
+          const bool quarRp = !s_xtReplayQuarantine.empty()
+                           && s_xtReplayQuarantine.count(commonRp) != 0;
 
           // --- the replay key, v3: ROUTE-DETERMINING identity only. History
           // of what got removed and why (each proven by a capture):
@@ -14624,7 +14849,47 @@ namespace dxvk {
           XtReplayRec* rec = nullptr;
           XtReplayRec* mruAll = nullptr;  // keyMiss attribution fallback
           bool projPreOk = false;  // proj (+ p13 camOrigin) proven at selection
-          if (!quarRp && setRp != nullptr && !setRp->recs.empty()) {
+          // v6.9f: this draw's WC nanoseconds, folded into the hit or miss
+          // total by closeRpSel below. Local because matchRec reads the buffer
+          // long before the draw's fate is decided.
+          int64_t rpWcNsDraw = 0;
+          // v6.9f: THE single exit for the selection bucket. Every draw that
+          // reaches the attribution chain below calls this exactly once, so
+          // tXt is always advanced and no search time can leak downstream into
+          // xs_pre. `attempted` = went on to try a replay; !attempted = fell
+          // through to the full path having searched for nothing.
+          auto closeRpSel = [&](bool attempted) {
+            s_perfRpWcNs += rpWcNsDraw;
+            if (attempted) {
+              s_perfRpWcNsHit += rpWcNsDraw;
+              markXtSub(s_perfRpSelAcc, s_perfRpSelMax);
+            } else {
+              s_perfRpWcNsMiss += rpWcNsDraw;
+              ++s_perfRpSelMissN;
+              markXtSub(s_perfRpSelMissAcc, s_perfRpSelMissMax);
+            }
+          };
+          // v6.9e BATCH REUSE (contract at s_rpBatchVs). Every condition here
+          // is an integer or pointer compare; the thing it replaces is a map
+          // lookup plus ~14 matchRec calls.
+          bool batchHit = false;
+          if (!quarRp && setRp != nullptr && setRp == s_rpBatchSet
+              && s_rpBatchRec != nullptr
+              && s_rpBatchVs     == commonRp
+              && s_rpBatchKey    == key
+              && s_rpBatchSetGen == setRp->gen
+              && s_rpBatchCb2Buf == xtCtl.cb2Buf
+              && s_rpBatchCb2Off == xtCtl.cb2Off
+              && s_rpBatchCb2Gen == xtCtl.cb2gen
+              && s_rpBatchRec->key == key) {
+            rec = s_rpBatchRec;
+            // Force the full byte re-verify downstream. Selection is what
+            // normally proves the proj content, and selection did not run.
+            projPreOk = false;
+            batchHit  = true;
+            ++s_perfRpBatchHit;
+          }
+          if (!batchHit && !quarRp && setRp != nullptr && !setRp->recs.empty()) {
             auto witOk = [&](const XtReplayRec& r) {
               return r.cb2Buf == xtCtl.cb2Buf && r.cb2Off == xtCtl.cb2Off
                   && r.cb2gen == xtCtl.cb2gen && r.cb2Buf != nullptr;
@@ -14668,20 +14933,38 @@ namespace dxvk {
                                         cbPs.buffer->Desc()->ByteWidth)
                          >= basePs + sizeof(pjNow)) {
                   // v6.9d: WRITE-COMBINED read during SELECTION. WC bypasses
-                  // cache and runs ~100x slower than a normal load -- roughly
-                  // 1-2 us for these 64 bytes. A few per draw would account for
-                  // the whole measured ~7.6 us/draw lookup on their own, which
-                  // would mean the tier's tax is uncached-memory traffic while
-                  // SEARCHING, not bookkeeping. If rpWcRead/draw is near zero
-                  // that theory is dead and the cost is elsewhere.
+                  // cache and runs ~100x slower than a normal load: 1192-2333
+                  // ns for these 64 bytes depending on the run (see the range
+                  // note at s_perfRpWcNs -- do not treat it as one number), at
+                  // 0.36 reads/draw, so ~0.5-0.9 ms/frame at 1084 draws.
+                  // Substantial, but NOT the largest item in the tier's tax --
+                  // xt_cap (the record-capture tail) is bigger, and was
+                  // unmeasured while this one was being optimised against.
+                  // 43% of these nanoseconds are rpWcNsMiss: reads issued while
+                  // searching for a record that was not there, removable
+                  // without touching a single route decision.
                   ++s_perfRpWcReads;
+                  const auto tWc0 = std::chrono::steady_clock::now();
                   memcpyFromWC(pjNow,
                                static_cast<const uint8_t*>(mappedPs.mapPtr) + basePs,
                                sizeof(pjNow));
+                  // v6.9f: per-draw, folded into the hit/miss split at exit.
+                  rpWcNsDraw += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now() - tWc0).count();
                   pjValid = true;
                 }
               }
               if (pjValid) pjHash = xtProjHash64(pjNow);
+              // v7.0 (capture economy): publish every successful read to the
+              // capture tail. Later freshProj calls for a different (slot,
+              // off) overwrite this -- the tail gates on slot/off equality,
+              // so a mismatched stash is simply ignored there.
+              if (pjValid) {
+                std::memcpy(xtCtl.pjCache, pjNow, sizeof(pjNow));
+                xtCtl.pjCacheSlot  = pjSlot;
+                xtCtl.pjCacheOff   = pjOff;
+                xtCtl.pjCacheValid = true;
+              }
               return pjValid;
             };
             bool c2Tried = false;
@@ -14696,6 +14979,31 @@ namespace dxvk {
                 c2base = (size_t) cb2s.constantOffset * 16;
               }
               return c2p;
+            };
+            // v6.9g: the hot-lane prefilter. Reads ONLY the 40-byte parallel
+            // entry and answers exactly one question -- "can this record be
+            // ruled out without touching its ~600 bytes?". It can only REJECT:
+            // every survivor is re-decided in full by matchRec below against
+            // the fat record, so a stale entry costs a missed replay, never a
+            // wrong one. Returns false when no lane is present, which makes
+            // the scan behave exactly as it did before.
+            //
+            // freshProj is memoised on (slot, off), so in the synced case the
+            // call here and matchRec's call are the same read, not two.
+            auto hotReject = [&](uint32_t idx) -> bool {
+              if (idx >= setRp->hot.size()) return false;
+              const auto& h = setRp->hot[idx];
+              if (h.key != key) return true;
+              const bool perDrawProjH =
+                   (h.flags & XtReplayRecSet::kHotEligible) != 0
+                && (h.flags & XtReplayRecSet::kHotProjValid) != 0
+                && h.projSlot != 2u;
+              if (!perDrawProjH) {
+                return !(h.cb2Buf == xtCtl.cb2Buf && h.cb2Off == xtCtl.cb2Off
+                      && h.cb2gen == xtCtl.cb2gen && h.cb2Buf != nullptr);
+              }
+              if (!freshProj(h.projSlot, h.projSrcOff)) return true;
+              return h.projHash != pjHash;
             };
             // 0 = no match; 1 = witness identity; 2 = proj-content identity
             // (projPreOk -- the attempt skips its proj memcmp).
@@ -14727,6 +15035,7 @@ namespace dxvk {
               // split is worth building -- and whether "MRU catches nearly
               // every draw" is true or just assumed.
               ++s_perfRpScanIters;
+              if (hotReject(idx)) continue;   // v6.9g: fat record never touched
               const int m = matchRec(setRp->recs[idx]);
               if (m != 0) {
                 rec = &setRp->recs[idx];
@@ -14738,6 +15047,7 @@ namespace dxvk {
             if (rec == nullptr) {
               for (uint32_t ri = 0; ri < (uint32_t) setRp->recs.size(); ++ri) {
                 ++s_perfRpScanIters;
+                if (hotReject(ri)) continue;   // v6.9g: fat record never touched
                 const int m = matchRec(setRp->recs[ri]);
                 if (m != 0) {
                   rec = &setRp->recs[ri];
@@ -14763,14 +15073,35 @@ namespace dxvk {
               rec = mruKey;
             }
           }
+          // v6.9e: publish this draw's selection for the rest of the batch.
+          // Only a record that a real selection actually chose is cached -- a
+          // keyMiss/MRU-attribution record (assigned below, after this point)
+          // is never published, so the batch can only ever replay a genuine
+          // match.
+          if (!batchHit) {
+            if (rec != nullptr && setRp != nullptr) {
+              s_rpBatchVs     = commonRp;
+              s_rpBatchKey    = key;
+              s_rpBatchCb2Buf = xtCtl.cb2Buf;
+              s_rpBatchCb2Off = xtCtl.cb2Off;
+              s_rpBatchCb2Gen = xtCtl.cb2gen;
+              s_rpBatchSet    = setRp;
+              s_rpBatchSetGen = setRp->gen;
+              s_rpBatchRec    = rec;
+            } else {
+              s_rpBatchRec = nullptr;   // nothing selected: batch is dead
+            }
+          }
 
           if (quarRp) {
             ++s_xtReplayStats.quarantined;
             // A banned ROUTE never re-records. Other keys on the same VS are
             // untouched and keep capturing/replaying normally.
             xtCtl.captureRecord = false;
+            closeRpSel(false);
           } else if (setRp == nullptr || setRp->recs.empty()) {
             // first sighting -- full path runs, record captured at the tail
+            closeRpSel(false);
           } else if (rec == nullptr) {
             // set exists, no record's key matches: attribute vs the MRU slot
             rec = mruAll;
@@ -14792,6 +15123,7 @@ namespace dxvk {
               if (rec->kVp != vpNow) ++s_xtReplayStats.kmVp;
               else                   ++s_xtReplayStats.kmOther;
             }
+            closeRpSel(false);
           } else if (!rec->eligible) {
             ++s_xtReplayStats.inelig;
             // Keep the verdict cheap-path, but let it EXPIRE: a verdict
@@ -14827,6 +15159,7 @@ namespace dxvk {
               }
               ++s_xtReplayStats.pathDet[rec->o2wPathId & 15u];
             }
+            closeRpSel(false);
           } else {
             // Binding identity matches. Two ways in:
             //  genOk   -- cb2 has not been rewritten since capture: every
@@ -14845,13 +15178,9 @@ namespace dxvk {
                              && rec->cb2gen == xtCtl.cb2gen
                              && rec->cb2Buf != nullptr);
             bool carried = false;
-            // v6.4: a wtvP3 record's worldToView depends on cb2 ranges the
-            // SELECTION pass never looked at, so the projPreOk shortcut below
-            // (which adopts the witness on the strength of the proj/camOrigin
-            // memcmps alone) is not a sufficient proof for it. Force those
-            // records down the explicit byte-compare branch.
-            const bool needWtvProof = rec->wtvP3Provable;
-            if (!genOk && rec->crossOk && projPreOk && !needWtvProof) {
+            // (v6.4's `needWtvProof` diversion removed with the carry proof it
+            //  guarded -- see the v6.4 note at the wtvPath-3 branch below.)
+            if (!genOk && rec->crossOk && projPreOk) {
               // v6: the selection pass already memcmp'd this record's proj
               // source (and, for path 13, c_cameraOrigin) against the LIVE
               // buffers this draw -- the exact checks the carry tier below
@@ -14860,6 +15189,11 @@ namespace dxvk {
               rec->cb2Buf = xtCtl.cb2Buf;
               rec->cb2Off = xtCtl.cb2Off;
               rec->cb2gen = xtCtl.cb2gen;
+              // v6.9g: witness adopted -- republish it to the hot lane, or the
+              // prefilter keeps rejecting on the OLD witness and every later
+              // draw of this stream takes the full path instead of the cheap
+              // compare this adoption exists to enable.
+              setRp->syncHot((size_t) (rec - setRp->recs.data()), *rec);
             } else if (!genOk && rec->crossOk) {
               const auto& cb2c = cbsRp[2];
               if (cb2c.buffer != nullptr) {
@@ -14884,28 +15218,20 @@ namespace dxvk {
                       && std::memcmp(c2p + c2base + rec->camSrcOff,
                                      &rec->p13CamOrigin, 12) == 0;
                   }
-                  // v6.4: prove the wtvPath-3 view-matrix inputs too. Both
-                  // ranges are cb2-resident, so the same staged pointer and
-                  // base serve. If they match, every input the recorded w2v
-                  // was built from is byte-identical, so rec->t.worldToView
-                  // is exact -- nothing is recomputed.
-                  if (bytesOk && rec->wtvP3Provable) {
-                    ++s_xtReplayStats.carryTry;
-                    bool wtvOk =
-                         rec->wtvRotValid
-                      && c2base + 64 <= c2len
-                      && std::memcmp(c2p + c2base + 16, rec->wtvRotSrc,
-                                     sizeof(rec->wtvRotSrc)) == 0;
-                    if (wtvOk) {
-                      wtvOk = rec->wtvCamValid
-                        && c2base + rec->wtvCamOff + 12 <= c2len
-                        && std::memcmp(c2p + c2base + rec->wtvCamOff,
-                                       rec->wtvCamSrc, sizeof(rec->wtvCamSrc)) == 0;
-                    }
-                    if (wtvOk) ++s_xtReplayStats.carryHit;
-                    else       ++s_xtReplayStats.carryBytesFail;
-                    bytesOk = wtvOk;
-                  }
+                  // v6.4's wtvPath-3 carry proof lived here and is DELETED.
+                  // It aimed to carry path-3 records across a cb2 rewrite by
+                  // memcmp'ing the VP rotation at cb2@16 and camXYZ at
+                  // cb2@wtvCamOff. It never ran once: carry{try=0 hit=0
+                  // bytesFail=0} in every window of every capture, because
+                  // crossOk refuses this population first (gm why{} reports
+                  // nonIdentW2v as 100% of genMiss). The premise was that
+                  // path 3's rotation comes from cb2@16, but the site prefers
+                  // the cached fanout VP rows and only falls back to cb2
+                  // before fanout has published -- i.e. never, in gameplay.
+                  // Cost was ~68 bytes on EVERY record (wtvRotSrc[12] +
+                  // wtvCamSrc[3] + offsets/flags) and record size is what
+                  // makes the linear scan expensive: rpScanIters measured 28.5
+                  // records walked per scanning draw.
                   if (bytesOk) {
                     carried = true;
                     // Later draws of this shader with the same binding take
@@ -14913,6 +15239,9 @@ namespace dxvk {
                     rec->cb2Buf = xtCtl.cb2Buf;
                     rec->cb2Off = xtCtl.cb2Off;
                     rec->cb2gen = xtCtl.cb2gen;
+                    // v6.9g: republish to the hot lane (see the note at the
+                    // witness adoption above).
+                    setRp->syncHot((size_t) (rec - setRp->recs.data()), *rec);
                   }
                 }
               }
@@ -14937,10 +15266,119 @@ namespace dxvk {
             // which is why a moved camera cannot invalidate them here.
             bool refreshed = false;
             Matrix4 refreshW2v;
+            // ---- v6.9h: EXTEND THE REFRESH TO o2w PATHS 5/6/13 ----
+            // Measured 2026-08-09: genMiss is 170/frame and [Perf.Replay.gm]
+            // attributes 100% of it to ONE clause -- nonIdentW2v in crossOk --
+            // with bytes=0, i.e. nothing ever fails on content. 95% of that
+            // population is wtvPath 3 (gmwtv p3=12476 of 13151), which is
+            // exactly what this refresh exists to rescue. It was skipping them
+            // only because of the o2wPath filter above.
+            //
+            // The exclusion note was right about the hazard and wrong about the
+            // remedy: paths 5/6/13 consume rec->p13CamOrigin, which the same
+            // cb2 rewrite invalidated. But EVERYTHING ELSE those paths use is
+            // already re-read live on the replay -- the bone matrix bm[] comes
+            // off cb3/t30 this draw, and g_engineSkyCamOrigin is a live global.
+            // So the camera origin is the ONLY stale input, and re-reading its
+            // 12 bytes makes the whole path valid rather than merely carried.
+            // cb2 is staged with ~100% hit rate ([Perf.CbStage] hitPct=100.2),
+            // so this is a cache read, not a write-combined one.
+            //
+            // If the read cannot be proven, the record does NOT refresh and the
+            // draw takes the full path exactly as it does today -- the failure
+            // mode is the current behaviour, not a wrong transform.
+            Vector3 refreshCamO;
+            bool    refreshCamOOk = false;
+            // v7.0 PATH 13 RE-ADMITTED VIA ITS OWN GATE, MIRRORED LIVE.
+            // The v6.9h first cut read cb2 at rec->camSrcOff blind and
+            // produced three VERIFY-FAILs (VS_7c6a14cb / VS_1953b6e9 /
+            // VS_4798dc2d): o2wPathFull is STICKY (m_lastO2wPathId persists
+            // across draws), so a draw whose live gate did NOT fire still
+            // reports path 13 while its o2w never had the origin added --
+            // replaying route 13 there is a wrong ROUTE, this tier's
+            // recurring failure class. The exclusion note's own remedy --
+            // "mirroring that gate, not the bytes" -- is what runs here:
+            // re-run the site's read gate (~:19322) against the LIVE VS and
+            // cb state on EVERY path-13 replay attempt:
+            //   RDEF reflects c_cameraOrigin (memoized per VS) -> slot
+            //   bound -> staged read (raw-map fallback, exactly as the
+            //   site) -> 3 finite floats.
+            // Gate fires  -> the site would take path 13 with THIS value;
+            //                replay AND refresh use it (p13LiveCamO).
+            // Gate silent -> the site is not on route 13 this draw; the
+            //                attempt bails to the full path (o2wOk=false at
+            //                the compose), which re-records the true route.
+            // rec->p13CamOrigin is untouched -- it remains the per-camera
+            // stream discriminator matchRec keys on.
+            //
+            // 5/6 keep their recorded-verdict scheme: the site's haveCamO
+            // verdict lives in rec->camSrcValid and the replay honours it
+            // (camSrcValid ? bm[3]+camO.x : bm[3]), so a refreshed origin
+            // can only change a value the site was always going to add.
+            // camSrcValid is REQUIRED below for exactly that reason.
+            bool    p13LiveOk = false;
+            Vector3 p13LiveCamO { 0.f, 0.f, 0.f };
+            const bool o2wIs13 = (rec->o2wPathId == 13u);
+            if (o2wIs13 && rec->eligible) {
+              const auto& vsP13m = m_context->m_state.vs.shader;
+              const D3D11CommonShader* commonP13m =
+                (vsP13m != nullptr) ? vsP13m->GetCommonShader() : nullptr;
+              auto camLocM = findCamOriginLoc(commonP13m);
+              if (camLocM && camLocM->size >= 12
+                  && camLocM->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+                const auto& cbM = m_context->m_state.vs.constantBuffers[camLocM->slot];
+                if (cbM.buffer != nullptr) {
+                  size_t lenM = 0;
+                  const uint8_t* pM = stagedCbBytes(cbM.buffer.ptr(), lenM);
+                  if (!pM) {
+                    pM = reinterpret_cast<const uint8_t*>(cbM.buffer->GetMappedSlice().mapPtr);
+                    lenM = cbM.buffer->Desc()->ByteWidth;
+                  }
+                  const size_t baseM =
+                    static_cast<size_t>(cbM.constantOffset) * 16 + camLocM->offset;
+                  if (pM && baseM + 12 <= lenM) {
+                    const float* fpM = reinterpret_cast<const float*>(pM + baseM);
+                    if (std::isfinite(fpM[0]) && std::isfinite(fpM[1])
+                        && std::isfinite(fpM[2])) {
+                      p13LiveCamO = Vector3(fpM[0], fpM[1], fpM[2]);
+                      p13LiveOk = true;
+                    }
+                  }
+                }
+              }
+            }
+            const bool o2wNeedsCamO = (rec->o2wPathId == 5u || rec->o2wPathId == 6u);
+            const bool o2wHasCamO   = rec->camSrcValid;
+            const bool o2wRefreshable =
+                 rec->o2wPathId == 1u || rec->o2wPathId == 2u
+              || rec->o2wPathId == 3u || rec->o2wPathId == 4u
+              || o2wNeedsCamO || o2wIs13;
+            if (!genOk && !carried && rec->eligible && rec->wtvPathId == 3u
+                && o2wNeedsCamO && o2wHasCamO) {
+              const auto& cb2Co = cbsRp[2];
+              if (cb2Co.buffer != nullptr) {
+                size_t coLen = 0;
+                const uint8_t* coP = stagedCbBytes(cb2Co.buffer.ptr(), coLen);
+                const size_t coBase = (size_t) cb2Co.constantOffset * 16;
+                if (coP != nullptr && coBase + rec->camSrcOff + 12 <= coLen) {
+                  float fco[3];
+                  std::memcpy(fco, coP + coBase + rec->camSrcOff, 12);
+                  refreshCamO   = Vector3(fco[0], fco[1], fco[2]);
+                  refreshCamOOk = true;
+                }
+              }
+              if (!refreshCamOOk) ++s_xtReplayStats.refreshFail;
+            }
+            // A path that needs no camO, or carries none, is unaffected.
+            // v7.0: path 13's readiness IS its live gate -- if the mirror
+            // did not fire, the route is not live and the refresh must not
+            // run (the draw falls through to the full path).
+            const bool camOReady = o2wIs13
+              ? p13LiveOk
+              : (!o2wNeedsCamO || !o2wHasCamO || refreshCamOOk);
             if (!genOk && !carried && rec->eligible
                 && rec->wtvPathId == 3u
-                && (rec->o2wPathId == 1u || rec->o2wPathId == 2u
-                 || rec->o2wPathId == 3u || rec->o2wPathId == 4u)) {
+                && o2wRefreshable && camOReady) {
               // FIX: wtvPath 3 has TWO producers. The CamCache hit at ~17268
               // assigns m_camFallbackCache.worldToView -- a matrix stored by
               // whichever draw reconstructed it earlier THIS frame -- and also
@@ -14964,6 +15402,7 @@ namespace dxvk {
                 refreshW2v = m_camFallbackCache.worldToView;
                 refreshed = true;
                 ++s_xtReplayStats.refreshOk;
+                ++s_xtReplayStats.refreshPath[rec->o2wPathId & 15u];
               } else {
                 Vector3 camRf;
                 uint32_t csRf = UINT32_MAX, coRf = 0;
@@ -14976,6 +15415,7 @@ namespace dxvk {
                                               slotD2Rf, /*requireLiveRot=*/true)) {
                   refreshed = true;
                   ++s_xtReplayStats.refreshOk;
+                  ++s_xtReplayStats.refreshPath[rec->o2wPathId & 15u];
                 } else {
                   ++s_xtReplayStats.refreshFail;
                 }
@@ -14983,6 +15423,20 @@ namespace dxvk {
             } else if (!genOk && !carried) {
               ++s_xtReplayStats.refreshSkip;
             }
+            // v6.9h: THE camera origin every o2w derivation below must use.
+            // v7.0: on a path-13 record it is ALWAYS the live mirror-gate
+            // value (the site re-reads it per draw, so the replay must too;
+            // the compose bails on !p13LiveOk before this is consumed). On a
+            // refreshed 5/6 record it is the live cb2 value; on every other
+            // route it is the recorded one, byte-proven by the witness or
+            // the carry memcmp. Note this deliberately does NOT write back to
+            // rec->p13CamOrigin: that field is the per-camera STREAM
+            // DISCRIMINATOR that matchRec and the capture placement use to keep
+            // the ~63 one-draw sub-view cameras from clobbering each other, and
+            // mutating it would merge streams that differ only by camera.
+            const Vector3 camORp = o2wIs13
+              ? p13LiveCamO
+              : (refreshCamOOk ? refreshCamO : rec->p13CamOrigin);
             if (!genOk && !carried && !refreshed) {
               ++s_xtReplayStats.genMiss;
               // v6.3: name the blocker. crossOk records that got here had
@@ -14997,7 +15451,15 @@ namespace dxvk {
                 }
               }
               ++s_xtReplayStats.gmWtv[rec->wtvPathId & 15u];
-              // fall through to the full path; the tail refreshes the record
+              // fall through to the full path; the tail refreshes the record.
+              // v6.9f: a FAILED refresh (resolvePath3CamOrigin /
+              // derivePath3WorldToView above) lands in rp_selMiss too. That is
+              // deliberate -- it is work the tier caused on a draw that pays
+              // the full path regardless, which is exactly what this bucket is
+              // for. A SUCCESSFUL refresh takes the else below and so sits in
+              // rp_sel; refresh is not strictly "search", but splitting it out
+              // is a separate question from closing the attribution hole.
+              closeRpSel(false);
             } else {
             // v6.9d: closes the SELECTION bucket -- map lookup, up to 4 MRU
             // probes, and the linear scan. This is precisely the work the tier
@@ -15005,7 +15467,11 @@ namespace dxvk {
             // full path's xt_setup + pv_validate + w2v_scan + xt_projScan1.
             // If the tier's own search costs as much as the search it skips,
             // it cannot pay no matter how high the hit rate goes.
-            markXtSub(s_perfRpSelAcc, s_perfRpSelMax);
+            // v6.9f: this branch is the ATTEMPT side only. The four fall-through
+            // branches above close the same bucket into rp_selMiss; the tier's
+            // total search cost is rp_sel + rp_selMiss, and neither alone is a
+            // denominator for anything.
+            closeRpSel(true);
             // --- REPLAY ATTEMPT: camera-side snapshot + fresh per-draw o2w ---
             // WITNESS v5: a non-cb2 projection source has no generation proof
             // (cb3/cb0 are rewritten per draw), so verify its 64 bytes against
@@ -15248,18 +15714,27 @@ namespace dxvk {
               }
               if (bm != nullptr) {
                 if (rec->o2wPathId == 13) {
+                  // v7.0: route 13 is only replayed when the live mirror
+                  // gate fired this draw -- the site's own per-draw
+                  // condition. A silent gate means the site is on a
+                  // different route right now (the sticky m_lastO2wPathId
+                  // notwithstanding); full path re-records the truth.
+                  if (!p13LiveOk) {
+                    o2wOk = false;
+                  } else {
                   // Same compose as the path-13 site: 3x3 transposed
                   // (row-major engine matrix into column-major Matrix4),
-                  // translation shifted by the RECORDED c_cameraOrigin --
-                  // which the witness proves is the byte-identical cb2
-                  // content this frame's full runs read.
+                  // translation shifted by the LIVE c_cameraOrigin the
+                  // mirror gate just read -- the same staged bytes the
+                  // site's own read gate serves this draw.
                   rt.objectToWorld = Matrix4(
                     Vector4(bm[0], bm[4], bm[8],  0.0f),
                     Vector4(bm[1], bm[5], bm[9],  0.0f),
                     Vector4(bm[2], bm[6], bm[10], 0.0f),
-                    Vector4(bm[3]  + rec->p13CamOrigin.x,
-                            bm[7]  + rec->p13CamOrigin.y,
-                            bm[11] + rec->p13CamOrigin.z, 1.0f));
+                    Vector4(bm[3]  + camORp.x,
+                            bm[7]  + camORp.y,
+                            bm[11] + camORp.z, 1.0f));
+                  }
                 } else if (recIsRdef) {
                   // Path-5/6 MODE RE-EVAL: the same cb3IsZero decision the
                   // rdef site takes, from the SAME fresh 48 bytes (kEps and
@@ -15284,8 +15759,8 @@ namespace dxvk {
                     && bm[8]==0.f && bm[9]==0.f && bm[10]==0.f && bm[11]==0.f;
                   const bool cb3ZeroRp = zIdT || zAll;
                   const bool camNonZeroRp = rec->camSrcValid
-                    && (rec->p13CamOrigin.x != 0.f || rec->p13CamOrigin.y != 0.f
-                     || rec->p13CamOrigin.z != 0.f);
+                    && (camORp.x != 0.f || camORp.y != 0.f
+                     || camORp.z != 0.f);
                   if (!bmFinite) {
                     // The site would have skipped the rdef route entirely.
                     o2wOk = false;
@@ -15299,8 +15774,8 @@ namespace dxvk {
                         Vector4(1.f, 0.f, 0.f, 0.f),
                         Vector4(0.f, 1.f, 0.f, 0.f),
                         Vector4(0.f, 0.f, 1.f, 0.f),
-                        Vector4(rec->p13CamOrigin.x, rec->p13CamOrigin.y,
-                                rec->p13CamOrigin.z, 1.f));
+                        Vector4(camORp.x, camORp.y,
+                                camORp.z, 1.f));
                       rtPathId = 6;
                     } else {
                       o2wOk = false;
@@ -15309,9 +15784,9 @@ namespace dxvk {
                     // Site: path 5 = row-major float3x4 compose, camO added
                     // to translation IFF the site had camO (haveCamO ==
                     // rec->camSrcValid, byte-proven identical).
-                    const float txRp = rec->camSrcValid ? (bm[3]  + rec->p13CamOrigin.x) : bm[3];
-                    const float tyRp = rec->camSrcValid ? (bm[7]  + rec->p13CamOrigin.y) : bm[7];
-                    const float tzRp = rec->camSrcValid ? (bm[11] + rec->p13CamOrigin.z) : bm[11];
+                    const float txRp = rec->camSrcValid ? (bm[3]  + camORp.x) : bm[3];
+                    const float tyRp = rec->camSrcValid ? (bm[7]  + camORp.y) : bm[7];
+                    const float tzRp = rec->camSrcValid ? (bm[11] + camORp.z) : bm[11];
                     rt.objectToWorld = Matrix4(
                       Vector4(bm[0], bm[4], bm[8],  0.f),
                       Vector4(bm[1], bm[5], bm[9],  0.f),
@@ -15347,7 +15822,10 @@ namespace dxvk {
                 // it predates this work. Re-derive on EVERY path-13 replay,
                 // not just the cross-frame ones; for genOk hits the inputs are
                 // unchanged so it returns the same answer at negligible cost.
-                if (rec->o2wPathId == 13) {
+                // v7.0: p13LiveOk required -- on a silent gate camORp is
+                // zeros and the write-back below would poison the record's
+                // flags for the draws that DO replay it.
+                if (rec->o2wPathId == 13 && p13LiveOk) {
                   // Crossing a frame boundary: the snapshot's isSubView /
                   // isSubViewSkybox were derived against THAT frame's
                   // g_engineSkyCamOrigin. camO is proven byte-identical, but
@@ -15355,9 +15833,9 @@ namespace dxvk {
                   // + per-VS skybox map the path-13 site applies.
                   bool svC = false;
                   if (g_engineSkyCamOriginValid != 0u) {
-                    const float sdxC = rec->p13CamOrigin.x - g_engineSkyCamOrigin[0];
-                    const float sdyC = rec->p13CamOrigin.y - g_engineSkyCamOrigin[1];
-                    const float sdzC = rec->p13CamOrigin.z - g_engineSkyCamOrigin[2];
+                    const float sdxC = camORp.x - g_engineSkyCamOrigin[0];
+                    const float sdyC = camORp.y - g_engineSkyCamOrigin[1];
+                    const float sdzC = camORp.z - g_engineSkyCamOrigin[2];
                     svC = (sdxC * sdxC + sdyC * sdyC + sdzC * sdzC) < (4.0f * 4.0f);
                   }
                   rt.isSubView = svC;
@@ -15728,6 +16206,11 @@ namespace dxvk {
                   rec->cb2Buf = xtCtl.cb2Buf;
                   rec->cb2Off = xtCtl.cb2Off;
                   rec->cb2gen = xtCtl.cb2gen;
+                  // v6.9g: republish to the hot lane. This is the v6.5 refresh
+                  // whose whole point is that the REST of the stream then takes
+                  // the cheap generation compare -- which now runs off the hot
+                  // entry, so leaving it stale would delete the win.
+                  setRp->syncHot((size_t) (rec - setRp->recs.data()), *rec);
                 }
                 m_lastO2wPathId = rtPathId;  // v6: mode re-evaled for 5/6
                 m_lastWtvPathId = rec->wtvPathId;
@@ -15763,6 +16246,12 @@ namespace dxvk {
                   m_lastGoodTransforms = rt;
                   ++s_xtLastGoodWriteN;
                 }
+                // v6.9f: EXIT 1 of 3. Everything since the rp_o2w mark -- the
+                // member restores above and the m_lastGoodTransforms mutex --
+                // was outside every bucket because the function returns here.
+                // This is the hottest exit: it fires on every replay hit.
+                ++s_perfRpCommitN;
+                markXtSub(s_perfRpCommitAcc, s_perfRpCommitMax);
                 return rt;
               }
             }
@@ -15856,25 +16345,8 @@ namespace dxvk {
       return sCachedShort;
     };
 
-    // NV-DXVK [perf]: the CBufCommonPerCamera.c_cameraOrigin field location is a
-    // pure function of the bound VS, but FindCBField("CBufCommonPerCamera",
-    // "c_cameraOrigin") was called at several per-draw sites â€” each allocating two
-    // std::string temps to hash the RDEF maps. Every site in a single draw queries
-    // the SAME bound VS, and draws are batched by VS, so cache (vs common ptr ->
-    // loc): the RDEF lookup runs once per VS instead of per draw/per site.
-    // thread_local => per-context, no locking. (Same proven memo idea as the
-    // classify() cache; routed at the hot ungated sites only.)
-    auto findCamOriginLoc = [](const D3D11CommonShader* common)
-        -> std::optional<D3D11CommonShader::CBFieldLoc> {
-      if (common == nullptr) return std::nullopt;
-      static thread_local const D3D11CommonShader* sCachedCommon = nullptr;
-      static thread_local std::optional<D3D11CommonShader::CBFieldLoc> sCachedLoc;
-      if (common != sCachedCommon) {
-        sCachedLoc = common->FindCBField("CBufCommonPerCamera", "c_cameraOrigin");
-        sCachedCommon = common;
-      }
-      return sCachedLoc;
-    };
+    // (findCamOriginLoc moved above the replay tier block -- v7.0 path-13
+    //  live gate mirror needs it there; see the definition near XtReplayCtl.)
 
     // Maximum bytes to scan per cbuffer. Projection/view/world matrices are
     // always in the first few hundred bytes of a cbuffer â€” capping the scan
@@ -16103,6 +16575,23 @@ namespace dxvk {
     // The active VP for THIS draw is whichever the game wrote into offset 16
     // for that pass (gameplay/shadow/portal/fog/...). Remix classifies the
     // resulting camera downstream. No scoring, no multi-slot scan.
+    // v6.9e: close xs_pre and open xs_cb2fast. Everything from here to the
+    // xt_setup mark is the cb2 deterministic-VP fast path -- a staged read plus
+    // up to TWO classifyPerspective calls (cb2@16, then cb2@96) on every draw
+    // that gets here. If xs_cb2fast dominates xt_setup's 6.1 us/draw then the
+    // full path's expense is this double classify, and it is attackable
+    // directly (memoise the verdict per cb2 generation) rather than only by
+    // skipping the whole function via replay.
+    //
+    // v6.9f: xs_pre WAS INFLATED and should drop with this change. markXt is a
+    // cursor, and until now the replay tier's miss branches closed no bucket at
+    // all -- so on every draw that searched the record set, found nothing and
+    // fell through here, the whole search (map lookup + up to a full scan +
+    // any WC read) was charged to xs_pre, which is simply the next marker it
+    // met. That was ~390 of 1084 draws/frame. Re-measure before splitting
+    // xs_pre further: the "biggest unsplit item" ranking that motivated the
+    // split was computed from the inflated number.
+    markXtSub(s_perfXsPreAcc, s_perfXsPreMax);
     if (projSlot == UINT32_MAX) {
       const auto& vsCbs = m_context->m_state.vs.constantBuffers;
       const uint32_t kSourceCamSlot = 2;
@@ -16164,6 +16653,7 @@ namespace dxvk {
       }
     }
 
+    markXtSub(s_perfXsCb2FastAcc, s_perfXsCb2FastMax);
     markXt(s_perfXtSetupAcc, s_perfXtSetupMax);
     // --- PROJECTION: first-draw scan (cache miss) ---
     // Single pass across all stages â€” classifyPerspective handles both layouts.
@@ -17741,10 +18231,10 @@ namespace dxvk {
           const bool gotCamP3 =
             resolvePath3CamOrigin(camVecP3, camSlotP3, camOffP3, sourceP3);
           camX = camVecP3.x; camY = camVecP3.y; camZ = camVecP3.z;
-          // Provenance for the replay carry proof (unset on the 'F' branch,
-          // which is member state rather than cb2 content).
-          m_lastWtvP3CamSlot = camSlotP3;
-          m_lastWtvP3CamOff  = camOffP3;
+          // (camSlotP3/camOffP3 were stored as provenance for the deleted v6.4
+          //  carry proof; both remain live out-params of resolvePath3CamOrigin
+          //  and are still reported by the [D3D11Rtx.path3Cam] log below.)
+          (void) camSlotP3; (void) camOffP3;
           (void) gotCamP3;
           // Log which source path 3 used (capped, only on change).
           {
@@ -17780,7 +18270,7 @@ namespace dxvk {
           const bool gotW2vP3 = derivePath3WorldToView(
             camVecP3, w2vP3, fromCb2P3, slotPickedIdx, slotPickedD2,
             /*requireLiveRot=*/false);
-          m_lastWtvP3FromCb2 = fromCb2P3;
+          (void) fromCb2P3;  // v6.4 carry-proof provenance; proof deleted
           // Log slot pick once per (vsHash, slotIdx) so we can see which
           // shaders are routing to which sub-camera basis.
           if (kDiagLogs) {
@@ -21230,6 +21720,8 @@ namespace dxvk {
           }
           s_xtReplayLastVs = nullptr;
           s_xtReplayLastRec = nullptr;
+          s_rpBatchRec = nullptr;   // v6.9e: the set it pointed into is gone
+          s_rpBatchSet = nullptr;
           // v6.6: `mats` was ONE bool over four matrices, so a failure could
           // not say whether the replay got objectToWorld wrong (the t31/t30
           // read) or worldToView wrong (the refresh). Both sides agreeing on
@@ -21301,13 +21793,18 @@ namespace dxvk {
       }
 
       // --- record refresh from this full run ---
-      if (xtCtl.captureRecord && s_xtReplayQuarantine.count(xtCtl.vsKey) == 0) {
+      // v6.9g: same empty short-circuit as the selection-side check.
+      if (xtCtl.captureRecord
+          && (s_xtReplayQuarantine.empty()
+              || s_xtReplayQuarantine.count(xtCtl.vsKey) == 0)) {
         if (s_xtReplayMap.size() > 4096u) {
           // Same bound-and-reset policy as vsLocCache / the layout table.
           s_xtReplayMap.clear();
           s_xtReplayRecTotal = 0;
           s_xtReplayLastVs = nullptr;
           s_xtReplayLastRec = nullptr;
+          s_rpBatchRec = nullptr;   // v6.9e: cached pointer is into a dead set
+          s_rpBatchSet = nullptr;
         }
         const uint32_t capFrame = m_context->m_device->getCurrentFrameId();
         // v6: build the record LOCALLY, place it at the end -- the
@@ -21415,33 +21912,10 @@ namespace dxvk {
           }
         }
 
-        // v6.4 wtvPath-3 carry inputs. Both ranges live in cb2, so both are
-        // read through the same staged path the site used and are covered by
-        // the cb2 witness triple; the carryover memcmp below re-proves them
-        // when the triple moves (ring-allocated cb2 = new buffer/offset, same
-        // camera content -- exactly the case that was falling into genMiss).
-        {
-          const auto& cb2W = m_context->m_state.vs.constantBuffers[2];
-          if (m_lastWtvPathId == 3u && m_lastWtvP3FromCb2
-              && m_lastWtvP3CamSlot == 2u && cb2W.buffer != nullptr) {
-            size_t lenW = 0;
-            const uint8_t* pW = stagedCbBytes(cb2W.buffer.ptr(), lenW);
-            if (pW != nullptr) {
-              const size_t baseW = static_cast<size_t>(cb2W.constantOffset) * 16;
-              if (baseW + 64 <= lenW) {
-                std::memcpy(rr.wtvRotSrc, pW + baseW + 16, sizeof(rr.wtvRotSrc));
-                rr.wtvRotValid = true;
-              }
-              if (baseW + m_lastWtvP3CamOff + 12 <= lenW) {
-                std::memcpy(rr.wtvCamSrc, pW + baseW + m_lastWtvP3CamOff,
-                            sizeof(rr.wtvCamSrc));
-                rr.wtvCamOff = m_lastWtvP3CamOff;
-                rr.wtvCamValid = true;
-              }
-            }
-          }
-          rr.wtvP3Provable = rr.wtvRotValid && rr.wtvCamValid;
-        }
+        // (v6.4's wtvPath-3 carry-input capture was here: a staged cb2 read
+        //  plus two memcpys into every record, on the path-3 population, to
+        //  feed a proof that never ran. Deleted -- the write cost went with the
+        //  ~68 bytes it was filling.)
 
         // Projection source bytes: the exact 64 bytes the resolved projection
         // was read from. WITNESS v5 (fifth capture, .det line): the projection
@@ -21456,6 +21930,21 @@ namespace dxvk {
         // Ranged read (hit-probe else 64-byte WC copy): cb3's generation moves
         // per draw, so stagedCbBytes would whole-buffer-stage on every call --
         // the exact [Perf.WcCopy] failure shape. Never call it for slot != 2.
+        // v7.0 (capture economy): selection often read this exact range
+        // already (freshProj, during the record scan of THIS draw). Reuse
+        // those bytes on (slot, offset) equality and skip the second read
+        // entirely -- its miss path is a 64-byte write-combined copy, the
+        // xt_cap cost the 08-09 handoff names. The genMiss-recapture
+        // population is selected via proj-content identity, so for it the
+        // stash hits by construction.
+        if (m_projStage == 0 && m_projSlot < 8u
+            && xtCtl.pjCacheValid
+            && xtCtl.pjCacheSlot == (uint32_t) m_projSlot
+            && xtCtl.pjCacheOff  == (uint32_t) m_projOffset) {
+          std::memcpy(rr.projSrc, xtCtl.pjCache, sizeof(rr.projSrc));
+          rr.projSrcOff = static_cast<uint32_t>(m_projOffset);
+          rr.projSrcValid = true;
+        } else
         if (m_projStage == 0 && m_projSlot < 8u) {
           const auto& cbPj = m_context->m_state.vs.constantBuffers[m_projSlot];
           if (cbPj.buffer != nullptr) {
@@ -21606,8 +22095,10 @@ namespace dxvk {
           // paths here would let them inherit the recorded frame's sub-view
           // verdict. Conservative on purpose; gmWtv/carry counters will show
           // what is left outside it.
-          && (isIdentityExact(transforms.worldToView)
-              || (rr.wtvP3Provable && m_lastO2wPathId == 13u))
+          // (v6.4 relaxed this with `|| (wtvP3Provable && o2wPath==13)` to let
+          //  path-3 records cross a cb2 rewrite. The relaxation admitted
+          //  nothing -- carry{try=0} always -- so it is gone with the proof.)
+          && isIdentityExact(transforms.worldToView)
           && rr.projSrcValid
           && !rr.camOriginSet
           && !rr.wroteLastGood
@@ -21626,9 +22117,7 @@ namespace dxvk {
         if (!m_skipViewMatrixScan)                        rr.crossWhy |= 1u;
         // Mirrors the crossOk clause exactly, so the attribution can never
         // report "no reason" for a record crossOk actually refused.
-        if (!isIdentityExact(transforms.worldToView)
-            && !(rr.wtvP3Provable && m_lastO2wPathId == 13u))
-                                                          rr.crossWhy |= 2u;
+        if (!isIdentityExact(transforms.worldToView))      rr.crossWhy |= 2u;
         if (!rr.projSrcValid)                             rr.crossWhy |= 4u;
         if (rr.camOriginSet)                              rr.crossWhy |= 8u;
         if (rr.wroteLastGood)                             rr.crossWhy |= 16u;
@@ -21641,66 +22130,110 @@ namespace dxvk {
         XtReplayRecSet& setCap = s_xtReplayMap[xtCtl.vsKey];
         XtReplayRec* dst = nullptr;
         bool sameStream = false;
-        // 1) same camera by witness triple (intra-frame refresh). v6.1: for
-        //    per-draw-proj records (slot != 2) the witness is NOT the whole
-        //    identity -- refreshing across a proj-variant boundary is exactly
-        //    the clobber that kept recs flat and projSel at 0. Different
-        //    variant -> fall through to the content match / append.
+        // ---- v6.9g PERF: ONE pass over setCap.recs, was up to SIX ----
+        // xt_cap measured 4.2-5.2 us per capture on 19% of draws (~1.08
+        // ms/frame) -- the largest single item in the replay tier, and
+        // unmeasured until the v6.9f exit buckets existed. An XtReplayRec is
+        // several hundred bytes and a VS holds ~39, so one walk strides ~15 KB
+        // of cold memory. There were six: three placement tiers, two LRU
+        // searches, and the keepVerified max -- and each ran to COMPLETION on
+        // the miss that made the next one necessary. They are priority tiers
+        // over one array; nothing about their order needed separate passes.
+        //
+        // Equivalence, clause by clause (this decides route placement, so it
+        // has to be exact, not merely close):
+        //  - tier 1 still wins outright and still takes the FIRST match in
+        //    array order, so it can still break the instant it hits.
+        //  - tiers 2 / 2b are REMEMBERED, not taken, until the pass ends --
+        //    so a tier-1 record later in the array still beats a tier-2 one
+        //    found earlier, exactly as when scan 1 completed first.
+        //  - a record tier 1 rejects as "different proj variant" (the old
+        //    `continue`) still falls through to tier 2 here, exactly as
+        //    before, because scan 2 walked the whole array including it.
+        //  - keepVerified and both LRU candidates are read ONLY on paths
+        //    where no tier matched, i.e. paths that never broke early, so
+        //    they are always complete where they are used.
+        XtReplayRec* cand2   = nullptr;  // proj-content match (cross-frame)
+        XtReplayRec* cand2b  = nullptr;  // proj-less match (ineligible caps)
+        XtReplayRec* lruCold = nullptr;  // LRU among slots not touched this frame
+        XtReplayRec* lruAny  = nullptr;  // LRU overall
+        uint32_t     keepMax = 0;
         for (auto& r : setCap.recs) {
+          // 1) same camera by witness triple (intra-frame refresh). v6.1: for
+          //    per-draw-proj records (slot != 2) the witness is NOT the whole
+          //    identity -- refreshing across a proj-variant boundary is
+          //    exactly the clobber that kept recs flat and projSel at 0.
           if (r.key == rr.key && r.cb2Buf == rr.cb2Buf && r.cb2Off == rr.cb2Off
-              && r.cb2gen == rr.cb2gen && r.cb2Buf != nullptr) {
-            if (r.projSrcValid && rr.projSrcValid && rr.projSlot != 2u
-                && (r.projHash != rr.projHash
-                    || std::memcmp(r.projSrc, rr.projSrc, sizeof(rr.projSrc)) != 0)) {
-              continue;  // same stream, different proj variant
-            }
+              && r.cb2gen == rr.cb2gen && r.cb2Buf != nullptr
+              && !(r.projSrcValid && rr.projSrcValid && rr.projSlot != 2u
+                   && (r.projHash != rr.projHash
+                       || std::memcmp(r.projSrc, rr.projSrc,
+                                      sizeof(rr.projSrc)) != 0))) {
             dst = &r; sameStream = true; break;
           }
-        }
-        // 2) same camera by proj content (cross-frame refresh -- the record
-        //    this draw would have SELECTED had its inputs matched)
-        if (dst == nullptr && rr.projSrcValid) {
-          for (auto& r : setCap.recs) {
-            if (r.key != rr.key || !r.projSrcValid) continue;
-            if (r.projSlot != rr.projSlot || r.projSrcOff != rr.projSrcOff) continue;
-            if (r.projHash != rr.projHash
-                || std::memcmp(r.projSrc, rr.projSrc, sizeof(rr.projSrc)) != 0) continue;
-            // Camera-origin cross-check generalized (v6.1): any two records
-            // carrying proven camO bytes (path 13 AND the 5/6 family) are
-            // distinct streams when those bytes differ.
-            if (r.p13CamOriginValid && rr.p13CamOriginValid
-                && std::memcmp(&r.p13CamOrigin, &rr.p13CamOrigin, 12) != 0) continue;
-            dst = &r; sameStream = true; break;
+          // 2) same camera by proj content (cross-frame refresh -- the record
+          //    this draw would have SELECTED had its inputs matched).
+          //    Camera-origin cross-check generalized (v6.1): any two records
+          //    carrying proven camO bytes (path 13 AND the 5/6 family) are
+          //    distinct streams when those bytes differ.
+          if (cand2 == nullptr && rr.projSrcValid
+              && r.key == rr.key && r.projSrcValid
+              && r.projSlot == rr.projSlot && r.projSrcOff == rr.projSrcOff
+              && r.projHash == rr.projHash
+              && std::memcmp(r.projSrc, rr.projSrc, sizeof(rr.projSrc)) == 0
+              && !(r.p13CamOriginValid && rr.p13CamOriginValid
+                   && std::memcmp(&r.p13CamOrigin, &rr.p13CamOrigin, 12) != 0)) {
+            cand2 = &r;
           }
-        }
-        // 2b) proj-less records (ineligible captures, ineligBits 16) carry
-        //     no per-camera identity: ONE slot per key is right (cameras
-        //     are indistinguishable without proj bytes). Refresh it instead
-        //     of appending a duplicate every 300-frame verdict expiry.
-        if (dst == nullptr && !rr.projSrcValid) {
-          for (auto& r : setCap.recs) {
-            if (r.key == rr.key && !r.projSrcValid) { dst = &r; sameStream = true; break; }
+          // 2b) proj-less records (ineligible captures, ineligBits 16) carry
+          //     no per-camera identity: ONE slot per key is right (cameras are
+          //     indistinguishable without proj bytes). Refresh it instead of
+          //     appending a duplicate every 300-frame verdict expiry.
+          if (cand2b == nullptr && !rr.projSrcValid
+              && r.key == rr.key && !r.projSrcValid) {
+            cand2b = &r;
           }
+          // Eviction candidates and the trust-carryover max, folded in for
+          // free -- they were two more full walks of this same array.
+          if (r.lastUseFrame != capFrame
+              && (lruCold == nullptr || r.lastUseFrame < lruCold->lastUseFrame)) {
+            lruCold = &r;
+          }
+          if (lruAny == nullptr || r.lastUseFrame < lruAny->lastUseFrame) {
+            lruAny = &r;
+          }
+          keepMax = std::max<uint32_t>(keepMax, r.verifiedOk);
+        }
+        if (dst == nullptr) {
+          dst = (cand2 != nullptr) ? cand2 : cand2b;
+          sameStream = (dst != nullptr);
         }
         // 3) new camera: append under the caps, else evict LRU -- never a
         //    slot another stream touched this frame if any other exists.
         if (dst == nullptr) {
+          // v6.9e: STRUCTURAL change -- append may reallocate the vector, and
+          // an LRU eviction repoints a slot at a different stream. Either
+          // invalidates any cached XtReplayRec*, so bump the set's gen.
+          ++setCap.gen;
           if (setCap.recs.size() < kXtReplayMaxRecsPerVs
               && s_xtReplayRecTotal < kXtReplayMaxRecsTotal) {
             setCap.recs.emplace_back();
-            dst = &setCap.recs.back();
+            dst = &setCap.recs.back();   // invalidates cand*/lru* -- all unused here
             ++s_xtReplayRecTotal;
           } else {
-            for (auto& r : setCap.recs) {
-              if (r.lastUseFrame == capFrame) continue;
-              if (dst == nullptr || r.lastUseFrame < dst->lastUseFrame) dst = &r;
-            }
-            if (dst == nullptr) {  // every slot hot this frame: true LRU
-              for (auto& r : setCap.recs) {
-                if (dst == nullptr || r.lastUseFrame < dst->lastUseFrame) dst = &r;
-              }
-            }
+            dst = (lruCold != nullptr) ? lruCold : lruAny;
           }
+        }
+        // v6.9g: pre-existing latent null deref, not introduced by the pass
+        // fusion. If the GLOBAL record cap is reached while this VS's set is
+        // still empty, there is nothing to append and nothing to evict, so
+        // both LRU candidates are null and `*dst = rr` below would fault.
+        // Unreachable at the current recs~2243, but the correct behaviour when
+        // no slot can be placed is to skip the capture, not to crash.
+        if (dst == nullptr) {
+          ++s_perfXtCapN;
+          markXtSub(s_perfXtCapAcc, s_perfXtCapMax);
+          return transforms;
         }
         // Trust carryover: a same-stream refresh keeps the record's own
         // counters. A NEW per-camera slot inherits the VS's route trust
@@ -21735,6 +22268,10 @@ namespace dxvk {
             dst->hitsSinceCap = 0;
             s_xtReplayLastVs = xtCtl.vsKey;
             s_xtReplayLastRec = &setCap;
+            // v6.9f: EXIT 2 of 3 -- the dormant-record early out. Same bucket
+            // as exit 3; both close the capture tail.
+            ++s_perfXtCapN;
+            markXtSub(s_perfXtCapAcc, s_perfXtCapMax);
             return transforms;
           }
         }
@@ -21744,10 +22281,11 @@ namespace dxvk {
           keepVerified = dst->verifiedOk;
           keepCarriedV = dst->carriedVerifies;
         } else {
-          keepVerified = 0;
-          for (const auto& r : setCap.recs) {
-            keepVerified = std::max(keepVerified, r.verifiedOk);
-          }
+          // v6.9g: computed during the single placement pass above. The old
+          // loop ran AFTER the append, so it also saw the freshly emplaced
+          // (zeroed) record -- which cannot change a max, so folding it into
+          // the pre-append pass is exact, not approximate.
+          keepVerified = keepMax;
           keepCarriedV = 0;
         }
         *dst = rr;
@@ -21755,11 +22293,21 @@ namespace dxvk {
         dst->carriedVerifies = keepCarriedV;
         dst->noHitCaps = nhNew;
         setCap.pushMru((uint32_t) (dst - setCap.recs.data()));
+        // v6.9g: the record's identity just changed wholesale -- republish it
+        // to the hot lane. This is the append/evict/refresh path, i.e. every
+        // way a slot's identity is written, so it is the primary sync point.
+        setCap.syncHot((size_t) (dst - setCap.recs.data()), *dst);
 
         s_xtReplayLastVs = xtCtl.vsKey;
         s_xtReplayLastRec = &setCap;
       }
     }
+    // v6.9f: EXIT 3 of 3 -- the full path's normal return. Closes the ~570
+    // lines of capture + verify adjudication since the xt_tail mark. Draws
+    // with xtCtl.vsKey == nullptr reach here having done none of that work and
+    // simply contribute ~0, which is correct rather than merely harmless.
+    ++s_perfXtCapN;
+    markXtSub(s_perfXtCapAcc, s_perfXtCapMax);
     return transforms;
   }
 
@@ -26965,28 +27513,29 @@ namespace dxvk {
     // enabled so no translucent geometry is submitted to the RT scene at all.
     if (RtxOptions::tf2DisableAlphaSurfaces()) {
       D3D11BlendState* bs = m_context->m_state.om.cbState;
-      if (bs != nullptr) {
-        D3D11_BLEND_DESC1 bd = {};
-        bs->GetDesc1(&bd);
-        if (bd.RenderTarget[0].BlendEnable) {
-          BumpFilter(FilterReason::AlphaSurface);
-          m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
-          return;
-        }
+      // NV-DXVK [perf] v7.0 (va_guards): read the immutable desc in place --
+      // GetDesc1 copied the full D3D11_BLEND_DESC1 (8 RT slots) per draw to
+      // answer one bit.
+      if (bs != nullptr && bs->Desc()->RenderTarget[0].BlendEnable) {
+        BumpFilter(FilterReason::AlphaSurface);
+        m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
+        return;
       }
     }
 
-    // Read actual depth/stencil state from the OM â€” don't hardcode.
+    // Read actual depth/stencil state from the OM -- don't hardcode.
+    // NV-DXVK [perf] v7.0 (va_guards): direct desc reads; state objects are
+    // immutable after creation so the per-draw GetDesc struct copy bought
+    // nothing. Same mechanism as the FillMat blend/depth decode caches.
     bool zEnable = true;
     bool zWriteEnable = true;
     bool stencilEnabled = false;
     D3D11DepthStencilState* dsState = m_context->m_state.om.dsState;
     if (dsState) {
-      D3D11_DEPTH_STENCIL_DESC dsDesc;
-      dsState->GetDesc(&dsDesc);
-      zEnable         = dsDesc.DepthEnable != FALSE;
-      zWriteEnable    = dsDesc.DepthWriteMask != D3D11_DEPTH_WRITE_MASK_ZERO;
-      stencilEnabled  = dsDesc.StencilEnable != FALSE;
+      const D3D11_DEPTH_STENCIL_DESC* dsDesc = dsState->Desc();
+      zEnable         = dsDesc->DepthEnable != FALSE;
+      zWriteEnable    = dsDesc->DepthWriteMask != D3D11_DEPTH_WRITE_MASK_ZERO;
+      stencilEnabled  = dsDesc->StencilEnable != FALSE;
     }
 
     // NV-DXVK [engine-post forward]: if this draw is the host game's final
@@ -27081,6 +27630,54 @@ namespace dxvk {
           || f == VK_FORMAT_R8G8_UNORM;           // 16  â€” 8-bit packed UVs (mobile ports)
     };
 
+    // NV-DXVK [perf] v7.0 (va_sem hoist): the semantic resolution below --
+    // the name/index/format matching loop plus its three fallback scans --
+    // is a pure function of the input layout object, but it ran per DRAW
+    // (~1300/frame, tens of strncmps each). Memoize the resolved semantic
+    // INDICES per layout pointer: a single-entry front probe (draws batch
+    // by layout) or one map find replaces the whole scan. Indices, not
+    // pointers, so a cache hit re-derives its pointers from the LIVE
+    // layout's semantics array and can never dangle. Same keying idiom and
+    // recycled-pointer exposure as sIlSkinSemCache further down -- accepted
+    // there, accepted here.
+    struct IlResolvedSems {
+      int16_t pos, nrm, tc, tc1, col, bw, bi, vtc3, vtc1, vtc2;
+    };
+    static thread_local const D3D11InputLayout* sIlSemLastIl = nullptr;
+    static thread_local IlResolvedSems sIlSemLastVal;
+    static thread_local std::unordered_map<uintptr_t, IlResolvedSems> sIlSemCache;
+    bool semsResolved = false;
+    {
+      const IlResolvedSems* rsHit = nullptr;
+      if (layout == sIlSemLastIl) {
+        rsHit = &sIlSemLastVal;
+      } else {
+        auto itS = sIlSemCache.find(reinterpret_cast<uintptr_t>(layout));
+        if (itS != sIlSemCache.end()) {
+          rsHit = &itS->second;
+          sIlSemLastIl  = layout;
+          sIlSemLastVal = itS->second;
+        }
+      }
+      if (rsHit != nullptr) {
+        const D3D11RtxSemantic* sb = semantics.data();
+        auto at = [&](int16_t i) -> const D3D11RtxSemantic* {
+          return (i >= 0 && (size_t) i < semantics.size()) ? sb + i : nullptr;
+        };
+        posSem     = at(rsHit->pos);
+        nrmSem     = at(rsHit->nrm);
+        tcSem      = at(rsHit->tc);
+        tc1Sem     = at(rsHit->tc1);
+        colSem     = at(rsHit->col);
+        bwSem      = at(rsHit->bw);
+        biSem      = at(rsHit->bi);
+        vguiTc3Sem = at(rsHit->vtc3);
+        vguiTc1Sem = at(rsHit->vtc1);
+        vguiTc2Sem = at(rsHit->vtc2);
+        semsResolved = true;
+      }
+    }
+    if (!semsResolved) {
     for (const auto& s : semantics) {
       if (s.perInstance) continue; // Skip per-instance data â€” only per-vertex geometry
       // Standard D3D semantic names
@@ -27173,6 +27770,25 @@ namespace dxvk {
         }
       }
     }
+
+    // v7.0 (va_sem hoist): store this layout's resolution -- including a
+    // null posSem, so known-unusable layouts skip the rescan too (the
+    // NoPosition filter below still bumps per draw, as before).
+    {
+      const D3D11RtxSemantic* sb2 = semantics.data();
+      auto ix = [&](const D3D11RtxSemantic* p) -> int16_t {
+        return (p != nullptr) ? (int16_t) (p - sb2) : (int16_t) -1;
+      };
+      const IlResolvedSems rsNew {
+        ix(posSem), ix(nrmSem), ix(tcSem), ix(tc1Sem), ix(colSem),
+        ix(bwSem), ix(biSem), ix(vguiTc3Sem), ix(vguiTc1Sem), ix(vguiTc2Sem) };
+      // Same bound-and-reset policy as vsLocCache / the layout table.
+      if (sIlSemCache.size() > 4096u) sIlSemCache.clear();
+      sIlSemCache[reinterpret_cast<uintptr_t>(layout)] = rsNew;
+      sIlSemLastIl  = layout;
+      sIlSemLastVal = rsNew;
+    }
+    }  // if (!semsResolved) -- va_sem hoist
 
     if (!posSem) {
       BumpFilter(FilterReason::NoPosition);
@@ -50810,6 +51426,12 @@ namespace dxvk {
         // children -- the report marks them (nested) and does not add them into
         // tail_emit, because parent + children = the original bucket.
         {
+          // NV-DXVK [Perf.SessionState]: measure the FRAME THREAD's execution
+          // speed once per emit window, on the thread itself (the census
+          // poller runs elsewhere and cannot answer this). Contract at the
+          // declaration in rtx_perf_report.h.
+          perfreport::sessionStateProbe("frame");
+
           static perfreport::WindowFrames s_wf;
           const uint32_t nf = s_wf.step();
           const auto pubNs = [nf](const perfreport::Slot slot, const auto acc) {
@@ -50830,6 +51452,66 @@ namespace dxvk {
           pubNs(perfreport::Slot::AccVsAnalysisMs,  s_perfSubmitDrawStageVsAnalysisAcc);
           pubNs(perfreport::Slot::AccO2wT31Ms,      s_perfO2wT31Acc);
           pubNs(perfreport::Slot::AccCullVtxMs,     s_perfBtCullVtxCountAcc);
+          // v6.9f/g: the replay tier, so [Perf.Report] shows what it costs in
+          // the same place it shows what the frame costs. Until now the only
+          // way to see any of this was to divide fields out of the raw acc line
+          // by hand, with a different denominator for nearly every one -- which
+          // is precisely how the tier's cost came to be understated by 2.8x.
+          pubNs(perfreport::Slot::AccRpKeyMs,      s_perfRpKeyAcc);
+          pubNs(perfreport::Slot::AccRpSelMs,      s_perfRpSelAcc);
+          pubNs(perfreport::Slot::AccRpSelMissMs,  s_perfRpSelMissAcc);
+          pubNs(perfreport::Slot::AccRpProofMs,    s_perfRpProofAcc);
+          pubNs(perfreport::Slot::AccRpCommitMs,   s_perfRpCommitAcc);
+          pubNs(perfreport::Slot::AccXtCapMs,      s_perfXtCapAcc);
+          pubNs(perfreport::Slot::AccRpO2wMs,      s_perfRpO2wAcc);
+          // v6.9g: per-stage NAMED-LEAF SUMS, so [Perf.Report] can print
+          // stage - leaves = residual itself. Each group is exactly the set of
+          // markStg/markSub accumulators whose call site falls between that
+          // stage's sdStallMark and the previous one -- derived from the mark
+          // line numbers, not from the order fields appear in the acc line.
+          // seg7 "rest" has no marks at all, so its residual IS its wall.
+          // KEEP THESE IN SYNC when adding a mark: a leaf left out of its sum
+          // inflates that stage's residual, which is the safe failure direction.
+          pubNs(perfreport::Slot::SdHeadLeavesMs,
+                s_perfPfsGuardAcc + s_perfPfsStudioAcc + s_perfPfsDropAcc
+              + s_perfSubmitDrawStagePfSetupAcc + s_perfPffUiInjectAcc
+              + s_perfPffCamCatAcc + s_perfPffVmHuntAcc + s_perfPffVmPassAcc
+              + s_perfPffMtnAcc + s_perfSubmitDrawStagePreFiltersAcc);
+          pubNs(perfreport::Slot::SdVsIdxLeavesMs,
+                s_perfVaGuardsAcc + s_perfVaSemAcc
+              + s_perfSubmitDrawStageVsAnalysisAcc
+              + s_perfSubmitDrawStageIndexSnapAcc);
+          pubNs(perfreport::Slot::SdSkinCullLeavesMs,
+                s_perfSubmitDrawStagePerVertSkinAcc + s_perfBtSkinDetectIfAcc
+              + s_perfBtCullVtxCountAcc + s_perfBtHashesAcc);
+          pubNs(perfreport::Slot::SdXformLeavesMs,
+                s_perfBtDcsCtorAcc + s_perfBtGeoCopyAcc + s_perfBtExtractXformAcc
+              + s_perfBtSkyboxFilterAcc + s_perfFltGateAcc + s_perfFltProbesAcc
+              + s_perfSubmitDrawStageBoneTrackAcc
+              + s_perfSubmitDrawStageFiltersAcc);
+          pubNs(perfreport::Slot::SdCommitLeavesMs,
+                s_perfBpCaptureAcc + s_perfBpHashAcc + s_perfCruDecodeAcc
+              + s_perfSubmitDrawStageBonePaletteAcc
+              + s_perfSubmitDrawStageCbcRawUvAcc
+              + s_perfSubmitDrawStageCvDecalAcc + s_perfSubmitDrawStageCvRecordAcc
+              + s_perfSubmitDrawStageCvrFillMatAcc + s_perfSubmitDrawStageCvrPreAcc
+              + s_perfSubmitDrawStageCvUvxformAcc + s_perfSubmitDrawStageCvVguiAcc);
+          pubNs(perfreport::Slot::SdCaptureLeavesMs,
+                s_perfSubmitDrawStageCbcTdrLogAcc
+              + s_perfSubmitDrawStageCommitBoneCapAcc
+              + s_perfSubmitDrawStageSkyClassifyAcc
+              + s_perfSubmitDrawStageTailCaptureAcc);
+          pubNs(perfreport::Slot::SdEmitLeavesMs,
+                s_perfSubmitDrawStageTailAcc + s_perfSubmitDrawStageTailEmitAcc
+              + s_perfTeCamDiagAcc + s_perfTeCensusAcc + s_perfTeMemoDupAcc
+              + s_perfTePhase2Acc + s_perfTePropIdAcc + s_perfTeSrcGeoAcc
+              + s_perfTeTraceAcc);
+          // TIER TAX = everything the tier spends that the full path does not.
+          // rp_o2w is excluded on purpose: both paths pay it, so including it
+          // would credit the tier with a saving it does not make.
+          pubNs(perfreport::Slot::RpTierTotalMs,
+                s_perfRpKeyAcc + s_perfRpSelAcc + s_perfRpSelMissAcc
+              + s_perfRpProofAcc + s_perfRpCommitAcc + s_perfXtCapAcc);
         }
 
         Logger::info(str::format("[Perf.SubmitDraw.acc] units=ns"
@@ -50876,12 +51558,65 @@ namespace dxvk {
                                  // optimised.
                                  " rp_key=",         s_perfRpKeyAcc,
                                  " rp_sel=",         s_perfRpSelAcc,
+                                 // v6.9f: the other half of the search. rp_sel
+                                 // alone was the hits-only bucket, and the miss
+                                 // half was leaking into xs_pre because markXt
+                                 // is a cursor and the miss branches never
+                                 // advanced it. TIER SEARCH TOTAL =
+                                 // rp_sel + rp_selMiss; divide rp_selMiss by
+                                 // rpSelMissN, NOT by rpDraws. Expect it to be
+                                 // large: a miss is the case that walks the
+                                 // whole set instead of stopping at an MRU
+                                 // probe, so this is the bucket that says
+                                 // whether the hot/cold record split is worth
+                                 // building.
+                                 " rp_selMiss=",     s_perfRpSelMissAcc,
+                                 " rpSelMissN=",     s_perfRpSelMissN,
                                  " rp_proof=",       s_perfRpProofAcc,
                                  " rp_o2w=",         s_perfRpO2wAcc,
+                                 // v6.9f EXIT BUCKETS -- the 25.5% of
+                                 // bt_extractXf that no child claimed, because
+                                 // the parent is timed by the caller while the
+                                 // cursor lives inside the function. Divide
+                                 // rp_commit by rpCommitN and xt_cap by
+                                 // xtCapN. xt_cap is the replay tier's WRITE
+                                 // side (record build/append/evict + verify
+                                 // adjudication); until now only its read side
+                                 // was measured, so every "what does the tier
+                                 // cost" number to date has been short by
+                                 // whatever this turns out to be.
+                                 " rp_commit=",      s_perfRpCommitAcc,
+                                 " rpCommitN=",      s_perfRpCommitN,
+                                 " xt_cap=",         s_perfXtCapAcc,
+                                 " xtCapN=",         s_perfXtCapN,
                                  " rpDraws=",        s_perfRpDraws,
                                  " rpKeySame=",      s_perfRpKeySame,
                                  " rpScanIters=",    s_perfRpScanIters,
                                  " rpWcRead=",       s_perfRpWcReads,
+                                 // v6.9e. rpWcNs/rpWcRead = the true per-read
+                                 // cost of a 64-byte write-combined load,
+                                 // replacing the "~1-2 us" guess. MEASURED
+                                 // 2192-2333 ns. rpBatchHit/rpDraws should land
+                                 // near rpKeySame's 56%; if it lands far below,
+                                 // the cb2 witness or the set gen is churning
+                                 // inside batches and THAT is the next thing to
+                                 // name.
+                                 // v6.9f: rpWcNs is over ALL draws, so it is
+                                 // only comparable against rp_sel + rp_selMiss.
+                                 // The Hit/Miss split says whether the WC reads
+                                 // are the price of a successful replay or the
+                                 // price of searching for a record that is not
+                                 // there -- the second is removable without
+                                 // touching a single route decision, the first
+                                 // is not.
+                                 " rpWcNs=",         s_perfRpWcNs,
+                                 " rpWcNsHit=",      s_perfRpWcNsHit,
+                                 " rpWcNsMiss=",     s_perfRpWcNsMiss,
+                                 " rpBatchHit=",     s_perfRpBatchHit,
+                                 // xt_setup split: xs_cb2fast is the double
+                                 // classifyPerspective (cb2@16 then cb2@96).
+                                 " xs_pre=",         s_perfXsPreAcc,
+                                 " xs_cb2fast=",     s_perfXsCb2FastAcc,
                                  " xt_vsLocHits=",   s_perfXtVsLocCacheHits,
                                  " xt_vsLocMiss=",   s_perfXtVsLocCacheMisses,
                                  " xt_setup=",       s_perfXtSetupAcc,
@@ -52326,12 +53061,24 @@ namespace dxvk {
         s_perfXtVsLocCacheMisses              = 0;
         s_perfRpKeyAcc                        = 0; s_perfRpKeyMax                        = 0;
         s_perfRpSelAcc                        = 0; s_perfRpSelMax                        = 0;
+        s_perfRpSelMissAcc                    = 0; s_perfRpSelMissMax                    = 0;
+        s_perfRpSelMissN                      = 0;
         s_perfRpProofAcc                      = 0; s_perfRpProofMax                      = 0;
         s_perfRpO2wAcc                        = 0; s_perfRpO2wMax                        = 0;
+        s_perfRpCommitAcc                     = 0; s_perfRpCommitMax                     = 0;
+        s_perfRpCommitN                       = 0;
+        s_perfXtCapAcc                        = 0; s_perfXtCapMax                        = 0;
+        s_perfXtCapN                          = 0;
         s_perfRpDraws                         = 0;
         s_perfRpKeySame                       = 0;
         s_perfRpScanIters                     = 0;
         s_perfRpWcReads                       = 0;
+        s_perfRpWcNs                          = 0;
+        s_perfRpWcNsHit                       = 0;
+        s_perfRpWcNsMiss                      = 0;
+        s_perfRpBatchHit                      = 0;
+        s_perfXsPreAcc                        = 0; s_perfXsPreMax                        = 0;
+        s_perfXsCb2FastAcc                    = 0; s_perfXsCb2FastMax                    = 0;
         s_perfXtSetupAcc                      = 0; s_perfXtSetupMax                      = 0;
         s_perfXtProjScan1Acc                  = 0; s_perfXtProjScan1Max                  = 0;
         s_perfXtProjScan1Fires                = 0;
