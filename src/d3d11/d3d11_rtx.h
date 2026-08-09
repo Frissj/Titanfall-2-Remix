@@ -512,6 +512,43 @@ namespace dxvk {
     // the replay record so the replay can re-read the same 48 bytes and
     // re-evaluate the cb3IsZero mode per draw. UINT32_MAX = not an rdef draw.
     uint32_t                             m_lastModelCbSlot = UINT32_MAX;
+    // NV-DXVK [Perf.Replay] v6.3 path-1/2/3 widening: the camera origin the
+    // t31 o2w site (path 1) actually added to its translation this draw, and
+    // WHERE it came from. Path 1 prefers the session-latched fanout origin
+    // (m_lastFanoutCamOrigin -- a member, so the replay reads the same live
+    // value the full path would) and falls back to cb2@+4, which IS cb2
+    // content and therefore has to be witness/carry proven like path 13's.
+    // Recording the source lets the replay reproduce the site's choice
+    // bit-exactly instead of guessing which branch ran.
+    //   m_lastO2wCamValid   -- the site's haveCam (false => no camO added)
+    //   m_lastO2wCamFromFanout -- true: fanout latch; false: cb2@m_lastO2wCamOff
+    // NV-DXVK [Perf.Replay] v6.4 genMiss fix: set when the wtvPath-3 view
+    // matrix was built from the cb2@16 VP-rotation branch (plus cb2@4
+    // camXYZ) -- the ONE path-3 rotation source that is pure cb2 content and
+    // therefore byte-provable. The fanout-VP branch and the
+    // !gotLiveRotation fallback both read mutable cross-draw state
+    // (m_lastGoodTransforms), so they can never carry and are excluded.
+    // v6.5: the shared path-3 camera derivation. Called by the full
+    // ExtractTransforms run AND by the replay refresh, so there is exactly
+    // one implementation of this math in the build.
+    bool resolvePath3CamOrigin(Vector3& camOut, uint32_t& slotOut,
+                               uint32_t& offOut, char& srcOut);
+    // requireLiveRot: replay callers pass true so the non-reproducible
+    // cached-rotation fallback returns false instead of composing from
+    // mutable cross-draw state. The site passes false (it needs the fallback).
+    bool derivePath3WorldToView(const Vector3& cam, Matrix4& outW2v,
+                                bool& outFromCb2, int& outSlotPicked,
+                                float& outSlotD2, bool requireLiveRot);
+    bool                                 m_lastWtvP3FromCb2 = false;
+    // Where path 3 got camXYZ this draw. 'R' (RDEF-resolved) and 'H'
+    // (hardcoded cb2@4) are cb2 reads and provable; 'F' (fanout cache) is
+    // mutable member state and is not. UINT32_MAX slot = not provable.
+    uint32_t                             m_lastWtvP3CamSlot = UINT32_MAX;
+    uint32_t                             m_lastWtvP3CamOff  = 0;
+    Vector3                              m_lastO2wCamOrigin{ 0.0f, 0.0f, 0.0f };
+    bool                                 m_lastO2wCamValid = false;
+    bool                                 m_lastO2wCamFromFanout = false;
+    uint32_t                             m_lastO2wCamOff = 0;
 
     // NV-DXVK: the canonical gameplay camera origin, populated by the
     // bone-fanout RDEF lookup at line ~593. Different VS permutations have

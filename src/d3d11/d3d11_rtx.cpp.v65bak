@@ -10099,9 +10099,8 @@ namespace dxvk {
   //    replayed population (settled votes, one-shot latches).
   //  - Sampled verify (rtx.replayExtractVerify): first 16 replays per VS and
   //    1-in-256 after run the FULL path and bit-compare; any mismatch
-  //    quarantines that (VS, key) ROUTE for the session -- v6.8; it used to
-  //    ban the whole VS. The verified draw always uses the full path's
-  //    result, so a wrong replay can never reach the screen.
+  //    quarantines the VS for the session. The verified draw always uses the
+  //    full path's result, so a wrong replay can never reach the screen.
   // ================================================================
   struct XtReplayRec {
     // NV-DXVK [Perf.Replay] 2026-08-08e KEY FIX (second capture, f=2700-4500):
@@ -10189,33 +10188,6 @@ namespace dxvk {
     uint32_t o2wPathId = 0;
     uint32_t wtvPathId = 0;
     bool     skipViewScan = false;
-    // v6.8 DIAGNOSTIC (route input, not yet keyed -- see the VERIFY-FAIL line).
-    // Whether the recorded run actually RAN the projection scan, or had it
-    // suppressed by the per-VS negative cache (skipExpensiveProjScan /
-    // sVsNoProjFrame, 64-frame TTL). This matters because the wtvPath-3 route
-    // is selected by `projSlot == UINT32_MAX`, and projSlot is forced to
-    // UINT32_MAX by that neg-cache BEFORE any scan runs -- so "no projection"
-    // can mean "we never looked". The replay commits and returns before the
-    // neg-cache maintenance at the function tail, so replay hits never refresh
-    // the stamp: the TTL runs down underneath the tier, and at expiry the next
-    // full-path draw (i.e. a verify sample) scans for the first time in 64
-    // frames, finds a projection, and takes wtvPath 1/5 where the record says
-    // 3. That is a deterministic divergence trigger, and unlike the inner gate
-    // it is NOT content-dependent: it is one hash lookup on the VS pointer the
-    // replay already holds. Capture it first, prove it on the VERIFY-FAIL
-    // line, and only then decide whether it belongs in the key.
-    bool     capScanRan = false;
-    // v6.9 ROUTE STATE. The per-VS location entry (VsCbLocations) as it stood
-    // when this record was captured. It decides which route the site takes and
-    // it is NOT cb content, so no byte witness can prove it:
-    //   - projSlot/viewSlot absent  -> projSlot stays UINT32_MAX -> wtvPath 3
-    //   - viewSlot present + valid  -> wtvPath 5 instead of wtvPath 1
-    //   - neg stamp inside its TTL  -> the scan is suppressed -> wtvPath 3
-    // A VS converges over its first draws (the write-back only ever ADDS a
-    // location), so records captured pre-convergence describe a route the VS
-    // no longer takes. That is both surviving verify failures.
-    uint32_t vsLocGen = 0;
-    bool     vsLocNeg = false;
     bool     foundRealProj = false;   // m_foundRealProjThisFrame contribution
     bool     wroteLastGood = false;   // the run wrote m_lastGoodTransforms
     bool     camOriginSet = false;    // m_lastDrawCamOriginSet
@@ -10279,9 +10251,6 @@ namespace dxvk {
     uint64_t genMiss = 0;      // identity matched, cb2 rewritten, carryover unavailable/failed
     uint64_t inelig = 0;       // record's routes outside the replayable population
     uint64_t quarantined = 0;  // VS disqualified by a verify failure
-    // v6.9: wtvPath-3 records refused because this draw's cb2 now classifies
-    // as a projection -- i.e. the full path would take wtvPath 1, not 3.
-    uint64_t routeMiss = 0;
     uint64_t verifyRuns = 0, verifyOk = 0, verifyFail = 0;
     uint64_t o2wReadFail = 0;  // cb3 unreadable on a replay attempt (fell back to full)
     uint64_t projByteMiss = 0; // no record matches this draw's proj source bytes
@@ -10318,10 +10287,6 @@ namespace dxvk {
     // refreshOk = converted; refreshFail = inputs unavailable this draw;
     // refreshSkip = record not a refresh candidate (wtv path or o2w path).
     uint64_t refreshOk = 0, refreshFail = 0, refreshSkip = 0;
-    // v6.6: where the path-1 o2w replay bails. Indices per the comment at the
-    // branch: 0 noIl 1 noFanoutCam 2 ilFacts 3 noSrv 4 noData 5 noIdx
-    // 6 oob 7 nonFinite 8 zeroRow.
-    uint64_t orfWhy[10] = {};
     // v6.3: path-1 records rejected because their camO came from cb2 rather
     // than the fanout latch (the subset the widening deliberately left out).
     uint64_t p1NoFanout = 0;
@@ -10407,67 +10372,7 @@ namespace dxvk {
     }
     return h;
   }
-  // [Perf.VsLocCache] Per-VS cache of proj + view cb-slot/offset locations.
-  // The m_projSlot/m_viewSlot members are SHARED across all VSes -- when TF2
-  // swaps shaders (constantly, ~25% of draws), the previous VS's cached offset
-  // is read as garbage by the validate path -> cls=0 -> a full 4-stage cbuffer
-  // rescan. Caching the discovered location per VS pointer restores the right
-  // offset BEFORE validate runs.
-  //
-  // v6.9, TWO CHANGES, both driven by the residual verify failures:
-  //  1. MERGED with the projection negative cache (formerly sVsNoProjFrame, a
-  //     second map keyed identically). One lookup instead of two on every
-  //     full-path draw.
-  //  2. HOISTED to class scope so the replay tier can consult it. This is the
-  //     state that actually decides the route: `projSlot == UINT32_MAX` at the
-  //     wtvPath-3 gate is reached either because the neg-cache suppressed the
-  //     scan (noProj within TTL) or because no location is cached, and wtvPath
-  //     5-vs-1 turns on whether viewSlot resolves. None of it is cb content,
-  //     so no amount of byte-witnessing can see it -- which is why records
-  //     captured in a VS's pre-convergence window replayed onto its settled
-  //     state and diverged.
-  //
-  // `gen` bumps whenever any route-deciding field changes, so a record proves
-  // the VS's location state is unchanged with ONE integer compare rather than
-  // seven. The TTL bit can't ride `gen` (it turns on elapsed frames, not on a
-  // write), so it is compared separately.
-  struct VsCbLocations {
-    uint32_t projSlot    = UINT32_MAX;
-    size_t   projOffset  = SIZE_MAX;
-    int      projStage   = -1;
-    bool     columnMajor = false;
-    uint32_t viewSlot    = UINT32_MAX;
-    size_t   viewOffset  = SIZE_MAX;
-    int      viewStage   = -1;
-    // An entry can now exist carrying ONLY a negative stamp, so "has a real
-    // location" needs its own flag rather than being implied by presence.
-    bool     haveLoc     = false;
-    uint32_t noProjFrame = 0;
-    bool     noProjValid = false;
-    uint32_t gen         = 0;
-  };
-  static constexpr uint32_t kVsNegProjTtlFrames = 64;
-  static thread_local std::unordered_map<uintptr_t, VsCbLocations> sVsCbLocCache;
-  // True when this VS is a confirmed projection-less shader still inside its
-  // TTL -- the exact predicate the site computes at the top of the projection
-  // block, factored out so the replay tier evaluates it identically.
-  static inline bool vsNegProjActive(const VsCbLocations* e, uint32_t frameId) {
-    return e != nullptr && e->noProjValid
-        && (frameId - e->noProjFrame) < kVsNegProjTtlFrames;
-  }
-
   static thread_local std::unordered_map<const void*, XtReplayRecSet> s_xtReplayMap;
-  // NV-DXVK [Perf.Replay] QUARANTINE GRANULARITY -- per VS, and it stays that
-  // way. v6.8 tried per (VS, key) on the theory that a failure convicts one
-  // route rather than the whole shader. MEASURED AND REVERTED: quarantined
-  // draws went 81 -> 189 per frame, banned units 3-4 -> 15, records 1716 ->
-  // 3620 (sets stop being purged, and record count is what makes the linear
-  // scans expensive), and VS_ef94e6c7 alone failed on ELEVEN distinct keys in
-  // one session. The failing population is not one bad route per shader, so
-  // the narrower ban just discovers the same badness incrementally while the
-  // sets grow. The real defect is the wtvPath-3 route discriminator not being
-  // re-tested on replay -- fixed at the projOk/routeOk gate in the replay
-  // attempt -- and with that closed the granularity is moot.
   static thread_local std::unordered_set<const void*> s_xtReplayQuarantine;
   static thread_local uint64_t s_xtReplayEpoch = 0;
   static thread_local XtReplayStats s_xtReplayStats;
@@ -14218,33 +14123,6 @@ namespace dxvk {
     m_lastWtvPathId = 0;
     m_lastO2wPathId = 0;
     m_lastModelCbSlot = UINT32_MAX;  // [Perf.Replay] path-5/6 widening
-
-    // [Perf.VsLocCache] v6.9: resolve the per-VS location entry ONCE, here,
-    // above the replay block. Two consumers need it and they must agree:
-    //  - the replay tier, to prove the route state a record was captured
-    //    under still holds (below);
-    //  - the projection/view site further down, which restores m_projSlot /
-    //    m_viewSlot from it and derives skipExpensiveProjScan.
-    // Resolving it once also collapses what used to be two hash lookups per
-    // full-path draw (locations + neg-cache, separate maps, identical key)
-    // into one.
-    uintptr_t vsLocKey = 0;
-    {
-      auto vsPtrL = m_context->m_state.vs.shader;
-      if (vsPtrL != nullptr && vsPtrL->GetCommonShader() != nullptr) {
-        vsLocKey = reinterpret_cast<uintptr_t>(vsPtrL->GetCommonShader());
-      }
-    }
-    VsCbLocations* xtVsLoc = nullptr;
-    if (vsLocKey != 0) {
-      auto itVl = sVsCbLocCache.find(vsLocKey);
-      if (itVl != sVsCbLocCache.end()) xtVsLoc = &itVl->second;
-    }
-    // gen == 0 means "no entry" -- the first write bumps 0 -> 1, so absence
-    // and presence can never compare equal.
-    const uint32_t xtVsLocGen = (xtVsLoc != nullptr) ? xtVsLoc->gen : 0u;
-    const bool     xtVsLocNeg =
-      vsNegProjActive(xtVsLoc, m_context->m_device->getCurrentFrameId());
     // [Perf.Replay] v6.3 path-1 widening: cleared per draw so a record can
     // never inherit the previous draw's camO provenance.
     m_lastO2wCamValid = false;
@@ -14298,13 +14176,7 @@ namespace dxvk {
             " projSel=", s_xtReplayStats.projSel,
             " mapSize=", (uint32_t) s_xtReplayMap.size(),
             " recs=", (uint32_t) s_xtReplayRecTotal,
-            " quarSize=", (uint32_t) s_xtReplayQuarantine.size(),
-            // v6.9: draws refused because THIS draw's cb2 now classifies as a
-            // projection while the record's route was chosen on "none found".
-            // This is the wtvPath 1-vs-3 divergence being caught at the gate
-            // instead of at verify. Expect verifyFail -> 0 and routeMiss > 0;
-            // routeMiss draws take the full path and re-record.
-            " routeMiss=", s_xtReplayStats.routeMiss));
+            " quarSize=", (uint32_t) s_xtReplayQuarantine.size()));
           Logger::warn(str::format(
             "[Perf.Replay.why] f=", xtFrame,
             " keyMiss{il=", s_xtReplayStats.kmIl,
@@ -14346,21 +14218,6 @@ namespace dxvk {
             " refresh{ok=", s_xtReplayStats.refreshOk,
             " fail=", s_xtReplayStats.refreshFail,
             " skip=", s_xtReplayStats.refreshSkip, "}"));
-          {
-            static const char* const kOrf[10] = {
-              "noIl", "noFanoutCam", "ilFacts", "noSrv", "noData",
-              "noIdx", "oob", "nonFinite", "zeroRow", "spare" };
-            std::string ov = "[Perf.Replay.orf] f=" + std::to_string(xtFrame)
-                           + " o2wReadFail=" + std::to_string(s_xtReplayStats.o2wReadFail)
-                           + " why{";
-            for (uint32_t i = 0; i < 10u; ++i) {
-              if (s_xtReplayStats.orfWhy[i] == 0) continue;
-              ov += std::string(kOrf[i]) + "="
-                  + std::to_string((int64_t) s_xtReplayStats.orfWhy[i]) + " ";
-            }
-            ov += "}";
-            Logger::warn(ov);
-          }
           {
             std::string wv = "[Perf.Replay.gmwtv] f=" + std::to_string(xtFrame) + " wtv{";
             for (uint32_t i = 0; i < 16u; ++i) {
@@ -14425,15 +14282,6 @@ namespace dxvk {
           xtCtl.lastGoodN0 = s_xtLastGoodWriteN;
           xtCtl.captureRecord = true;
 
-          // Quarantine test BEFORE the key build. It used to sit at the bottom
-          // of the selection chain, so a quarantined VS paid the full 8-round
-          // key (GetContentGeneration, two RDEF slot resolves, viewport read)
-          // and the map lookup before being thrown away. The outcome is
-          // identical either way -- full path, no capture -- so this is pure
-          // cost removal on a population the 08-09 capture measured at 81
-          // draws/frame.
-          const bool quarRp = s_xtReplayQuarantine.count(commonRp) != 0;
-
           // --- the replay key, v3: ROUTE-DETERMINING identity only. History
           // of what got removed and why (each proven by a capture):
           //   v1 keyed every CB's content generation -- materialsystem
@@ -14490,18 +14338,6 @@ namespace dxvk {
                 && srvsRp[miSlotK].ptr() != nullptr) routeBitsRp |= 4ull;
             if (bmSlotK < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT
                 && srvsRp[bmSlotK].ptr() != nullptr) routeBitsRp |= 8ull;
-            // v6.7: RT0 PRESENCE. The camera-reconstruction block is gated on
-            // `isUintPosLayout || hasColorRt`, and hasColorRt is
-            // om.renderTargetViews[0] != nullptr -- the bound render target,
-            // which was nowhere in the key. So the same VS+IL takes wtv path 3
-            // with skipViewScan=1 when a colour RT is bound and wtv path 1
-            // with skipViewScan=0 when it is not, and records crossed freely
-            // between the two. That is every remaining skipVS=(1/0) /
-            // wtvPath=1/3 verify failure. It is a route-determining input, so
-            // it belongs in the key exactly like the SRV route bits above.
-            if (m_context->m_state.om.renderTargetViews[0] != nullptr) {
-              routeBitsRp |= 16ull;
-            }
             key = xtMix(key, routeBitsRp);
           }
           if (m_context->m_state.rs.numViewports > 0) {
@@ -14535,7 +14371,7 @@ namespace dxvk {
           XtReplayRec* rec = nullptr;
           XtReplayRec* mruAll = nullptr;  // keyMiss attribution fallback
           bool projPreOk = false;  // proj (+ p13 camOrigin) proven at selection
-          if (!quarRp && setRp != nullptr && !setRp->recs.empty()) {
+          if (setRp != nullptr && !setRp->recs.empty()) {
             auto witOk = [&](const XtReplayRec& r) {
               return r.cb2Buf == xtCtl.cb2Buf && r.cb2Off == xtCtl.cb2Off
                   && r.cb2gen == xtCtl.cb2gen && r.cb2Buf != nullptr;
@@ -14660,11 +14496,9 @@ namespace dxvk {
             }
           }
 
-          if (quarRp) {
+          if (s_xtReplayQuarantine.count(commonRp) != 0) {
             ++s_xtReplayStats.quarantined;
-            // A banned ROUTE never re-records. Other keys on the same VS are
-            // untouched and keep capturing/replaying normally.
-            xtCtl.captureRecord = false;
+            xtCtl.captureRecord = false;   // quarantined VSes never re-record
           } else if (setRp == nullptr || setRp->recs.empty()) {
             // first sighting -- full path runs, record captured at the tail
           } else if (rec == nullptr) {
@@ -14837,44 +14671,19 @@ namespace dxvk {
                 && rec->wtvPathId == 3u
                 && (rec->o2wPathId == 1u || rec->o2wPathId == 2u
                  || rec->o2wPathId == 3u || rec->o2wPathId == 4u)) {
-              // FIX: wtvPath 3 has TWO producers. The CamCache hit at ~17268
-              // assigns m_camFallbackCache.worldToView -- a matrix stored by
-              // whichever draw reconstructed it earlier THIS frame -- and also
-              // stamps wtvPathId=3. Recomputing unconditionally therefore
-              // disagreed with the full path whenever the cache would hit,
-              // which is the mats=0 / wtvPath=3/3 verify failure. Reproduce
-              // the site's branch: cache first, derive only on a miss.
-              auto* cb2BufRf = m_context->m_state.vs.constantBuffers[2].buffer.ptr();
-              const uint64_t cb2GenRf =
-                cb2BufRf ? cb2BufRf->GetContentGeneration() : UINT64_MAX;
-              const uint32_t cb2OffRf =
-                m_context->m_state.vs.constantBuffers[2].constantOffset;
-              const uint32_t camFrameRf = m_context->m_device->getCurrentFrameId();
-              const bool camHitRf = m_camFallbackCache.valid
-                  && cb2BufRf != nullptr
-                  && m_camFallbackCache.cb2Buffer == cb2BufRf
-                  && m_camFallbackCache.cb2Gen    == cb2GenRf
-                  && m_camFallbackCache.cb2Offset == cb2OffRf
-                  && m_camFallbackCache.frameId   == camFrameRf;
-              if (camHitRf) {
-                refreshW2v = m_camFallbackCache.worldToView;
+              Vector3 camRf;
+              uint32_t csRf = UINT32_MAX, coRf = 0;
+              char srcRf = '-';
+              bool fromCb2Rf = false;
+              int slotRf = -1;
+              float slotD2Rf = 0.0f;
+              if (resolvePath3CamOrigin(camRf, csRf, coRf, srcRf)
+                  && derivePath3WorldToView(camRf, refreshW2v, fromCb2Rf, slotRf,
+                                            slotD2Rf, /*requireLiveRot=*/true)) {
                 refreshed = true;
                 ++s_xtReplayStats.refreshOk;
               } else {
-                Vector3 camRf;
-                uint32_t csRf = UINT32_MAX, coRf = 0;
-                char srcRf = '-';
-                bool fromCb2Rf = false;
-                int slotRf = -1;
-                float slotD2Rf = 0.0f;
-                if (resolvePath3CamOrigin(camRf, csRf, coRf, srcRf)
-                    && derivePath3WorldToView(camRf, refreshW2v, fromCb2Rf, slotRf,
-                                              slotD2Rf, /*requireLiveRot=*/true)) {
-                  refreshed = true;
-                  ++s_xtReplayStats.refreshOk;
-                } else {
-                  ++s_xtReplayStats.refreshFail;
-                }
+                ++s_xtReplayStats.refreshFail;
               }
             } else if (!genOk && !carried) {
               ++s_xtReplayStats.refreshSkip;
@@ -14937,82 +14746,7 @@ namespace dxvk {
                 ++s_xtReplayStats.projByteMiss;
               }
             }
-            // v6.9 ROUTE PROOF, part 1 of 2: STATE.
-            // Two integer compares against the per-VS location entry resolved
-            // once at the top of this call. This closes the residuals the cb2
-            // content test below cannot see, because they turn on no cb bytes
-            // at all:
-            //   VS_b23bbad1  wtvPath 1/3, scanRanFull=1 scanRanRec=0 -- the neg
-            //     stamp expired, so projSlot came from the cached LOCATION
-            //     instead of being forced to UINT32_MAX, and the cb2 fast-path
-            //     never ran.
-            //   VS_3d628ad0  wtvPath 5/1 -- viewSlot resolved on the live draw
-            //     and had not when the record was captured.
-            // Same defect both times: a record outliving the per-VS state that
-            // chose its route. A VS converges over its first draws (the
-            // write-back only ever ADDS a location), so pre-convergence records
-            // describe a route the VS no longer takes. Comparing the state is
-            // cheaper than modelling any of the branches it feeds.
-            bool routeOk = (rec->vsLocGen == xtVsLocGen)
-                        && (rec->vsLocNeg == xtVsLocNeg);
-            if (!routeOk) {
-              ++s_xtReplayStats.routeMiss;
-            }
-
-            // v6.9 ROUTE PROOF, part 2 of 2: CONTENT -- the fix for the
-            // residual verify failures the 08-09 handoff recommended leaving
-            // alone. Complementary to part 1: the state can be unchanged while
-            // cb2's contents flip the same decision.
-            //
-            // 15 of 16 failures in the 03:54 capture are one signature:
-            //   wtvPathFull=1  wtvPathReplay=3  skipVSfull=0 skipVSreplay=1
-            // The record says "no projection resolved, use the cached camera";
-            // the full run says "projection resolved, decompose it". The
-            // handoff called that per-draw content-dependent and unkeyable.
-            // It is content-dependent -- and that is exactly why it must be
-            // RE-TESTED rather than keyed. What picks between the two is the
-            // site's cb2 fast-path (~:15790): classifyPerspective on cb2@16,
-            // then cb2@96. classifyPerspective is a PURE function of those 16
-            // floats (verified: no member reads, no cross-draw state), so
-            // running it here answers "would this draw resolve a projection?"
-            // exactly, for the price of one already-staged read.
-            //
-            // Why the existing witness cannot cover this: a wtvPath-3 record's
-            // projSrc is captured at m_projSlot/m_projOffset, which on such a
-            // draw is a location the route never read (the draw resolved no
-            // projection of its own). So the 64-byte projSrc memcmp proves
-            // nothing about the bytes that DECIDE the route -- the same defect
-            // class as the v6.6 viewToProjection fix, one level up: that one
-            // was the wrong VALUE, this one is the wrong ROUTE.
-            //
-            // Mirrors the site exactly, including its raw-pointer offsets (the
-            // fast path does not apply constantOffset; the later SE2
-            // last-resort at ~:17100 does). Deliberate -- a "corrected" offset
-            // here would test different bytes than the branch it models.
-            if (projOk && routeOk && rec->wtvPathId == 3u) {
-              const auto& cb2Rt = cbsRp[2];
-              if (cb2Rt.buffer != nullptr) {
-                size_t lenRt = 0;
-                const uint8_t* pRt = stagedCbBytes(cb2Rt.buffer.ptr(), lenRt);
-                size_t sizeRt = lenRt;
-                if (pRt == nullptr) {
-                  pRt = reinterpret_cast<const uint8_t*>(
-                          cb2Rt.buffer->GetMappedSlice().mapPtr);
-                  sizeRt = cb2Rt.buffer->Desc()->ByteWidth;
-                }
-                if (pRt != nullptr && sizeRt >= 160) {
-                  if (classifyPerspective(readCbMatrix(pRt, 16, sizeRt), true) > 0
-                   || classifyPerspective(readCbMatrix(pRt, 96, sizeRt), true) > 0) {
-                    // This draw WOULD resolve its own projection and take
-                    // wtvPath 1. Refuse the replay; the full path runs and the
-                    // tail re-records under the route that actually fires.
-                    routeOk = false;
-                    ++s_xtReplayStats.routeMiss;
-                  }
-                }
-              }
-            }
-            if (projOk && routeOk) {
+            if (projOk) {
             DrawCallTransforms rt = rec->t;
             // v6.5: on a refresh the snapshot's worldToView is the ONE stale
             // field -- viewToProjection is byte-verified separately above,
@@ -15021,20 +14755,6 @@ namespace dxvk {
             // which consumes it (path 4 inverts it; all paths build o2v).
             if (refreshed) {
               rt.worldToView = refreshW2v;
-            }
-            // v6.6 FIX, named by the split verify compare: 23 of 25 failures
-            // were o2w=1 o2v=1 w2v=1 v2p=0 -- every matrix correct EXCEPT
-            // viewToProjection. For wtvPath-3 draws the site does not derive
-            // it from the projection source at all; both branches (CamCache
-            // hit ~17296 and reconstruction ~17301) assign
-            // m_lastGoodTransforms.viewToProjection, which is mutable
-            // cross-draw state. So the record's 64-byte projSrc memcmp -- the
-            // thing the whole proj-witness tier is built on -- proves nothing
-            // about it, and a snapshot taken under one cached FOV replays
-            // against a later, different one. Read the live member, exactly
-            // as the site does.
-            if (rec->wtvPathId == 3u) {
-              rt.viewToProjection = m_lastGoodTransforms.viewToProjection;
             }
             bool o2wOk = true;
             // v6 path-5/6 widening: the REPLAYED path id -- for the rdef
@@ -15166,17 +14886,7 @@ namespace dxvk {
                   rt.objectToView = rt.worldToView * rt.objectToWorld;
                 }
                 rt.sanitize();
-                // v6.7: was `carried && o2wPathId == 13`. The sub-view flags
-                // are NOT pure functions of the record: g_engineSkyCamOrigin
-                // moves, and g_subViewSkyboxByVs is populated asynchronously
-                // by the vertex-scan loop, so a record captured before its VS
-                // was classified replays isSubViewSkybox=false while the full
-                // run now reads true. That is the VS_eda5efc1 failure -- all
-                // four matrices byte-identical, svSky the only mismatch, and
-                // it predates this work. Re-derive on EVERY path-13 replay,
-                // not just the cross-frame ones; for genOk hits the inputs are
-                // unchanged so it returns the same answer at negligible cost.
-                if (rec->o2wPathId == 13) {
+                if (carried && rec->o2wPathId == 13) {
                   // Crossing a frame boundary: the snapshot's isSubView /
                   // isSubViewSkybox were derived against THAT frame's
                   // g_engineSkyCamOrigin. camO is proven byte-identical, but
@@ -15221,29 +14931,13 @@ namespace dxvk {
               // a keyMiss. Skipped work = the projection/view scans and the
               // classifier votes that surround this read in the full path.
               o2wOk = false;
-              // v6.6 attribution: o2wReadFail is ~452/frame and tracks the
-              // refresh count, so refreshed draws are reaching this read and
-              // bailing -- but the counter is a single number and cannot say
-              // WHICH precondition failed. orfWhy indexes the bail points:
-              //   0 no IL   1 no fanout camO   2 IL facts (semantic/blendidx)
-              //   3 no model-inst SRV   4 no mapped t31 data   5 no instance
-              //   index   6 entry out of range   7 non-finite   8 zero row
-              ++s_xtReplayStats.orfWhy[0];   // provisional; cleared on progress
               auto* ilRp = m_context->m_state.ia.inputLayout.ptr();
-              if (ilRp == nullptr) { /* orfWhy[0] stands */ }
-              else if (!m_hasFanoutCamOrigin) {
-                --s_xtReplayStats.orfWhy[0]; ++s_xtReplayStats.orfWhy[1];
-              }
               if (ilRp != nullptr && m_hasFanoutCamOrigin) {
-                --s_xtReplayStats.orfWhy[0];
-                ++s_xtReplayStats.orfWhy[2];
                 const IlFacts& ilfRp = memoIlFacts(ilRp->GetRtxSemantics());
                 // Re-checked, not assumed: the site routes skinned characters
                 // (BLENDINDICES present) away from t31 entirely.
                 if (ilfRp.hasInstIdxSem && !ilfRp.hasBlendIndices
                     && ilfRp.instSemSlot < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) {
-                  --s_xtReplayStats.orfWhy[2];
-                  ++s_xtReplayStats.orfWhy[3];
                   // FIX: the site does NOT read slot 31 -- it resolves the
                   // g_modelInst bind slot from RDEF (memoModelInstSlot) and
                   // only enters the t31 route when rdefFound OR the
@@ -15302,24 +14996,7 @@ namespace dxvk {
                   constexpr uint32_t kBytesPerInstanceRp = 208u;
                   const size_t t31OffRp =
                     static_cast<size_t>(charIdxRp) * kBytesPerInstanceRp;
-                  // Narrow the attribution from "no SRV" to the real stopper.
-                  if (t31Data != nullptr) {
-                    --s_xtReplayStats.orfWhy[3];
-                    ++s_xtReplayStats.orfWhy[6];
-                  } else if (miRp != nullptr) {
-                    --s_xtReplayStats.orfWhy[3];
-                    ++s_xtReplayStats.orfWhy[4];
-                  }
-                  if (!haveIdxRp) ++s_xtReplayStats.orfWhy[5];  // now diagnostic only
-                  // FIX: the site does NOT require the per-instance index read
-                  // to succeed -- charIdx is initialised to 0 and the t31 read
-                  // proceeds against entry 0 regardless (see charIdxReason,
-                  // which is a REASON STRING, not a gate). Requiring haveIdxRp
-                  // here made the replay bail where the site produces a
-                  // transform, which is 100% of o2wReadFail (why{noIdx}).
-                  // charIdxRp is already 0-initialised, so dropping the
-                  // requirement reproduces the site exactly.
-                  if (t31Data != nullptr && t31OffRp + 48 <= t31Len) {
+                  if (haveIdxRp && t31Data != nullptr && t31OffRp + 48 <= t31Len) {
                     alignas(16) float e31Rp[12];
                     memcpyFromWC(e31Rp, t31Data + t31OffRp, 48);
                     const float* m = e31Rp;
@@ -15331,16 +15008,10 @@ namespace dxvk {
                     const bool r0nzRp = m[0] != 0.f || m[1] != 0.f || m[2]  != 0.f;
                     const bool r1nzRp = m[4] != 0.f || m[5] != 0.f || m[6]  != 0.f;
                     const bool r2nzRp = m[8] != 0.f || m[9] != 0.f || m[10] != 0.f;
-                    if (!finRp) {
-                      --s_xtReplayStats.orfWhy[6]; ++s_xtReplayStats.orfWhy[7];
-                    } else if (!(r0nzRp && r1nzRp && r2nzRp)) {
-                      --s_xtReplayStats.orfWhy[6]; ++s_xtReplayStats.orfWhy[8];
-                    }
                     if (finRp && r0nzRp && r1nzRp && r2nzRp) {
                       // Eligibility admitted only fanout-latch camO, and the
                       // latch is live above -- the same member, same value the
                       // site would read on this draw.
-                      --s_xtReplayStats.orfWhy[6];   // success: no bail
                       rt.objectToWorld = Matrix4(
                         Vector4(m[0], m[4], m[8],  0.0f),
                         Vector4(m[1], m[5], m[9],  0.0f),
@@ -15482,15 +15153,7 @@ namespace dxvk {
               }
             }
             // (o2wPathId == 0: identity route -- the snapshot already holds
-            //  identity o2w and the matching o2v; nothing per-draw to read.
-            //  A v6.6 guard here re-tested the route-claim gates on the theory
-            //  that identity records were being replayed over draws that did
-            //  have a transform. identClaimed measured 0 in every window: the
-            //  theory was backwards -- the records carried a ROUTE and the
-            //  full run produced identity -- and the real cause was RT0
-            //  presence missing from the key, fixed there. Guard removed; it
-            //  cost an unmemoized FindCBuffer string lookup per path-0 replay
-            //  and never rejected anything.)
+            //  identity o2w and the matching o2v; nothing per-draw to read.)
 
             if (o2wOk) {
               // NV-DXVK [Perf.Replay] SAMPLING FIX (second capture): the
@@ -15581,7 +15244,7 @@ namespace dxvk {
                 return rt;
               }
             }
-            }  // end if (projOk && routeOk)
+            }  // end if (projOk)
             }  // end genOk/carried else (replay attempt)
           }
         }
@@ -15863,28 +15526,64 @@ namespace dxvk {
       return found;
     };
 
-    // [Perf.VsLocCache] v6.9: the struct, the map and the neg-cache TTL now
-    // live at class scope (see VsCbLocations) so the replay tier can evaluate
-    // the same per-VS state before it decides to skip this site. The lookup
-    // itself also moved above the replay block -- `xtVsLoc` is the result,
-    // resolved once per draw and shared by both consumers, so a full-path draw
-    // now does ONE hash lookup where it used to do two (locations + neg-cache
-    // were separate maps keyed by the same pointer).
-    if (xtVsLoc != nullptr && xtVsLoc->haveLoc) {
-      ++s_perfXtVsLocCacheHits;
-      // Override member-var cache with this VS's known-correct location
-      // BEFORE the validate path reads them. Subsequent code reads
-      // m_projSlot/etc. and finds the matrix at the right offset on the
-      // first try â€” no rescan, no full scan.
-      m_projSlot   = xtVsLoc->projSlot;
-      m_projOffset = xtVsLoc->projOffset;
-      m_projStage  = xtVsLoc->projStage;
-      m_columnMajor = xtVsLoc->columnMajor;
-      m_viewSlot   = xtVsLoc->viewSlot;
-      m_viewOffset = xtVsLoc->viewOffset;
-      m_viewStage  = xtVsLoc->viewStage;
-    } else if (vsLocKey != 0) {
-      ++s_perfXtVsLocCacheMisses;
+    // [Perf.VsLocCache] Per-VS cache of proj + view cb-slot/offset locations.
+    // The existing m_projSlot/m_viewSlot are SHARED across all VSes â€” when
+    // TF2 swaps shaders (constantly, ~25% of draws), the previous VS's
+    // cached offset is read as garbage by the validate path â†’ cls=0 â†’
+    // pv_rescan (~67ms/frame) or xt_projScan1 (~66ms/frame), both full
+    // 4-stage cbuffer scans. By caching the discovered location *per VS
+    // pointer* we restore the right offset BEFORE validate runs, so it
+    // hits a known-good offset on the first read. Self-heals: if validate
+    // still fails (e.g. shader recompiled at same address), the existing
+    // rescan path recovers and the post-extract write below updates the
+    // cache.
+    struct VsCbLocations {
+      uint32_t projSlot;
+      size_t   projOffset;
+      int      projStage;
+      bool     columnMajor;
+      uint32_t viewSlot;
+      size_t   viewOffset;
+      int      viewStage;
+    };
+    static thread_local std::unordered_map<uintptr_t, VsCbLocations> sVsCbLocCache;
+    // NV-DXVK [proj/view negative cache]: VSes whose projection scan repeatedly
+    // comes up empty (UI/sprite/ortho shaders) were costing ~350ms/frame in the
+    // rescan + path-10 view fallback ([Perf.SubmitDraw.acc] pvr_rescanBlk +
+    // w2v_scan, both with pv_rescanN=0 = found nothing). Remember the frame each
+    // VS was last CONFIRMED projection-less (a full scan ran and found nothing)
+    // and skip the two expensive full-cbuffer scans for it. Self-heals two ways:
+    // the cheap cb2 fast-path below still runs every draw (catches a projection
+    // that appears in cb2), and an entry is only trusted for kVsNegProjTtlFrames
+    // frames before a full re-scan is forced. Keyed by GetCommonShader() ptr,
+    // same as sVsCbLocCache.
+    static constexpr uint32_t kVsNegProjTtlFrames = 64;
+    static thread_local std::unordered_map<uintptr_t, uint32_t> sVsNoProjFrame;
+    uintptr_t vsLocKey = 0;
+    {
+      auto vsPtrL = m_context->m_state.vs.shader;
+      if (vsPtrL != nullptr && vsPtrL->GetCommonShader() != nullptr) {
+        vsLocKey = reinterpret_cast<uintptr_t>(vsPtrL->GetCommonShader());
+      }
+    }
+    if (vsLocKey != 0) {
+      auto it = sVsCbLocCache.find(vsLocKey);
+      if (it != sVsCbLocCache.end()) {
+        ++s_perfXtVsLocCacheHits;
+        // Override member-var cache with this VS's known-correct location
+        // BEFORE the validate path reads them. Subsequent code reads
+        // m_projSlot/etc. and finds the matrix at the right offset on the
+        // first try â€” no rescan, no full scan.
+        m_projSlot   = it->second.projSlot;
+        m_projOffset = it->second.projOffset;
+        m_projStage  = it->second.projStage;
+        m_columnMajor = it->second.columnMajor;
+        m_viewSlot   = it->second.viewSlot;
+        m_viewOffset = it->second.viewOffset;
+        m_viewStage  = it->second.viewStage;
+      } else {
+        ++s_perfXtVsLocCacheMisses;
+      }
     }
 
     // NV-DXVK [neg-cache]: is this VS a confirmed projection-less shader still
@@ -15892,11 +15591,14 @@ namespace dxvk {
     // expensive full scans (first-draw scan + rescan + path-10 view). The cheap
     // cb2 fast-path below still runs (projSlot is forced to UINT32_MAX), so a VS
     // that gains a cb2 projection self-heals on the very next draw.
-    // v6.9: same predicate, now read out of the merged per-VS entry via the
-    // shared helper -- the replay tier calls vsNegProjActive() on the same
-    // entry so the two can never disagree.
-    const bool skipExpensiveProjScan =
-      vsNegProjActive(xtVsLoc, m_context->m_device->getCurrentFrameId());
+    bool skipExpensiveProjScan = false;
+    if (vsLocKey != 0) {
+      auto nit = sVsNoProjFrame.find(vsLocKey);
+      if (nit != sVsNoProjFrame.end()
+          && (m_context->m_device->getCurrentFrameId() - nit->second) < kVsNegProjTtlFrames) {
+        skipExpensiveProjScan = true;
+      }
+    }
 
     uint32_t projSlot   = skipExpensiveProjScan ? UINT32_MAX : m_projSlot;
     size_t   projOffset = m_projOffset;
@@ -17580,10 +17282,18 @@ namespace dxvk {
                 " cam=(", camX, ",", camY, ",", camZ, ")"));
             }
           }
-          // The camera basis and its slot pick are resolved inside
-          // derivePath3WorldToView() below; the rows it prefers are the cached
-          // fanout VP rows (per-slot pick by nearest origin), falling back to
-          // per-draw cb2@16 only before fanout has published.
+          // Read VP rotation. Prefer the cached fanout VP rows (captured at
+          // the same moment as m_lastFanoutCamOrigin) so every path-3 draw
+          // gets the SAME gameplay pose regardless of which VS's cb2 is
+          // bound for this specific draw. Only fall back to per-draw cb2@96
+          // when fanout hasn't published yet (very early boot frames).
+          Vector3 right(0, -1, 0), up(0, 0, 1), fwd(1, 0, 0);  // defaults
+          bool gotLiveRotation = false;
+          bool usedFanoutVp = false;
+          // NV-DXVK [slot pick]: prefer a secondary slot whose origin matches
+          // this draw's cb2 camera position (camX/camY/camZ above were read
+          // from the current draw's own cb2.c_cameraOrigin). On miss, fall
+          // back to the cached single m_lastFanoutVpRow* â€” same as baseline.
           // v6.5: slot pick + rotation + compose now live in
           // derivePath3WorldToView(), so the replay refresh runs THIS code
           // instead of a copy of it. requireLiveRot=false keeps the site's
@@ -17623,27 +17333,109 @@ namespace dxvk {
                 " hadFanout=", (m_hasFanoutVpRows ? 1 : 0)));
             }
           }
-          // v6.5: rotation + compose now live in derivePath3WorldToView(),
-          // called above -- the replay refresh runs that same function, so
-          // there is exactly one copy of this math in the build. The ViewRot
-          // diagnostic reads the basis back out of the resulting matrix,
-          // which is stored BY COLUMNS (see the path-1 fix).
-          if (m_rawDrawCount < 15) {
-            static uint32_t sRotLogCount = 0;
-            if (sRotLogCount < 200) {
-              ++sRotLogCount;
-              Logger::info(str::format(
-                "[D3D11Rtx] ViewRot: live=", gotW2vP3 ? 1 : 0,
-                " R=(", w2vP3[0][0], ",", w2vP3[1][0], ",", w2vP3[2][0], ")",
-                " U=(", w2vP3[0][1], ",", w2vP3[1][1], ",", w2vP3[2][1], ")",
-                " F=(", w2vP3[0][2], ",", w2vP3[1][2], ",", w2vP3[2][2], ")",
-                " cam=(", camX, ",", camY, ",", camZ, ")",
-                " raw=", m_rawDrawCount));
+          // (rotation resolution + compose now inside derivePath3WorldToView)
+          if (false) {
+            size_t camLen2 = 0;
+            const uint8_t* camPtr = nullptr;
+            // DIAGNOSED FROM SHADER DECOMPILE (VS_d69c3951f050e757):
+            // CBufCommonPerCamera.c_cameraRelativeToClip is at byte offset
+            // 16 (current frame). The previous code read offset 96 which
+            // is c_cameraRelativeToClipPrevFrame, marked [unused] in every
+            // TF2 VS â€” the game never writes it, so its contents are zeros
+            // or stale. That produced garbage right/up/fwd extraction.
+            //
+            // M = P * V_rot (column convention; shader does `clip = M*v`):
+            //   row 0: (Sx*Rx, Sx*Ry, Sx*Rz, 0)
+            //   row 1: (Sy*Ux, Sy*Uy, Sy*Uz, 0)
+            //   row 2: (Q*Fx,  Q*Fy,  Q*Fz,  -nearZ*Q)
+            // Each row's xyz is R/U/F scaled by a SINGLE scalar (Sx, Sy,
+            // Q). Normalizing xyz recovers the unit basis vectors.
+            if (camPtr && camLen2 >= 80) {
+              const float* vp = reinterpret_cast<const float*>(camPtr + 16);
+              Vector3 vpRight(vp[0], vp[1], vp[2]);
+              Vector3 vpUp   (vp[4], vp[5], vp[6]);
+              Vector3 vpFwd  (vp[8], vp[9], vp[10]);
+              float magR = length(vpRight), magU = length(vpUp), magF = length(vpFwd);
+              // Check if VP is valid (not identity â€” identity has mag â‰ˆ 1 for all rows
+              // and diagonal-dominant structure, while a real VP has different scales)
+              if (magR > 0.1f && magU > 0.1f && magF > 0.001f &&
+                  std::abs(magR - magU) > 0.01f) {  // real VP has different Sx vs Sy
+                fwd   = vpFwd   / magF;
+                // Source RH (X=fwd, Y=left, Z=up) â€” right = fwd Ã— worldUp.
+                const Vector3 worldUpP3cb(0.0f, 0.0f, 1.0f);
+                right = cross(fwd, worldUpP3cb);
+                float rightLenP3cb = length(right);
+                if (rightLenP3cb > 0.001f) right = right / rightLenP3cb;
+                else right = Vector3(0.0f, -1.0f, 0.0f);
+                up = cross(right, fwd);
+                float upLenP3cb = length(up);
+                if (upLenP3cb > 0.001f) up = up / upLenP3cb;
+                else up = worldUpP3cb;
+                gotLiveRotation = true;
+                // v6.4: THIS is the byte-provable rotation source -- cb2@16,
+                // read through the staged/mapped cb2 above. Combined with the
+                // cb2@4 camXYZ below it makes the whole path-3 worldToView a
+                // pure function of cb2[4..64), so the carry tier can prove it
+                // with one memcmp instead of the tier refusing every
+                // non-identity view matrix.
+                m_lastWtvP3FromCb2 = true;
+              }
             }
           }
-          if (gotW2vP3) {
-            m_lastWtvPathId = 3;
-            transforms.worldToView = w2vP3;
+          // Log rotation once per frame (not per draw) to track mouse look
+          static uint32_t sRotLogFrame = UINT32_MAX;
+          static uint32_t sRotLogCount = 0;
+          if (m_rawDrawCount < 15 && sRotLogCount < 200) {
+            // Only log on first draw of each frame
+            uint32_t frameApprox = sRotLogCount; // approximate
+            ++sRotLogCount;
+            Logger::info(str::format(
+              "[D3D11Rtx] ViewRot: live=", gotLiveRotation ? 1 : 0,
+              " R=(", right.x, ",", right.y, ",", right.z, ")",
+              " U=(", up.x, ",", up.y, ",", up.z, ")",
+              " F=(", fwd.x, ",", fwd.y, ",", fwd.z, ")",
+              " cam=(", camX, ",", camY, ",", camZ, ")",
+              " w2vT=(", transforms.worldToView[3][0], ",", transforms.worldToView[3][1], ",", transforms.worldToView[3][2], ")",
+              " raw=", m_rawDrawCount));
+          }
+          // Fallback: use cached rotation from VP decomposition
+          if (!gotLiveRotation) {
+            const Matrix4& cachedView = m_lastGoodTransforms.worldToView;
+            Vector3 cRight(cachedView[0][0], cachedView[0][1], cachedView[0][2]);
+            Vector3 cUp   (cachedView[1][0], cachedView[1][1], cachedView[1][2]);
+            Vector3 cFwd  (cachedView[2][0], cachedView[2][1], cachedView[2][2]);
+            if (length(cRight) > 0.5f && length(cFwd) > 0.5f) {
+              right = cRight; up = cUp; fwd = cFwd;
+            }
+          }
+          // cb3 = objectToCameraRelative = objectToWorld Ã— viewRotation.
+          // We need Remix's camera to know the rotation so rays track the
+          // camera direction. Set worldToView = liveRotation (from VP),
+          // then objectToWorld = inverse(liveRotation) Ã— cb3 to undo the
+          // double rotation. No translation in worldToView (cb3 has it).
+          //
+          // Use the live VP rotation from cb2@96 as worldToView.
+          // DON'T apply Y-flip â€” the VP rotation must match what cb3 was
+          // built with so inverse(rotation) Ã— cb3 cancels correctly.
+          // The axis swap is handled by the VP rotation itself (it maps
+          // Source axes to the projection's expected space).
+          // Validate rotation vectors are finite
+          bool rotValid = std::isfinite(right.x) && std::isfinite(right.y) && std::isfinite(right.z)
+                       && std::isfinite(up.x) && std::isfinite(up.y) && std::isfinite(up.z)
+                       && std::isfinite(fwd.x) && std::isfinite(fwd.y) && std::isfinite(fwd.z)
+                       && length(right) > 0.5f && length(fwd) > 0.5f;
+          if (rotValid) {
+            // Full view matrix with rotation AND camera translation
+            float tR = -(right.x*camX + right.y*camY + right.z*camZ);
+            float tU = -(up.x*camX    + up.y*camY    + up.z*camZ);
+            float tF = -(fwd.x*camX   + fwd.y*camY   + fwd.z*camZ);
+            m_lastWtvPathId = 3; // path 3: bone-fanout primary, raw VP rotation + cb2@4 cam
+            // NV-DXVK: store by columns â€” see path 1 fix.
+            transforms.worldToView = Matrix4(
+              Vector4(right.x, up.x, fwd.x, 0),
+              Vector4(right.y, up.y, fwd.y, 0),
+              Vector4(right.z, up.z, fwd.z, 0),
+              Vector4(tR,      tU,   tF,   1));
           }
           // (path 4 â€” bone-fanout fixed-axis-swap fallback â€” deleted: probe
           // confirmed never reached since Bug #1 fixes. If !rotValid now,
@@ -20335,23 +20127,6 @@ namespace dxvk {
       // Cap cache; level changes can flush ~hundreds of stale VS pointers.
       if (sVsCbLocCache.size() >= 4096) sVsCbLocCache.clear();
       VsCbLocations& e = sVsCbLocCache[vsLocKey];
-      // v6.9: bump `gen` only when a field that changes WHICH BRANCH RUNS
-      // changes -- slot/stage presence and identity, not offsets within a
-      // slot. TF2's cb2 fast-path legitimately alternates projOffset between
-      // 16 and 96 across passes while taking the same decompose branch both
-      // times; folding that into `gen` would invalidate every record of such a
-      // VS on alternating draws and collapse its hit rate. The offset's effect
-      // is on VALUES, and values are already covered -- projOk memcmps the 64
-      // proj bytes at the record's own projSrcOff against the live buffer, so
-      // a moved or rewritten projection fails there instead.
-      // Steady state is a no-op, which is what makes this one integer compare
-      // on the replay side rather than a re-derivation.
-      if (!e.haveLoc
-          || e.projSlot  != m_projSlot  || e.projStage  != m_projStage
-          || e.viewSlot  != m_viewSlot  || e.viewStage  != m_viewStage) {
-        ++e.gen;
-      }
-      e.haveLoc     = true;
       e.projSlot    = m_projSlot;
       e.projOffset  = m_projOffset;
       e.projStage   = m_projStage;
@@ -20369,23 +20144,11 @@ namespace dxvk {
     // the rescan + path-10 scan. When we already skipped the scan, leave the old
     // stamp untouched so the TTL expires and a full re-scan is eventually forced.
     if (vsLocKey != 0) {
-      // v6.9: the stamp now lives in the merged per-VS entry. Clearing or
-      // setting it flips vsNegProjActive(), which is a route input, so both
-      // transitions bump `gen` -- otherwise a record captured under one TTL
-      // state would keep matching after the state flipped, which is exactly
-      // the wtvPath 1-vs-3 divergence.
       if (projSlot != UINT32_MAX) {
-        auto itNp = sVsCbLocCache.find(vsLocKey);
-        if (itNp != sVsCbLocCache.end() && itNp->second.noProjValid) {
-          itNp->second.noProjValid = false;
-          ++itNp->second.gen;
-        }
+        sVsNoProjFrame.erase(vsLocKey);
       } else if (!skipExpensiveProjScan) {
-        if (sVsCbLocCache.size() >= 4096) sVsCbLocCache.clear();
-        VsCbLocations& eNp = sVsCbLocCache[vsLocKey];
-        if (!eNp.noProjValid) ++eNp.gen;
-        eNp.noProjValid = true;
-        eNp.noProjFrame = m_context->m_device->getCurrentFrameId();
+        if (sVsNoProjFrame.size() >= 4096) sVsNoProjFrame.clear();
+        sVsNoProjFrame[vsLocKey] = m_context->m_device->getCurrentFrameId();
       }
 
       // NV-DXVK [NoProj]: LAYER-1 root probe. When projSlot stays UINT32_MAX no
@@ -21030,10 +20793,6 @@ namespace dxvk {
           }
         } else {
           ++s_xtReplayStats.verifyFail;
-          // Read anything needed off the record BEFORE the erase below
-          // invalidates the pointer (pd.rec points into the set's vector).
-          const int recScanRan =
-            (pd.rec != nullptr) ? (pd.rec->capScanRan ? 1 : 0) : -1;
           s_xtReplayQuarantine.insert(xtCtl.vsKey);
           {
             auto itVf = s_xtReplayMap.find(xtCtl.vsKey);
@@ -21045,71 +20804,14 @@ namespace dxvk {
           }
           s_xtReplayLastVs = nullptr;
           s_xtReplayLastRec = nullptr;
-          // v6.6: `mats` was ONE bool over four matrices, so a failure could
-          // not say whether the replay got objectToWorld wrong (the t31/t30
-          // read) or worldToView wrong (the refresh). Both sides agreeing on
-          // the route while the numbers differ points at w2v, but that is an
-          // inference -- split the compare and print the translation rows so
-          // the next capture states it outright.
-          const bool o2wSame = std::memcmp(&pd.t.objectToWorld,
-            &transforms.objectToWorld, sizeof(Matrix4)) == 0;
-          const bool o2vSame = std::memcmp(&pd.t.objectToView,
-            &transforms.objectToView, sizeof(Matrix4)) == 0;
-          const bool w2vSame = std::memcmp(&pd.t.worldToView,
-            &transforms.worldToView, sizeof(Matrix4)) == 0;
-          const bool v2pSame = std::memcmp(&pd.t.viewToProjection,
-            &transforms.viewToProjection, sizeof(Matrix4)) == 0;
           Logger::warn(str::format(
             "[Perf.Replay] VERIFY-FAIL vs=", getVsHashShort(),
             " mats=", matsSame ? 1 : 0,
-            " o2w=", o2wSame ? 1 : 0,
-            " o2v=", o2vSame ? 1 : 0,
-            " w2v=", w2vSame ? 1 : 0,
-            " v2p=", v2pSame ? 1 : 0,
             " texEnc=", pd.t.texcoordEncoding == transforms.texcoordEncoding ? 1 : 0,
             " subView=", pd.t.isSubView == transforms.isSubView ? 1 : 0,
-            // The remaining flagsSame terms. VS_eda5efc1 fails with mats=1,
-            // texEnc=1, subView=1 and matching path ids, so the culprit is
-            // one of THESE and the line never printed them -- which is why
-            // that failure has been unexplained since before this work began.
-            " svSky=", pd.t.isSubViewSkybox == transforms.isSubViewSkybox ? 1 : 0,
-            // v6.8: every full-vs-replay pair below is now LABELLED. The old
-            // line printed skipVS as (replay/full) while o2wPath and wtvPath
-            // printed full/replay -- two orders in one line, which is how the
-            // 08-09 handoff recorded a residual signature ("skipVS=0(1/0),
-            // wtvPath=1/3") that mixes both conventions and describes only 2
-            // of the 4 VSes. Naming each side removes the trap instead of
-            // silently swapping an order that older logs were read under.
-            " skipVS=", pd.skipViewScan == m_skipViewMatrixScan ? 1 : 0,
-            " skipVSfull=", m_skipViewMatrixScan ? 1 : 0,
-            " skipVSreplay=", pd.skipViewScan ? 1 : 0,
-            " fbNow=", m_lastExtractUsedFallback ? 1 : 0,
-            " uiNow=", m_lastClassifierSaidUi ? 1 : 0,
-            " boneNow=", m_currentDrawIsBoneTransformed ? 1 : 0,
-            " o2wPathFull=", m_lastO2wPathId, " o2wPathReplay=", pd.o2wPathId,
-            " wtvPathFull=", m_lastWtvPathId, " wtvPathReplay=", pd.wtvPathId,
-            // v6.8 ROOT PROBE for the wtvPath-3 residual class. scanRanFull=0
-            // means THIS draw had its projection scan suppressed by the
-            // per-VS neg-cache (64-frame TTL); scanRanRec is the same bit as
-            // the record captured it. A failure with scanRanFull=1 against
-            // scanRanRec=0 (or the reverse) is the neg-cache TTL expiring
-            // underneath the tier -- a keyable input, NOT the content-
-            // dependent inner gate. -1 = record pointer unavailable.
-            " scanRanFull=", skipExpensiveProjScan ? 0 : 1,
-            " scanRanRec=", recScanRan,
+            " o2wPath=", m_lastO2wPathId, "/", pd.o2wPathId,
+            " wtvPath=", m_lastWtvPathId, "/", pd.wtvPathId,
             " fb=", m_lastExtractUsedFallback ? 1 : 0,
-            " w2vT_full=(", transforms.worldToView[3][0], ",",
-                            transforms.worldToView[3][1], ",",
-                            transforms.worldToView[3][2], ")",
-            " w2vT_replay=(", pd.t.worldToView[3][0], ",",
-                              pd.t.worldToView[3][1], ",",
-                              pd.t.worldToView[3][2], ")",
-            " o2wT_full=(", transforms.objectToWorld[3][0], ",",
-                            transforms.objectToWorld[3][1], ",",
-                            transforms.objectToWorld[3][2], ")",
-            " o2wT_replay=(", pd.t.objectToWorld[3][0], ",",
-                              pd.t.objectToWorld[3][1], ",",
-                              pd.t.objectToWorld[3][2], ")",
             " -- VS quarantined from replay this session"));
         }
         s_xtReplayPending.active = false;
@@ -21154,15 +20856,6 @@ namespace dxvk {
         rr.p1CamOff        = m_lastO2wCamOff;
         rr.wtvPathId = m_lastWtvPathId;
         rr.skipViewScan = m_skipViewMatrixScan;
-        // v6.8 root probe: did THIS run actually scan for a projection, or was
-        // the scan suppressed by the per-VS neg-cache? See XtReplayRec.
-        rr.capScanRan = !skipExpensiveProjScan;
-        // v6.9: the per-VS route state this run was decided under. Read the
-        // values latched at ENTRY, not the entry as the write-back above just
-        // left it -- the record describes the route that ran, and the replay
-        // compares against the same entry-time snapshot.
-        rr.vsLocGen = xtVsLocGen;
-        rr.vsLocNeg = xtVsLocNeg;
         rr.foundRealProj = m_foundRealProjThisFrame;
         rr.wroteLastGood = (s_xtLastGoodWriteN != xtCtl.lastGoodN0);
         rr.camOriginSet = m_lastDrawCamOriginSet;
@@ -21316,18 +21009,10 @@ namespace dxvk {
         // a different worldToView -- the wtvPath=5/1 verify failure. Only
         // paths 1-3, whose derivation is a closed form over keyed inputs,
         // stay in the population.
-        // The wtv-path restriction has to apply to BOTH branches. Tightening
-        // only the scan branch left the skipViewScan branch admitting ANY
-        // wtvPathId whenever the matrix happened to come out identity -- so a
-        // path-5 ("cached view-matrix slot") record stayed eligible, replayed
-        // identity, and the full run then derived path 1 non-identity. That is
-        // the mats=0 / wtvPath=5/1 failure, still firing after the first
-        // attempt at this fix because the first attempt missed this branch.
         const bool xtViewOk =
-            m_lastWtvPathId <= 3u
-            && (m_skipViewMatrixScan
-                  ? (isIdentityExact(transforms.worldToView) || m_lastWtvPathId == 3)
-                  : (m_lastWtvPathId >= 1 && m_lastWtvPathId <= 3));
+            m_skipViewMatrixScan
+              ? (isIdentityExact(transforms.worldToView) || m_lastWtvPathId == 3)
+              : (m_lastWtvPathId >= 1 && m_lastWtvPathId <= 3);
         // Reason bits instead of one opaque bool, so [Perf.Replay.why] can
         // report WHICH rule keeps draws out of the population.
         uint32_t ineligBits = 0;
