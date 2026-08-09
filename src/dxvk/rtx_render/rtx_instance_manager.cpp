@@ -6088,7 +6088,9 @@ namespace dxvk {
   namespace {
     struct UpdInstSplitGuard {
       using clk = std::chrono::steady_clock;
-      static constexpr int      kStages     = 9;
+      // NV-DXVK [Perf.UpdInst] 2026-08-09: 9 -> 10. Stage 9 (`fastRet`) closes the
+      // FAST-PATH span. See the mark(9) site for why it had to exist.
+      static constexpr int      kStages     = 10;
       static constexpr uint32_t kSampleMask = 63u;   // duration-sample 1 in 64
 
       bool on = false;
@@ -6096,6 +6098,12 @@ namespace dxvk {
       uint32_t frameId = 0;
       clk::time_point t;
       int64_t ns[kStages] = {};
+      // NV-DXVK [Perf.UpdInst] 2026-08-09: which marks actually FIRED on this
+      // instance. Needed because updateInstance has an early return (the fast
+      // path, at the mark(9) site ~:6795) that
+      // most instances take, so stages differ in how many instances reach them and
+      // a single denominator cannot serve them all -- see the print.
+      uint16_t marked = 0;
 
       // Exact, every instance. Set once at the end from the function's own values.
       bool cFirst = false, cXfChg = false, cMatChg = false, cPrevPos = false, cStatic = false;
@@ -6114,7 +6122,31 @@ namespace dxvk {
         if (!on) {
           return;
         }
-        static thread_local uint32_t s_seq = 0;
+        // NV-DXVK [Perf.UpdInst] 2026-08-09: PHASE-OFFSET BY HALF A PERIOD, and
+        // the reason is a measurement bug that both cross-vals caught.
+        //
+        // SceneObjSplitGuard (~:3868) uses the IDENTICAL construction -- same
+        // mask, same increment, same thread -- and processSceneObjectImpl calls
+        // updateInstance exactly once per instance. So the two s_seq counters ran
+        // in LOCKSTEP and sampled the SAME instances. SceneObj's `update` span
+        // brackets this call, so every instance it timed was an instance this
+        // guard was also timing: its sampled mean absorbed this guard's
+        // clk::now() reads (~4 of them, ~164 ns, on the 92% fast path) and was
+        // then multiplied by the FULL instance count -- projecting a 1-in-64 cost
+        // onto 64-in-64.
+        //
+        // Measured: SceneObj summed to 18.71 ms against [ProcDCS] instMs 14.64 --
+        // children larger than their parent, which is impossible -- and both
+        // cross-vals FAILed at a constant 21.7% across windows with different
+        // absolute values. 15,266 inst x ~164 ns is ~2.5 ms/frame, the right
+        // order for the 3.66 ms residual between UpdInst's 8.27 and SceneObj's
+        // 11.93.
+        //
+        // Starting half a period out means the outer probe never samples an
+        // instance this one is timing. TWO SAMPLED PROBES AT THE SAME STRIDE ARE
+        // NOT TWO INDEPENDENT INSTRUMENTS -- if a third nested probe is ever
+        // added here, give it its own phase too.
+        static thread_local uint32_t s_seq = (kSampleMask + 1u) / 2u;
         timed = ((s_seq++ & kSampleMask) == 0u);
         if (timed) {
           t = clk::now();
@@ -6128,6 +6160,7 @@ namespace dxvk {
         const auto now = clk::now();
         ns[s] = std::chrono::duration_cast<std::chrono::nanoseconds>(now - t).count();
         t = now;
+        marked |= static_cast<uint16_t>(1u << s);
       }
 
       void counts(bool first, bool xfChg, bool matChg, bool prevPos, bool isStatic) {
@@ -6140,6 +6173,10 @@ namespace dxvk {
         }
 
         static thread_local int64_t  sNs[kStages] = {};
+        // NV-DXVK [Perf.UpdInst] 2026-08-09: sampled instances that REACHED each
+        // stage. Only touched on sampled instances (1 in 64), so ~10 increments
+        // per 64 instances.
+        static thread_local uint64_t sMarked[kStages] = {};
         static thread_local uint64_t sSamples = 0, sInst = 0, sFrames = 0;
         static thread_local uint64_t sFirst = 0, sXfChg = 0, sMatChg = 0, sPrevPos = 0,
                                      sStatic = 0, sRedundant = 0, sSurfSkip = 0, sTailSkip = 0;
@@ -6157,6 +6194,9 @@ namespace dxvk {
           ++sSamples;
           for (int i = 0; i < kStages; ++i) {
             sNs[i] += ns[i];
+            if (marked & (1u << i)) {
+              ++sMarked[i];
+            }
           }
         }
         if (cFirst)   ++sFirst;
@@ -6177,17 +6217,55 @@ namespace dxvk {
         const uint64_t inst   = sInst ? sInst : 1;
         const double   perFrm = double(sInst) / double(frames);
 
-        // us/inst is the sampled mean; estMs is that mean x the EXACT instance
-        // count, so the two columns answer different questions -- which stage is
-        // expensive per instance, and which stage owns the frame.
-        std::string us, est;
+        // Three columns, three questions: what a stage costs on an instance that
+        // RUNS it (usPerInst), what it costs the frame (estMsPerFrame), and how
+        // many instances get there at all (reachPct). The first and third are new
+        // 2026-08-09; before that a single denominator served every stage and the
+        // fast-path early return (the mark(9) site) made the late ones unreadable.
+        std::string us, est, rch;
+        double estMs[kStages] = {};   // kept for the [Perf.Report] publish below
         static const char* kNames[kStages] = {
-          "entry", "surf", "xform", "flags", "viewmodel", "billboard", "census", "anticull", "tail"
+          "entry", "surf", "xform", "flags", "viewmodel", "billboard", "census", "anticull", "tail",
+          "fastRet"
         };
         for (int i = 0; i < kStages; ++i) {
-          const double meanNs = double(sNs[i]) / double(smp);
+          // TWO DENOMINATORS, on purpose -- they answer different questions and
+          // sharing one is what made this instrument unreadable.
+          //  usPerInst   -> divide by the instances that ACTUALLY RAN the stage.
+          //     The fast-path early return takes ~92% of instances, so stages 1-8
+          //     are reached by ~8% of them; dividing those by sSamples reported a
+          //     per-instance mean ~13x too low and made every stage look free.
+          //  estMsPerFrame -> keep the sNs/sSamples form. The sampled zeros and
+          //     the reach fraction cancel exactly, so this stays an UNBIASED
+          //     estimate of the stage's total ms/frame and remains directly
+          //     comparable to [ProcDCS] instMs. Do not "fix" it to match usPerInst.
+          const uint64_t reach  = sMarked[i] ? sMarked[i] : 1;
+          const double   meanNs = double(sNs[i]) / double(reach);
+          estMs[i] = (double(sNs[i]) / double(smp)) * perFrm / 1e6;
           us  += str::format(" ", kNames[i], "=", (meanNs / 1000.0));
-          est += str::format(" ", kNames[i], "=", (meanNs * perFrm / 1e6));
+          est += str::format(" ", kNames[i], "=", estMs[i]);
+          rch += str::format(" ", kNames[i], "=", (sMarked[i] * 100 / uint64_t(smp)));
+        }
+
+        // NV-DXVK [Perf.Report] 2026-08-09: publish updateInstance's stages as
+        // children of SceneObjUpdateMs. estMsPerFrame only -- already computed
+        // for the line above, so this adds no clock reads. Stage order is the
+        // kNames order; `rest` folds the four ~0.1 ms stages so the nested rows
+        // stay readable and the sum still closes exactly.
+        {
+          using perfreport::Slot;
+          double total = 0.0;
+          for (int i = 0; i < kStages; ++i) {
+            total += estMs[i];
+          }
+          perfreport::publish(Slot::UpdInstEntryMs,   estMs[0]);
+          perfreport::publish(Slot::UpdInstSurfMs,    estMs[1]);
+          perfreport::publish(Slot::UpdInstXformMs,   estMs[2]);
+          perfreport::publish(Slot::UpdInstFlagsMs,   estMs[3]);
+          perfreport::publish(Slot::UpdInstRestMs,    estMs[4] + estMs[5] + estMs[6] + estMs[7]);
+          perfreport::publish(Slot::UpdInstTailMs,    estMs[8]);
+          perfreport::publish(Slot::UpdInstFastRetMs, estMs[9]);
+          perfreport::publish(Slot::UpdInstTotalMs,   total);
         }
 
         Logger::info(str::format(
@@ -6195,6 +6273,16 @@ namespace dxvk {
           " instPerFrame=", perFrm, " samples=", sSamples,
           " | usPerInst", us,
           " | estMsPerFrame", est,
+          // NV-DXVK [Perf.UpdInst] 2026-08-09: % of SAMPLED instances that reached
+          // each stage -- the mechanism check for the two columns above. Expected
+          // shape: entry=100 (mark(0) is unconditional), fastRet~92 (matches
+          // [Perf.FastInst] fast / instPerFrame), and stages 1-8 all at
+          // ~(100 - fastRet) -- EXCEPT surf, which sits inside a conditional (see
+          // the mark(1) site) and should read ~1 point lower. That one is checked
+          // and benign. Any OTHER stage reading differently from its neighbours
+          // means a further conditional exit exists between the marks -- which is
+          // exactly the bug fastRet was added to close, so check here first.
+          " | reachPct", rch,
           " | first=",     (sFirst     * 100 / inst),
           "% xfChg=",      (sXfChg     * 100 / inst),
           "% matChg=",     (sMatChg    * 100 / inst),
@@ -6213,7 +6301,7 @@ namespace dxvk {
           // moving every frame (streaming churn), not at the material key.
           "% tailSkip=",   (sTailSkip  * 100 / inst), "%"));
 
-        for (int i = 0; i < kStages; ++i) { sNs[i] = 0; }
+        for (int i = 0; i < kStages; ++i) { sNs[i] = 0; sMarked[i] = 0; }
         sSamples = sInst = sFrames = 0;
         sFirst = sXfChg = sMatChg = sPrevPos = sStatic = sRedundant = sSurfSkip = sTailSkip = 0;
         sLastLog = tEnd;
@@ -6717,6 +6805,19 @@ namespace dxvk {
               }
             }
 
+            // NV-DXVK [Perf.UpdInst] 2026-08-09 -- CLOSE THE FAST-PATH SPAN.
+            // Until now mark(0) closed `entry` above and this path returned below
+            // without ever calling mark(1), so everything in between -- the
+            // fast-path eligibility checks and the OMM event-handler dispatch loop
+            // immediately above -- was timed into NO STAGE AT ALL. That is not a
+            // rare corner: [Perf.FastInst] measures fast=14,358/frame against
+            // [Perf.UpdInst] instPerFrame=15,529, so 92.5% of every instance's
+            // work was unmeasured. It is the block [ProcDCS] instMs could see and
+            // the nine stages could not, and it is why the two instruments on
+            // updateInstance disagreed (SceneObj update=12.86 vs the stage sum
+            // 4.47). Marked BEFORE the probe bookkeeping below so the probe's own
+            // atomics and emit are not billed to game work.
+            uiSplit.mark(9);
             uiSplit.surfSkipped();
             uiSplit.tailSkipped();
             uiSplit.counts(/*first*/ true, /*xfChg*/ false, /*matChg*/ false,
@@ -7137,7 +7238,21 @@ namespace dxvk {
         }
       }
 
-      uiSplit.mark(1);   // NV-DXVK [Perf.UpdInst]: end of `surf`
+      // NV-DXVK [Perf.UpdInst]: end of `surf`. NOTE THE SCOPE -- unlike marks 0
+      // and 2-8 this one is INSIDE `if (isFirstUpdateThisFrame ||
+      // overridePreviousCameraUpdate)` (~:6588), so on the ~1% of instances where
+      // that is false it never fires and reachPct=surf reads ~1 point below its
+      // neighbours.
+      //
+      // THAT IS CORRECT, NOT A LEAK, and it was checked rather than assumed:
+      // between mark(0) (~:6554) and the `if` there is only comment, so when the
+      // block is skipped the mark(0)->mark(2) span covers no executable code and
+      // `xform` absorbs ~0. surf genuinely did not run; a zero reach is the
+      // honest report. Do NOT "fix" this by hoisting the mark past the block's
+      // closing brace (~:7536) -- that would move everything between this mark
+      // and that brace out of `xform` and
+      // into `surf` and silently redefine both stages.
+      uiSplit.mark(1);
 
       // Update transform
       {

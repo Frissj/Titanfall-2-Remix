@@ -471,6 +471,16 @@ namespace dxvk {
         { 2, "processDrawCallState",   Slot::ProcDcsMs,         RowKind::kNested },
         { 3, "processSceneObject",     Slot::ProcDcsInstMs,     RowKind::kNested },
         { 4, "updateInstance",         Slot::SceneObjUpdateMs,  RowKind::kNested },
+        // [Perf.UpdInst] stages. fastRet is the 92.5% fast-path body that was
+        // timed into no stage before 2026-08-09; if it is large, that is where
+        // the "unattributed" block inside processSceneObjectImpl went.
+        { 5, "ui_fastRet",             Slot::UpdInstFastRetMs,  RowKind::kNested },
+        { 5, "ui_entry",               Slot::UpdInstEntryMs,    RowKind::kNested },
+        { 5, "ui_surf",                Slot::UpdInstSurfMs,     RowKind::kNested },
+        { 5, "ui_xform",               Slot::UpdInstXformMs,    RowKind::kNested },
+        { 5, "ui_flags",               Slot::UpdInstFlagsMs,    RowKind::kNested },
+        { 5, "ui_tail",                Slot::UpdInstTailMs,     RowKind::kNested },
+        { 5, "ui_rest (vm/bb/cen/ac)", Slot::UpdInstRestMs,     RowKind::kNested },
         { 4, "findSimilarInstance",    Slot::SceneObjFindMs,    RowKind::kNested },
         { 4, "mid",                    Slot::SceneObjMidMs,     RowKind::kNested },
         { 4, "addInstance",            Slot::SceneObjAddMs,     RowKind::kNested },
@@ -553,6 +563,23 @@ namespace dxvk {
         const Read pdInst = read(Slot::ProcDcsInstMs, now);
         check("dxvk-cs        SceneObj    vs ProcDCS instMs",
               soSum.v, pdInst.v, 15.0, soSum.seen, pdInst.seen);
+
+        // TWO INSTRUMENTS ON updateInstance. [Perf.SceneObj]'s `update` bucket
+        // brackets the call; [Perf.UpdInst]'s stages split its inside. They are
+        // independent, so they are worth holding against each other -- rtx.conf
+        // ~1451 asked for exactly this check and never got a clean answer.
+        //
+        // History, so a FAIL here is read correctly: these disagreed 12.86 vs
+        // 4.47 and the gap was blamed on unattributed work inside
+        // processSceneObjectImpl. The real cause was a missing mark on the
+        // 92.5% fast-path return, now stage `fastRet`. So if this FAILs again,
+        // suspect a THIRD conditional exit between marks before believing in
+        // work that no probe can see -- and read [Perf.UpdInst] reachPct, which
+        // was added to make that failure mode visible directly.
+        const Read uiTot = read(Slot::UpdInstTotalMs, now);
+        const Read soUpd = read(Slot::SceneObjUpdateMs, now);
+        check("dxvk-cs        UpdInst sum vs SceneObj update",
+              uiTot.v, soUpd.v, 15.0, uiTot.seen, soUpd.seen);
 
         const Read prep = read(Slot::PrepSceneMs, now);
         const Read fat  = read(Slot::CsFatChunkMs, now);
@@ -643,6 +670,12 @@ namespace dxvk {
             { "prepScene merge loop",                     Slot::MergeLoopMs,      false },
             { "prepScene buildBlases",                    Slot::MergeBuildBlasMs, false },
             { "updateInstance",                           Slot::SceneObjUpdateMs, false },
+            // NESTED INSIDE updateInstance above -- do not add the two together.
+            // Listed on its own because it is the one stage in here that is the
+            // FAST path: work the fast path was believed to have skipped. Every
+            // ms shown is work still being done on 92.5% of instances, and it was
+            // invisible to every instrument until 2026-08-09.
+            { "  ui_fastRet (INSIDE updateInstance)",     Slot::UpdInstFastRetMs, false },
             { "findSimilarInstance",                      Slot::SceneObjFindMs,   false },
             { "prepScene gc",                             Slot::PrepGcMs,         false },
             { "ProcDCS geom",                             Slot::ProcDcsGeomMs,    false },

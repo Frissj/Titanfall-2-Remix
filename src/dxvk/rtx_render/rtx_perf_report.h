@@ -121,6 +121,28 @@ namespace dxvk {
       CommitRtMs, CommitSubmitMs, CommitFinalizeMs,
       ProcDcsMs, ProcDcsGeomMs, ProcDcsInstMs,
       SceneObjFindMs, SceneObjMidMs, SceneObjAddMs, SceneObjUpdateMs,
+
+      // ---- updateInstance's own stages, from [Perf.UpdInst] ----
+      // Children of SceneObjUpdateMs, which is the largest single item on this
+      // thread and until now had no children in the report at all -- the split
+      // existed only in a log line, so the report could show a 12.86 ms leaf and
+      // say nothing about what was inside it.
+      //
+      // UpdInstFastRetMs is the stage that did not exist before 2026-08-09. The
+      // fast path returns from updateInstance after mark(0) and before mark(1)
+      // ([Perf.FastInst] fast=14,358 of instPerFrame=15,529, i.e. 92.5% of
+      // instances), so its whole body was timed into no stage. The nine stages
+      // summed to 4.47 ms against SceneObjUpdateMs=12.86 and the gap was read as
+      // "unattributed work inside processSceneObjectImpl". It was not work that
+      // was missing, it was a mark.
+      //
+      // UpdInstRestMs folds viewmodel+billboard+census+anticull, all ~0.1 ms, so
+      // the nested rows stay readable while the sum still closes exactly.
+      // These are all estMsPerFrame, already computed for the log line -- no new
+      // clock reads (§ the header contract above).
+      UpdInstEntryMs, UpdInstFastRetMs, UpdInstSurfMs, UpdInstXformMs,
+      UpdInstFlagsMs, UpdInstTailMs, UpdInstRestMs, UpdInstTotalMs,
+
       MatDataMs,
 
       // ---- dxvk-cs: the once-per-frame serial pass ----
