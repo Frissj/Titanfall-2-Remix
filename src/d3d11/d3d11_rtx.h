@@ -1,6 +1,13 @@
 #pragma once
 
 #include "d3d11_include.h"
+// NV-DXVK [DrawSnapshot]: DrawSnapshot stores D3D11VertexBufferBinding /
+// D3D11IndexBufferBinding BY VALUE and holds Com<> refs to the shader, input
+// layout and SRV types, so it needs their full definitions -- forward
+// declarations are not enough. Safe to include here: d3d11_context_state.h
+// pulls in buffer/shader/state/view headers and references nothing in this
+// file, so there is no cycle.
+#include "d3d11_context_state.h"
 #include <array>
 #include <mutex>
 #include <optional>
@@ -34,6 +41,151 @@ namespace dxvk {
   // .cpp-local MatSnapshot; the D3D11Rtx member is an owning pointer (pImpl) which is
   // why this class needs an out-of-line destructor.
   struct GeometryBatchArena;
+
+  // ==================================================================
+  // NV-DXVK [DrawSnapshot] 2026-08-10 -- an owned, immutable per-draw record of
+  // every D3D11 pipeline input the RT derivation reads.
+  //
+  // WHY THIS EXISTS. SubmitDraw's derivation stages read LIVE context state --
+  // ~460 read sites across 24 distinct m_context->m_state paths -- so they can
+  // only run on the frame thread, in draw order, before the game rebinds for
+  // the next draw. That is the ONLY reason the derivation is serial. It is also
+  // why the cross-draw carrier census (rtx.perfStageDepCensus) had to exist:
+  // once per-draw work reads shared mutable state, proving any two draws
+  // independent becomes an analysis problem instead of a property of the data.
+  //
+  // A production renderer does not have this problem, because the dependency is
+  // inverted. UE's FMeshDrawCommand (Engine/Source/Runtime/Renderer/Public/
+  // MeshPassProcessor.h:1281) owns its shader bindings, vertex streams, index
+  // buffer, PSO id and counts, and references no context at all -- which is
+  // precisely what lets FMeshDrawCommandPassSetupTask build, sort and merge
+  // commands on a worker, with ordering carried by a sort key plus an explicit
+  // index array rather than by thread joins. DrawSnapshot is that record for
+  // this translation layer: capture once at the draw entry point, then every
+  // derivation stage becomes a pure function of it.
+  //
+  // THE RULE THAT MAKES IT CORRECT -- READ BEFORE ADDING A FIELD.
+  // Com<D3D11Buffer> pins the buffer OBJECT, not its CONTENTS. A dynamic buffer
+  // that the game Map(WRITE_DISCARD)es keeps the same D3D11Buffer while its
+  // backing slice is renamed underneath, so a pinned ref read later yields
+  // whatever the game wrote NEXT. That is the dropship COLOR1.y race and the
+  // getImageHash streaming race, both already paid for in this project.
+  // Therefore:
+  //   - if the derivation reads a resource's BYTES, those bytes are COPIED here
+  //     at capture time, on the frame thread, while the binding is still live;
+  //   - a Com<> ref is permitted ONLY for identity (map keys, hashes, pointer
+  //     compares) and lifetime, never as a promise about contents.
+  // Immutable-after-creation objects (shader blobs, input layouts, and the
+  // reflection data behind GetCommonShader) are safe to hold by ref: their
+  // contents cannot change while the ref is held.
+  //
+  // STAGING. Snapshots live in a per-frame arena that is cleared, never freed,
+  // so capture costs no allocation -- the same reason DrawWorkItem is a
+  // reserved vector (per-draw heap traffic is what made the per-draw material
+  // futures break even). The byte capture is bounded and reports overflow
+  // rather than silently truncating, because a missed range is a WRONG RESULT,
+  // not a slow one.
+  // ==================================================================
+  struct DrawSnapshot {
+    // Bounded inline byte capture. 512 B covers the ranges the derivation
+    // actually reads today (cb2@16 / cb2@96 projection-view blocks at 64 B,
+    // the cb3 object-to-world block at 48 B, and headroom). Bone palettes are
+    // deliberately NOT here -- they already have their own deferred capture
+    // (BatchSkinJob), which copies rather than pins for this same reason.
+    static constexpr uint32_t kMaxCbRanges = 8u;
+    static constexpr uint32_t kCbBytesCap  = 512u;
+
+    struct CbRange {
+      uint32_t stage      = 0;  // 0 = VS, 1 = PS, 2 = GS, 3 = DS
+      uint32_t slot       = 0;  // cbuffer slot within that stage
+      uint32_t byteOffset = 0;  // offset within the BOUND range, matching the
+                                //   live-path reads (constantOffset * 16 + n)
+      uint32_t byteCount  = 0;
+      uint32_t dataOffset = 0;  // where the bytes start in `cbBytes`
+    };
+
+    // -- ordering. drawIndex IS the sort key: it is the draw's position in the
+    // frame's submission order, so results can be applied in order after any
+    // amount of out-of-order derivation. UE carries this as
+    // FMeshDrawCommandSortKey + the VisibleMeshDrawCommands index array.
+    uint32_t frameId   = 0;
+    uint32_t drawIndex = 0;
+
+    // -- identity / immutable-by-construction. Safe as refs (see the rule).
+    Com<D3D11VertexShader> vs          = nullptr;
+    Com<D3D11PixelShader>  ps          = nullptr;
+    Com<D3D11InputLayout>  inputLayout = nullptr;
+
+    // -- raw state-object pointers, used ONLY for identity and for decoding
+    // blend/depth/raster descriptions. Not owned: these live as long as the
+    // device and the existing code already reads them bare.
+    D3D11BlendState*        blendState = nullptr;
+    D3D11DepthStencilState* depthState = nullptr;
+    D3D11RasterizerState*   rasterState = nullptr;
+
+    // -- geometry stream bindings. Held by ref for IDENTITY and LIFETIME only:
+    // the vertex/index CONTENTS are consumed downstream on the CS thread via
+    // the existing capture path, not by the derivation.
+    D3D11_PRIMITIVE_TOPOLOGY topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    std::array<D3D11VertexBufferBinding,
+               D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertexBuffers = { };
+    D3D11IndexBufferBinding                               indexBuffer   = { };
+
+    // -- SRVs. Identity only (t30/t31 bone + instance streams are resolved by
+    // slot, and their bytes go through the staging path).
+    std::array<Com<D3D11ShaderResourceView>,
+               D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> vsSrvs = { };
+
+    // -- viewport state. Plain POD, copied whole: the viewport fallback path
+    // reads it to synthesise a projection when no real one is found.
+    uint32_t numViewports = 0;
+    std::array<D3D11_VIEWPORT,
+               D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE>
+                                                        viewports = { };
+
+    // -- THE COPIED BYTES. Everything above is identity; this is content.
+    uint32_t                                 numCbRanges = 0;
+    std::array<CbRange, kMaxCbRanges>        cbRanges    = { };
+    // alignas(16) is LOAD-BEARING, not tidiness: consumers reinterpret_cast the
+    // returned pointer to const float* / Matrix4 exactly as they do with the
+    // staging-ring pointer they replace. std::array<uint8_t,N> is 1-byte
+    // aligned by default, which would make those casts unaligned reads. The
+    // capture also rounds each range's dataOffset up to 16 so every span inside
+    // stays aligned regardless of the preceding span's size.
+    alignas(16) std::array<uint8_t, kCbBytesCap> cbBytes = { };
+
+    // Set when a range did not fit in kMaxCbRanges / kCbBytesCap. A snapshot
+    // with this flag is INCOMPLETE and must fall back to the live path -- it
+    // must never be silently derived from. If this ever fires in normal play
+    // the capture set is wrong; raise the caps and find out which consumer.
+    bool overflowed = false;
+
+    // Look up a captured range. Returns nullptr when this draw did not capture
+    // it, which is the signal to take the live path rather than to assume zero.
+    const uint8_t* find(uint32_t stage, uint32_t slot,
+                        uint32_t byteOffset, uint32_t byteCount) const {
+      for (uint32_t i = 0; i < numCbRanges; ++i) {
+        const CbRange& r = cbRanges[i];
+        if (r.stage == stage && r.slot == slot
+            && byteOffset >= r.byteOffset
+            && byteOffset + byteCount <= r.byteOffset + r.byteCount) {
+          return cbBytes.data() + r.dataOffset + (byteOffset - r.byteOffset);
+        }
+      }
+      return nullptr;
+    }
+
+    void reset() {
+      numCbRanges = 0;
+      overflowed  = false;
+      vs = nullptr; ps = nullptr; inputLayout = nullptr;
+      blendState = nullptr; depthState = nullptr; rasterState = nullptr;
+      indexBuffer = { };
+      for (auto& v : vertexBuffers) v = { };
+      for (auto& s : vsSrvs)        s = nullptr;
+      numViewports = 0;
+    }
+  };
 
   // NV-DXVK [Phase1] GPU-driven-injection formal layout descriptor.
   // See HANDOFF_GPU_DRIVEN_INJECTION.md §5. This is the FORMALIZED, uploadable
@@ -152,6 +304,19 @@ namespace dxvk {
     Matrix4 objectToWorld;
     Matrix4 worldToView;
     Matrix4 viewToProjection;
+  };
+
+  // NV-DXVK [Perf.StageDep]: the carrier GROUPS the stage-dependency census
+  // hashes separately. Namespace scope, not a class member: the census's free
+  // helpers in d3d11_rtx.cpp need it, and the grouping is a property of the
+  // probe rather than of D3D11Rtx. See rtx.perfStageDepCensus.
+  enum SdepGroup : uint32_t {
+    kSdepCam = 0,   // camera origins / fanout latches / smoothing
+    kSdepRoute,     // the sticky path ids
+    kSdepCbLoc,     // shared proj/view cb slot+offset locations
+    kSdepBone,      // bone + cb3 caches a later draw reuses
+    kSdepStatic,    // m_foundRealProjThisFrame + m_lastGoodTransforms
+    kSdepGroupCount
   };
 
   class D3D11Rtx {
@@ -288,6 +453,16 @@ namespace dxvk {
     // diagnostic must not produce.
     bool IsStablePropIdSuppressed() const;
 
+    // NV-DXVK [Perf.StageDep]: the CROSS-DRAW carriers this class keeps -- the
+    // state that makes SubmitDraw serial -- hashed in GROUPS rather than as one
+    // value. Capture 2 showed why: `filters` moved a carrier on 43% of eligible
+    // draws and a single hash could only say "something", which is not enough to
+    // act on. One hash per group names the culprit directly.
+    // Member function because the fields are private and the probe lives in
+    // markStg. Const: it must never perturb what it measures. The SdepGroup
+    // enum is at namespace scope above -- the census's free helpers need it.
+    void stageDepCarrierGroups(uint64_t out[kSdepGroupCount]) const;
+
     static constexpr uint32_t kMaxConcurrentDraws = 6 * 1024;
     // NV-DXVK [BatchSubmitDraw perf]: LowLatency=FALSE so idle workers SLEEP on a
     // condition variable instead of spinning. The default (LowLatency=true) makes
@@ -324,6 +499,121 @@ namespace dxvk {
     // No-op when the arena is empty. Called at the top of EndFrame (before its own
     // camera/inject EmitCs work) so all geometry is committed before injectRTX.
     void flushGeometryBatch();
+
+    // NV-DXVK [DrawSnapshot]: the current draw's captured inputs. See the
+    // DrawSnapshot struct at the top of this header for the design and, more
+    // importantly, the copy-vs-pin rule that keeps it race-free.
+    //
+    // STAGING PLAN -- this is deliberately ONE reusable snapshot, not an arena.
+    // Step 1 (this change) captures at SubmitDraw entry and converts derivation
+    // stages to read from it, WITHOUT moving any work off-thread. That is
+    // verifiable for free: the replay tier's 16-replays-per-VS bit-compare must
+    // still report FAIL=0, which proves the converted stages are pure functions
+    // of the snapshot. Only once that holds does deferral become safe, and only
+    // then does this become a per-frame vector<DrawSnapshot> indexed by
+    // drawIndex -- the equivalent of UE's MeshDrawCommandStorage.
+    // Doing it in the other order would move work off-thread on the strength of
+    // an unproven purity claim, which is how the two confirmed races here
+    // (COLOR1.y, getImageHash) happened.
+    // Per-frame arena, cleared not freed, so capture costs no allocation. This
+    // is the MeshDrawCommandStorage equivalent: a snapshot must outlive its
+    // draw for any off-thread consumer to read it, which a single reusable
+    // slot cannot provide. Reserved once; never reallocated mid-frame, because
+    // m_drawSnapCur points into it.
+    std::vector<DrawSnapshot> m_drawSnaps;
+    // The draw currently being derived. Null when capture is off or the arena
+    // is full -- every consumer treats null as "take the live path".
+    DrawSnapshot*             m_drawSnapCur = nullptr;
+    // Used when the arena is at cap, so m_drawSnapCur is ALWAYS valid once
+    // capture has run. That keeps the consumer guard a single flag test rather
+    // than a flag test plus a null test on every read.
+    DrawSnapshot              m_drawSnapScratch;
+
+    // NV-DXVK [DrawSnapshot] 2026-08-10: LATCHED per draw at the capture point.
+    //
+    // Consumers used to guard on RtxOptions::useDrawSnapshot() re-read at the
+    // consumer, which is sound only if the option cannot change between capture
+    // and consume. It can -- rtx options are runtime-tweakable from the panel.
+    // Flip it on mid-draw and SubmitDraw's entry did NOT capture, so a consumer
+    // reading true then either dereferences m_drawSnapCur while it is still the
+    // frame-reset nullptr, or -- worse, because it is silent -- reads the
+    // PREVIOUS draw's snapshot and serves its cb2 bytes as this draw's
+    // transforms. Latching turns "is this draw snapshotted?" into a property of
+    // the draw rather than a question re-asked of global state, which is the
+    // same rule sec 1c applies to the record as a whole.
+    //
+    // Costs the consumer exactly what the old guard did: one bool test.
+    bool                      m_drawSnapValid = false;
+
+    // Fallback-safe accessor. Returns nullptr whenever this draw has no usable
+    // snapshot -- capture off, capture skipped, or the record incomplete -- and
+    // every consumer treats nullptr as "run the live path". Use this rather
+    // than touching m_drawSnapCur directly; the overflow rule in particular is
+    // stated on DrawSnapshot::overflowed and is easy to forget at a call site.
+    const DrawSnapshot* drawSnap() const {
+      return (m_drawSnapValid && m_drawSnapCur != nullptr
+              && !m_drawSnapCur->overflowed) ? m_drawSnapCur : nullptr;
+    }
+
+    // Captures m_context->m_state into the arena and points m_drawSnapCur at
+    // it. Frame thread only, called at SubmitDraw entry while every binding is
+    // still the one this draw uses.
+    void captureDrawSnapshot(uint32_t drawIndex);
+
+    // NV-DXVK [DrawSnapshot] viewport accessor -- the FIRST derivation input
+    // moved off live state and onto the record.
+    //
+    // HANDOFF sec 3 lists "the viewport fallback" among the live reads that
+    // keep ExtractTransforms impure. The viewport is already captured, so this
+    // is wiring, not new capture: it reads the snapshot when this draw has one
+    // and falls back to m_context->m_state otherwise, which keeps every caller
+    // correct whether or not rtx.useDrawSnapshot is on.
+    //
+    // Returns false when no viewport is bound, so callers stop indexing
+    // viewports[0] unconditionally -- several sites did, and read a
+    // default-constructed viewport when numViewports was 0.
+    // Defined in the .cpp: D3D11DeviceContext is incomplete in this header.
+    bool drawViewport0(D3D11_VIEWPORT& out) const;
+
+    // The replay tier's packed viewport key, (Width << 32) | Height. Three
+    // sites computed this independently -- the entry key build, the keyMiss
+    // attribution, and the record capture at exit -- and they MUST agree or the
+    // tier mis-attributes a miss or admits a record keyed on a viewport that
+    // was never hashed. One helper so they cannot drift, and it routes through
+    // the snapshot like every other converted read.
+    //
+    // Those sites carried the comment "bindings cannot change mid-draw" as an
+    // assumption. Reading them from the record makes it true by construction
+    // rather than by assertion, which is the whole point of the record.
+    //
+    // Returns PRESENCE, not just the value, because the three sites treated
+    // "no viewport bound" differently and the distinction is load-bearing: the
+    // key build skipped the xtMix entirely (so the key differs from one that
+    // mixed a zero), while the other two left their field at 0. outKey is set
+    // to 0 when this returns false.
+    bool drawViewportKey(uint64_t& outKey) const;
+
+    // The remaining identity accessors, same contract as drawViewport0: read
+    // the record when this draw has one, else live state. These are the fields
+    // the capture already held and nothing read -- wiring them up is what turns
+    // the identity half of DrawSnapshot from dead weight into the thing sec 1c
+    // describes.
+    //
+    // ONLY VALID INSIDE THE DRAW. m_drawSnapValid is latched at SubmitDraw
+    // entry and cleared at frame reset, so these are correct anywhere reachable
+    // from SubmitDraw (ExtractTransforms included) and MUST NOT be used from
+    // EndFrame or any other out-of-draw context -- there they would serve the
+    // last draw's bindings. That is why the conversion was applied per site
+    // rather than by a blanket replace: 10 of the 22 inputLayout reads in this
+    // file are outside SubmitDraw.
+    D3D11InputLayout*        drawInputLayout() const;
+    D3D11ShaderResourceView* drawVsSrv(uint32_t slot) const;
+    // TOTAL: an out-of-range slot yields a binding whose buffer is null rather
+    // than reading past the array. The call sites this replaced indexed
+    // vertexBuffers[slot] unchecked and every one of them already handles a
+    // null buffer, so this is a drop-in that removes an out-of-bounds read.
+    const D3D11VertexBufferBinding& drawVertexBuffer(uint32_t slot) const;
+
     // NV-DXVK [flicker V8: SubmitDraw-ordered geometry capture]: predictor for
     // "will this draw (re)bake its BLAS inputs?". The real decision
     // (DrawCallCache hash comparison) happens later on the CS thread, but the
