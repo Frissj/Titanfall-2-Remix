@@ -42,6 +42,22 @@ namespace dxvk {
   // why this class needs an out-of-line destructor.
   struct GeometryBatchArena;
 
+  // NV-DXVK [Perf.StageDep]: the carrier GROUPS the stage-dependency census
+  // hashes separately. Namespace scope, not a class member: the census's free
+  // helpers in d3d11_rtx.cpp need it, and the grouping is a property of the
+  // probe rather than of D3D11Rtx. See rtx.perfStageDepCensus.
+  // MOVED HERE 2026-08-10 from just above class D3D11Rtx: DrawSnapshot now
+  // stores one hash PER GROUP (see DrawSnapshot::carrierGrp), so
+  // kSdepGroupCount has to be visible before the struct. Nothing else changed.
+  enum SdepGroup : uint32_t {
+    kSdepCam = 0,   // camera origins / fanout latches / smoothing
+    kSdepRoute,     // the sticky path ids
+    kSdepCbLoc,     // shared proj/view cb slot+offset locations
+    kSdepBone,      // bone + cb3 caches a later draw reuses
+    kSdepStatic,    // m_foundRealProjThisFrame + m_lastGoodTransforms
+    kSdepGroupCount
+  };
+
   // ==================================================================
   // NV-DXVK [DrawSnapshot] 2026-08-10 -- an owned, immutable per-draw record of
   // every D3D11 pipeline input the RT derivation reads.
@@ -92,8 +108,16 @@ namespace dxvk {
     // the cb3 object-to-world block at 48 B, and headroom). Bone palettes are
     // deliberately NOT here -- they already have their own deferred capture
     // (BatchSkinJob), which copies rather than pins for this same reason.
-    static constexpr uint32_t kMaxCbRanges = 8u;
-    static constexpr uint32_t kCbBytesCap  = 512u;
+    // RAISED 2026-08-10 with the per-VS span manifest. The four NAMED spans
+    // (proj 64 / view 64 / cameraOrigin 12 / cb3 48) are joined by up to
+    // kMaxCbManifest LEARNED spans -- the offsets a VS's derivation was
+    // observed to read live -- so the ceiling has to clear 4 + 6 with margin.
+    // Sizing it tight would be actively harmful, not merely wasteful:
+    // `overflowed` invalidates the WHOLE record (drawSnap() returns nullptr),
+    // so one span too many sends the draw fully live, identity accessors
+    // included. Bytes: 192 named + up to 6 x 64 learned = 576, under 768.
+    static constexpr uint32_t kMaxCbRanges = 12u;
+    static constexpr uint32_t kCbBytesCap  = 768u;
 
     struct CbRange {
       uint32_t stage      = 0;  // 0 = VS, 1 = PS, 2 = GS, 3 = DS
@@ -136,6 +160,40 @@ namespace dxvk {
     std::array<Com<D3D11ShaderResourceView>,
                D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> vsSrvs = { };
 
+    // -- VS constant-buffer BINDINGS. Identity and generation, never contents.
+    //
+    // This is the distinction the "cbuffers are the barrier" summary hides.
+    // The 32 remaining live cbuffer reads are not one problem, they are two:
+    //   (a) BINDING identity -- which buffer, at what offset. Several sites
+    //       read only this, as cache keys (the camera-fallback cache compares
+    //       cb2Buffer / cb2Gen / cb2Off). Pure, cheap, and captured here.
+    //   (b) CONTENTS -- the scans. Those cannot be made pure by a narrow copy
+    //       and are still the real blocker; see the option doc.
+    //
+    // contentGen IS LOAD-BEARING FOR DEFERRAL, not a convenience. It moves only
+    // in DiscardSlice(), i.e. only when the backing slice is RENAMED -- exactly
+    // the dropship COLOR1.y failure, where a Map(WRITE_DISCARD) swapped the
+    // bytes under a pointer that still compared equal. A consumer running off
+    // the frame thread cannot ask "are these still my draw's bytes?" by reading
+    // the buffer, because by then the answer has already changed. Captured
+    // here, at the instant the binding was this draw's, it can.
+    struct CbBinding {
+      D3D11Buffer* buffer         = nullptr;  // IDENTITY ONLY -- never read bytes through this
+      uint32_t     constantOffset = 0;
+      uint32_t     constantBound  = 0;
+      uint64_t     contentGen     = UINT64_MAX;  // sentinel = nothing bound
+    };
+    std::array<CbBinding,
+               D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT> vsCbs = { };
+
+    // -- render target 0. PRESENCE ONLY, and only slot 0: the two derivation
+    // sites that read it both just ask "is anything bound here" -- one sets a
+    // route bit in the replay key, the other is a depth-only-pass test. Stored
+    // as a bare pointer because the state itself holds these as
+    // Com<D3D11RenderTargetView, false>, i.e. already non-owning, and because
+    // nothing here ever dereferences it.
+    D3D11RenderTargetView* rtv0 = nullptr;
+
     // -- viewport state. Plain POD, copied whole: the viewport fallback path
     // reads it to synthesise a projection when no real one is found.
     uint32_t numViewports = 0;
@@ -153,6 +211,349 @@ namespace dxvk {
     // capture also rounds each range's dataOffset up to 16 so every span inside
     // stays aligned regardless of the preceding span's size.
     alignas(16) std::array<uint8_t, kCbBytesCap> cbBytes = { };
+
+    // THE DEFERRAL PARTITION PREDICATE. True when this draw's VS had a resolved
+    // projection/view location in sVsCbLocCache at capture time.
+    //
+    // WHY THIS IS THE PREDICATE, MEASURED 2026-08-10. The stated blocker on
+    // deferring the derivation is that it SCANS live cbuffers -- the offset-64
+    // projection scan, the cross-stage all-cb scan, the m_viewSlot hunt -- and a
+    // scan cannot be made pure by a narrow copy. That is true of the code and
+    // empirically vacuous in steady state: over the 03:18 windows the scans
+    // fired ZERO times (xt_projScan1N=0, pv_rescanN=0) because the per-VS
+    // location cache never missed (xt_vsLocMiss=0 against xt_vsLocHits=5849).
+    // The scan is guarded by `projSlot == UINT32_MAX && !skipExpensiveProjScan`,
+    // and a resolved VS sets projSlot from the cache before that test.
+    //
+    // So the scans are a COLD-START path, and the question for deferral is not
+    // "how do we make a scan pure" but "can we tell, before deriving, that this
+    // draw will not take one". This flag is that answer, and it is free: the
+    // capture already does the sVsCbLocCache lookup to decide which spans to
+    // copy. It WILL be false for the cases that genuinely scan -- a VS's first
+    // sighting, after the 4096-entry cache clear, after a neg-cache TTL expiry.
+    //
+    // NOT A PURITY CERTIFICATE. It says this draw skips the scans. It does NOT
+    // say the derivation is a pure function of the snapshot: the content reads
+    // still go through stagedCbBytes()/GetMappedSlice(), which read live buffer
+    // bytes at consume time, and the m_last* carriers are a separate axis. Use
+    // it to PARTITION, then prove purity the way the tier already proves it
+    // (FAIL=0). Deferring on this flag alone repeats the COLOR1.y mistake.
+    bool layoutResolved = false;
+
+    // THE PURITY CERTIFICATE. Written at the END of the derivation, not at
+    // capture, because it is a statement about what the derivation DID.
+    //
+    // layoutResolved says the draw skips the cold-start scans. It deliberately
+    // does NOT say the derivation is a pure function of this record -- the
+    // handoff calls that out and it was the remaining barrier: the content
+    // reads still went through stagedCbBytes()/GetMappedSlice(), which read
+    // LIVE buffer bytes at consume time. Deferring on layoutResolved alone
+    // repeats the dropship COLOR1.y mistake.
+    //
+    // Every content read now goes through D3D11Rtx::drawCbSpan(), which counts
+    // itself into exactly one of these two. So:
+    //   cbLiveReads == 0 && cbRecordReads > 0
+    // means this draw's derivation read cbuffer CONTENT only from bytes copied
+    // at capture time, under the captured generations. That is the fact a
+    // deferred reader needs and the fact no flag could assert before.
+    //
+    // NOT SUFFICIENT ON ITS OWN, and the gap is named rather than papered
+    // over: this covers cbuffer CONTENT. The m_last* cross-draw carriers are a
+    // separate axis (the StageDep census measures those), and vertex/index/
+    // bone bytes go through their own capture path. A deferral gate is the
+    // CONJUNCTION of all three, and it must still be proven the way the tier
+    // proves everything else -- FAIL=0.
+    uint16_t cbLiveReads   = 0;
+    uint16_t cbRecordReads = 0;
+
+    // THE SECOND AXIS: CROSS-DRAW CARRIERS.
+    //
+    // WHY THIS IS A WRITE TEST AND NOT A READ TEST -- the thing that took a
+    // wrong turn before it took the right one. The obvious move is to capture
+    // the carriers into this record the way the cbuffer bindings are captured,
+    // and serve the derivation's ~99 carrier reads from the copy. That does
+    // NOT make deferral correct, and the reason is worth writing down: the
+    // carriers are written BY the derivation. Draw N writes
+    // m_lastFanoutCamOrigin; draw N+1 reads it. If both are deferred, N+1's
+    // capture runs on the frame thread at its own SubmitDraw entry, BEFORE N's
+    // worker has produced that write -- so N+1 captures a stale carrier and the
+    // deferred result differs from the serial one. Capturing converts a race
+    // into a deterministic divergence, which is an improvement but is not
+    // correctness.
+    //
+    // The sufficient condition is simply that the draw MOVES no carrier. Then
+    // there is no ordering edge into any later draw, and reading them live or
+    // from a copy is the same answer. [Perf.StageDep] already measured this:
+    // bt_extractXf is the ONLY stage that moves cross-draw D3D11Rtx state, at
+    // wrote=14% / wroteElig=13%, and all 47 others read 0%. So ~86% of draws
+    // are already carrier-free and the question is only which ones.
+    //
+    // carrierGrp holds the per-group fingerprints at capture; carrierMask is
+    // set at the end of the derivation by re-hashing and comparing group by
+    // group. The enumeration is stageDepCarrierGroups(), which is the tree's
+    // existing, reviewed carrier list -- deliberately reused rather than
+    // re-derived, because a carrier missing from that list is invisible to
+    // both this and the census.
+    //
+    // CONSERVATIVE BY CONSTRUCTION: the capture fingerprint is taken at
+    // SubmitDraw entry, a few stages EARLIER than the derivation. Those stages
+    // measure wrote=0%, but if one ever did move a carrier this would report
+    // a carrier move on a draw whose derivation was innocent -- a false
+    // positive, which costs a deferral opportunity. It can never produce a
+    // false negative, which is the only direction that would be unsafe.
+    // MEASURED 2026-08-10 and the concern is empty: [Perf.StageDep] reads
+    // wrote=0% on all 47 stages other than bt_extractXf, so the wide baseline
+    // costs nothing today. Left wide anyway -- it is the safe direction, and
+    // narrowing it buys zero draws.
+    //
+    // ONE HASH PER GROUP, NOT ONE FOLDED HASH -- changed 2026-08-10.
+    // The fold could only ever say "something moved", and the number it
+    // produced (carrierMoved=13% of draws, 19% of the draws that pass axis 1)
+    // is not actionable, because the five groups are not the same KIND of
+    // dependency:
+    //
+    //   kSdepCam    a real draw-N -> draw-N+1 data flow: N writes
+    //               m_lastFanoutCamOrigin, N+1 reads it. A true ordering edge,
+    //               and the case the paragraph above is about. ~780 draws per
+    //               3 s window, and after the cbLoc work below it is now
+    //               essentially the whole carrier axis.
+    //   kSdepBone   bone/cb3 caches a later draw reuses. Measured at ZERO
+    //               moves per window, so it costs nothing either way.
+    //   kSdepStatic m_lastGoodTransforms + m_foundRealProjThisFrame: a
+    //               last-known-good FALLBACK latch, order-affecting but not
+    //               consumed as this draw's answer. ~65 draws/window.
+    //   kSdepCbLoc  88% of all carrier moves (~5,600/window vs cam's 780) and
+    //               the single largest eligibility cost at ~3,750 draws per
+    //               3 s window. STILL HASHED: it is a real dependency, and two
+    //               attempts to retire it (sentinel seed; frame-scoped hint)
+    //               were measured and reverted -- the second broke the replay
+    //               tier with FAIL=1. See stageDepCarrierGroups.
+    //   kSdepRoute  hashes nothing by construction; see stageDepCarrierGroups.
+    //
+    // safeToDefer() still requires ALL of them clean, byte for byte the same
+    // gate as before this change. The mask exists so the NEXT decision --
+    // whether a per-group gate that trusts the caches is worth building -- is
+    // made from a counter rather than from this comment. DO NOT relax the gate
+    // on the strength of the reasoning above; relax it on the strength of
+    // [DrawPure] eligCacheOk, which is exactly the population such a gate
+    // would add.
+    //
+    // STRICTLY SAFER THAN THE FOLD, not merely equivalent: two different group
+    // vectors could fold to the same 64 bits and report clean. Comparing per
+    // group removes that false negative and cannot introduce one.
+    uint64_t carrierGrp[kSdepGroupCount] = {};
+    // Bit g set == group g's hash differs between capture and derivation exit.
+    uint8_t  carrierMask = 0;
+    static_assert(kSdepGroupCount <= 8, "carrierMask is 8 bits wide");
+
+    bool wroteCarrier() const { return carrierMask != 0; }
+
+    bool contentPure() const {
+      return cbLiveReads == 0 && cbRecordReads > 0;
+    }
+
+    // ==================================================================
+    // AXIS 3 -- VERTEX / INDEX / BONE BYTES. The third of the three things
+    // deferral needs, and until now the one nothing in this record spoke for.
+    //
+    // WHY IT IS A DIFFERENT QUESTION FROM AXIS 1. Axis 1 is about cbuffer
+    // CONTENT and is answered by counting reads through drawCbSpan. These bytes
+    // never go through that accessor: they reach the RT side as Rc<DxvkBuffer>
+    // slots on RasterGeometry, and they are consumed by jobs that ALREADY run
+    // on a worker -- runBatchHashJob, runBatchBboxJob, runBatchSkinJob in
+    // flushGeometryBatch. So the bytes are read off-thread today; the question
+    // is only whether what they read can change underneath them.
+    //
+    // THE ONE THING THAT MAKES IT UNSAFE is the rule at the top of this struct:
+    // a Com<>/Rc<> pins the buffer OBJECT, not its CONTENTS. A buffer created
+    // D3D11_USAGE_DYNAMIC is Map(WRITE_DISCARD)ed by the game, which RENAMES
+    // its backing slice while the object identity stays put -- so a pin taken
+    // at SubmitDraw entry and read at frame end yields whatever the game wrote
+    // NEXT, not what this draw drew. That is the dropship COLOR1.y race
+    // exactly, and it is why this is a per-draw fact and not a global claim.
+    // IMMUTABLE / DEFAULT / STAGING buffers cannot be renamed that way, so a
+    // pin on one of them IS a promise about contents.
+    //
+    // WHAT THESE FIELDS SAY. Which of this draw's geometry inputs are backed by
+    // a DYNAMIC buffer. They do NOT say the draw is unsafe: a dynamic buffer
+    // whose bytes were COPIED (the index snapshot, the t31 read cache, the bone
+    // palette materialisation) is fine, and those copies are exactly what the
+    // existing jobs' copy-vs-pin rules are for. What they give is the
+    // POPULATION -- the draws where the copy-vs-pin question has to be asked at
+    // all -- measured rather than assumed.
+    //
+    // DELIBERATELY NOT WIRED INTO safeToDefer() YET. Publishing the fact and
+    // reporting it comes first, the same order axis 2 went in: the carrier mask
+    // was measured for a run before anything acted on it, and that discipline
+    // is what caught the cbLoc dependency instead of shipping it. Wire it in
+    // once [DrawPure] shows what fraction of eligible draws also pass here.
+    // MEASURED: geoDynVsSrv fires on ~100% of draws because t31 is bound and
+    // DYNAMIC essentially always. That is NOT a bug to be excluded away -- it
+    // was tried, on evidence that turned out to be about other consumers of
+    // the same buffer, and reverted. The derivation's own o2w_t31 path reads
+    // t31 LIVE off GetMappedSlice().mapPtr, so a deferred draw really would
+    // race it. See the capture loop for the full account. geoStatic therefore
+    // reads ~0% until that read is converted onto the record.
+    uint32_t geoDynVbMask = 0;      // bit i = vertex buffer slot i is DYNAMIC
+    bool     geoDynIb     = false;  // index buffer is DYNAMIC
+    bool     geoDynVsSrv  = false;  // any DYNAMIC-backed VS SRV is bound
+    // Split of geoDynVsSrv by whether the dynamic slot is the model-instance
+    // (t31) stream the derivation reads, or some OTHER slot. The whole slot is
+    // resolved from RDEF at capture (memoModelInstSlot), never hardcoded to 31.
+    bool     geoDynSrvT31   = false;  // the model-inst SRV slot is DYNAMIC
+    bool     geoDynSrvOther = false;  // some other bound VS SRV is DYNAMIC
+
+    // ==================================================================
+    // THE t31 / COLOR1 CONVERSION (handoff 5b) -- the bytes the DERIVATION
+    // reads, moved from consume time to capture time.
+    //
+    // WHAT HELD AXIS 3 AT ZERO. The o2w_t31 path reads 48 bytes at
+    // charIdx*208 off a DYNAMIC structured buffer, LIVE, at derivation time,
+    // and t31 is bound-and-DYNAMIC on essentially every draw. The
+    // binding-property test therefore vetoed everything. Excluding the slot was
+    // tried and was wrong -- the evidence cited was about two OTHER consumers of
+    // the same buffer (the instanced fanout's m_t31ReadCache and BatchSkinJob's
+    // bone palette), and this third consumer inside the derivation still raced.
+    // The fix is the conversion, not an exclusion: copy at capture, serve from
+    // the record, fall back live. Same discipline that already worked twice for
+    // cb3.
+    //
+    // COLOR1 IS PART OF THE CAPTURE, not just the t31 entry. charIdx comes from
+    // a live read of the per-instance vertex buffer at
+    // m_currentInstanceIndex * stride + instSemByteOffset, which is itself a
+    // rename-capable source. Capturing the entry but not the index it was
+    // selected by would leave half the race in place. Capturing the whole
+    // 8-byte COLOR1 (uint16 x4) covers BOTH index reads the derivation does:
+    // .x -> charIdx for the t31 path, .y -> boneIdx for the t30 bone path.
+    //
+    // ONE ENTRY IS ENOUGH because the instanced fanout issues one SubmitDraw per
+    // instance -- it sets m_currentInstanceIndex and calls SubmitDraw in a loop
+    // -- so a snapshot covers exactly one instance and exactly one charIdx.
+    bool     instSemValid = false;  // COLOR1 below was captured this draw
+    uint32_t instSemSlot  = UINT32_MAX;  // the vertex-buffer slot it came from
+    uint16_t instSem[4]   = { };    // COLOR1: .x=charIdx  .y=boneIdx
+    bool     t31Valid     = false;  // the 48 bytes below were captured this draw
+    uint32_t t31CharIdx   = 0;      // the entry index they were read at
+    // alignas(16): consumers reinterpret this as a float3x4 exactly as they do
+    // the write-combined pointer it replaces. Same reason cbBytes is aligned.
+    alignas(16) float t31Entry[12] = { };
+
+    // ==================================================================
+    // AXIS 3 AS A READ CERTIFICATE. The masks above are properties of the
+    // BINDINGS -- "is anything bound here rename-capable". That is the wrong
+    // question and it is why the axis answered ~0%: bound is not the same as
+    // read, the identical defect the deleted cb3 predictor existed to fix.
+    //
+    // The question that actually gates deferral is the one axis 1 asks about
+    // cbuffers: DID THIS DERIVATION READ RENAME-CAPABLE BYTES LIVE? A live read
+    // of an IMMUTABLE or DEFAULT buffer is safe -- neither can be renamed by
+    // Map(WRITE_DISCARD) -- and a buffer that is never read cannot race at all.
+    // So only a live read FROM A DYNAMIC SOURCE increments geoLiveReads.
+    //
+    // NOT YET SUFFICIENT ON ITS OWN, and this is the trap to not walk into: the
+    // certificate is only as good as the routing behind it. Every cbuffer
+    // content read goes through drawCbSpan, which is what makes cbLiveReads
+    // trustworthy. The geometry reads are routed at the four sites that exist
+    // today (two t31, two COLOR1), but the derivation is ~3,800 lines and an
+    // unrouted read would be INVISIBLE here. So geoBytesStatic() below keeps the
+    // conservative binding vetoes as a backstop and uses the certificate only to
+    // excuse the inputs whose reads are provably all routed. Retire a veto when
+    // the numbers say the input is unread, not on the strength of this comment.
+    uint16_t geoLiveReads   = 0;
+    uint16_t geoRecordReads = 0;
+
+    // No geometry input the DERIVATION reads can be renamed under a worker.
+    //
+    // THE BINDING VETOES ARE GONE, 2026-08-10, and this is the change that
+    // finally moved the axis off zero. They were: veto if any bound VB / IB /
+    // VS SRV is DYNAMIC. Measured with the certificate alongside them, they
+    // rejected 100% of draws while geoLiveReads counted 6 live reads in 36,015
+    // draws. They were not measuring the race; they were measuring what happened
+    // to be bound. That is the deleted cb3 predictor's defect for the third time
+    // in this file: BOUND IS NOT READ.
+    //
+    // WHAT MAKES THE CERTIFICATE SUFFICIENT is an audit, not optimism. Every
+    // live read inside ExtractTransforms is one of:
+    //   - a CBUFFER read (stagedCbBytes / GetMappedSlice on a cb slot). Those
+    //     are axis 1's business and are counted by cbLiveReads; safeToDefer()
+    //     already requires that to be zero.
+    //   - the t31 model-instance entry -- CONVERTED, served from this record.
+    //   - the COLOR1 per-instance entry -- CONVERTED (all four read sites).
+    //   - the t30 bone palette -- SCORED via noteGeoLiveRead, not converted.
+    // Nothing in it reads the index buffer, which is why geoDynIb's ~21% was
+    // pure cost: the max-index scan lives in bt_cullVtx, a different stage,
+    // outside anything being deferred.
+    //
+    // THE CONTRACT THIS PLACES ON FUTURE EDITS: a new live read of geometry
+    // bytes added to the derivation MUST go through drawInstSem / drawT31Entry,
+    // or call noteGeoLiveRead. An unrouted read is invisible here and would make
+    // this certificate lie. That is the same contract drawCbSpan carries for
+    // axis 1, and it is the price of asking about reads instead of bindings.
+    // geoDynVbMask / geoDynIb / geoDynVsSrv are retained as DIAGNOSTICS -- they
+    // size the population where the question could arise, which is how [DrawPure]
+    // reports them and all they were ever good for.
+    bool geoBytesStatic() const {
+      return geoLiveReads == 0;
+    }
+
+    // THE TWO AXES THIS RECORD CAN ANSWER FOR, CONJOINED. Call this, never
+    // contentPure() alone -- the conjunction is load-bearing in a way that is
+    // easy to miss:
+    //
+    //   contentPure() counts reads that went through drawCbSpan. The SCANS do
+    //   not go through it (they iterate offsets, so there is no span to name)
+    //   and therefore do not increment cbLiveReads. A scanning draw would
+    //   report contentPure() while reading live buffer bytes the whole time.
+    //   layoutResolved is exactly what excludes it: a draw that scans is a
+    //   draw whose VS had no resolved location, so layoutResolved is false.
+    //
+    // So neither flag is sufficient and the pair is not redundant. That is
+    // also why this is a named method rather than an && at the call site: the
+    // next person to add a deferral path should not have to rediscover it.
+    //
+    // WHAT IT STILL DOES NOT COVER: VERTEX / INDEX / BONE bytes, which have
+    // their own capture path (BatchSkinJob and the geometry capture) and no
+    // per-draw statement anywhere. That is the third axis and it is not
+    // expressed here -- see safeToDefer().
+    bool cbSafeToDefer() const {
+      return layoutResolved && contentPure() && !overflowed;
+    }
+
+    // THE GATE. Two of the three axes, conjoined, per draw:
+    //   cbSafeToDefer() -- the derivation read cbuffer CONTENT only from this
+    //                      record, and did not take a cold-start scan.
+    //   !wroteCarrier() -- it moved no cross-draw D3D11Rtx state in ANY group,
+    //                      so it creates no ordering edge into any later draw.
+    //                      Deliberately all-groups: see carrierGrp for which
+    //                      of them are true dependencies and which are caches,
+    //                      and for why that distinction must be measured
+    //                      before it is acted on.
+    //
+    // THE THIRD AXIS IS STILL ABSENT FROM THIS CONJUNCTION, but it is no longer
+    // unmeasured: geoBytesStatic() above answers it per draw, and [DrawPure]
+    // reports the intersection as elig3. It is deliberately not ANDed in here
+    // yet -- the carrier axis was published and read for a run before anything
+    // acted on it, and that order is what surfaced the cbLoc dependency
+    // instead of shipping it. AND it in once elig3 has been read.
+    //
+    // Until then, a caller that hands a draw to a worker on this flag alone has
+    // proven two thirds of what it needs. Partition on
+    // safeToDefer() && geoBytesStatic().
+    //
+    // Named as a gate rather than left as an && at the call site so the axis
+    // list lives in one place and the missing third is impossible to forget.
+    // THE THIRD AXIS IS NOW IN. It was held out deliberately while it was a
+    // binding property that read 0% -- publishing a fact and reading it for a
+    // run before acting on it is what caught the cbLoc dependency instead of
+    // shipping it. That run happened: geoLive=6 against 36,015 draws with
+    // t31Cap=15,198 and geoRec=15,258, i.e. the conversion fires and the
+    // derivation reads essentially nothing renameable live. So the conjunction
+    // is the real gate now, and callers no longer have to remember to AND
+    // geoBytesStatic() at the call site -- which the old comment here asked them
+    // to do, and which is exactly the kind of instruction that gets missed once.
+    bool safeToDefer() const {
+      return cbSafeToDefer() && !wroteCarrier() && geoBytesStatic();
+    }
 
     // Set when a range did not fit in kMaxCbRanges / kCbBytesCap. A snapshot
     // with this flag is INCOMPLETE and must fall back to the live path -- it
@@ -178,8 +579,18 @@ namespace dxvk {
     void reset() {
       numCbRanges = 0;
       overflowed  = false;
+      layoutResolved = false;
+      cbLiveReads = 0; cbRecordReads = 0;
+      carrierMask = 0;
+      geoDynVbMask = 0; geoDynIb = false; geoDynVsSrv = false;
+      geoDynSrvT31 = false; geoDynSrvOther = false;
+      instSemValid = false; instSemSlot = UINT32_MAX;
+      t31Valid = false; t31CharIdx = 0;
+      geoLiveReads = 0; geoRecordReads = 0;
       vs = nullptr; ps = nullptr; inputLayout = nullptr;
       blendState = nullptr; depthState = nullptr; rasterState = nullptr;
+      rtv0 = nullptr;
+      for (auto& c : vsCbs) c = { };
       indexBuffer = { };
       for (auto& v : vertexBuffers) v = { };
       for (auto& s : vsSrvs)        s = nullptr;
@@ -306,18 +717,7 @@ namespace dxvk {
     Matrix4 viewToProjection;
   };
 
-  // NV-DXVK [Perf.StageDep]: the carrier GROUPS the stage-dependency census
-  // hashes separately. Namespace scope, not a class member: the census's free
-  // helpers in d3d11_rtx.cpp need it, and the grouping is a property of the
-  // probe rather than of D3D11Rtx. See rtx.perfStageDepCensus.
-  enum SdepGroup : uint32_t {
-    kSdepCam = 0,   // camera origins / fanout latches / smoothing
-    kSdepRoute,     // the sticky path ids
-    kSdepCbLoc,     // shared proj/view cb slot+offset locations
-    kSdepBone,      // bone + cb3 caches a later draw reuses
-    kSdepStatic,    // m_foundRealProjThisFrame + m_lastGoodTransforms
-    kSdepGroupCount
-  };
+  // (SdepGroup moved above struct DrawSnapshot -- see the note there.)
 
   class D3D11Rtx {
   public:
@@ -463,6 +863,14 @@ namespace dxvk {
     // enum is at namespace scope above -- the census's free helpers need it.
     void stageDepCarrierGroups(uint64_t out[kSdepGroupCount]) const;
 
+    // NV-DXVK [DrawSnapshot] 2026-08-10: this is ALSO the per-draw
+    // did-this-draw-move-a-carrier test. Called twice per draw (capture
+    // baseline + derivation exit) versus the census's 48 (one per stage
+    // boundary), so the deferral gate does not need that probe's 1-in-8
+    // sampling. The folded carrierFingerprint() that used to sit here was
+    // deleted when DrawSnapshot moved to per-group hashes -- see the note at
+    // the definition in d3d11_rtx.cpp.
+
     static constexpr uint32_t kMaxConcurrentDraws = 6 * 1024;
     // NV-DXVK [BatchSubmitDraw perf]: LowLatency=FALSE so idle workers SLEEP on a
     // condition variable instead of spinning. The default (LowLatency=true) makes
@@ -521,6 +929,11 @@ namespace dxvk {
     // slot cannot provide. Reserved once; never reallocated mid-frame, because
     // m_drawSnapCur points into it.
     std::vector<DrawSnapshot> m_drawSnaps;
+    // Next free slot in the arena. Reset (not cleared) at frame rollover, so
+    // slots are REUSED rather than destroyed and reconstructed -- see the note
+    // in captureDrawSnapshot for why that is safe and what it costs when it is
+    // not. Rolls over with m_drawCallID, which is the ordering key.
+    size_t                    m_drawSnapNext = 0;
     // The draw currently being derived. Null when capture is off or the arena
     // is full -- every consumer treats null as "take the live path".
     DrawSnapshot*             m_drawSnapCur = nullptr;
@@ -606,8 +1019,134 @@ namespace dxvk {
     // last draw's bindings. That is why the conversion was applied per site
     // rather than by a blanket replace: 10 of the 22 inputLayout reads in this
     // file are outside SubmitDraw.
+    // Returned BY CONST REFERENCE, deliberately: the 34 call sites this
+    // replaced bind it in every shape there is -- `auto x = ...` (Com copy),
+    // `const auto& x = ...` (reference), `... != nullptr`, `...->GetCommonShader()`,
+    // `....ptr()`. Handing back the same Com<> lvalue the live read produced
+    // keeps all of them type-identical and refcount-identical, so the
+    // conversion cannot change behaviour at any of them. Both storages outlive
+    // the call: the snapshot's copy lives in the arena slot for the whole draw,
+    // the live one in context state.
+    const Com<D3D11VertexShader>& drawVertexShaderCom() const;
+
     D3D11InputLayout*        drawInputLayout() const;
     D3D11ShaderResourceView* drawVsSrv(uint32_t slot) const;
+    D3D11RenderTargetView*   drawRtv0() const;
+    // Binding identity for a VS constant-buffer slot. Out-of-range yields an
+    // empty binding (null buffer, UINT64_MAX generation), matching the
+    // "nothing bound" answer every caller already handles.
+    const DrawSnapshot::CbBinding& drawVsCb(uint32_t slot) const;
+
+    // ================================================================
+    // NV-DXVK [DrawSnapshot] 2026-08-10: THE CONTENT-READ ACCESSOR.
+    //
+    // This is the piece that finishes the conversion. The identity half was
+    // done by the accessors above; the barrier that remained was cbuffer
+    // CONTENT -- ~32 sites in ExtractTransforms, each hand-rolling the same
+    // twelve lines: stagedCbBytes(), fall back to GetMappedSlice(), bounds-
+    // check, cast at base+offset. Every one of them reads LIVE bytes at
+    // consume time, which is precisely what a deferred reader cannot do.
+    //
+    // WHY ONE ACCESSOR RATHER THAN 32 CONVERSIONS. Converting the sites
+    // individually is what the previous two sessions did for four of them, and
+    // it does not converge: each site re-derives its own offset arithmetic, and
+    // the proj-vs-view convention divergence (one adds constantOffset*16, the
+    // other does not) means every new site is a fresh chance to capture a
+    // different 64 bytes than the consumer reads. Here the convention is a
+    // PARAMETER -- `rebase` -- supplied once per site and used by BOTH the
+    // lookup and the capture, so the two cannot disagree by construction.
+    //
+    // WHAT IT DOES, in order:
+    //   1. resolve the binding (from the record when this draw has one);
+    //   2. abs = (rebase ? constantOffset*16 : 0) + relOffset;
+    //   3. return the captured bytes if the record holds that span;
+    //   4. otherwise read live exactly as the site used to -- AND record
+    //      (slot, relOffset, byteCount, rebase) into the VS's span manifest,
+    //      so the NEXT draw of this shader captures it and step 3 hits.
+    //
+    // THE LEARNING IS THE POINT, and it is the same self-healing shape the cb3
+    // predictor already proved: being wrong is free. A span the manifest has
+    // not learned yet is served live -- correct, just not pure -- and learning
+    // it costs one bounded array write. It converges per VS within a draw or
+    // two of that shader's first sighting, and it needs no advance list of
+    // which offsets the derivation reads, which is exactly the list nobody
+    // could write by hand.
+    //
+    // Returns nullptr when the slot is unbound or the span does not fit the
+    // buffer -- the same answer the live code produced, and every caller
+    // already handles it.
+    //
+    // `rebase` is NOT a default argument on purpose. The two conventions are
+    // the trap this file has already been bitten by; making every call site
+    // spell out which one it uses is the point.
+    //
+    // narrowScratch -- THE HIT-ONLY LIVE FALLBACK, added 2026-08-10, and the
+    // thing that let the last un-routed content consumer come in.
+    //
+    // The default live fallback calls stagedCbBytes(), whose MISS path stages
+    // the WHOLE buffer (~6.3 KB) to serve one narrow read. For a cbuffer the
+    // game Map(WRITE_DISCARD)es every draw -- slot 3 is the case -- the content
+    // generation moves every draw, so the staging ring can NEVER hit and that
+    // miss path is the only path. That is the [Perf.WcCopy] shape (~3.4 MB/frame,
+    // 91% of pole-thread WC bytes) a previous session removed from the cb3->o2w
+    // site by hand, and it is why that site kept a private find() instead of
+    // routing here (handoff 4d).
+    //
+    // Pass a caller-owned buffer of at least byteCount bytes and the live
+    // fallback becomes: staging ring HIT-ONLY (free when another site already
+    // staged this generation), else GetMappedSlice + a narrow memcpyFromWC of
+    // exactly byteCount into that buffer. stagedCbBytes() is never called. The
+    // returned pointer is then into the scratch, so it is valid for as long as
+    // the caller's storage is -- which is why this is a parameter and not an
+    // internal static: the site owns the lifetime, as it already did.
+    //
+    // WHY ROUTE AT ALL, given the site's hand-rolled version was already
+    // correct: the private copy could not reach noteCbSpanRead(), so the span
+    // manifest never learned slot 3 from the consumer that reads it most. That
+    // kept the cb3 PREDICTOR alive as a second, overlapping mechanism. Routed,
+    // the manifest learns it like every other span and the predictor was
+    // deleted (see captureDrawSnapshot).
+    const uint8_t* drawCbSpan(uint32_t slot, uint32_t relOffset,
+                              uint32_t byteCount, bool rebase,
+                              uint8_t* narrowScratch = nullptr);
+
+    // [5b] THE GEOMETRY-BYTE ANALOGUES OF drawCbSpan. Same contract: serve from
+    // the record when it was captured, fall back to the live read otherwise, and
+    // COUNT which one happened so the record can certify itself.
+    //
+    // The counting rule is the one thing here that is not obvious. A live
+    // fallback increments geoLiveReads ONLY when the source buffer is
+    // D3D11_USAGE_DYNAMIC, because only DYNAMIC can be renamed by
+    // Map(WRITE_DISCARD) under a worker. Reading an IMMUTABLE vertex buffer live
+    // is perfectly safe and must not cost the draw its eligibility -- scoring it
+    // as unsafe is what made the binding-property version of this axis useless.
+    //
+    // Both return nullptr when the value is unavailable from either source,
+    // which is the signal to take the site's existing "skip" branch. Neither
+    // applies the sites' finite/zero-row validity checks: those are decisions
+    // about the VALUE and stay with the consumer.
+
+    // The draw's per-instance COLOR1 entry (uint16 x4): .x = charIdx for the
+    // t31 model-instance path, .y = boneIdx for the t30 bone path.
+    const uint16_t* drawInstSem(uint32_t slot, uint32_t byteOffset,
+                                uint16_t* scratch4);
+
+    // t31[charIdx].objectToCameraRelative -- the float3x4 at entry+0, 48 bytes.
+    // Serves from the record only when the record captured THIS charIdx; a
+    // mismatch means the consumer chose a different instance than the capture
+    // saw, so the read goes live and is scored live.
+    const float* drawT31Entry(uint32_t srvSlot, uint32_t charIdx,
+                              float* scratch12);
+
+    // SCORING ONLY, for a derivation read that is deliberately NOT converted
+    // onto the record. The t30 bone palette is the case: it is read live at four
+    // points across the full and replay paths, and it is not DYNAMIC in any
+    // scene measured (dynSrvSlots names only t4 and t31), so converting it would
+    // buy nothing and cost a 48-byte capture on every skinned draw. Noting it
+    // costs one Desc() read and keeps geoLiveReads HONEST -- the certificate
+    // stops depending on t30 happening to be immutable, and correctly vetoes the
+    // draw the day a scene ships a dynamic bone buffer.
+    void noteGeoLiveRead(D3D11Buffer* src);
     // TOTAL: an out-of-range slot yields a binding whose buffer is null rather
     // than reading past the array. The call sites this replaced indexed
     // vertexBuffers[slot] unchecked and every one of them already handles a
@@ -1497,6 +2036,15 @@ namespace dxvk {
     uint32_t                             m_viewSlot   = UINT32_MAX;
     size_t                               m_viewOffset = SIZE_MAX;
     int                                  m_viewStage  = -1;
+
+    // NV-DXVK [DrawSnapshot] 2026-08-10: the seven members above DO carry
+    // across draws, deliberately, and two attempts to stop them were measured
+    // and reverted -- see stageDepCarrierGroups' kSdepCbLoc block and the
+    // VsLocCache site in ExtractTransforms. The carry is the bootstrap channel
+    // by which a first-sighting VS acquires a location, and these fields are
+    // an input to the replay tier's record keying. Retiring them from the
+    // carrier set is worth ~3,750 eligible draws per 3 s window but needs the
+    // tier decoupled from them first.
 
     // NV-DXVK [Phase1]: formal per-VS layout table (GPU-driven injection).
     // Populated at the tail of ExtractTransforms from the same resolved state

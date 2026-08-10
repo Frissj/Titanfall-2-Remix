@@ -8973,6 +8973,38 @@ namespace dxvk {
   static thread_local int64_t s_perfBtDcsCtorAcc        = 0, s_perfBtDcsCtorMax        = 0;
   static thread_local int64_t s_perfBtGeoCopyAcc        = 0, s_perfBtGeoCopyMax        = 0;
   static thread_local int64_t s_perfBtExtractXformAcc   = 0, s_perfBtExtractXformMax   = 0;
+  // NV-DXVK [Perf.EligCost] handoff 5a: bt_extractXf, SPLIT BY THE DEFERRAL GATE.
+  //
+  // WHY THIS EXISTS. eligible% is a proxy for what deferral would buy, and it may
+  // be a bad one. ~73% of draws hit the replay tier and are already cheap -- that
+  // is what the tier is FOR -- so a gate covering 36% of draws that happen to be
+  // the EXPENSIVE ones is worth more than one covering 60% of cheap ones. Nobody
+  // knows which of those two worlds this is, and the whole of 5b/5d is sized off
+  // the answer. These are the ~20 lines that replace the guess with a number.
+  //
+  // READ IT AS ns/draw, NOT as a total: xfElig/xfEligN against xfInelig/xfIneligN.
+  // The totals alone cannot tell "many cheap draws" from "few expensive draws",
+  // and that distinction IS the question. A small xfElig with a low ns/draw means
+  // this line of work stops and the frame time is somewhere else.
+  //
+  // ZERO EXTRA CLOCK READS. The interval markStg bills to bt_extractXf is exactly
+  // the ExtractTransforms() call -- bt_geoCopy's mark re-stamps tStg on the line
+  // immediately before it -- so the split re-bills a dNs that has already been
+  // computed. markStg returns it for that reason, and the stage total itself is
+  // untouched, so bt_extractXf stays comparable against every prior run.
+  //
+  // WITH rtx.useDrawSnapshot=False every draw reports ineligible (there is no
+  // record to gate on) and xfElig reads 0. That is the flag being off, not a
+  // finding.
+  static thread_local int64_t  s_xfEligNs = 0, s_xfIneligNs = 0, s_xfElig3Ns = 0;
+  static thread_local uint32_t s_xfEligN  = 0, s_xfIneligN  = 0, s_xfElig3N  = 0;
+  // Published by XtPurityGuard at every exit of ExtractTransforms, consumed by the
+  // markStg call on the very next line of SubmitDraw. Deliberately NOT cleared
+  // between draws: the guard is RAII and writes both on every exit, so a stale
+  // value cannot outlive a draw that ran the derivation, and nothing else reads
+  // them.
+  static thread_local bool s_xtEligLast  = false;  // safeToDefer() -- axes 1+2
+  static thread_local bool s_xtElig3Last = false;  // ...&& geoBytesStatic() -- all 3
   static thread_local int64_t s_perfBtSkyboxFilterAcc   = 0, s_perfBtSkyboxFilterMax   = 0;
   // [Perf.SubmitDraw] ExtractTransforms() internal subdivision. The function
   // is ~3,800 lines long and bt_extractXf (its total) is the dominant cost
@@ -9515,6 +9547,39 @@ namespace dxvk {
   static thread_local int64_t s_perfDrawSnapAccNs      = 0, s_perfDrawSnapMaxNs      = 0;
   static thread_local int64_t s_perfDrawSnapAllocAccNs = 0, s_perfDrawSnapAllocMaxNs = 0;
   static thread_local int64_t s_perfDrawSnapIdAccNs    = 0, s_perfDrawSnapIdMaxNs    = 0;
+  // NV-DXVK [DrawSnapshot] AXIS 3 attribution. Which VS SRV slots are backed
+  // by a DYNAMIC (rename-capable) buffer, counted per slot. Exists because the
+  // any-slot answer measured useless -- it fired on 100% of draws -- and the
+  // fix needs to know which slots are always bound versus which ones a draw
+  // actually reads. Same shape as s_drawSnapWcMissBySlot and s_xtCbLiveBySlot:
+  // zeroes omitted at emit, so one dominant slot is immediately visible.
+  static constexpr uint32_t kGeoDynSrvSlots = 32;
+  static thread_local uint32_t s_geoDynSrvBySlot[kGeoDynSrvSlots] = { };
+  // (drawSnapCb3_ns removed 2026-08-10 with the named cb3 span it timed. The
+  // manifest owns slot 3 now, and its spans are copied by the same loop as
+  // every other learned span -- there is no cb3-specific block left to time.
+  // If slot 3 ever needs isolating again, time it inside the manifest replay
+  // by entry, not with a bespoke block.)
+  // NV-DXVK [DrawSnapshot] 2026-08-10: WC TRANSACTION COUNT, the thing that
+  // actually costs. [Perf.WcCopy] measured the capture's narrow copies at
+  // 222,858 calls per 5 s window averaging 55.7 B -- ~2,894 separate
+  // write-combined reads per frame. WC is LATENCY-bound, not bandwidth-bound
+  // (the tree's own figure is 1192-2333 ns for 64 B, i.e. ~30-50 MB/s), so the
+  // bill is set by how many transactions there are, not how many bytes. These
+  // two count how often the coalescing window served a span for free versus
+  // how often a new WC read had to be issued.
+  static thread_local uint32_t s_drawSnapWcWinHit  = 0;
+  static thread_local uint32_t s_drawSnapWcWinMiss = 0;
+  // WHICH SLOTS ACTUALLY REACH THE WC PATH. Added 2026-08-10 after the first
+  // coalescing attempt measured 0% coalesced: the window was built on the
+  // premise that a draw's WC-path spans cluster on ONE cbuffer, and the
+  // measurement refuted it -- 2.11 WC reads per draw against meanRanges 5.11,
+  // so most spans already hit the staging ring and the few that miss are on
+  // DIFFERENT buffers. That premise was a guess where a counter belonged, the
+  // same mistake one level down from the one that found the WC cost at all.
+  // This is the counter.
+  static thread_local uint32_t
+    s_drawSnapWcMissBySlot[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = { };
   // NV-DXVK [perf] 2026-08-10: SPLIT THE tail_emit REMAINDER.
   //
   // tail_emit is 212 ms per 5 s window = ~1.91 ms/frame, 64% of the whole
@@ -10857,6 +10922,63 @@ namespace dxvk {
     uint32_t noProjFrame = 0;
     bool     noProjValid = false;
     uint32_t gen         = 0;
+    // NV-DXVK [DrawSnapshot] 2026-08-10 -- THE SPAN MANIFEST.
+    //
+    // It makes the content half of the conversion finite, and as of the same
+    // day it is the ONLY cb-span mechanism: the hand-named cb3 span and the
+    // per-VS cb3 PREDICTOR (cb3Draws/cb3Want) that used to live here are
+    // deleted. The predictor guessed, from a VS's history, whether that shader
+    // reaches the cb3->o2w gate; the manifest records which spans the
+    // derivation ACTUALLY read, per shader, with the offset convention the
+    // consumer used. Learning beats predicting and there is no reason to run
+    // both. Do not re-add it -- see the note in captureDrawSnapshot.
+    //
+    // The manifest answers "which spans does this VS's derivation actually
+    // read?" by OBSERVATION rather than by a list someone maintains:
+    // D3D11Rtx::drawCbSpan appends here whenever it has to serve a read live,
+    // and captureDrawSnapshot replays the entries on the next draw of the same
+    // shader.
+    //
+    // BEING WRONG IS FREE, which is what the predictor relied on too: a span
+    // the manifest has not learned yet makes find() return nullptr and the
+    // consumer runs its original live path -- correct, just not pure -- and
+    // that same live read is what teaches it, so the VS self-heals on the next
+    // draw of that shader.
+    //
+    // WHY PER-VS AND NOT PER-DRAW. The capture runs at SubmitDraw entry, before
+    // any derivation, so it cannot know what this draw will read. It can know
+    // what the LAST draw of this shader read -- and draws batch by VS, which is
+    // the same assumption the location cache, the RDEF memos and the replay
+    // tier are all already built on and which the tier re-proves every draw.
+    //
+    // OFFSETS ARE STORED RELATIVE, WITH THEIR CONVENTION. `offset` is what the
+    // consumer added on top of its base, and `rebase` says whether that base is
+    // constantOffset*16 (proj, cameraOrigin, cb3) or nothing at all (view). The
+    // capture re-derives the base from THIS draw's binding, so a shader whose
+    // cbuffer moves to a different constantOffset still gets the right bytes
+    // instead of silently capturing a stale absolute window. Storing absolutes
+    // would not be unsafe -- find() would simply miss -- but it would never
+    // converge, which defeats the purpose.
+    //
+    // BOUNDED AND SATURATING. Six entries. A VS that reads more distinct spans
+    // than that keeps the first six and serves the rest live: degraded purity,
+    // never wrong bytes. Unbounded growth would be the real hazard, because
+    // exceeding kMaxCbRanges sets `overflowed` and invalidates the whole record.
+    //
+    // NOT ROUTE-DECIDING: these must NEVER bump `gen`. `gen` is what lets a
+    // replay record prove the VS's location state is unchanged with one
+    // compare; a capture hint cannot change any derivation result, and folding
+    // it into `gen` would invalidate replay records for a field that means
+    // nothing to them.
+    struct CbSpanReq {
+      uint32_t offset    = 0;      // RELATIVE -- see the rebase note above
+      uint16_t byteCount = 0;
+      uint8_t  slot      = 0;
+      bool     rebase    = false;
+    };
+    static constexpr uint32_t kMaxCbManifest = 6;
+    CbSpanReq manifest[kMaxCbManifest] = { };
+    uint8_t   manifestN = 0;
   };
   static constexpr uint32_t kVsNegProjTtlFrames = 64;
   static thread_local std::unordered_map<uintptr_t, VsCbLocations> sVsCbLocCache;
@@ -10866,6 +10988,85 @@ namespace dxvk {
   static inline bool vsNegProjActive(const VsCbLocations* e, uint32_t frameId) {
     return e != nullptr && e->noProjValid
         && (frameId - e->noProjFrame) < kVsNegProjTtlFrames;
+  }
+
+  // NV-DXVK [DrawSnapshot] 2026-08-10: the CURRENT DRAW's location entry.
+  //
+  // ExtractTransforms already resolves this pointer once at its top (xtVsLoc,
+  // "[Perf.VsLocCache] v6.9") so the replay tier and the projection site agree
+  // on one lookup. drawCbSpan needs the same entry to append to its manifest,
+  // and it is called from ~30 sites nested arbitrarily deep inside that
+  // function -- passing it down would mean threading a parameter through every
+  // one of them. File-scope thread_local, mirroring s_xtCb3StashValid directly
+  // above the same function.
+  //
+  // LIFETIME RULE, and it is not theoretical: sVsCbLocCache is CLEARED when it
+  // reaches 4096 entries, from inside ExtractTransforms itself, which would
+  // dangle this pointer mid-draw. Both clear sites re-point it at the entry
+  // they then create, so it is never left pointing into a cleared map. Any new
+  // clear site MUST do the same. It is also cleared per draw at the top, so a
+  // draw whose VS has no entry cannot append to the previous draw's shader.
+  static thread_local VsCbLocations* s_xtVsLocCur = nullptr;
+
+  // NV-DXVK [DrawSnapshot] 2026-08-10: per-draw content-read purity tally.
+  // Incremented by drawCbSpan, published onto the record at the end of the
+  // derivation (DrawSnapshot::cbLiveReads / cbRecordReads), reset at the top of
+  // every ExtractTransforms. A draw ending with live == 0 and record > 0 read
+  // its cbuffer content ENTIRELY from bytes captured at SubmitDraw entry.
+  static thread_local uint32_t s_xtCbLiveReads   = 0;
+  static thread_local uint32_t s_xtCbRecordReads = 0;
+
+  // NV-DXVK [DrawSnapshot] 2026-08-10: WHAT THE RESIDUAL IS MADE OF.
+  //
+  // The first run measured pure=96% of touched, steady, with satN=0 -- so the
+  // 4% is NOT manifest saturation and NOT cold start (it does not decay). A
+  // percentage cannot say which of three unrelated things it is, and the three
+  // want opposite fixes: a missing record is a capture-coverage problem, a
+  // find() miss is a manifest problem, a non-VS read is not fixable at all
+  // without capturing other stages. So attribute instead of theorising.
+  //
+  // Window accumulators, reset in the census emit rather than per draw: the
+  // question is about the window, and per-draw resets would cost 17 stores on
+  // every draw to answer it.
+  static thread_local uint32_t s_xtCbLiveNoSnap = 0;  // no usable record at all
+  static thread_local uint32_t s_xtCbLiveMiss   = 0;  // record present, span not in it
+  static thread_local uint32_t s_xtCbLiveNonVs  = 0;  // non-VS stage: unrepresentable
+  static thread_local uint32_t
+    s_xtCbLiveBySlot[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = { };
+
+  // Append a span to a VS's manifest, if it is not already covered.
+  //
+  // COVERAGE, NOT EQUALITY: a request for 12 bytes inside a 64-byte entry that
+  // is already recorded needs no new entry, because the capture will copy the
+  // 64 and find() serves any sub-range of it. Matching on equality instead
+  // would burn manifest slots on the cameraOrigin-inside-the-view-block shape
+  // and hit the six-entry ceiling on shaders that are perfectly well covered.
+  static inline void noteCbSpanRead(VsCbLocations* L, uint32_t slot,
+                                    uint32_t relOffset, uint32_t byteCount,
+                                    bool rebase) {
+    if (L == nullptr || byteCount == 0)
+      return;
+    // A span wider than a manifest entry can describe, or wider than the
+    // record's whole byte budget, is not capturable -- leave it live rather
+    // than recording a truncated request that would serve short bytes.
+    // Same reason for the slot bound: `slot` is narrowed to uint8_t below, and
+    // a truncating store would name a DIFFERENT slot rather than fail.
+    if (byteCount > 256u || slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
+      return;
+    for (uint32_t i = 0; i < L->manifestN; ++i) {
+      const VsCbLocations::CbSpanReq& e = L->manifest[i];
+      if (e.slot == slot && e.rebase == rebase
+          && relOffset >= e.offset
+          && relOffset + byteCount <= uint32_t(e.offset) + e.byteCount)
+        return;  // already covered
+    }
+    if (L->manifestN >= VsCbLocations::kMaxCbManifest)
+      return;  // saturated: this span stays live, which is correct-but-slow
+    VsCbLocations::CbSpanReq& n = L->manifest[L->manifestN++];
+    n.slot      = static_cast<uint8_t>(slot);
+    n.offset    = relOffset;
+    n.byteCount = static_cast<uint16_t>(byteCount);
+    n.rebase    = rebase;
   }
 
   static thread_local std::unordered_map<const void*, XtReplayRecSet> s_xtReplayMap;
@@ -14697,7 +14898,7 @@ namespace dxvk {
     // into one.
     uintptr_t vsLocKey = 0;
     {
-      auto vsPtrL = m_context->m_state.vs.shader;
+      auto vsPtrL = drawVertexShaderCom();
       if (vsPtrL != nullptr && vsPtrL->GetCommonShader() != nullptr) {
         vsLocKey = reinterpret_cast<uintptr_t>(vsPtrL->GetCommonShader());
       }
@@ -14707,6 +14908,330 @@ namespace dxvk {
       auto itVl = sVsCbLocCache.find(vsLocKey);
       if (itVl != sVsCbLocCache.end()) xtVsLoc = &itVl->second;
     }
+    // NV-DXVK [DrawSnapshot]: publish the SAME entry drawCbSpan appends its
+    // span manifest to. One resolution, one truth -- the alternative was a
+    // second lookup inside an accessor called ~30 times per draw. Null when
+    // this VS has no entry yet, which simply means its first draws learn
+    // nothing and are served live.
+    s_xtVsLocCur = xtVsLoc;
+    // Per-draw content-read purity tally. Reset here, published onto the
+    // record at the derivation's exit.
+    s_xtCbLiveReads   = 0;
+    s_xtCbRecordReads = 0;
+
+    // NV-DXVK [DrawSnapshot] 2026-08-10: publish the purity verdict on EVERY
+    // exit. RAII rather than three copies at three `return transforms;` sites,
+    // for the same reason SubmitCpuGuard is RAII: this function has grown exits
+    // and a hand-placed publish would be wrong at whichever one gets added
+    // next. A local class in a member function has full access to the
+    // enclosing class's privates, so this needs no new member.
+    //
+    // WHAT THE CENSUS ANSWERS. Not "is the capture fast" -- that is a separate
+    // and, for now, secondary question. It answers the one that gates
+    // everything: HOW MANY DRAWS ARE ALREADY PURE. Deferral is legal per draw,
+    // and pure% is the size of the population it is legal for. A run where
+    // pure% climbs toward the resolved% ceiling and stays there is the
+    // signal that the manifest has converged and the partition is real.
+    struct XtPurityGuard {
+      D3D11Rtx* self;
+      ~XtPurityGuard() {
+        DrawSnapshot* snap = self->m_drawSnapCur;
+        bool elig = false, carrierMoved = false;
+        // Axis 1 alone (content pure + layout resolved + not overflowed),
+        // BEFORE the carrier gate, and the per-group move mask. Kept as
+        // locals so the tally below can attribute the pure-but-not-eligible
+        // draws to the axis that actually rejected them -- a single `elig`
+        // bool cannot, and that is the split this probe exists to produce.
+        bool    cbSafe = false;
+        uint8_t cmask  = 0;
+        // Axis 3, read off the record the capture already filled.
+        bool geoStatic = false, dynVb = false, dynIb = false, dynSrv = false;
+        // [5b] the read certificate behind geoStatic, and whether the t31
+        // capture actually fired on this draw.
+        uint32_t geoLive = 0, geoRec = 0;
+        bool     t31Cap  = false;
+        if (snap != nullptr && self->m_drawSnapValid) {
+          snap->cbLiveReads =
+            (uint16_t) std::min<uint32_t>(s_xtCbLiveReads,   UINT16_MAX);
+          snap->cbRecordReads =
+            (uint16_t) std::min<uint32_t>(s_xtCbRecordReads, UINT16_MAX);
+          // Carrier axis, closing half. Re-hash and compare against the
+          // baseline taken at capture: if a group moved, this draw created an
+          // ordering edge into some later draw and cannot be reordered.
+          // PER GROUP rather than folding first -- same two enumerations per
+          // draw as before, the only change is that the comparison happens
+          // before the fold instead of after, so the verdict carries WHICH
+          // group moved. safeToDefer() is unaffected: it still requires all
+          // of them clean.
+          uint64_t grpNow[kSdepGroupCount];
+          self->stageDepCarrierGroups(grpNow);
+          for (uint32_t g = 0; g < kSdepGroupCount; ++g) {
+            if (grpNow[g] != snap->carrierGrp[g])
+              cmask |= (uint8_t) (1u << g);
+          }
+          snap->carrierMask = cmask;
+          carrierMoved = snap->wroteCarrier();
+          cbSafe = snap->cbSafeToDefer();
+          // THE NUMBER THAT DECIDES WHETHER DEFERRAL IS WORTH BUILDING.
+          // Evaluated here, after the writes above, because safeToDefer()
+          // reads all three. Nothing acts on it yet -- it sizes the population
+          // a parallel path would serve, and a parallel path for a small
+          // population is a lot of race surface for very little frame time.
+          elig = snap->safeToDefer();
+          geoStatic = snap->geoBytesStatic();
+          dynVb  = (snap->geoDynVbMask != 0);
+          dynIb  = snap->geoDynIb;
+          dynSrv = snap->geoDynVsSrv;
+          // [5b] The read certificate. geoLive is the number that decides
+          // whether the remaining conservative vetoes can be retired: it counts
+          // ROUTED reads that fell back to a live DYNAMIC source. geoRec counts
+          // the ones the record served -- if it stays 0 the conversion is not
+          // firing at all and geoStatic's rise would be meaningless.
+          geoLive = snap->geoLiveReads;
+          geoRec  = snap->geoRecordReads;
+          t31Cap  = snap->t31Valid;
+        }
+        // NV-DXVK [Perf.EligCost] 5a: hand the verdict to SubmitDraw, whose
+        // markStg bills this draw's ExtractTransforms interval on the line right
+        // after the call. Written on EVERY exit for the same reason the tallies
+        // below are -- this is RAII precisely because the function has grown
+        // exits and a hand-placed publish would be wrong at whichever one gets
+        // added next. Both stay false when there is no usable record, which is
+        // the honest reading: a draw the gate cannot judge is not deferrable.
+        s_xtEligLast  = elig;
+        s_xtElig3Last = elig && geoStatic;
+        static thread_local uint32_t sDraws = 0, sPure = 0, sTouched = 0, sElig = 0;
+        static thread_local uint32_t sCarrier = 0;
+        // Per-group move counts, and the two numbers that size a per-group
+        // gate. See DrawSnapshot::carrierGrp.
+        static thread_local uint32_t sGrp[kSdepGroupCount] = {};
+        static thread_local uint32_t sCbSafe = 0, sEligCacheOk = 0;
+        // AXIS 3 tallies. sGeoStatic counts draws referencing no rename-capable
+        // geometry input at all; sElig3 is the intersection with the two-axis
+        // gate, i.e. THE ACTUAL DEFERRABLE POPULATION on all three axes. The
+        // per-input counters exist so a low sElig3 names which input is
+        // responsible instead of leaving it to be guessed.
+        static thread_local uint32_t sGeoStatic = 0, sElig3 = 0;
+        static thread_local uint32_t sDynVb = 0, sDynIb = 0, sDynSrv = 0;
+        // [5b] certificate tallies: total routed reads by kind, the DRAW count
+        // that took any live one (the population that still blocks), and how
+        // often the t31 capture actually produced bytes.
+        static thread_local uint64_t sGeoLive = 0, sGeoRec = 0;
+        static thread_local uint32_t sGeoLiveDraws = 0, sT31Cap = 0;
+        static thread_local uint64_t sLive = 0, sRec = 0;
+        static thread_local uint32_t sSat = 0;
+        static thread_local std::chrono::steady_clock::time_point sLast {};
+        ++sDraws;
+        sLive += s_xtCbLiveReads;
+        sRec  += s_xtCbRecordReads;
+        // "touched" = this draw read cbuffer content at all. Draws that read
+        // none are trivially pure and would inflate pure% into meaninglessness,
+        // so they are counted separately rather than folded in.
+        if (s_xtCbLiveReads + s_xtCbRecordReads > 0) {
+          ++sTouched;
+          if (s_xtCbLiveReads == 0) ++sPure;
+        }
+        if (elig) ++sElig;
+        if (carrierMoved) ++sCarrier;
+        if (cbSafe) ++sCbSafe;
+        for (uint32_t g = 0; g < kSdepGroupCount; ++g) {
+          if (cmask & (1u << g)) ++sGrp[g];
+        }
+        // Draws that pass axis 1 and moved nothing but the non-cam groups.
+        //
+        // THIS NUMBER HAS DONE ITS JOB AND IS NOW A REGRESSION DETECTOR.
+        // It was added to size a hypothetical per-group gate, and it answered
+        // immediately: eligCacheOk - eligible read ~3,750/window, ~88% of it
+        // kSdepCbLoc. That did NOT become a relaxed gate -- it became the
+        // cbLoc retirement (ExtractTransforms seeds the cb-location members
+        // per draw, so they stopped being carriers at all), which is the same
+        // eligibility WITHOUT trusting anything.
+        //
+        // So after that change the difference should COLLAPSE to roughly the
+        // kSdepStatic count (~65/window) while `eligible` absorbs the ~3,750.
+        // A difference that stays large means the seed is not covering every
+        // read of those fields; a difference that grows means a new cache-like
+        // carrier has appeared and wants the same treatment. Reported, never
+        // acted on: nothing here widens safeToDefer().
+        static constexpr uint8_t kCarrierTrueDepMask = (uint8_t) (1u << kSdepCam);
+        if (cbSafe && (cmask & kCarrierTrueDepMask) == 0) ++sEligCacheOk;
+        if (geoStatic) ++sGeoStatic;
+        if (elig && geoStatic) ++sElig3;
+        if (dynVb)  ++sDynVb;
+        if (dynIb)  ++sDynIb;
+        if (dynSrv) ++sDynSrv;
+        sGeoLive += geoLive;
+        sGeoRec  += geoRec;
+        if (geoLive != 0) ++sGeoLiveDraws;
+        if (t31Cap)       ++sT31Cap;
+        if (s_xtVsLocCur != nullptr
+            && s_xtVsLocCur->manifestN >= VsCbLocations::kMaxCbManifest)
+          ++sSat;
+        const auto now = std::chrono::steady_clock::now();
+        if (sLast.time_since_epoch().count() == 0) sLast = now;
+        if (now - sLast >= std::chrono::seconds(3)) {
+          // Snapshot the attribution accumulators into locals so the format
+          // call reads one consistent set, and build the per-slot list with
+          // ZEROES OMITTED -- 14 slots of which 3 are ever used would bury the
+          // signal in a line that is already long.
+          const uint32_t sNoSnap = s_xtCbLiveNoSnap;
+          const uint32_t sMiss   = s_xtCbLiveMiss;
+          const uint32_t sNonVs  = s_xtCbLiveNonVs;
+          std::string slotStr = " liveSlots{";
+          for (uint32_t i = 0; i < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; ++i) {
+            if (s_xtCbLiveBySlot[i] != 0)
+              slotStr += str::format("cb", i, "=", s_xtCbLiveBySlot[i], " ");
+          }
+          slotStr += "}";
+          // Same zeroes-omitted treatment for the axis-3 SRV attribution.
+          std::string geoSrvSlotStr = " dynSrvSlots{";
+          for (uint32_t i = 0; i < kGeoDynSrvSlots; ++i) {
+            if (s_geoDynSrvBySlot[i] != 0)
+              geoSrvSlotStr += str::format("t", i, "=", s_geoDynSrvBySlot[i], " ");
+          }
+          geoSrvSlotStr += "}";
+          Logger::warn(str::format(
+            "[DrawPure] draws=", sDraws,
+            " touched=", sTouched,
+            " pure=", sPure,
+            " (", (sTouched ? (sPure * 100u / sTouched) : 0u), "% of touched)",
+            // safeToDefer() -- TWO of the three axes: cb content pure, no
+            // cold-start scan, AND no cross-draw carrier moved. Read it
+            // against [DrawSnap]'s resolved% (~80% of ALL draws), which is its
+            // ceiling. The third axis (vertex/index/bone bytes) is NOT in this
+            // number; see DrawSnapshot::safeToDefer.
+            " eligible=", sElig,
+            " (", (sDraws ? (sElig * 100u / sDraws) : 0u), "% of draws)",
+            // Draws whose derivation MOVED a cross-draw carrier. Cross-check
+            // against [Perf.StageDep] bt_extractXf{wrote=} -- that probe
+            // samples 1 draw in 8 and hashes per stage; this counts every draw
+            // and hashes twice. They measure the same thing by different means,
+            // so a large disagreement means one of them is wrong, and it is
+            // worth knowing which BEFORE anything is deferred on it.
+            " carrierMoved=", sCarrier,
+            " (", (sDraws ? (sCarrier * 100u / sDraws) : 0u), "%)",
+            // WHICH carriers moved. Names match the SdepGroup enum; the
+            // letters [Perf.StageDep] prints in its grp={} field are the same
+            // five in the same order (c r l b s), so bt_extractXf{grp=cls}
+            // there is cam+cbLoc+static here. Only kSdepCam is a true
+            // draw-to-draw dependency -- see DrawSnapshot::carrierGrp.
+            " carrierGrp{cam=", sGrp[kSdepCam],
+            " route=", sGrp[kSdepRoute],
+            // cbLoc and route hash nothing by construction and MUST read 0.
+            // A non-zero cbLoc means someone reinstated cross-draw cb-location
+            // state without putting it back in the hash -- see
+            // stageDepCarrierGroups. Kept in the line precisely so that would
+            // be visible rather than silent.
+            " cbLoc=", sGrp[kSdepCbLoc],
+            " bone=", sGrp[kSdepBone],
+            " static=", sGrp[kSdepStatic], "}",
+            // cbSafe = axis 1 alone (pure + layoutResolved + !overflowed),
+            // before the carrier gate. cbSafe - eligible is what the carrier
+            // axis costs; pure - cbSafe is what layoutResolved costs. Those
+            // two were indistinguishable while only `eligible` was reported.
+            " cbSafe=", sCbSafe,
+            // Post-cbLoc-retirement this should sit within ~100 of eligible.
+            // A large gap means the per-draw seed is missing a read site.
+            " eligCacheOk=", sEligCacheOk,
+            " (+", (sEligCacheOk >= sElig ? sEligCacheOk - sElig : 0u),
+            " over eligible)",
+            // AXIS 3. geoStatic = the draw references no DYNAMIC (renameable)
+            // vertex buffer, index buffer or VS SRV, so nothing it pins can be
+            // swapped under a worker. dyn{} attributes the rest.
+            //
+            // elig3 IS THE HEADLINE: eligible AND geoStatic, i.e. the draws
+            // that pass all THREE axes. This is the first number in this
+            // project that sizes the genuinely deferrable population --
+            // `eligible` alone has always been two thirds of a gate and said
+            // so. Expect elig3 <= eligible; how much smaller is the whole
+            // question 3d exists to answer.
+            //
+            // A LOW elig3 IS NOT A DEAD END. geoStatic is the CONSERVATIVE
+            // reading -- it asks whether anything is renameable at all, not
+            // whether the renameable thing is actually read live. A dynamic
+            // buffer whose bytes were copied (the index snapshot, the t31 read
+            // cache, the bone palette build) is safe, and dyn{} says which
+            // input to go and check the copy discipline of first.
+            " geoStatic=", sGeoStatic,
+            " (", (sDraws ? (sGeoStatic * 100u / sDraws) : 0u), "%)",
+            " elig3=", sElig3,
+            " (", (sElig ? (sElig3 * 100u / sElig) : 0u), "% of eligible)",
+            " dyn{vb=", sDynVb, " ib=", sDynIb, " vsSrv=", sDynSrv, "}",
+            // [5b] THE READ CERTIFICATE, and how to act on it next run:
+            //   geoRec=0        the t31/COLOR1 conversion never fires -- check
+            //                   t31Cap before believing any rise in geoStatic.
+            //   geoLiveDraws    draws that still took a live DYNAMIC geometry
+            //                   read. These are the ones the certificate itself
+            //                   rejects; everything else is rejected by the
+            //                   conservative VB/IB vetoes still in
+            //                   geoBytesStatic().
+            //   geoStatic vs (draws - dynIb)  if geoStatic lands just short of
+            //                   that, the index-buffer veto is the whole
+            //                   remaining cost and geoLiveDraws=0 is the
+            //                   evidence needed to retire it -- the derivation
+            //                   is not believed to read the IB at all.
+            " geoRec=", sGeoRec,
+            " geoLive=", sGeoLive,
+            " geoLiveDraws=", sGeoLiveDraws,
+            " t31Cap=", sT31Cap,
+            // WHICH SRV slots are dynamic. A slot whose count equals draws is
+            // bound-always and is what made the any-slot test useless; a slot
+            // that tracks the skinned population is a real bone/instance
+            // stream. That distinction is what narrows the test.
+            geoSrvSlotStr,
+            " liveReads=", sLive,
+            " recReads=", sRec,
+            " live/draw=", (sDraws ? (sLive * 100u / sDraws) : 0u), "/100",
+            // Manifest saturation. A shader reading more than kMaxCbManifest
+            // distinct spans keeps the first six and serves the rest live, so
+            // a persistently non-zero satN with pure% stuck below the ceiling
+            // is the signal to RAISE kMaxCbManifest (and kMaxCbRanges with
+            // it) -- not to widen any individual span.
+            " satN=", sSat,
+            // WHAT THE LIVE READS ARE. Three disjoint causes, three different
+            // fixes, and a single percentage cannot tell them apart:
+            //   noSnap -- no usable record for the draw at all (capture off,
+            //             arena past cap, or the record overflowed). A
+            //             CAPTURE-COVERAGE problem; the manifest cannot help.
+            //   miss   -- record present, span not in it. The only one the
+            //             manifest closes, and it should decay toward 0 within
+            //             seconds. Persistently non-zero with satN=0 means a
+            //             span whose offset MOVES per draw, so it is learned
+            //             and immediately stale -- find the site, do not raise
+            //             kMaxCbManifest.
+            //   nonVs  -- the read is on GS/DS/PS. NOT FIXABLE by any manifest
+            //             change: the record holds VS bindings only. A hard
+            //             floor on pure%, and the number that says whether
+            //             capturing other stages would be worth it.
+            " why{noSnap=", sNoSnap, " miss=", sMiss, " nonVs=", sNonVs, "}",
+            slotStr,
+            "  | pure = derivation read cb CONTENT only from the record."
+            " DENOMINATOR IS touched, NOT draws: a draw that reads no cb"
+            " content is trivially pure and would inflate the ratio, so it is"
+            " excluded rather than counted. Expect pure% to climb toward 100"
+            " of touched as manifests converge."
+            " TOUCHED JUMPED 2026-08-10 (~43% -> ~73% of draws) BY DESIGN: the"
+            " replay tier's own cb3->o2w read was routed through drawCbSpan,"
+            " so replayed draws now count. That is more honest -- they DO read"
+            " cb content -- but it means touched/pure are not comparable across"
+            " that change. eligible/cbSafe are unaffected: a replayed draw has"
+            " no resolved layout of its own and was never eligible."
+            " carrierGrp/cbSafe/eligCacheOk are DIAGNOSTIC ONLY -- safeToDefer"
+            " still requires every group clean, unchanged"));
+          sDraws = sPure = sTouched = sSat = sElig = sCarrier = 0;
+          sCbSafe = sEligCacheOk = 0;
+          sGeoStatic = sElig3 = sDynVb = sDynIb = sDynSrv = 0;
+          sGeoLive = sGeoRec = 0;
+          sGeoLiveDraws = sT31Cap = 0;
+          for (auto& gs : s_geoDynSrvBySlot) gs = 0;
+          for (auto& gc : sGrp) gc = 0;
+          sLive = sRec = 0;
+          s_xtCbLiveNoSnap = s_xtCbLiveMiss = s_xtCbLiveNonVs = 0;
+          for (auto& sl : s_xtCbLiveBySlot) sl = 0;
+          sLast = now;
+        }
+      }
+    } xtPurityGuard { this };
     // gen == 0 means "no entry" -- the first write bumps 0 -> 1, so absence
     // and presence can never compare equal.
     const uint32_t xtVsLocGen = (xtVsLoc != nullptr) ? xtVsLoc->gen : 0u;
@@ -14944,7 +15469,7 @@ namespace dxvk {
           s_rpBatchRec = nullptr;
           s_rpBatchSet = nullptr;
         }
-        const auto& vsRp = m_context->m_state.vs.shader;
+        const auto& vsRp = drawVertexShaderCom();
         const D3D11CommonShader* commonRp =
           (vsRp != nullptr) ? vsRp->GetCommonShader() : nullptr;
         if (commonRp != nullptr) {
@@ -15034,7 +15559,7 @@ namespace dxvk {
             // between the two. That is every remaining skipVS=(1/0) /
             // wtvPath=1/3 verify failure. It is a route-determining input, so
             // it belongs in the key exactly like the SRV route bits above.
-            if (m_context->m_state.om.renderTargetViews[0] != nullptr) {
+            if (drawRtv0() != nullptr) {
               routeBitsRp |= 16ull;
             }
             key = xtMix(key, routeBitsRp);
@@ -15577,30 +16102,26 @@ namespace dxvk {
             Vector3 p13LiveCamO { 0.f, 0.f, 0.f };
             const bool o2wIs13 = (rec->o2wPathId == 13u);
             if (o2wIs13 && rec->eligible) {
-              const auto& vsP13m = m_context->m_state.vs.shader;
+              const auto& vsP13m = drawVertexShaderCom();
               const D3D11CommonShader* commonP13m =
                 (vsP13m != nullptr) ? vsP13m->GetCommonShader() : nullptr;
               auto camLocM = findCamOriginLoc(commonP13m);
               if (camLocM && camLocM->size >= 12
                   && camLocM->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
-                const auto& cbM = m_context->m_state.vs.constantBuffers[camLocM->slot];
-                if (cbM.buffer != nullptr) {
-                  size_t lenM = 0;
-                  const uint8_t* pM = stagedCbBytes(cbM.buffer.ptr(), lenM);
-                  if (!pM) {
-                    pM = reinterpret_cast<const uint8_t*>(cbM.buffer->GetMappedSlice().mapPtr);
-                    lenM = cbM.buffer->Desc()->ByteWidth;
-                  }
-                  const size_t baseM =
-                    static_cast<size_t>(cbM.constantOffset) * 16 + camLocM->offset;
-                  if (pM && baseM + 12 <= lenM) {
-                    const float* fpM = reinterpret_cast<const float*>(pM + baseM);
-                    if (std::isfinite(fpM[0]) && std::isfinite(fpM[1])
-                        && std::isfinite(fpM[2])) {
-                      p13LiveCamO = Vector3(fpM[0], fpM[1], fpM[2]);
-                      p13LiveOk = true;
-                    }
-                  }
+                // NV-DXVK [DrawSnapshot] -- c_cameraOrigin via the shared
+                // accessor. REBASE=true: every RDEF-resolved camera reader
+                // computes constantOffset*16 + camLoc->offset, verified across
+                // all six of them before the span was ever added.
+                // The hand-rolled snapshot-then-live block this replaced is now
+                // the accessor's body, so the null-buffer guard, the bounds
+                // check and the staged/mapped fallback all live in one place.
+                const float* fpM = reinterpret_cast<const float*>(
+                    drawCbSpan(camLocM->slot,
+                               static_cast<uint32_t>(camLocM->offset), 12u, true));
+                if (fpM && std::isfinite(fpM[0]) && std::isfinite(fpM[1])
+                    && std::isfinite(fpM[2])) {
+                  p13LiveCamO = Vector3(fpM[0], fpM[1], fpM[2]);
+                  p13LiveOk = true;
                 }
               }
             }
@@ -15643,11 +16164,15 @@ namespace dxvk {
               // disagreed with the full path whenever the cache would hit,
               // which is the mats=0 / wtvPath=3/3 verify failure. Reproduce
               // the site's branch: cache first, derive only on a miss.
-              auto* cb2BufRf = m_context->m_state.vs.constantBuffers[2].buffer.ptr();
-              const uint64_t cb2GenRf =
-                cb2BufRf ? cb2BufRf->GetContentGeneration() : UINT64_MAX;
-              const uint32_t cb2OffRf =
-                m_context->m_state.vs.constantBuffers[2].constantOffset;
+              // NV-DXVK [DrawSnapshot] -- converted consumer. Binding identity
+              // only: all three feed the camera-fallback cache KEY, none reads
+              // bytes. The generation now comes from the capture instant rather
+              // than from an atomic re-read here, which is what makes this key
+              // answerable off the frame thread.
+              const DrawSnapshot::CbBinding& cb2Rf = drawVsCb(2u);
+              auto* cb2BufRf           = cb2Rf.buffer;
+              const uint64_t cb2GenRf  = cb2Rf.contentGen;
+              const uint32_t cb2OffRf  = cb2Rf.constantOffset;
               const uint32_t camFrameRf = m_context->m_device->getCurrentFrameId();
               const bool camHitRf = m_camFallbackCache.valid
                   && cb2BufRf != nullptr
@@ -15976,31 +16501,40 @@ namespace dxvk {
               o2wOk = false;
             } else
             if (rec->o2wPathId == 13 || rec->o2wPathId == 4 || recIsRdef) {
-              // Exact copy of the path-13/path-4 ranged cb3 read (hit-only
-              // staging probe, else a 48-byte WC copy -- never a whole-buffer
-              // stage). All these routes consume the same 48-byte block; they
-              // differ only in the compose below. Paths 5/6 read it from the
-              // recorded RDEF model-cb slot instead of slot 3.
+              // The path-13/path-4 ranged cb3 read. All these routes consume
+              // the same 48-byte block; they differ only in the compose below.
+              // Paths 5/6 read it from the recorded RDEF model-cb slot instead
+              // of slot 3.
+              //
+              // NV-DXVK [DrawSnapshot] 2026-08-10 v2: ROUTED through
+              // drawCbSpan's narrowScratch overload. This is the HIGHEST-VALUE
+              // routing in the file and it was the last one blocked by trap 4d:
+              // the tier re-executes this read on ~93% of the draws that reach
+              // it, and it is the single largest contributor to
+              // [DrawSnap] wcMissSlots{cb3}, which sits at ~1.00 WC transaction
+              // per draw -- the dominant slot by an order of magnitude.
+              //
+              // On a record hit it now costs NO write-combined read at all. On
+              // a miss the fallback is byte-for-byte what stood here: staging
+              // ring hit-only, else a 48-byte memcpyFromWC into bmLocal, with
+              // the same bounds test. It never calls stagedCbBytes(), which is
+              // the whole-buffer stage 4d was protecting this site from.
+              //
+              // rebase=true matches the deleted `constantOffset*16 + 0` base.
+              // The slot is the RECORDED one, so a VS with several model slots
+              // teaches the manifest one entry per slot -- bounded at
+              // kMaxCbManifest, and satN on [DrawPure] is what says whether any
+              // shader is being truncated by that.
               const uint32_t rSlotRp = recIsRdef ? rec->modelSlot : 3u;
               const auto& cb3Rp = m_context->m_state.vs.constantBuffers[rSlotRp];
               const float* bm = nullptr;
               alignas(16) float bmLocal[12];
               if (cb3Rp.buffer != nullptr) {
-                const size_t cb3Off = static_cast<size_t>(cb3Rp.constantOffset) * 16;
-                size_t cb3Len = 0;
-                const uint8_t* cb3Bytes = stagedCbBytesIfHit(cb3Rp.buffer.ptr(), cb3Len);
-                if (cb3Bytes != nullptr && cb3Len >= cb3Off + 48) {
-                  bm = reinterpret_cast<const float*>(cb3Bytes + cb3Off);
-                } else {
-                  const auto mappedRp = cb3Rp.buffer->GetMappedSlice();
-                  if (mappedRp.mapPtr != nullptr
-                      && std::min<size_t>(mappedRp.length, cb3Rp.buffer->Desc()->ByteWidth) >= cb3Off + 48) {
-                    memcpyFromWC(bmLocal,
-                                 static_cast<const uint8_t*>(mappedRp.mapPtr) + cb3Off,
-                                 sizeof(bmLocal));
-                    bm = bmLocal;
-                  }
-                }
+                const uint8_t* rpSpan = drawCbSpan(
+                    rSlotRp, 0u, 48u, /*rebase*/ true,
+                    reinterpret_cast<uint8_t*>(bmLocal));
+                if (rpSpan != nullptr)
+                  bm = reinterpret_cast<const float*>(rpSpan);
               }
               if (bm != nullptr) {
                 if (rec->o2wPathId == 13) {
@@ -16190,7 +16724,7 @@ namespace dxvk {
                   // read the wrong SRV (usually none), which is why every
                   // path-1 replay bailed into o2wReadFail at ~449/frame.
                   uint32_t miSlotRp = UINT32_MAX;
-                  const auto& vsT31Rp = m_context->m_state.vs.shader;
+                  const auto& vsT31Rp = drawVertexShaderCom();
                   if (vsT31Rp != nullptr && vsT31Rp->GetCommonShader() != nullptr) {
                     miSlotRp = memoModelInstSlot(vsT31Rp->GetCommonShader());
                   }
@@ -16217,30 +16751,23 @@ namespace dxvk {
                       }
                     }
                   }
+                  // [5b] ROUTED, same as the full-path site -- the tier
+                  // re-executes this read on ~93% of the draws that reach it, so
+                  // leaving it live would have kept axis 3 at zero for exactly
+                  // the population deferral is aimed at.
                   uint32_t charIdxRp = 0;
                   bool haveIdxRp = false;
                   {
-                    const auto& instVbRp =
-                      drawVertexBuffer(ilfRp.instSemSlot);
-                    if (instVbRp.buffer != nullptr) {
-                      DxvkBufferSlice instSliceRp =
-                        instVbRp.buffer->GetBufferSlice(instVbRp.offset);
-                      const uint8_t* instPtrRp = instSliceRp.defined()
-                        ? reinterpret_cast<const uint8_t*>(instSliceRp.mapPtr(0))
-                        : nullptr;
-                      const size_t instOffRp =
-                        static_cast<size_t>(m_currentInstanceIndex) * instVbRp.stride
-                        + ilfRp.instSemByteOffset;
-                      if (instPtrRp != nullptr && instSliceRp.length() >= instOffRp + 2) {
-                        charIdxRp =
-                          reinterpret_cast<const uint16_t*>(instPtrRp + instOffRp)[0];
-                        haveIdxRp = true;
-                      }
+                    uint16_t instScratchRp[4];
+                    const uint16_t* c1Rp = drawInstSem(
+                      ilfRp.instSemSlot, ilfRp.instSemByteOffset, instScratchRp);
+                    if (c1Rp != nullptr) {
+                      charIdxRp  = c1Rp[0];
+                      haveIdxRp  = true;
                     }
                   }
-                  constexpr uint32_t kBytesPerInstanceRp = 208u;
-                  const size_t t31OffRp =
-                    static_cast<size_t>(charIdxRp) * kBytesPerInstanceRp;
+                  // (the entry offset and its bounds check moved inside
+                  // drawT31Entry with the read itself)
                   // Narrow the attribution from "no SRV" to the real stopper.
                   if (t31Data != nullptr) {
                     --s_xtReplayStats.orfWhy[3];
@@ -16258,10 +16785,21 @@ namespace dxvk {
                   // transform, which is 100% of o2wReadFail (why{noIdx}).
                   // charIdxRp is already 0-initialised, so dropping the
                   // requirement reproduces the site exactly.
-                  if (t31Data != nullptr && t31OffRp + 48 <= t31Len) {
-                    alignas(16) float e31Rp[12];
-                    memcpyFromWC(e31Rp, t31Data + t31OffRp, 48);
-                    const float* m = e31Rp;
+                  //
+                  // [5b] BEHAVIOUR CHANGE, DELIBERATE AND WORTH WATCHING: the
+                  // gate was `t31Data != nullptr && t31Off + 48 <= t31Len`, i.e.
+                  // the LIVE pointer had to resolve. It is now "the accessor
+                  // produced 48 bytes", which also succeeds when the live
+                  // pointer is unavailable but the capture took the entry. So a
+                  // few draws that previously bailed into o2wReadFail will now
+                  // produce a transform -- the CORRECT one, read at this draw's
+                  // own SubmitDraw entry rather than at consume time. Expect
+                  // o2wReadFail to fall. If it falls to zero AND anything looks
+                  // wrong on screen, this is the line to suspect first.
+                  alignas(16) float e31Rp[12];
+                  const float* m = (miSlotRp != UINT32_MAX)
+                    ? drawT31Entry(miSlotRp, charIdxRp, e31Rp) : nullptr;
+                  if (m != nullptr) {
                     // Same three guards the site applies, same order.
                     bool finRp = true;
                     for (int kRp = 0; kRp < 12 && finRp; ++kRp) {
@@ -16319,7 +16857,7 @@ namespace dxvk {
               // site's comment documents for VS_6e3e6f28.
               bool t30EligibleRp = false;
               {
-                const auto& vsBoneRp = m_context->m_state.vs.shader;
+                const auto& vsBoneRp = drawVertexShaderCom();
                 if (vsBoneRp != nullptr && vsBoneRp->GetCommonShader() != nullptr
                     && memoBoneMatrixSlot(vsBoneRp->GetCommonShader()) != UINT32_MAX) {
                   t30EligibleRp = true;
@@ -16336,6 +16874,7 @@ namespace dxvk {
                 ? drawVsSrv(30) : nullptr;
               if (boneSrvRp != nullptr) {
                 auto* boneBufRp = probeSrvCached(boneSrvRp).buf;
+                noteGeoLiveRead(boneBufRp);   // [5b] same unconverted read, tier side
                 DxvkBufferSlice boneSliceRp =
                   boneBufRp ? boneBufRp->GetBufferSlice() : DxvkBufferSlice();
                 const uint8_t* bonePtrRp = boneSliceRp.defined()
@@ -16348,20 +16887,15 @@ namespace dxvk {
                   const IlFacts& ilfB = memoIlFacts(ilBoneRp->GetRtxSemantics());
                   if (ilfB.hasInstIdxSem
                       && ilfB.instSemSlot < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) {
-                    const auto& instVbB = drawVertexBuffer(ilfB.instSemSlot);
-                    if (instVbB.buffer != nullptr) {
-                      DxvkBufferSlice instSliceB =
-                        instVbB.buffer->GetBufferSlice(instVbB.offset);
-                      const uint8_t* instPtrB =
-                        reinterpret_cast<const uint8_t*>(instSliceB.mapPtr(0));
-                      const size_t instOffB =
-                        static_cast<size_t>(m_currentInstanceIndex) * instVbB.stride
-                        + ilfB.instSemByteOffset;
-                      if (instPtrB != nullptr && instSliceB.length() >= instOffB + 4) {
-                        // COLOR1.y = second uint16, exactly as the site reads.
-                        boneIdxRp = reinterpret_cast<const uint16_t*>(instPtrB + instOffB)[1];
-                        haveBoneIdxRp = true;
-                      }
+                    // [5b] ROUTED -- the fourth and last COLOR1 read in the
+                    // derivation. COLOR1.y = second uint16, exactly as the
+                    // full-path site reads it.
+                    uint16_t instScratchB2[4];
+                    const uint16_t* c1B2 = drawInstSem(
+                      ilfB.instSemSlot, ilfB.instSemByteOffset, instScratchB2);
+                    if (c1B2 != nullptr) {
+                      boneIdxRp     = c1B2[1];
+                      haveBoneIdxRp = true;
                     }
                   }
                 }
@@ -16567,7 +17101,7 @@ namespace dxvk {
     // RTX_D3D11_DIAG so it costs nothing in normal play (part of xt_setup). The
     // real classification used for the override (clsV2) is computed separately.
     if (s_xtDiagEnabled) {
-      auto vsPtrC = m_context->m_state.vs.shader;
+      auto vsPtrC = drawVertexShaderCom();
       if (vsPtrC != nullptr) {
         const D3D11CommonShader* common = vsPtrC->GetCommonShader();
         static std::unordered_set<uintptr_t> sShadowLogged;
@@ -16618,7 +17152,7 @@ namespace dxvk {
       // NV-DXVK PERF (2026-08-08d, xt_setup): reference, not Com copy — this
       // helper runs ~10-25x per draw and the copy paid an atomic
       // AddRef/Release pair per call even on the memo-hit path.
-      const auto& vsPtr = m_context->m_state.vs.shader;
+      const auto& vsPtr = drawVertexShaderCom();
       if (vsPtr == nullptr || vsPtr->GetCommonShader() == nullptr) return sNoVs;
       auto& s = vsPtr->GetCommonShader()->GetShader();
       if (s == nullptr) return sNoVs;
@@ -16836,6 +17370,36 @@ namespace dxvk {
     } else if (vsLocKey != 0) {
       ++s_perfXtVsLocCacheMisses;
     }
+    // NV-DXVK [DrawSnapshot] 2026-08-10 -- DO NOT SEED THESE PER DRAW. Two
+    // attempts, both measured, both reverted. Read this before trying a third.
+    //
+    // THE GOAL was to stop the seven cb-location members carrying the PREVIOUS
+    // DRAW'S values into a draw whose VS has no cached location, because that
+    // inheritance is what makes kSdepCbLoc a real cross-draw carrier -- 88% of
+    // all carrier moves, worth ~3,750 otherwise-eligible draws per 3 s window
+    // ([DrawPure] eligCacheOk minus eligible).
+    //
+    // ATTEMPT 1, seed sentinels: xt_vsLocMiss 0 -> 37,478, resolved 79% -> 41%,
+    // cbSafe 21,412 -> 4,058, eligible 36% -> 7%. The inheritance is not a
+    // search hint, it is the BOOTSTRAP CHANNEL -- a first-sighting VS borrows a
+    // location, validates it, and the write-back at the tail then saves it as
+    // that VS's OWN. Cut the borrow and a VS that fails to resolve never saves,
+    // never acquires a record, and misses forever.
+    //
+    // ATTEMPT 2, seed a frame-scoped hint latched at EndFrame: resolved only
+    // recovered to 49%, xt_vsLocMiss 30,074. AND IT BROKE THE REPLAY TIER --
+    // hit/full went 302k/22k to 40k/284k, inelig 5,100 -> 279,381, with
+    // FAIL=1. That is the signal nothing else matters past.
+    //
+    // WHY IT BREAKS MORE THAN THE SCAN, which neither attempt anticipated:
+    // these members feed the REPLAY RECORD (rr.projSlot/projStage/... at the
+    // commit site) and the tier's route proof gates on them. Changing what an
+    // unresolved draw holds changes which records get built and which are
+    // considered eligible to replay -- so this is not a localized hint, it is
+    // an input to the tier's keying. Any future attempt has to keep the tier's
+    // view of these fields identical, which means the seed cannot simply come
+    // from somewhere else; the per-VS record has to be populated by a path that
+    // does not depend on a neighbouring draw at all.
 
     // NV-DXVK [neg-cache]: is this VS a confirmed projection-less shader still
     // within its TTL? If so, force the no-projection path and skip the two
@@ -16891,15 +17455,27 @@ namespace dxvk {
       const auto& srcCb = vsCbs[kSourceCamSlot];
       if (srcCb.buffer != nullptr) {
         // NV-DXVK [CbStage]: cached staged copy of cb2 (see stagedCbBytes).
-        size_t stagedLen = 0;
-        const uint8_t* ptr = stagedCbBytes(srcCb.buffer.ptr(), stagedLen);
-        size_t bufSize = stagedLen;
-        if (!ptr) {
-          ptr = reinterpret_cast<const uint8_t*>(srcCb.buffer->GetMappedSlice().mapPtr);
-          bufSize = srcCb.buffer->Desc()->ByteWidth;
-        }
-        if (ptr && bufSize >= 160) {
-          Matrix4 raw16 = readCbMatrix(ptr, 16, bufSize);
+        //
+        // NV-DXVK [DrawSnapshot] 2026-08-10 -- converted consumer (cb2 fast VP).
+        // This is NOT one of the scans: it reads two FIXED windows, cb2@16 and
+        // cb2@96, so it is a per-draw content read and belongs on the record.
+        //
+        // REBASE=false, and this is the site that MAKES the trap-2 divergence
+        // real rather than merely inheriting it: it indexes 16 and 96 as
+        // ABSOLUTE buffer offsets and then stores them into m_projOffset, which
+        // the replay tier re-bases by constantOffset*16. The two agree only
+        // while constantOffset is 0 -- which is what [DrawSnap]'s cbOff counter
+        // watches, and it has read 0 all along. Converting with rebase=false is
+        // faithful to what this code does TODAY; if cbOff ever goes non-zero,
+        // this site and the tier disagree with each other and that has to be
+        // fixed here, not papered over by changing the capture.
+        //
+        // The old `bufSize >= 160` guard covered both windows at once. Each
+        // span is now bounds-checked on its own, which is strictly tighter:
+        // a buffer long enough for @16 but not @96 used to be rejected whole.
+        const uint8_t* p16 = drawCbSpan(kSourceCamSlot, 16u, 64u, false);
+        if (p16 != nullptr) {
+          Matrix4 raw16 = readCbMatrix(p16, 0, 64);
           const int cls16 = classifyPerspective(raw16, true);
           int usedCls = 0;
           if (cls16 > 0) {
@@ -16911,8 +17487,9 @@ namespace dxvk {
             m_projStage   = 0;
             m_columnMajor = (cls16 == 2);
             usedCls = cls16;
-          } else {
-            Matrix4 raw96 = readCbMatrix(ptr, 96, bufSize);
+          } else if (const uint8_t* p96 =
+                       drawCbSpan(kSourceCamSlot, 96u, 64u, false)) {
+            Matrix4 raw96 = readCbMatrix(p96, 0, 64);
             const int cls96 = classifyPerspective(raw96, true);
             if (cls96 > 0) {
               projSlot    = kSourceCamSlot;
@@ -17016,14 +17593,37 @@ namespace dxvk {
         // NV-DXVK [CbStage]: per-draw validate reads the staged cached copy
         // of the projection cbuffer (typically cb2) â€” this site runs for
         // EVERY draw and was a steady WC-read cost in pv_validate.
+        //
+        // NV-DXVK [DrawSnapshot] 2026-08-10 -- converted consumer (proj
+        // validate). The single hottest content read in the function: it runs
+        // on every draw that has a cached projection location, which is the
+        // ~80% population [DrawSnap] reports as resolved.
+        //
+        // REBASE=false to match the read it replaces -- projOffset is applied
+        // as an absolute buffer offset here, exactly as at the cb2 fast-path
+        // site above, and NOT re-based the way the replay tier's projSrcOff is.
+        // Same trap-2 divergence, same cbOff=0 evidence, same rule: make the
+        // capture follow the consumer, never the other way round.
         size_t cbBytesLen = 0;
-        const uint8_t* ptr = stagedCbBytes(cb.buffer.ptr(), cbBytesLen);
-        if (!ptr) {
-          ptr = reinterpret_cast<const uint8_t*>(cb.buffer->GetMappedSlice().mapPtr);
-          cbBytesLen = cb.buffer->Desc()->ByteWidth;
+        size_t projOffIn  = projOffset;
+        const uint8_t* ptr = (projStage == 0)
+            ? drawCbSpan(projSlot, (uint32_t) projOffset, 64u, false)
+            : nullptr;
+        if (ptr != nullptr) {
+          cbBytesLen = 64;   // the span IS the matrix
+          projOffIn  = 0;
+        } else if (projStage != 0) {
+          // Projection outside the VS stage: nothing captured, stays live, and
+          // counted as such so pure% cannot claim a draw it did not serve.
+          ++s_xtCbLiveReads; ++s_xtCbLiveNonVs;
+          ptr = stagedCbBytes(cb.buffer.ptr(), cbBytesLen);
+          if (!ptr) {
+            ptr = reinterpret_cast<const uint8_t*>(cb.buffer->GetMappedSlice().mapPtr);
+            cbBytesLen = cb.buffer->Desc()->ByteWidth;
+          }
         }
         if (ptr) {
-          Matrix4 raw = readCbMatrix(ptr, projOffset, cbBytesLen);
+          Matrix4 raw = readCbMatrix(ptr, projOffIn, cbBytesLen);
           // NV-DXVK: Always allow VP in validation â€” the projection was
           // already found and classified on a previous draw.  Restricting
           // allowVP by rawDrawCount causes the cache to invalidate on
@@ -17193,7 +17793,7 @@ namespace dxvk {
                 if (drawViewport0(vpVm)) {
                   isViewModelPass = vpVm.MaxDepth <= 0.08f;
                 }
-                const auto vsPtrP1 = m_context->m_state.vs.shader;
+                const auto vsPtrP1 = drawVertexShaderCom();
                 // NV-DXVK [pilot-eye-capture]: when this draw IS a viewmodel
                 // pass, read cb2.c_cameraOrigin via the same RDEF mechanism
                 // path 1 uses for non-viewmodel draws and publish it to the
@@ -17213,18 +17813,15 @@ namespace dxvk {
                     const auto& vsCbsVm = m_context->m_state.vs.constantBuffers;
                     const auto& camCbVm = vsCbsVm[camLocVm->slot];
                     if (camCbVm.buffer != nullptr) {
-                      // NV-DXVK [CbStage]: staged read (fallback to raw mapping).
-                      size_t lenVm = 0;
-                      const uint8_t* pVm = stagedCbBytes(camCbVm.buffer.ptr(), lenVm);
-                      if (!pVm) {
-                        pVm = reinterpret_cast<const uint8_t*>(camCbVm.buffer->GetMappedSlice().mapPtr);
-                        lenVm = camCbVm.buffer->Desc()->ByteWidth;
-                      }
-                      const size_t baseVm =
-                        static_cast<size_t>(camCbVm.constantOffset) * 16 + camLocVm->offset;
-                      if (pVm && baseVm + 12 <= lenVm) {
-                        const float* fpVm = reinterpret_cast<const float*>(pVm + baseVm);
-                        if (std::isfinite(fpVm[0]) && std::isfinite(fpVm[1]) && std::isfinite(fpVm[2])) {
+                      // NV-DXVK [DrawSnapshot] -- c_cameraOrigin via the shared
+                      // accessor. rebase=true, the convention all six
+                      // RDEF-resolved camera readers share.
+                      const float* fpVm = reinterpret_cast<const float*>(
+                          drawCbSpan(camLocVm->slot,
+                                     static_cast<uint32_t>(camLocVm->offset),
+                                     12u, true));
+                      {
+                        if (fpVm && std::isfinite(fpVm[0]) && std::isfinite(fpVm[1]) && std::isfinite(fpVm[2])) {
                           dxvk::tf2::g_pilotEyeX.store(fpVm[0], std::memory_order_relaxed);
                           dxvk::tf2::g_pilotEyeY.store(fpVm[1], std::memory_order_relaxed);
                           dxvk::tf2::g_pilotEyeZ.store(fpVm[2], std::memory_order_relaxed);
@@ -17266,18 +17863,15 @@ namespace dxvk {
                     const auto& vsCbsP1 = m_context->m_state.vs.constantBuffers;
                     const auto& camCbP1 = vsCbsP1[camLocP1->slot];
                     if (camCbP1.buffer != nullptr) {
-                      // NV-DXVK [CbStage]: staged read (fallback to raw mapping).
-                      size_t lenP1 = 0;
-                      const uint8_t* pP1 = stagedCbBytes(camCbP1.buffer.ptr(), lenP1);
-                      if (!pP1) {
-                        pP1 = reinterpret_cast<const uint8_t*>(camCbP1.buffer->GetMappedSlice().mapPtr);
-                        lenP1 = camCbP1.buffer->Desc()->ByteWidth;
-                      }
-                      const size_t baseP1 =
-                        static_cast<size_t>(camCbP1.constantOffset) * 16 + camLocP1->offset;
-                      if (pP1 && baseP1 + 12 <= lenP1) {
-                        const float* fp = reinterpret_cast<const float*>(pP1 + baseP1);
-                        if (std::isfinite(fp[0]) && std::isfinite(fp[1]) && std::isfinite(fp[2])) {
+                      // NV-DXVK [DrawSnapshot] -- c_cameraOrigin via the shared
+                      // accessor (rebase=true, same convention as every other
+                      // RDEF-resolved camera read).
+                      const float* fp = reinterpret_cast<const float*>(
+                          drawCbSpan(camLocP1->slot,
+                                     static_cast<uint32_t>(camLocP1->offset),
+                                     12u, true));
+                      {
+                        if (fp && std::isfinite(fp[0]) && std::isfinite(fp[1]) && std::isfinite(fp[2])) {
                           // Sanity-gate: cb2's c_cameraOrigin must match the
                           // fanout cache's X/Y within 5 units. Otherwise this
                           // is a non-main camera (mirror/portal/etc.) that
@@ -17727,7 +18321,7 @@ namespace dxvk {
                             m_lastFanoutCamOrigin.z);
             bool usedLive = false;
             {
-              const auto vsPtrL = m_context->m_state.vs.shader;
+              const auto vsPtrL = drawVertexShaderCom();
               if (vsPtrL != nullptr && vsPtrL->GetCommonShader() != nullptr) {
                 const auto* commonL = vsPtrL->GetCommonShader();
                 auto camLocL = commonL->FindCBField(
@@ -17777,7 +18371,7 @@ namespace dxvk {
                         if (kDiagLogs) {
                           std::string vsKeyR = "?";
                           {
-                            auto vsP = m_context->m_state.vs.shader;
+                            auto vsP = drawVertexShaderCom();
                             if (vsP != nullptr && vsP->GetCommonShader() != nullptr) {
                               auto& sh = vsP->GetCommonShader()->GetShader();
                               if (sh != nullptr) vsKeyR = sh->getShaderKeyStr().substr(0, 19);
@@ -17818,7 +18412,7 @@ namespace dxvk {
                 // family VS, usedLive=1 a world-family VS).
                 std::string vsKeyL = "?";
                 {
-                  auto vsP = m_context->m_state.vs.shader;
+                  auto vsP = drawVertexShaderCom();
                   if (vsP != nullptr && vsP->GetCommonShader() != nullptr) {
                     auto& sh = vsP->GetCommonShader()->GetShader();
                     if (sh != nullptr) vsKeyL = sh->getShaderKeyStr().substr(0, 19);
@@ -18029,7 +18623,7 @@ namespace dxvk {
           const uint64_t n = sCacheWriteN.fetch_add(1, std::memory_order_relaxed);
           if ((n & 63) == 0) {
             std::string vsKey;
-            auto vsP = m_context->m_state.vs.shader;
+            auto vsP = drawVertexShaderCom();
             if (vsP != nullptr && vsP->GetCommonShader() != nullptr) {
               const auto& sh = vsP->GetCommonShader()->GetShader();
               if (sh != nullptr) vsKey = sh->getShaderKeyStr().substr(0, 19);
@@ -18457,7 +19051,7 @@ namespace dxvk {
       // for the measured per-VS evidence.
       const bool hasColorRt =
         RtxOptions::camReconAllowColorRtDraws()
-        && m_context->m_state.om.renderTargetViews[0] != nullptr;
+        && drawRtv0() != nullptr;
       if (isUintPosLayout || hasColorRt) {
         // NV-DXVK [CamCache]: the camera reconstruction below (cached-projection
         // copy + per-draw c_cameraOrigin read + worldToView assembly from the
@@ -18471,9 +19065,12 @@ namespace dxvk {
         // world->viewmodel->sky) bumps the generation => cache miss => re-derive,
         // so per-frame camera changes still work. objectToWorld (the t31 path
         // further down) is genuinely per-draw and always runs.
-        const D3D11Buffer* cb2Buf = m_context->m_state.vs.constantBuffers[2].buffer.ptr();
-        const uint64_t cb2Gen     = cb2Buf ? cb2Buf->GetContentGeneration() : UINT64_MAX;
-        const uint32_t cb2Off     = m_context->m_state.vs.constantBuffers[2].constantOffset;
+        // NV-DXVK [DrawSnapshot] -- converted consumer, same camera-fallback
+        // cache key as the replay REFRESH site above. Identity only, no bytes.
+        const DrawSnapshot::CbBinding& cb2Bind = drawVsCb(2u);
+        const D3D11Buffer* cb2Buf = cb2Bind.buffer;
+        const uint64_t cb2Gen     = cb2Bind.contentGen;
+        const uint32_t cb2Off     = cb2Bind.constantOffset;
         const uint32_t camFrameId = m_context->m_device->getCurrentFrameId();
         const bool camHit = m_camFallbackCache.valid
             && cb2Buf != nullptr
@@ -18576,7 +19173,7 @@ namespace dxvk {
           // shaders are routing to which sub-camera basis.
           if (kDiagLogs) {
             std::string vsKey;
-            const auto vsP = m_context->m_state.vs.shader;
+            const auto vsP = drawVertexShaderCom();
             if (vsP != nullptr && vsP->GetCommonShader() != nullptr) {
               const auto& sh = vsP->GetCommonShader()->GetShader();
               if (sh != nullptr) vsKey = sh->getShaderKeyStr().substr(0, 19);
@@ -18688,7 +19285,7 @@ namespace dxvk {
           bool rdefFound = false;
           {
             // NV-DXVK [perf]: reference, not Com copy â€” skips AddRef/Release per draw.
-            const auto& vsPtrT31 = m_context->m_state.vs.shader;
+            const auto& vsPtrT31 = drawVertexShaderCom();
             if (vsPtrT31 != nullptr && vsPtrT31->GetCommonShader() != nullptr) {
               modelInstSlot = memoModelInstSlot(vsPtrT31->GetCommonShader());
               if (modelInstSlot != UINT32_MAX) rdefFound = true;
@@ -18716,7 +19313,7 @@ namespace dxvk {
           // let the "no bone transform â†’ fallback" flag at line ~2806 fire.
           bool cb3OwnsTransform = false;
           {
-            const auto& vsPtrCb3 = m_context->m_state.vs.shader;
+            const auto& vsPtrCb3 = drawVertexShaderCom();
             if (vsPtrCb3 != nullptr && vsPtrCb3->GetCommonShader() != nullptr) {
               // NV-DXVK [RdefCache]: FindCBuffer is a string-keyed map lookup
               // that ran for every uintPos draw â€” memoize on the shader ptr.
@@ -18820,46 +19417,57 @@ namespace dxvk {
 
             // Read charIdx from COLOR1 per-instance semantic (R16G16B16A16_UINT).
             // VS disasm uses v1.x which is the first uint16 of the 8-byte entry.
+            // [5b] ROUTED through drawInstSem: served from the record when the
+            // capture took these 8 bytes, else read live through the identical
+            // slot/offset arithmetic and SCORED as a live read only if the
+            // source buffer is DYNAMIC. Same value either way -- what changes is
+            // that a deferred worker no longer touches a renameable buffer.
+            //
+            // The three separate failure strings collapse into one: the accessor
+            // returns nullptr for all of (null buffer, null map, slice too
+            // small), and they shared a single outcome here anyway (charIdx
+            // stays 0 and the t31 read proceeds against entry 0).
             uint32_t charIdx = 0;
             const char* charIdxReason = "no_perinstance_r16g16b16a16_uint_semantic";
             if (sfHasInstIdxSem) {  // fused IL scan above â€” same first-match semantics
-              const auto& instVb = drawVertexBuffer(sfInstSemSlot);
-              if (instVb.buffer == nullptr) {
-                charIdxReason = "instVb_buffer_null";
+              uint16_t instScratch[4];
+              const uint16_t* c1 =
+                drawInstSem(sfInstSemSlot, sfInstSemByteOffset, instScratch);
+              if (c1 != nullptr) {
+                charIdx = c1[0];
+                charIdxReason = "ok";
               } else {
-                DxvkBufferSlice instSlice = instVb.buffer->GetBufferSlice(instVb.offset);
-                const uint8_t* instPtr =
-                  instSlice.defined() ? reinterpret_cast<const uint8_t*>(instSlice.mapPtr(0)) : nullptr;
-                const size_t instOff =
-                  static_cast<size_t>(m_currentInstanceIndex) * instVb.stride + sfInstSemByteOffset;
-                if (!instPtr) {
-                  charIdxReason = "instPtr_null";
-                } else if (instSlice.length() < instOff + 2) {
-                  charIdxReason = "instSlice_too_small";
-                } else {
-                  charIdx = reinterpret_cast<const uint16_t*>(instPtr + instOff)[0];
-                  charIdxReason = "ok";
-                }
+                charIdxReason = "instsem_unavailable";
               }
             }
 
             // Fetch t31[charIdx].objectToCameraRelative (float3x4 at entry+0).
             constexpr uint32_t BYTES_PER_INSTANCE = 208u;
             const size_t t31Off = static_cast<size_t>(charIdx) * BYTES_PER_INSTANCE;
-            if (!t31Data) {
-              t31SkipReason = "t31Data_null";
-            } else if (t31Off + 48 > t31Len) {
-              t31SkipReason = "t31Off_oob";
+            // [5b] ROUTED through drawT31Entry. Previously this was the read
+            // that held axis 3 at zero: 48 bytes off a mapped DYNAMIC buffer at
+            // derivation time, i.e. the dropship COLOR1.y race in a different
+            // costume. It now comes from the record whenever the capture took
+            // THIS charIdx, and falls back to the identical live read otherwise.
+            //
+            // The live pointer above is still resolved because the diag-gated
+            // dumps further down read t31Data/t31Len directly, and resolving a
+            // pointer is not a content read. Only the 48 bytes moved.
+            //
+            // NV-DXVK [perf, WC staging]: the finite/zero-row checks + Matrix4
+            // build below did 20+ scalar uncached reads of the entry PER DRAW;
+            // one streaming-load copy to the stack makes every read cached. That
+            // property is preserved -- the accessor copies into t31Scratch.
+            alignas(16) float t31Scratch[12];
+            const float* m = drawT31Entry(modelInstSlot, charIdx, t31Scratch);
+            if (m == nullptr) {
+              // Keep the original attribution: the accessor collapses every
+              // failure into nullptr, so re-derive which one it was from the
+              // live pointer the diagnostics already hold.
+              t31SkipReason = !t31Data          ? "t31Data_null"
+                            : (t31Off + 48 > t31Len) ? "t31Off_oob"
+                                                     : "t31_entry_unavailable";
             } else {
-              // NV-DXVK [perf, WC staging]: t31 is a mapped write-combined
-              // buffer â€” the finite/zero-row checks + Matrix4 build below did
-              // 20+ scalar uncached reads of the 48-byte entry PER DRAW. One
-              // streaming-load copy to the stack, then every read is cached.
-              // No cross-draw caching: SRV buffers allow NO_OVERWRITE writes
-              // (the stagedCbBytes generation contract does NOT apply here).
-              alignas(16) float t31Entry[12];
-              memcpyFromWC(t31Entry, t31Data + t31Off, 48);
-              const float* m = t31Entry;
               bool finite = true;
               for (int k = 0; k < 12 && finite; ++k) if (!std::isfinite(m[k])) finite = false;
               const bool r0nz = m[0] != 0.f || m[1] != 0.f || m[2] != 0.f;
@@ -18887,16 +19495,15 @@ namespace dxvk {
                 } else {
                   const auto& cb2 = m_context->m_state.vs.constantBuffers[2];
                   if (cb2.buffer != nullptr) {
-                    // NV-DXVK [CbStage]: staged read (fallback to raw mapping).
-                    size_t len2 = 0;
-                    const uint8_t* p2 = stagedCbBytes(cb2.buffer.ptr(), len2);
-                    if (!p2) {
-                      p2 = reinterpret_cast<const uint8_t*>(cb2.buffer->GetMappedSlice().mapPtr);
-                      len2 = cb2.buffer->Desc()->ByteWidth;
-                    }
-                    const size_t base = static_cast<size_t>(cb2.constantOffset) * 16;
-                    if (p2 && base + 16 <= len2) {
-                      const float* fp = reinterpret_cast<const float*>(p2 + base + 4);
+                    // NV-DXVK [DrawSnapshot] 2026-08-10 -- converted. The
+                    // hardcoded cb2@4 camera origin (12 B at constantOffset*16
+                    // + 4), which is a DIFFERENT location from the
+                    // RDEF-resolved c_cameraOrigin by definition -- so it gets
+                    // its own manifest entry rather than being folded into the
+                    // named span. rebase=true, matching the base below.
+                    const float* fp = reinterpret_cast<const float*>(
+                        drawCbSpan(2u, 4u, 12u, true));
+                    if (fp != nullptr) {
                       if (std::isfinite(fp[0]) && std::isfinite(fp[1]) && std::isfinite(fp[2])) {
                         camOri[0] = fp[0]; camOri[1] = fp[1]; camOri[2] = fp[2];
                         haveCam = true;
@@ -19022,7 +19629,7 @@ namespace dxvk {
         // correct (-5246,410,43)).
         bool t30PathEligible = false;
         {
-          const auto& vsPtrBone = m_context->m_state.vs.shader;
+          const auto& vsPtrBone = drawVertexShaderCom();
           if (vsPtrBone != nullptr && vsPtrBone->GetCommonShader() != nullptr) {
             if (memoBoneMatrixSlot(vsPtrBone->GetCommonShader()) != UINT32_MAX)
               t30PathEligible = true;
@@ -19053,6 +19660,12 @@ namespace dxvk {
             // instead of GetResource — same substitution as the t31 path;
             // lifetime anchored by the live t30 binding.
             auto* boneBuf = probeSrvCached(boneSrv).buf;
+            // [5b] The derivation's one unconverted geometry read. Scored, not
+            // captured -- see noteGeoLiveRead. Placed at the resolve rather than
+            // at each of the three read paths below, which over-counts a draw
+            // that resolves but never reads: a false positive costs one deferral
+            // opportunity and can never produce a false negative.
+            noteGeoLiveRead(boneBuf);
             DxvkBufferSlice boneBufSlice = boneBuf ? boneBuf->GetBufferSlice() : DxvkBufferSlice();
             const uint8_t* bonePtr = boneBufSlice.defined() ?
               reinterpret_cast<const uint8_t*>(boneBufSlice.mapPtr(0)) : nullptr;
@@ -19060,22 +19673,20 @@ namespace dxvk {
 
             // Find the per-instance bone index from slot 1
             // (R16G16B16A16_UINT, perInstance=1, instance 0 for non-instanced draws)
+            // [5b] ROUTED. Same 8 bytes as the charIdx read above, different
+            // component: the shader does bone_index = BLENDINDICES(0) + COLOR1.y,
+            // and COLOR1 is [x,y,z,w] uint16, so .y is element [1]. Capturing
+            // the whole entry once is what lets BOTH index reads come off the
+            // record -- they were two live reads of the same buffer.
             uint32_t boneIdx = 0;
             bool hasBoneIdx = false;
             if (sfHasInstIdxSem) {  // fused IL scan above â€” same first-match semantics
-              const auto& instVb = drawVertexBuffer(sfInstSemSlot);
-              if (instVb.buffer != nullptr) {
-                DxvkBufferSlice instSlice = instVb.buffer->GetBufferSlice(instVb.offset);
-                const uint8_t* instPtr = reinterpret_cast<const uint8_t*>(instSlice.mapPtr(0));
-                // Read COLOR1.y (second uint16) at the current instance index.
-                // The shader does: bone_index = BLENDINDICES(0) + COLOR1.y
-                // COLOR1 layout: [x=uint16, y=uint16, z=uint16, w=uint16]
-                // COLOR1.y = the second uint16 = byte offset +2 from semantic start
-                const size_t instOff = static_cast<size_t>(m_currentInstanceIndex) * instVb.stride + sfInstSemByteOffset;
-                if (instPtr && instSlice.length() >= instOff + 4) {
-                  boneIdx = reinterpret_cast<const uint16_t*>(instPtr + instOff)[1]; // [1] = COLOR1.y
-                  hasBoneIdx = true;
-                }
+              uint16_t instScratchB[4];
+              const uint16_t* c1B =
+                drawInstSem(sfInstSemSlot, sfInstSemByteOffset, instScratchB);
+              if (c1B != nullptr) {
+                boneIdx    = c1B[1];   // COLOR1.y
+                hasBoneIdx = true;
               }
             }
 
@@ -19293,14 +19904,39 @@ namespace dxvk {
       if (cb.buffer != nullptr) {
         // NV-DXVK [CbStage]: per-draw cached-view re-read from the staged
         // copy â€” this is the w2vs_cached hot path that runs every draw.
+        //
+        // NV-DXVK [DrawSnapshot] 2026-08-10 -- converted consumer (view).
+        // REBASE=false, and this is the trap-2 convention divergence stated as
+        // code rather than as a comment: this read has always indexed
+        // m_viewOffset with NO bound-range base, unlike every projection read,
+        // and the named view span is captured the same way. drawCbSpan carries
+        // the convention through to the capture so the two cannot drift.
+        //
+        // STAGE 0 ONLY. The record captures VS bindings; a view matrix living
+        // in GS/DS/PS has nothing captured and stays live -- correctly, and it
+        // is counted as a live read below so pure% does not flatter itself.
         size_t vLen = 0;
-        const uint8_t* ptr = stagedCbBytes(cb.buffer.ptr(), vLen);
-        if (!ptr) {
-          ptr = reinterpret_cast<const uint8_t*>(cb.buffer->GetMappedSlice().mapPtr);
-          vLen = cb.buffer->Desc()->ByteWidth;
+        size_t vOff = m_viewOffset;
+        const uint8_t* ptr = (m_viewStage == 0 && m_viewSlot != UINT32_MAX)
+            ? drawCbSpan(m_viewSlot, (uint32_t) m_viewOffset, 64u, false)
+            : nullptr;
+        if (ptr != nullptr) {
+          // The span IS the 64 bytes, so the offset into it is 0 -- the same
+          // shape the replay tier's converted view read already uses.
+          vLen = 64;
+          vOff = 0;
+        } else if (m_viewStage != 0) {
+          // Not routable through the record. Count it so the purity census
+          // stays honest about why this draw can never be pure.
+          ++s_xtCbLiveReads; ++s_xtCbLiveNonVs;
+          ptr = stagedCbBytes(cb.buffer.ptr(), vLen);
+          if (!ptr) {
+            ptr = reinterpret_cast<const uint8_t*>(cb.buffer->GetMappedSlice().mapPtr);
+            vLen = cb.buffer->Desc()->ByteWidth;
+          }
         }
         if (ptr) {
-          Matrix4 c = readMatrix(ptr, m_viewOffset, vLen);
+          Matrix4 c = readMatrix(ptr, vOff, vLen);
           if (isViewMatrix(c)) {
             m_lastWtvPathId = 5; // cached view-matrix slot
             // NV-DXVK: readCbMatrix stores rows-as-columns (passes raw[i][j]
@@ -19634,46 +20270,52 @@ namespace dxvk {
       const float* bm = nullptr;
       alignas(16) float bmLocal[12];
       if (cb3.buffer != nullptr) {
-        const size_t cb3Off = static_cast<size_t>(cb3.constantOffset) * 16;
-        // NV-DXVK [DrawSnapshot] -- FIRST CONVERTED CONSUMER, 2026-08-10.
-        // captureDrawSnapshot already copied exactly this 48 B slot-3 span at
-        // SubmitDraw entry, while the binding was still this draw's. Serving it
-        // from the snapshot skips the staging-ring probe here and, on a probe
-        // miss, the whole-buffer WC read below. This is the highest-frequency
-        // content read in the hottest stage: the replay tier re-executes it on
-        // EVERY hit, i.e. ~93% of draws.
+        // NV-DXVK [DrawSnapshot] -- THE HIGHEST-FREQUENCY CONTENT READ in the
+        // hottest stage: the replay tier re-executes it on EVERY hit, i.e.
+        // ~93% of the draws that reach the tier. Served from the record when
+        // the manifest has learned it, live otherwise.
         //
-        // FALLBACK-SAFE BY CONSTRUCTION. find() returns nullptr when the flag
-        // is off, when the layout never resolved, or when the span was not
-        // captured -- and the original path below then runs unchanged. That is
-        // what makes this conversion self-verifying: the tier's 16-replays-per-VS
-        // bit-compare must still read FAIL=0, and a nonzero FAIL means the
-        // captured bytes differ from the live ones, i.e. a bug at the CAPTURE
-        // POINT. Catching that here, while the work is still on the frame
-        // thread and one flag reverts it, is the entire reason conversion comes
-        // before deferral.
-        const DrawSnapshot* snapD3 = drawSnap();
-        const uint8_t* snapCb3 = (snapD3 != nullptr)
-            ? snapD3->find(0u, 3u, static_cast<uint32_t>(cb3Off), 48u)
-            : nullptr;
-        if (snapCb3 != nullptr) {
-          bm = reinterpret_cast<const float*>(snapCb3);
-        } else {
-        size_t cb3Len = 0;
-        const uint8_t* cb3Bytes = stagedCbBytesIfHit(cb3.buffer.ptr(), cb3Len);
-        if (cb3Bytes != nullptr && cb3Len >= cb3Off + 48) {
-          bm = reinterpret_cast<const float*>(cb3Bytes + cb3Off);
-        } else {
-          const auto mapped = cb3.buffer->GetMappedSlice();
-          if (mapped.mapPtr != nullptr
-              && std::min<size_t>(mapped.length, cb3.buffer->Desc()->ByteWidth) >= cb3Off + 48) {
-            memcpyFromWC(bmLocal,
-                         static_cast<const uint8_t*>(mapped.mapPtr) + cb3Off,
-                         sizeof(bmLocal));
-            bm = bmLocal;
-          }
-        }
-        }
+        // FALLBACK-SAFE BY CONSTRUCTION. drawCbSpan returns the live bytes
+        // when the flag is off, when there is no record, or when the span is
+        // not in it -- so the tier's 16-replays-per-VS bit-compare is the
+        // check: FAIL=0 means the captured bytes match the live ones, and a
+        // nonzero FAIL means a bug at the CAPTURE POINT. Catching that while
+        // the work is still on the frame thread and one flag reverts it is the
+        // entire reason conversion comes before deferral.
+        //
+        // NV-DXVK [DrawSnapshot] 2026-08-10 v2: ROUTED, and this retires
+        // handoff trap 4d for this site.
+        //
+        // It used to keep a hand-rolled find() plus its own live fallback,
+        // because drawCbSpan's fallback called the full stagedCbBytes() --
+        // whose miss path stages the WHOLE ~6.3 KB buffer to serve 48 bytes,
+        // the [Perf.WcCopy] shape a previous session removed from here. cb3 is
+        // Map(WRITE_DISCARD)ed every draw so its generation always moves and
+        // that miss path is the ONLY path, which made routing a guaranteed
+        // regression rather than a risk.
+        //
+        // The narrowScratch overload removes the reason: the live fallback is
+        // now ring-hit-only then a 48-byte memcpyFromWC into bmLocal -- the
+        // identical two steps this block used to do inline, with the identical
+        // bounds test. What routing BUYS is noteCbSpanRead: the span manifest
+        // now learns slot 3 from the consumer that reads it most, on every VS
+        // that reaches this gate. That is what made the cb3 predictor
+        // redundant, and the predictor is gone (see captureDrawSnapshot).
+        //
+        // The tally comes free and correct with the routing. Counting it was
+        // never optional -- a draw whose cb3 read fell back to live while its
+        // other reads came from the record would otherwise report
+        // contentPure() and be eligible for deferral while holding a pointer
+        // into live buffer bytes.
+        //
+        // rebase=true: the offset convention here is constantOffset*16 + 0,
+        // which is what the deleted named-span capture used and what the
+        // manifest will now store.
+        const uint8_t* cb3Span = drawCbSpan(
+            3u, 0u, 48u, /*rebase*/ true,
+            reinterpret_cast<uint8_t*>(bmLocal));
+        if (cb3Span != nullptr)
+          bm = reinterpret_cast<const float*>(cb3Span);
       }
       if (bm) {
         // NV-DXVK [Perf.Replay] cb3 single-read share: stash the 48 bytes so
@@ -19722,7 +20364,7 @@ namespace dxvk {
         const uint32_t p13R8Bit =
           ((g_vanishDiagCapturedA3 & 0x10u) != 0u) ? 1u : 0u;
         {
-          const auto vsP13 = m_context->m_state.vs.shader;
+          const auto vsP13 = drawVertexShaderCom();
           const D3D11CommonShader* commonP13 =
             (vsP13 != nullptr) ? vsP13->GetCommonShader() : nullptr;
           if (commonP13 != nullptr) {
@@ -19747,19 +20389,17 @@ namespace dxvk {
               const auto& cbP13 =
                 m_context->m_state.vs.constantBuffers[camLocP13->slot];
               if (cbP13.buffer != nullptr) {
-                // NV-DXVK [CbStage]: staged read (fallback to raw mapping).
-                size_t lenP13 = 0;
-                const uint8_t* pP13 = stagedCbBytes(cbP13.buffer.ptr(), lenP13);
-                if (!pP13) {
-                  pP13 = reinterpret_cast<const uint8_t*>(cbP13.buffer->GetMappedSlice().mapPtr);
-                  lenP13 = cbP13.buffer->Desc()->ByteWidth;
-                }
-                const size_t baseP13 =
-                  static_cast<size_t>(cbP13.constantOffset) * 16 + camLocP13->offset;
-                if (pP13 && baseP13 + 12 <= lenP13) {
-                  const float* fpP13 =
-                    reinterpret_cast<const float*>(pP13 + baseP13);
-                  if (std::isfinite(fpP13[0]) && std::isfinite(fpP13[1])
+                // NV-DXVK [DrawSnapshot] -- c_cameraOrigin via the shared
+                // accessor (rebase=true). This is the per-draw discriminator
+                // path 13 turns on, so it runs on every BSP draw whose VS
+                // reflects the field -- one of the reads the manifest exists
+                // to cover.
+                const float* fpP13 = reinterpret_cast<const float*>(
+                    drawCbSpan(camLocP13->slot,
+                               static_cast<uint32_t>(camLocP13->offset),
+                               12u, true));
+                {
+                  if (fpP13 && std::isfinite(fpP13[0]) && std::isfinite(fpP13[1])
                       && std::isfinite(fpP13[2])) {
                     p13CamOrigin[0] = fpP13[0];
                     p13CamOrigin[1] = fpP13[1];
@@ -19863,7 +20503,7 @@ namespace dxvk {
           // for that draw and marks the cache, so subsequent frames
           // are tagged at ExtractTransforms time.
           if (transforms.isSubView) {
-            const auto vsPtrSvs = m_context->m_state.vs.shader;
+            const auto vsPtrSvs = drawVertexShaderCom();
             if (vsPtrSvs != nullptr && vsPtrSvs->GetCommonShader() != nullptr) {
               const auto& shSvs = vsPtrSvs->GetCommonShader()->GetShader();
               if (shSvs != nullptr) {
@@ -19893,7 +20533,7 @@ namespace dxvk {
         // is whether path 13 fires once the sky-cam becomes valid. No
         // matrix math, no instancesToObject access â€” safe.
         if (s_xtDiagEnabled) {
-          const auto vsPtrP13d = m_context->m_state.vs.shader;
+          const auto vsPtrP13d = drawVertexShaderCom();
           uint64_t vsXxhP13d = 0;
           if (vsPtrP13d != nullptr && vsPtrP13d->GetCommonShader() != nullptr) {
             auto& shP13d = vsPtrP13d->GetCommonShader()->GetShader();
@@ -19948,7 +20588,7 @@ namespace dxvk {
         // splits the Z-line question â€” does the bogus translation come
         // from cb3 itself or from the inverse(worldToView) multiply?
         if (s_xtDiagEnabled) {
-          const auto vsPtrMc = m_context->m_state.vs.shader;
+          const auto vsPtrMc = drawVertexShaderCom();
           uint64_t vsXxhMc = 0;
           if (vsPtrMc != nullptr && vsPtrMc->GetCommonShader() != nullptr) {
             auto& shMc = vsPtrMc->GetCommonShader()->GetShader();
@@ -20029,21 +20669,32 @@ namespace dxvk {
       auto trySourceFloat3x4 = [&](const D3D11ConstantBufferBindings& cbs,
                                     uint32_t slot, uint32_t byteOffset = 0) -> bool {
         if (slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) return false;
-        const auto& cb = cbs[slot];
-        if (cb.buffer == nullptr) return false;
-        // NV-DXVK [CbStage]: staged read (fallback to raw mapping).
-        size_t bufSize = 0;
-        const uint8_t* ptr = stagedCbBytes(cb.buffer.ptr(), bufSize);
-        if (!ptr) {
-          ptr = reinterpret_cast<const uint8_t*>(cb.buffer->GetMappedSlice().mapPtr);
-          bufSize = cb.buffer->Desc()->ByteWidth;
+        // NV-DXVK [DrawSnapshot] 2026-08-10 -- converted. 48 bytes (3 rows x
+        // 16) at constantOffset*16 + byteOffset, so rebase=true. Same
+        // stage-identity check as rdefReadFloats: both call sites pass the VS
+        // bindings today, and the record cannot answer for any other stage.
+        const float* f = nullptr;
+        if (&cbs == &m_context->m_state.vs.constantBuffers) {
+          f = reinterpret_cast<const float*>(drawCbSpan(slot, byteOffset, 48u, true));
+          if (f == nullptr) return false;
+        } else {
+          const auto& cb = cbs[slot];
+          if (cb.buffer == nullptr) return false;
+          // NV-DXVK [CbStage]: staged read (fallback to raw mapping).
+          ++s_xtCbLiveReads; ++s_xtCbLiveNonVs;  // unrepresentable in the record
+          size_t bufSize = 0;
+          const uint8_t* ptr = stagedCbBytes(cb.buffer.ptr(), bufSize);
+          if (!ptr) {
+            ptr = reinterpret_cast<const uint8_t*>(cb.buffer->GetMappedSlice().mapPtr);
+            bufSize = cb.buffer->Desc()->ByteWidth;
+          }
+          if (!ptr) return false;
+          const size_t cbBase  = static_cast<size_t>(cb.constantOffset) * 16;
+          const size_t base    = cbBase + byteOffset;
+          // Need at least 48 bytes (3 rows Ã— 16 bytes).
+          if (base + 48 > bufSize) return false;
+          f = reinterpret_cast<const float*>(ptr + base);
         }
-        if (!ptr) return false;
-        const size_t cbBase  = static_cast<size_t>(cb.constantOffset) * 16;
-        const size_t base    = cbBase + byteOffset;
-        // Need at least 48 bytes (3 rows Ã— 16 bytes).
-        if (base + 48 > bufSize) return false;
-        const float* f = reinterpret_cast<const float*>(ptr + base);
         // Read the 3Ã—4 matrix.
         const float R00 = f[0],  R01 = f[1],  R02 = f[2],  Tx = f[3];
         const float R10 = f[4],  R11 = f[5],  R12 = f[6],  Ty = f[7];
@@ -20109,19 +20760,32 @@ namespace dxvk {
       auto tryWorldCb = [&](const D3D11ConstantBufferBindings& cbs, uint32_t slot,
                             int skipStage, uint32_t skipSlot) -> bool {
         if (slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) return false;
-        const auto& cb = cbs[slot];
-        if (cb.buffer == nullptr) return false;
-        // NV-DXVK [CbStage]: staged read (fallback to raw mapping).
-        size_t bufSize = 0;
-        const uint8_t* ptr = stagedCbBytes(cb.buffer.ptr(), bufSize);
-        if (!ptr) {
-          ptr = reinterpret_cast<const uint8_t*>(cb.buffer->GetMappedSlice().mapPtr);
-          bufSize = cb.buffer->Desc()->ByteWidth;
+        // NV-DXVK [DrawSnapshot] 2026-08-10 -- converted, VS bindings only.
+        // This one genuinely IS called cross-stage (the *stageCbs[si] loop
+        // below), which is exactly why the check is on the bindings' identity
+        // and not on a comment claiming the caller always passes vsCbs.
+        // 64 bytes at constantOffset*16 -> rebase=true, relative offset 0.
+        Matrix4 candidate;
+        if (&cbs == &m_context->m_state.vs.constantBuffers) {
+          const uint8_t* span = drawCbSpan(slot, 0u, 64u, true);
+          if (span == nullptr) return false;
+          candidate = readMatrix(span, 0, 64);
+        } else {
+          const auto& cb = cbs[slot];
+          if (cb.buffer == nullptr) return false;
+          // NV-DXVK [CbStage]: staged read (fallback to raw mapping).
+          ++s_xtCbLiveReads; ++s_xtCbLiveNonVs;  // unrepresentable in the record
+          size_t bufSize = 0;
+          const uint8_t* ptr = stagedCbBytes(cb.buffer.ptr(), bufSize);
+          if (!ptr) {
+            ptr = reinterpret_cast<const uint8_t*>(cb.buffer->GetMappedSlice().mapPtr);
+            bufSize = cb.buffer->Desc()->ByteWidth;
+          }
+          if (!ptr) return false;
+          const size_t base    = static_cast<size_t>(cb.constantOffset) * 16;
+          if (base + 64 > bufSize) return false;
+          candidate = readMatrix(ptr, base, bufSize);
         }
-        if (!ptr) return false;
-        const size_t base    = static_cast<size_t>(cb.constantOffset) * 16;
-        if (base + 64 > bufSize) return false;
-        Matrix4 candidate = readMatrix(ptr, base, bufSize);
         if (isIdentityExact(candidate) || classifyPerspective(candidate) != 0 || isViewMatrix(candidate))
           return false;
         if (std::abs(candidate[3][3] - 1.0f) > 0.01f) return false;
@@ -20185,16 +20849,28 @@ namespace dxvk {
       // fallback for shaders that stripped RDEF.
       const D3D11CommonShader* commonVS = nullptr;
       // NV-DXVK PERF (2026-08-08d, xt_bone): reference, not Com copy.
-      const auto& vsPtr = m_context->m_state.vs.shader;
+      const auto& vsPtr = drawVertexShaderCom();
       if (vsPtr != nullptr) commonVS = vsPtr->GetCommonShader();
 
       auto rdefReadFloats = [&](const D3D11ConstantBufferBindings& cbs,
                                 uint32_t slot, uint32_t fieldOff,
                                 uint32_t fieldSize, float* out) -> bool {
         if (slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) return false;
+        // NV-DXVK [DrawSnapshot] 2026-08-10 -- converted. Both call sites pass
+        // the VS bindings, but the parameter allows any stage, so the identity
+        // is CHECKED rather than assumed: the record holds VS bindings only,
+        // and a GS/DS/PS caller must keep the live path or it would be served
+        // another stage's bytes. rebase=true matches the base this computed.
+        if (&cbs == &m_context->m_state.vs.constantBuffers) {
+          const uint8_t* src = drawCbSpan(slot, fieldOff, fieldSize, true);
+          if (src == nullptr) return false;
+          std::memcpy(out, src, fieldSize);
+          return true;
+        }
         const auto& cb = cbs[slot];
         if (cb.buffer == nullptr) return false;
         // NV-DXVK [CbStage]: staged read (fallback to raw mapping).
+        ++s_xtCbLiveReads; ++s_xtCbLiveNonVs;  // unrepresentable in the record
         size_t cbLen = 0;
         const uint8_t* ptr = stagedCbBytes(cb.buffer.ptr(), cbLen);
         if (!ptr) {
@@ -20578,9 +21254,9 @@ namespace dxvk {
                 if (sCamOrigLog < 60) {
                   // Get current VS hash
                   XXH64_hash_t vsH = 0;
-                  if (m_context->m_state.vs.shader != nullptr
-                      && m_context->m_state.vs.shader->GetCommonShader() != nullptr) {
-                    auto& s = m_context->m_state.vs.shader->GetCommonShader()->GetShader();
+                  if (drawVertexShaderCom() != nullptr
+                      && drawVertexShaderCom()->GetCommonShader() != nullptr) {
+                    auto& s = drawVertexShaderCom()->GetCommonShader()->GetShader();
                     if (s != nullptr) vsH = static_cast<XXH64_hash_t>(s->getHash());
                   }
                   // Read prev-frame cameraOrigin at offset 84 (float3)
@@ -20758,15 +21434,13 @@ namespace dxvk {
       float camX = 0, camY = 0, camZ = 0;
       const auto& camCb = m_context->m_state.vs.constantBuffers[2];
       if (camCb.buffer != nullptr) {
-        // NV-DXVK [CbStage]: staged read (fallback to raw mapping).
-        size_t camSz = 0;
-        const uint8_t* p = stagedCbBytes(camCb.buffer.ptr(), camSz);
-        if (!p) {
-          p = reinterpret_cast<const uint8_t*>(camCb.buffer->GetMappedSlice().mapPtr);
-          camSz = camCb.buffer->Desc()->ByteWidth;
-        }
-        if (p && camSz >= 16) {
-          const float* co = reinterpret_cast<const float*>(p + 4);
+        // NV-DXVK [DrawSnapshot] 2026-08-10 -- converted (bone-draw camera).
+        // REBASE=FALSE, and the difference is not cosmetic: this site reads
+        // `p + 4` with NO constantOffset base, unlike the otherwise identical
+        // cb2@4 read on the o2w path. Recording the convention per span is the
+        // only reason both can be captured correctly from the same shader.
+        if (const float* co = reinterpret_cast<const float*>(
+                drawCbSpan(2u, 4u, 12u, false))) {
           camX = co[0]; camY = co[1]; camZ = co[2];
         }
       }
@@ -20847,7 +21521,7 @@ namespace dxvk {
       const auto& vsCbs = m_context->m_state.vs.constantBuffers;
       std::string vsHashStr = "?";
       uint64_t vsXxh = 0;
-      auto vsShader = m_context->m_state.vs.shader;
+      auto vsShader = drawVertexShaderCom();
       if (vsShader != nullptr && vsShader->GetCommonShader() != nullptr) {
         auto& shader = vsShader->GetCommonShader()->GetShader();
         if (shader != nullptr) {
@@ -20910,7 +21584,7 @@ namespace dxvk {
       // NV-DXVK PERF (2026-08-08d, xt_cls): reference, not Com copy — the copy
       // paid an atomic AddRef/Release pair on EVERY draw. The binding cannot
       // change under us inside this draw's SubmitDraw.
-      const auto& vsPtrV2 = m_context->m_state.vs.shader;
+      const auto& vsPtrV2 = drawVertexShaderCom();
       const D3D11CommonShader* commonV2 =
         (vsPtrV2 != nullptr) ? vsPtrV2->GetCommonShader() : nullptr;
       const auto* ilV2 = drawInputLayout();
@@ -20931,10 +21605,6 @@ namespace dxvk {
             if (!std::isfinite(out[i])) return false;
           return true;
         }
-        const auto& cb = m_context->m_state.vs.constantBuffers[slot];
-        if (cb.buffer == nullptr) return false;
-        const size_t base = static_cast<size_t>(cb.constantOffset) * 16 + byteOff;
-        if (base + nBytes > cb.buffer->Desc()->ByteWidth) return false;
         // NV-DXVK [perf]: read the STAGED (cached-heap) copy of the cbuffer.
         // This lambda previously memcpy'd straight out of the mapped slice â€”
         // write-combined memory, where every read is an uncached transaction â€”
@@ -20942,17 +21612,16 @@ namespace dxvk {
         // staging cache is keyed on (buffer, content generation), and cbuffers
         // are DISCARD-map-only, so an unchanged generation proves unchanged
         // content; cb2 is per-camera so one copy serves the whole frame.
-        size_t stagedLen = 0;
-        const uint8_t* ptr = stagedCbBytes(cb.buffer.ptr(), stagedLen);
-        if (ptr != nullptr && base + nBytes <= stagedLen) {
-          std::memcpy(out, ptr + base, nBytes);
-        } else {
-          // Staging unavailable (unmapped / oversized) â€” original direct read.
-          const auto mapped = cb.buffer->GetMappedSlice();
-          const uint8_t* raw = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
-          if (!raw) return false;
-          std::memcpy(out, raw + base, nBytes);
-        }
+        //
+        // NV-DXVK [DrawSnapshot] 2026-08-10 -- converted. This lambda is the
+        // StaticWorld path's whole cbuffer interface, so routing it converts
+        // every one of its call sites at once, and it already had the exact
+        // (slot, relative byteOff, size) shape drawCbSpan takes. rebase=true:
+        // the base it computed was constantOffset*16 + byteOff.
+        // The staged/mapped/bounds triple is now the accessor's body.
+        const uint8_t* src = drawCbSpan(slot, byteOff, nBytes, true);
+        if (src == nullptr) return false;
+        std::memcpy(out, src, nBytes);
         for (uint32_t i = 0; i < nBytes / 4; ++i)
           if (!std::isfinite(out[i])) return false;
         return true;
@@ -21189,7 +21858,7 @@ namespace dxvk {
       // behind RTX_D3D11_DIAG so it costs nothing in normal play (part of xt_tail).
       if (s_xtDiagEnabled) {
         uint64_t vsXxhZ = 0;
-        const auto vsZ = m_context->m_state.vs.shader;
+        const auto vsZ = drawVertexShaderCom();
         if (vsZ != nullptr && vsZ->GetCommonShader() != nullptr
             && vsZ->GetCommonShader()->GetShader() != nullptr) {
           vsXxhZ = static_cast<uint64_t>(vsZ->GetCommonShader()->GetShader()->getHash());
@@ -21223,7 +21892,7 @@ namespace dxvk {
         const auto& vsCbsG = m_context->m_state.vs.constantBuffers;
         std::string vsHashStrG = "?";
         uint64_t vsXxhG = 0;
-        auto vsShaderG = m_context->m_state.vs.shader;
+        auto vsShaderG = drawVertexShaderCom();
         if (vsShaderG != nullptr && vsShaderG->GetCommonShader() != nullptr) {
           auto& shaderG = vsShaderG->GetCommonShader()->GetShader();
           if (shaderG != nullptr) { vsHashStrG = shaderG->getShaderKeyStr(); vsXxhG = shaderG->getHash(); }
@@ -21273,7 +21942,7 @@ namespace dxvk {
     // Promotes the encoding to RtSurface so surface_interaction.slangh can
     // apply the matching decode after the raw fetch.
     {
-      const D3D11VertexShader* vsPtr = m_context->m_state.vs.shader.ptr();
+      const D3D11VertexShader* vsPtr = drawVertexShaderCom().ptr();
       if (vsPtr != nullptr) {
         const D3D11CommonShader* cs = vsPtr->GetCommonShader();
         if (cs != nullptr) {
@@ -21343,8 +22012,13 @@ namespace dxvk {
     // so we don't poison the cache with garbage.
     if (vsLocKey != 0 && m_projSlot != UINT32_MAX) {
       // Cap cache; level changes can flush ~hundreds of stale VS pointers.
-      if (sVsCbLocCache.size() >= 4096) sVsCbLocCache.clear();
+      // NV-DXVK [DrawSnapshot]: the clear DANGLES s_xtVsLocCur, which
+      // drawCbSpan appends to and which was resolved at the top of this same
+      // draw. Re-point it at the entry created immediately below -- the same
+      // shader, so nothing is lost but the manifest learned before the flush.
+      if (sVsCbLocCache.size() >= 4096) { sVsCbLocCache.clear(); s_xtVsLocCur = nullptr; }
       VsCbLocations& e = sVsCbLocCache[vsLocKey];
+      if (s_xtVsLocCur == nullptr) s_xtVsLocCur = &e;
       // v6.9: bump `gen` only when a field that changes WHICH BRANCH RUNS
       // changes -- slot/stage presence and identity, not offsets within a
       // slot. TF2's cb2 fast-path legitimately alternates projOffset between
@@ -21391,8 +22065,10 @@ namespace dxvk {
           ++itNp->second.gen;
         }
       } else if (!skipExpensiveProjScan) {
-        if (sVsCbLocCache.size() >= 4096) sVsCbLocCache.clear();
+        // Same dangle rule as the positive-stamp clear above.
+        if (sVsCbLocCache.size() >= 4096) { sVsCbLocCache.clear(); s_xtVsLocCur = nullptr; }
         VsCbLocations& eNp = sVsCbLocCache[vsLocKey];
+        if (s_xtVsLocCur == nullptr) s_xtVsLocCur = &eNp;
         if (!eNp.noProjValid) ++eNp.gen;
         eNp.noProjValid = true;
         eNp.noProjFrame = m_context->m_device->getCurrentFrameId();
@@ -21425,7 +22101,7 @@ namespace dxvk {
           (uint64_t(vsLocKey) << 1) | (skipExpensiveProjScan ? 0ull : 1ull);
         if (sNoProjLogged.size() < 512 && sNoProjLogged.insert(npKey).second) {
           XXH64_hash_t npVsHash = 0;
-          auto vsPtrNp = m_context->m_state.vs.shader;
+          auto vsPtrNp = drawVertexShaderCom();
           if (vsPtrNp != nullptr && vsPtrNp->GetCommonShader() != nullptr) {
             const auto& npShader = vsPtrNp->GetCommonShader()->GetShader();
             if (npShader != nullptr) {
@@ -21529,7 +22205,7 @@ namespace dxvk {
     m_currentLayoutId = UINT32_MAX;
     if ((RtxOptions::capturePhase2() || RtxOptions::logPhase0Descriptor())
         && !m_lastExtractUsedFallback) {
-      auto vsPtrP0 = m_context->m_state.vs.shader;
+      auto vsPtrP0 = drawVertexShaderCom();
       if (vsPtrP0 != nullptr && vsPtrP0->GetCommonShader() != nullptr) {
         const D3D11CommonShader* commonP0 = vsPtrP0->GetCommonShader();
         const auto* ilP0 = drawInputLayout();
@@ -21843,7 +22519,7 @@ namespace dxvk {
     // Once per (VS, frame): at single-digit fps a hit-count throttle samples
     // one phase forever (conf trap 9).
     if (!RtxOptions::subViewGateProbeVsHashes().empty()) {
-      const auto vsPtrOp = m_context->m_state.vs.shader;
+      const auto vsPtrOp = drawVertexShaderCom();
       uint64_t vsXxhOp = 0;
       if (vsPtrOp != nullptr && vsPtrOp->GetCommonShader() != nullptr) {
         auto& shOp = vsPtrOp->GetCommonShader()->GetShader();
@@ -22153,7 +22829,7 @@ namespace dxvk {
         rr.cb2gen = xtCtl.cb2gen;
         rr.epoch = s_xtReplayEpoch;
         {
-          const auto& vsCapH = m_context->m_state.vs.shader;
+          const auto& vsCapH = drawVertexShaderCom();
           if (vsCapH != nullptr && vsCapH->GetCommonShader() != nullptr) {
             const auto& shCapH = vsCapH->GetCommonShader()->GetShader();
             if (shCapH != nullptr) {
@@ -22203,6 +22879,94 @@ namespace dxvk {
         rr.viewOffset = m_viewOffset;
         rr.t = transforms;
 
+        // NV-DXVK [CbLocSrc] 2026-08-10 -- PURE PROBE, NO BEHAVIOUR. Reads
+        // only; nothing below consults it.
+        //
+        // THE QUESTION IT EXISTS TO ANSWER. kSdepCbLoc is the largest single
+        // eligibility cost in the tree -- 88% of all carrier moves, ~3,750
+        // otherwise-eligible draws per 3 s window -- and it is a REAL carrier,
+        // because a draw whose VS has no cached location inherits the previous
+        // draw's slot and the validate path can accept it. Two attempts to stop
+        // that inheritance were measured and reverted (sentinel seed: resolved
+        // 79% -> 41%; frame-scoped hint: resolved 49% AND the tier broke with
+        // FAIL=1). Both failed for the same unanticipated reason: THESE SEVEN
+        // MEMBERS ARE AN INPUT TO THE TIER'S KEYING, via exactly the six
+        // assignments above and the route proof further down.
+        //
+        // So the way out is not another seed. It is to source the record from
+        // the PER-VS entry (xtVsLoc) instead of from the members -- then the
+        // tier is keyed on per-VS state, which is stable and convergent, the
+        // members become pure search scratch, and their cross-draw carry
+        // affects only WHERE THE SEARCH STARTS rather than anything recorded.
+        // At that point kSdepCbLoc retires legitimately.
+        //
+        // THAT SWAP IS ONLY MECHANICAL IF THE TWO ALREADY AGREE HERE, and
+        // after being wrong twice that gets measured before it gets written.
+        // Per draw: do the six member values equal the VS entry's? Reported as
+        // agree/differ with a per-field breakdown, so a disagreement names the
+        // field instead of just existing.
+        //
+        // HOW TO READ IT:
+        //   same == commits, no entry small  -> the swap is safe and mechanical.
+        //   a field dominates differ         -> that field is genuinely
+        //                                       per-draw and cannot come from
+        //                                       the entry; the swap has to
+        //                                       leave it on the member, and the
+        //                                       carrier retirement is partial.
+        //   noEnt large                      -> most committing draws have no
+        //                                       per-VS entry at all, and this
+        //                                       whole route is dead: the entry
+        //                                       cannot be the source of truth
+        //                                       for records it does not have.
+        {
+          static thread_local uint64_t sCommits = 0, sSame = 0, sNoEnt = 0;
+          static thread_local uint64_t sDPSlot = 0, sDPOff = 0, sDPStage = 0;
+          static thread_local uint64_t sDCol = 0, sDVSlot = 0, sDVOff = 0;
+          static thread_local std::chrono::steady_clock::time_point sLast {};
+          ++sCommits;
+          if (xtVsLoc == nullptr || !xtVsLoc->haveLoc) {
+            ++sNoEnt;
+          } else {
+            const bool dPSlot  = (xtVsLoc->projSlot   != m_projSlot);
+            const bool dPOff   = (xtVsLoc->projOffset != m_projOffset);
+            const bool dPStage = (xtVsLoc->projStage  != m_projStage);
+            const bool dCol    = (xtVsLoc->columnMajor != m_columnMajor);
+            const bool dVSlot  = (xtVsLoc->viewSlot   != m_viewSlot);
+            const bool dVOff   = (xtVsLoc->viewOffset != m_viewOffset);
+            if (dPSlot)  ++sDPSlot;
+            if (dPOff)   ++sDPOff;
+            if (dPStage) ++sDPStage;
+            if (dCol)    ++sDCol;
+            if (dVSlot)  ++sDVSlot;
+            if (dVOff)   ++sDVOff;
+            if (!(dPSlot || dPOff || dPStage || dCol || dVSlot || dVOff))
+              ++sSame;
+          }
+          const auto nowCl = std::chrono::steady_clock::now();
+          if (sLast.time_since_epoch().count() == 0) sLast = nowCl;
+          if (nowCl - sLast >= std::chrono::seconds(3)) {
+            Logger::warn(str::format(
+              "[CbLocSrc] commits=", sCommits,
+              " same=", sSame,
+              " (", (sCommits ? (sSame * 100u / sCommits) : 0u), "%)",
+              " noEntry=", sNoEnt,
+              " differ{projSlot=", sDPSlot,
+              " projOff=", sDPOff,
+              " projStage=", sDPStage,
+              " colMajor=", sDCol,
+              " viewSlot=", sDVSlot,
+              " viewOff=", sDVOff, "}",
+              "  | can the replay record be sourced from the per-VS entry"
+              " instead of the m_proj*/m_view* members? same~100% means yes and"
+              " the cbLoc carrier retirement becomes mechanical; a dominant"
+              " differ field names what is genuinely per-draw; a large noEntry"
+              " kills the approach outright"));
+            sCommits = sSame = sNoEnt = 0;
+            sDPSlot = sDPOff = sDPStage = sDCol = sDVSlot = sDVOff = 0;
+            sLast = nowCl;
+          }
+        }
+
         // Path-13 compose input: read c_cameraOrigin from the SAME staged
         // cb2 bytes the route read (bit-exact source), never arithmetically
         // reconstructed from o2w minus cb3. SLOT==2 REQUIRED: with only
@@ -22217,24 +22981,24 @@ namespace dxvk {
         // ineligible (population check below).
         if (m_lastO2wPathId == 13 || m_lastO2wPathId == 5 || m_lastO2wPathId == 6) {
           const D3D11CommonShader* commonCap =
-            (m_context->m_state.vs.shader != nullptr)
-              ? m_context->m_state.vs.shader->GetCommonShader() : nullptr;
+            (drawVertexShaderCom() != nullptr)
+              ? drawVertexShaderCom()->GetCommonShader() : nullptr;
           auto camLocCap = findCamOriginLoc(commonCap);
           if (camLocCap && camLocCap->size >= 12
               && camLocCap->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
             const auto& cbCap = m_context->m_state.vs.constantBuffers[camLocCap->slot];
             if (cbCap.buffer != nullptr) {
-              size_t lenCap = 0;
-              const uint8_t* pCap = stagedCbBytes(cbCap.buffer.ptr(), lenCap);
-              if (!pCap) {
-                pCap = reinterpret_cast<const uint8_t*>(cbCap.buffer->GetMappedSlice().mapPtr);
-                lenCap = cbCap.buffer->Desc()->ByteWidth;
-              }
-              const size_t baseCap =
-                static_cast<size_t>(cbCap.constantOffset) * 16 + camLocCap->offset;
-              if (pCap && baseCap + 12 <= lenCap) {
-                const float* fpCap = reinterpret_cast<const float*>(pCap + baseCap);
-                if (std::isfinite(fpCap[0]) && std::isfinite(fpCap[1]) && std::isfinite(fpCap[2])) {
+              // NV-DXVK [DrawSnapshot] -- c_cameraOrigin via the shared
+              // accessor (rebase=true). This one feeds the REPLAY RECORD's
+              // p13CamOrigin, so serving it from the record also makes the
+              // record's camera input come from the same instant as its
+              // proj/view spans rather than being sampled later.
+              const float* fpCap = reinterpret_cast<const float*>(
+                  drawCbSpan(camLocCap->slot,
+                             static_cast<uint32_t>(camLocCap->offset),
+                             12u, true));
+              {
+                if (fpCap && std::isfinite(fpCap[0]) && std::isfinite(fpCap[1]) && std::isfinite(fpCap[2])) {
                   rr.camSrcValid = true;  // the rdef site's haveCamO this draw
                   if (camLocCap->slot == 2u) {
                     rr.p13CamOrigin = Vector3(fpCap[0], fpCap[1], fpCap[2]);
@@ -23327,10 +24091,150 @@ namespace dxvk {
     return true;
   }
 
+  const Com<D3D11VertexShader>& D3D11Rtx::drawVertexShaderCom() const {
+    if (const DrawSnapshot* s = drawSnap())
+      return s->vs;
+    return m_context->m_state.vs.shader;
+  }
+
   D3D11InputLayout* D3D11Rtx::drawInputLayout() const {
     if (const DrawSnapshot* s = drawSnap())
       return s->inputLayout.ptr();
     return m_context->m_state.ia.inputLayout.ptr();
+  }
+
+  const DrawSnapshot::CbBinding& D3D11Rtx::drawVsCb(uint32_t slot) const {
+    static const DrawSnapshot::CbBinding kNoCb {};
+    if (const DrawSnapshot* s = drawSnap()) {
+      if (slot >= s->vsCbs.size())
+        return kNoCb;
+      return s->vsCbs[slot];
+    }
+    // Live path: synthesise the same view over context state. thread_local so
+    // the returned reference stays valid until this thread's next call, which
+    // matches how every call site uses it (read the fields, then move on).
+    static thread_local DrawSnapshot::CbBinding sLiveCb;
+    const auto& cbs = m_context->m_state.vs.constantBuffers;
+    if (slot >= cbs.size()) {
+      sLiveCb = {};
+      return sLiveCb;
+    }
+    const auto& src = cbs[slot];
+    D3D11Buffer* buf       = src.buffer.ptr();
+    sLiveCb.buffer         = buf;
+    sLiveCb.constantOffset = src.constantOffset;
+    sLiveCb.constantBound  = src.constantBound;
+    sLiveCb.contentGen     = (buf != nullptr) ? buf->GetContentGeneration()
+                                              : UINT64_MAX;
+    return sLiveCb;
+  }
+
+  // NV-DXVK [DrawSnapshot] 2026-08-10: THE CONTENT-READ ACCESSOR.
+  // Contract, rationale and the reason it learns rather than being told are on
+  // the declaration in d3d11_rtx.h. This is the mechanics.
+  const uint8_t* D3D11Rtx::drawCbSpan(uint32_t slot, uint32_t relOffset,
+                                      uint32_t byteCount, bool rebase,
+                                      uint8_t* narrowScratch) {
+    if (byteCount == 0)
+      return nullptr;
+
+    // The BINDING comes from the record when this draw has one. That is not a
+    // micro-optimisation: constantOffset participates in the address, so
+    // reading it live while the bytes come from the record would mix two
+    // instants -- the exact class of bug the record exists to remove.
+    const DrawSnapshot::CbBinding& b = drawVsCb(slot);
+    if (b.buffer == nullptr)
+      return nullptr;
+
+    // Named absOff, not abs: a local called `abs` shadows the C library's abs()
+    // in a file that calls std::abs a few hundred times.
+    const size_t absOff = (rebase ? size_t(b.constantOffset) * 16u : 0u)
+                        + size_t(relOffset);
+
+    // 1. Served from the record.
+    if (const DrawSnapshot* s = drawSnap()) {
+      // find() is total: a span the capture did not take returns nullptr, and
+      // a sub-range of one it DID take returns the right interior pointer. The
+      // uint32 narrowing is safe because a cbuffer offset that does not fit 32
+      // bits cannot address a D3D11 constant buffer in the first place.
+      if (absOff <= UINT32_MAX) {
+        if (const uint8_t* p = s->find(0u, slot, uint32_t(absOff), byteCount)) {
+          ++s_xtCbRecordReads;
+          return p;
+        }
+      }
+    }
+
+    // 2. Live, exactly as the site did before -- staged ring first, raw
+    //    mapping second, bounds-checked. Unchanged behaviour is the whole
+    //    point: a manifest that has not converged yet must produce identical
+    //    bytes, or the tier's FAIL=0 would be measuring the accessor rather
+    //    than the derivation.
+    //
+    //    2b. NARROW MODE. With a caller scratch, the ring is probed HIT-ONLY
+    //    and the miss path copies exactly byteCount instead of staging the
+    //    whole buffer. Structurally the same two-step -- ring, then mapping --
+    //    so a converged manifest is unaffected; only the miss cost differs.
+    //    See the declaration for which cbuffers need this and why.
+    size_t len = 0;
+    const uint8_t* p = nullptr;
+    bool narrowCopied = false;
+    if (narrowScratch != nullptr) {
+      p = stagedCbBytesIfHit(b.buffer, len);
+      if (p == nullptr) {
+        const auto mapped = b.buffer->GetMappedSlice();
+        const size_t mapLen = (mapped.mapPtr != nullptr)
+            ? std::min<size_t>(mapped.length, b.buffer->Desc()->ByteWidth)
+            : 0u;
+        // Bounds-check BEFORE the copy: memcpyFromWC has no idea how long the
+        // mapping is, and a short buffer here is the normal not-yet-written
+        // case, not an error.
+        if (mapped.mapPtr != nullptr && absOff + byteCount <= mapLen) {
+          memcpyFromWC(narrowScratch,
+                       static_cast<const uint8_t*>(mapped.mapPtr) + absOff,
+                       byteCount);
+          narrowCopied = true;
+        }
+      }
+    } else {
+      p = stagedCbBytes(b.buffer, len);
+      if (p == nullptr) {
+        const auto mapped = b.buffer->GetMappedSlice();
+        p = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+        len = (p != nullptr) ? b.buffer->Desc()->ByteWidth : 0u;
+      }
+    }
+
+    // 3. LEARN IT -- before the bounds test, deliberately. A read that fails
+    //    its bounds check this draw is still a read the derivation WANTS, and
+    //    the buffer it was too short for is typically one that has not been
+    //    written yet this frame. Recording it costs a bounded array write and
+    //    lets the span be captured the moment the buffer is big enough.
+    //    Counted as a live read either way: nothing came from the record.
+    ++s_xtCbLiveReads;
+    // Attribute it. "No record at all" and "record did not hold this span" are
+    // different failures with different fixes, and only the second one the
+    // manifest can ever close.
+    if (drawSnap() == nullptr) ++s_xtCbLiveNoSnap;
+    else                       ++s_xtCbLiveMiss;
+    if (slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
+      ++s_xtCbLiveBySlot[slot];
+    noteCbSpanRead(s_xtVsLocCur, slot, relOffset, byteCount, rebase);
+
+    // Narrow mode already relocated the bytes to the caller's storage and did
+    // its own bounds test, so the span starts at offset 0 of the scratch.
+    if (narrowCopied)
+      return narrowScratch;
+
+    if (p == nullptr || absOff + byteCount > len)
+      return nullptr;
+    return p + absOff;
+  }
+
+  D3D11RenderTargetView* D3D11Rtx::drawRtv0() const {
+    if (const DrawSnapshot* s = drawSnap())
+      return s->rtv0;
+    return m_context->m_state.om.renderTargetViews[0].ptr();
   }
 
   D3D11ShaderResourceView* D3D11Rtx::drawVsSrv(uint32_t slot) const {
@@ -23359,6 +24263,82 @@ namespace dxvk {
     return vbs[slot];
   }
 
+  // [5b] See the declarations for the contract. The two of them are what move
+  // axis 3 off zero: with the derivation's geometry reads served from the record
+  // under the captured generations, a draw on the instanced route stops
+  // referencing rename-capable bytes at consume time.
+  const uint16_t* D3D11Rtx::drawInstSem(uint32_t slot, uint32_t byteOffset,
+                                        uint16_t* scratch4) {
+    if (const DrawSnapshot* s = drawSnap()) {
+      // Slot AND offset must match what the capture read, not just the slot: a
+      // consumer asking about a different semantic offset is asking a different
+      // question, and serving it from these 8 bytes would be silently wrong.
+      if (s->instSemValid && s->instSemSlot == slot) {
+        ++m_drawSnapCur->geoRecordReads;
+        return s->instSem;
+      }
+    }
+    const auto& vb = drawVertexBuffer(slot);
+    if (vb.buffer == nullptr)
+      return nullptr;
+    DxvkBufferSlice sl = vb.buffer->GetBufferSlice(vb.offset);
+    const uint8_t* p = sl.defined()
+        ? reinterpret_cast<const uint8_t*>(sl.mapPtr(0)) : nullptr;
+    const size_t off =
+        static_cast<size_t>(m_currentInstanceIndex) * vb.stride + byteOffset;
+    if (p == nullptr || sl.length() < off + 8u)
+      return nullptr;
+    memcpyFromWC(scratch4, p + off, 8u);
+    // Live -- but only unsafe if the source can be renamed underneath a worker.
+    if (m_drawSnapCur != nullptr && m_drawSnapValid
+        && vb.buffer->Desc()->Usage == D3D11_USAGE_DYNAMIC)
+      ++m_drawSnapCur->geoLiveReads;
+    return scratch4;
+  }
+
+  void D3D11Rtx::noteGeoLiveRead(D3D11Buffer* src) {
+    if (src == nullptr || m_drawSnapCur == nullptr || !m_drawSnapValid)
+      return;
+    if (src->Desc()->Usage == D3D11_USAGE_DYNAMIC)
+      ++m_drawSnapCur->geoLiveReads;
+  }
+
+  const float* D3D11Rtx::drawT31Entry(uint32_t srvSlot, uint32_t charIdx,
+                                      float* scratch12) {
+    if (const DrawSnapshot* s = drawSnap()) {
+      if (s->t31Valid && s->t31CharIdx == charIdx) {
+        ++m_drawSnapCur->geoRecordReads;
+        return s->t31Entry;
+      }
+    }
+    if (srvSlot >= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT)
+      return nullptr;
+    ID3D11ShaderResourceView* srv = drawVsSrv(srvSlot);
+    if (srv == nullptr)
+      return nullptr;
+    D3D11Buffer* buf = probeSrvCached(srv).buf;
+    if (buf == nullptr)
+      return nullptr;
+    const uint8_t* data = nullptr;
+    size_t len = 0;
+    auto map = buf->GetMappedSlice();
+    if (map.mapPtr && map.length > 0) {
+      data = reinterpret_cast<const uint8_t*>(map.mapPtr);
+      len  = map.length;
+    } else if (void* raw = buf->GetBuffer()->mapPtr(0)) {
+      data = reinterpret_cast<const uint8_t*>(raw);
+      len  = buf->GetBuffer()->info().size;
+    }
+    const size_t off = static_cast<size_t>(charIdx) * 208u;
+    if (data == nullptr || off + 48u > len)
+      return nullptr;
+    memcpyFromWC(scratch12, data + off, 48u);
+    if (m_drawSnapCur != nullptr && m_drawSnapValid
+        && buf->Desc()->Usage == D3D11_USAGE_DYNAMIC)
+      ++m_drawSnapCur->geoLiveReads;
+    return scratch12;
+  }
+
   bool D3D11Rtx::drawViewportKey(uint64_t& outKey) const {
     D3D11_VIEWPORT vp = {};
     if (!drawViewport0(vp)) {
@@ -23378,26 +24358,48 @@ namespace dxvk {
     // which is the same graceful degradation as an unresolved layout.
     static constexpr size_t kSnapArenaCap = 4096;
     // NV-DXVK [perf] 2026-08-10: time the SLOT ACQUISITION separately from the
-    // field copies. emplace_back value-initialises a whole DrawSnapshot, and
-    // the record is ~2.7 KB (1024 B of SRV slots + 512 B of VB bindings + 512 B
-    // cbBytes + 384 B viewports + the rest). clear() at frame end keeps the
-    // capacity but destroys the elements, so every draw constructs a fresh slot
-    // -- ~2.7 KB of stores into a 4096-slot / ~11 MB arena, i.e. cache-cold
-    // write-allocate misses, ~2.5 MB/frame at 913 draws/frame. That is a
-    // different cost from the field copies and must not be billed to them.
+    // field copies.
+    //
+    // WHAT THIS USED TO COST, AND WHY IT NO LONGER DOES. The arena was
+    // clear()ed each frame and re-grown with emplace_back, which
+    // value-initialises a whole ~3 KB DrawSnapshot per draw -- cache-cold
+    // write-allocate traffic into a 4096-slot / ~12 MB arena, measured at
+    // drawSnapAlloc_ns = 1.44 ms/frame. Every one of those stores was then
+    // OVERWRITTEN by the identity block a few lines below, which assigns
+    // vertexBuffers, vsSrvs and vsCbs wholesale. It was duplicated work, not
+    // safety.
+    //
+    // Now the arena is sized ONCE and slots are reused by index. That is only
+    // correct because the capture unconditionally reassigns every field except
+    // the five scalars cleared below -- if you add a field that is written
+    // CONDITIONALLY, it must be added to that clear or it will carry a
+    // previous draw's value into this one, which is precisely the class of bug
+    // the record exists to prevent. viewports beyond numViewports are left
+    // stale on purpose: every read is bounded by numViewports.
     const auto tSnapAlloc0 = std::chrono::steady_clock::now();
-    if (m_drawSnaps.capacity() < kSnapArenaCap)
-      m_drawSnaps.reserve(kSnapArenaCap);
-    if (m_drawSnaps.size() < kSnapArenaCap) {
-      // emplace_back VALUE-INITIALISES the element: every member of
-      // DrawSnapshot has an NSDMI (`= nullptr`, `= { }`), so a freshly
-      // constructed slot is already in exactly the state reset() produces.
-      // Calling reset() here as well re-cleared 32 vertex-buffer bindings and
-      // 128 SRV slots -- 160 Com assignments per draw -- to no effect. reset()
-      // is kept on the scratch path below, where the slot IS reused and the
-      // clear is load-bearing.
-      m_drawSnaps.emplace_back();
-      m_drawSnapCur = &m_drawSnaps.back();
+    if (m_drawSnaps.size() < kSnapArenaCap)
+      m_drawSnaps.resize(kSnapArenaCap);
+    if (m_drawSnapNext < kSnapArenaCap) {
+      m_drawSnapCur = &m_drawSnaps[m_drawSnapNext++];
+      // The five that are NOT unconditionally reassigned. numCbRanges is the
+      // one that would corrupt silently: a stale count would make find()
+      // return the PREVIOUS draw's captured bytes as this draw's transforms.
+      m_drawSnapCur->numCbRanges    = 0;
+      m_drawSnapCur->overflowed     = false;
+      m_drawSnapCur->layoutResolved = false;
+      m_drawSnapCur->cbLiveReads    = 0;
+      m_drawSnapCur->cbRecordReads  = 0;
+      // [5b] CONDITIONALLY WRITTEN -- the t31/COLOR1 capture below runs only for
+      // draws on the instanced route, so without these a non-instanced draw
+      // would inherit the previous draw's charIdx and 48-byte entry and serve
+      // them as its own. That is exactly the silent-carry failure this clear
+      // exists to prevent; see the block comment above.
+      m_drawSnapCur->instSemValid   = false;
+      m_drawSnapCur->instSemSlot    = UINT32_MAX;
+      m_drawSnapCur->t31Valid       = false;
+      m_drawSnapCur->t31CharIdx     = 0;
+      m_drawSnapCur->geoLiveReads   = 0;
+      m_drawSnapCur->geoRecordReads = 0;
     } else {
       // Arena full (pathological draw count): still capture, into the scratch
       // slot, so consumers behave identically. Only a deferred reader would
@@ -23415,24 +24417,40 @@ namespace dxvk {
     }
     s.frameId   = g_remixFrameId.load(std::memory_order_relaxed);
     s.drawIndex = drawIndex;
+    // Carrier axis, baseline half. Taken HERE, at the same instant as every
+    // other input, so the comparison at the derivation's exit measures the
+    // derivation and nothing else. See DrawSnapshot::carrierGrp for why this
+    // is a write test rather than a read test, and why the groups are kept
+    // apart instead of folded.
+    // Cheaper than the carrierFingerprint() it replaces, not dearer: that call
+    // ran this same enumeration and then folded it: the fold is what is gone.
+    stageDepCarrierGroups(s.carrierGrp);
+    s.carrierMask = 0;
 
     const auto& st = m_context->m_state;
 
     // NV-DXVK [perf] 2026-08-10: nested ns timer over the identity/stream/
     // viewport block ONLY.
     //
-    // WHY THIS BLOCK IS TIMED SEPARATELY. Grep says the ONLY reads of a
-    // snapshot anywhere in the tree are four m_drawSnapCur->find() calls
-    // (~:15041, ~:15625, ~:15722, ~:19505), and find() reads cbRanges/cbBytes
-    // exclusively. Nothing reads vs/ps/inputLayout/blendState/depthState/
-    // rasterState/topology/vertexBuffers/indexBuffer/vsSrvs/viewports. They are
-    // captured for the FUTURE pure-function design (HANDOFF sec 1c), which is
-    // correct as intent -- but it means every draw currently pays for ~1.9 KB
-    // of pointer arrays (128 SRV slots = 1024 B, 32 VB bindings = 512 B, 16
-    // viewports = 384 B) that no consumer touches, out of a ~2.7 KB record.
-    // At 913 draws/frame that is ~1.75 MB/frame of cache-cold writes.
+    // WHY THIS BLOCK IS TIMED SEPARATELY -- UPDATED 2026-08-10, and the reason
+    // has INVERTED since the timer was added. It was: nothing read any of these
+    // fields, so the block was ~1.9 KB/draw of pointer arrays paid for intent
+    // alone, and the number existed to decide whether to delete them.
     //
-    // This does NOT change what is captured -- deleting or gating a field the
+    // They are now read. ExtractTransforms' identity reads were converted onto
+    // the record (viewports, vertexBuffers, vs.shader, inputLayout, vsSrvs,
+    // rtv0, cbuffer bindings -- ~70 call sites, via the drawSnap() accessors),
+    // taking that function from 106 live m_context->m_state reads to 30. So
+    // this block is load-bearing, and the question the timer answers changed
+    // from "should this be deleted?" to "what does the record cost now that it
+    // is doing its job?".
+    //
+    // Record size is ~3.0 KB (128 SRV slots = 1024 B, 32 VB bindings = 512 B,
+    // cbBytes = 512 B, 16 viewports = 384 B, 14 cbuffer bindings = 336 B, rest)
+    // across a 4096-slot arena, ~12 MB. Still the right thing to watch: it is
+    // written cache-cold once per draw.
+    //
+    // This block does NOT change what is captured -- dropping a field the
     // architecture is built around is a design call, not a perf edit. It prices
     // it, so the decision is made on a number instead of on intent.
     const auto tSnapId0 = std::chrono::steady_clock::now();
@@ -23455,6 +24473,195 @@ namespace dxvk {
     s.vertexBuffers = st.ia.vertexBuffers;
     s.indexBuffer   = st.ia.indexBuffer;
     s.vsSrvs        = st.vs.shaderResources.views;
+    s.rtv0          = st.om.renderTargetViews[0].ptr();
+
+    // NV-DXVK [DrawSnapshot] 2026-08-10 -- AXIS 3, the rename-capability scan.
+    // See DrawSnapshot::geoDynVbMask for what this is and why it is a
+    // per-draw fact rather than a global claim.
+    //
+    // Done HERE and not in a pass of its own because the three arrays were
+    // just assigned above and are hot in cache; the scan is a Desc()->Usage
+    // read per BOUND slot, and the loops below stop at the first null binding
+    // rather than walking all 32 / 128 slots. D3D11 requires contiguous
+    // binding from slot 0 for the streams a draw actually uses, so a null is
+    // the end of the bound set, not a hole -- the same assumption the identity
+    // block's own comment relies on ("the BOUND slot (typically 1-3), not 160
+    // atomics").
+    //
+    // ONLY D3D11_USAGE_DYNAMIC RENAMES. IMMUTABLE cannot be mapped at all,
+    // DEFAULT is updated through UpdateSubresource (which does not swap the
+    // backing slice), and STAGING is not bound as geometry. So a pin on
+    // anything but DYNAMIC is a promise about contents and needs no copy.
+    s.geoDynVbMask = 0;
+    s.geoDynIb     = false;
+    s.geoDynVsSrv  = false;
+    for (uint32_t i = 0; i < s.vertexBuffers.size(); ++i) {
+      D3D11Buffer* vb = s.vertexBuffers[i].buffer.ptr();
+      if (vb == nullptr)
+        break;
+      if (vb->Desc()->Usage == D3D11_USAGE_DYNAMIC)
+        s.geoDynVbMask |= (1u << i);
+    }
+    if (D3D11Buffer* ib = s.indexBuffer.buffer.ptr())
+      s.geoDynIb = (ib->Desc()->Usage == D3D11_USAGE_DYNAMIC);
+    // The VS SRVs are where the bone palette and the t31 instance stream live,
+    // which is the "bone" third of this axis.
+    //
+    // GetResourceType()/GetResourceDesc() and NOT ID3D11View::GetResource():
+    // the COM getter AddRefs, and this loop runs over up to 128 slots on every
+    // draw -- that is exactly the "160 atomics" the identity block above was
+    // rewritten to avoid, and it would have cost more than the whole axis is
+    // worth. Both accessors read D3D11ShaderResourceView's internal m_resource
+    // with no refcount traffic.
+    //
+    // Texture-backed views are skipped: a texture is not renamed by
+    // Map(WRITE_DISCARD) the way a DYNAMIC buffer is, so it cannot produce the
+    // class of race this axis exists to find.
+    //
+    // No early `break` on a null slot here, unlike the vertex-buffer loop --
+    // SRV slots are genuinely sparse (t30/t31 sit at high indices with nothing
+    // bound below them), so stopping at the first null would miss precisely
+    // the bone and instance streams this is looking for.
+    //
+    // NO SLOT IS EXCLUDED, AND t31 ESPECIALLY IS NOT. Read this before adding
+    // an exclusion, because it was tried on the strength of the wrong evidence.
+    //
+    // The first version of this loop asked "is ANY bound VS SRV dynamic" and
+    // fired on 100% of draws, driving geoStatic and elig3 to zero -- "bound is
+    // not the same as needed", the identical defect the deleted cb3 predictor
+    // existed to fix. The per-slot tally named the culprit in one run:
+    // dynSrvSlots{t4=387 t31=58736} against ~59k draws, i.e. t31 bound-dynamic
+    // essentially always, t4 under 1%.
+    //
+    // t31 WAS THEN EXCLUDED AND THAT WAS WRONG. The justification cited the
+    // m_t31ReadCache memcpyFromWC and the DrawSnapshot header's note that
+    // BatchSkinJob "copies rather than pins". Both are TRUE and both are about
+    // DIFFERENT CONSUMERS -- the instanced fanout and the bone palette. There
+    // is a THIRD consumer, inside the derivation itself: the o2w_t31 path
+    // resolves the SRV's buffer and reads 48 bytes at charIdx*208 straight off
+    // GetMappedSlice().mapPtr (this file, the t31Data/t31Off block). That read
+    // is LIVE, at derivation time, from a DYNAMIC buffer -- exactly the rename
+    // race this axis exists to catch. Deferring such a draw is the dropship
+    // COLOR1.y bug again.
+    //
+    // The lesson worth more than the slot: evidence about one consumer of a
+    // buffer says nothing about another consumer of the same buffer. Establish
+    // the copy-vs-pin rule of the READ SITE the deferred code will execute.
+    //
+    // So the loop is conservative for every slot, and geoStatic will read ~0%
+    // until the o2w_t31 read is converted onto the record the way the cb3 read
+    // was -- capture the 48 bytes at capture time, serve from the snapshot,
+    // fall back live. That conversion is the thing that "incorporates" t31,
+    // not a special case here.
+    //
+    // 2026-08-10 [5b]: the loop now SPLITS the verdict by whether the dynamic
+    // slot is the model-instance stream the derivation reads (t31) or some other
+    // slot, because the t31 read is being converted onto the record below and a
+    // converted read must stop vetoing. The slot is resolved from RDEF, never
+    // hardcoded -- hardcoding 31 is a bug this file has already made once (see
+    // the replay tier's path-1 note).
+    uint32_t miSlotCap = UINT32_MAX;
+    if (D3D11VertexShader* vsCap = s.vs.ptr()) {
+      if (vsCap->GetCommonShader() != nullptr)
+        miSlotCap = memoModelInstSlot(vsCap->GetCommonShader());
+    }
+    for (uint32_t i = 0; i < s.vsSrvs.size(); ++i) {
+      D3D11ShaderResourceView* srv = s.vsSrvs[i].ptr();
+      if (srv == nullptr)
+        continue;
+      if (srv->GetResourceType() != D3D11_RESOURCE_DIMENSION_BUFFER)
+        continue;
+      if (srv->GetResourceDesc().Usage != D3D11_USAGE_DYNAMIC)
+        continue;
+      if (i < kGeoDynSrvSlots)
+        ++s_geoDynSrvBySlot[i];
+      s.geoDynVsSrv = true;
+      if (i == miSlotCap) s.geoDynSrvT31   = true;
+      else                s.geoDynSrvOther = true;
+    }
+
+    // ---- [5b] THE CONVERTED READS: COLOR1 and the t31 entry. --------------
+    //
+    // This reproduces, at capture time, exactly what the derivation's o2w_t31
+    // and t30 paths do at consume time -- same slot resolution, same offsets,
+    // same 48-byte streaming copy. It deliberately does NOT reproduce their
+    // VALIDITY CHECKS (finite / zero-row): those are decisions about the value
+    // and belong to the consumer, which still makes them. Capture copies bytes.
+    //
+    // GUARDED THE SAME WAY THE SITES ARE. A capture that read t31 for a skinned
+    // character (BLENDINDICES present) would be copying a bone palette the
+    // o2w_t31 path deliberately routes away from, so the eligibility test is
+    // the site's, not a looser one.
+    if (s.inputLayout != nullptr) {
+      const IlFacts& ilfCap = memoIlFacts(s.inputLayout->GetRtxSemantics());
+      const bool t31EligibleCap =
+          (miSlotCap != UINT32_MAX || ilfCap.hasInstIdxSem) && !ilfCap.hasBlendIndices;
+      if (t31EligibleCap && ilfCap.hasInstIdxSem
+          && ilfCap.instSemSlot < s.vertexBuffers.size()) {
+        // COLOR1, the 8-byte per-instance entry. Serves BOTH index reads:
+        // .x -> charIdx (t31 path), .y -> boneIdx (t30 bone path).
+        const auto& instVbCap = s.vertexBuffers[ilfCap.instSemSlot];
+        if (instVbCap.buffer != nullptr) {
+          DxvkBufferSlice sliceCap =
+              instVbCap.buffer->GetBufferSlice(instVbCap.offset);
+          const uint8_t* pCap = sliceCap.defined()
+              ? reinterpret_cast<const uint8_t*>(sliceCap.mapPtr(0)) : nullptr;
+          const size_t offCap =
+              static_cast<size_t>(m_currentInstanceIndex) * instVbCap.stride
+              + ilfCap.instSemByteOffset;
+          if (pCap != nullptr && sliceCap.length() >= offCap + sizeof(s.instSem)) {
+            memcpyFromWC(s.instSem, pCap + offCap, sizeof(s.instSem));
+            s.instSemSlot  = ilfCap.instSemSlot;
+            s.instSemValid = true;
+          }
+        }
+      }
+      // The t31 entry at charIdx*208. charIdx is taken from the COLOR1 bytes
+      // just captured -- NOT re-read live -- so the pair is internally
+      // consistent even if the game renames the instance buffer between the two
+      // reads. The sites default charIdx to 0 when the semantic is absent and
+      // proceed against entry 0; reproduced here for the same reason the replay
+      // tier reproduces it (charIdxReason is a reason string, not a gate).
+      if (t31EligibleCap && miSlotCap < s.vsSrvs.size()) {
+        if (D3D11ShaderResourceView* miSrvCap = s.vsSrvs[miSlotCap].ptr()) {
+          if (D3D11Buffer* t31BufCap = probeSrvCached(miSrvCap).buf) {
+            const uint8_t* t31DataCap = nullptr;
+            size_t t31LenCap = 0;
+            auto t31MapCap = t31BufCap->GetMappedSlice();
+            if (t31MapCap.mapPtr && t31MapCap.length > 0) {
+              t31DataCap = reinterpret_cast<const uint8_t*>(t31MapCap.mapPtr);
+              t31LenCap  = t31MapCap.length;
+            } else if (void* pRawCap = t31BufCap->GetBuffer()->mapPtr(0)) {
+              t31DataCap = reinterpret_cast<const uint8_t*>(pRawCap);
+              t31LenCap  = t31BufCap->GetBuffer()->info().size;
+            }
+            const uint32_t charIdxCap = s.instSemValid ? s.instSem[0] : 0u;
+            const size_t   t31OffCap  = static_cast<size_t>(charIdxCap) * 208u;
+            if (t31DataCap != nullptr && t31OffCap + 48u <= t31LenCap) {
+              memcpyFromWC(s.t31Entry, t31DataCap + t31OffCap, 48u);
+              s.t31CharIdx = charIdxCap;
+              s.t31Valid   = true;
+            }
+          }
+        }
+      }
+    }
+
+    // -- VS cbuffer BINDINGS (identity + generation, no contents). See the
+    // CbBinding note for why contentGen has to be sampled HERE: it is the only
+    // moment at which "this is the slice the draw used" is still true.
+    // GetContentGeneration is an acquire load, so this is 14 pointer copies
+    // plus one atomic per BOUND slot (typically 3-5), not 14 atomics.
+    for (uint32_t i = 0; i < s.vsCbs.size(); ++i) {
+      const auto& src = st.vs.constantBuffers[i];
+      DrawSnapshot::CbBinding& dst = s.vsCbs[i];
+      D3D11Buffer* buf   = src.buffer.ptr();
+      dst.buffer         = buf;
+      dst.constantOffset = src.constantOffset;
+      dst.constantBound  = src.constantBound;
+      dst.contentGen     = (buf != nullptr) ? buf->GetContentGeneration()
+                                            : UINT64_MAX;
+    }
 
     // -- plain POD.
     s.numViewports = std::min<uint32_t>(
@@ -23472,7 +24679,57 @@ namespace dxvk {
     }
 
     // -- THE COPIED BYTES.
-    auto capture = [&s](const D3D11ConstantBufferBindings& cbs, uint32_t stage,
+    //
+    // NV-DXVK [DrawSnapshot] 2026-08-10: THE WC COALESCING WINDOW.
+    //
+    // WHY THIS EXISTS, measured rather than assumed. [Perf.WcCopy] billed this
+    // capture's narrow copies at 222,858 calls / 12.43 MB per 5 s window --
+    // 55.7 bytes each, ~2,894 separate write-combined reads per frame. At the
+    // tree's own measured 1192-2333 ns per 64 B WC read that is ~4.3 ms/frame,
+    // which is essentially the whole 5.07 ms/frame the span copy was costing.
+    // The bill is TRANSACTION COUNT, not bytes: WC is latency-bound, and one
+    // 256 B read costs barely more than one 64 B read while replacing three or
+    // four of them.
+    //
+    // WHAT IT DOES. On a WC miss, read a 256 B window starting at the span's
+    // 16-aligned offset instead of the span alone, and keep it for the rest of
+    // this draw. TF2's spans cluster in the first ~160 bytes of a cbuffer
+    // (cb2 at 4 / 16 / 96, cb3 at 0..48), so one window serves every span on
+    // that buffer and the second and third spans cost a memcpy from cached
+    // memory instead of a WC transaction.
+    //
+    // THIS IS NOT TRAP 3 COMING BACK. Trap 3 says never call stagedCbBytes()
+    // here, because its miss path stages the WHOLE ~6.3 KB buffer to serve one
+    // narrow read. That reasoning was written when the capture took ONE 48 B
+    // span; at meanRanges 5.11 the arithmetic inverts. The window is the middle
+    // answer and strictly better than either end: bounded at 256 B (never the
+    // whole buffer), and one transaction per BUFFER rather than per SPAN.
+    //
+    // Per DRAW, deliberately: it is reset for every capture, so it can never
+    // serve one draw's bytes to another. That is the same rule the record
+    // itself is built on.
+    //
+    // FOUR-WAY, CORRECTED 2026-08-10 -- the single-slot version measured 0%
+    // coalesced. The capture visits spans in a fixed order that ALTERNATES
+    // buffers (proj/view/cameraOrigin on cb2, then cb3, then the learned
+    // manifest spans on whichever), so a one-entry window is evicted by the
+    // next buffer and re-taken by the one after. Four ways covers the two or
+    // three distinct cbuffers a draw actually reads, at 1 KB of stack.
+    //
+    // IF THIS STILL READS ~0% COALESCED, the alternation theory is wrong too
+    // and the answer is in wcMissBySlot, not in more ways. Do not widen it a
+    // third time without reading that counter first.
+    struct WcWindow {
+      D3D11Buffer* buf = nullptr;
+      uint32_t     lo  = 0;
+      uint32_t     len = 0;
+      alignas(16) uint8_t bytes[256];
+    };
+    static constexpr uint32_t kWcWays = 4;
+    WcWindow wc[kWcWays];
+    uint32_t wcNext = 0;
+
+    auto capture = [&s, &wc, &wcNext](const D3D11ConstantBufferBindings& cbs, uint32_t stage,
                         uint32_t slot, uint32_t byteOffset, uint32_t byteCount) {
       if (slot >= cbs.size() || byteCount == 0)
         return;
@@ -23506,7 +24763,11 @@ namespace dxvk {
       // have quietly reintroduced the exact cost that fix removed, on every
       // draw, and called it a snapshot.
       // So: probe the ring hit-only (free when another site already staged this
-      // generation), else copy just the bytes we named straight from the map.
+      // generation), else take a BOUNDED 256 B window from the map -- never the
+      // whole buffer, and shared across every span on that buffer for the rest
+      // of this draw. See the WcWindow note above for why the window replaced a
+      // per-span read: the cost is transaction count, and [Perf.WcCopy] measured
+      // ~2,894 of them per frame before it.
       size_t len = 0;
       if (const uint8_t* p = stagedCbBytesIfHit(b.buffer.ptr(), len)) {
         // A short buffer is NOT an error: it means this draw does not have that
@@ -23515,15 +24776,79 @@ namespace dxvk {
           return;
         std::memcpy(s.cbBytes.data() + dst, p + byteOffset, byteCount);
       } else {
-        const auto mapped = b.buffer->GetMappedSlice();
-        const size_t avail = (mapped.mapPtr != nullptr)
-            ? std::min<size_t>(mapped.length, b.buffer->Desc()->ByteWidth)
-            : 0u;
-        if (avail < static_cast<size_t>(byteOffset) + byteCount)
-          return;
-        memcpyFromWC(s.cbBytes.data() + dst,
-                     static_cast<const uint8_t*>(mapped.mapPtr) + byteOffset,
-                     byteCount);
+        const size_t need = static_cast<size_t>(byteOffset) + byteCount;
+        // Already inside a window this draw read for the same buffer? Then
+        // this span costs a cached memcpy and NO write-combined transaction,
+        // which is the entire point.
+        const WcWindow* hit = nullptr;
+        for (uint32_t w = 0; w < kWcWays; ++w) {
+          if (wc[w].buf == b.buffer.ptr() && byteOffset >= wc[w].lo
+              && need <= static_cast<size_t>(wc[w].lo) + wc[w].len) {
+            hit = &wc[w];
+            break;
+          }
+        }
+        if (hit != nullptr) {
+          std::memcpy(s.cbBytes.data() + dst,
+                      hit->bytes + (byteOffset - hit->lo), byteCount);
+          ++s_drawSnapWcWinHit;
+        } else {
+          const auto mapped = b.buffer->GetMappedSlice();
+          const size_t avail = (mapped.mapPtr != nullptr)
+              ? std::min<size_t>(mapped.length, b.buffer->Desc()->ByteWidth)
+              : 0u;
+          if (avail < need)
+            return;
+          ++s_drawSnapWcWinMiss;
+          if (slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
+            ++s_drawSnapWcMissBySlot[slot];
+          // ANCHOR THE WINDOW AT THE BOUND RANGE, NOT AT THIS SPAN.
+          //
+          // MEASURED 2026-08-10, and this was the actual defect behind
+          // "0% coalesced" -- not the number of ways. Anchoring at
+          // `byteOffset & ~15` makes the window's POSITION depend on capture
+          // ORDER: cb3 carries the object-to-world block at offset 0
+          // (rebase=true) and, for the ~813 draws/frame whose projection lives
+          // in cb3, a 64 B projection at rebase=false projOffset (commonly 96).
+          // Take the offset-96 span first and the window becomes [96, 352), so
+          // the offset-0 span misses -- and cb3 is 92% of all WC misses
+          // (wcMissSlots cb3=111624 of 121196), so that one mis-anchoring was
+          // most of the cost.
+          //
+          // constantOffset*16 is where D3D11 says this draw's data starts, it
+          // is already 16-aligned, and the record captures it. Anchoring there
+          // makes the window order-independent and covers every span in the
+          // first 256 B of the bound range with ONE transaction. Still bounded
+          // and still never the whole buffer, so trap 3 holds.
+          const uint32_t bound = static_cast<uint32_t>(b.constantOffset) * 16u;
+          const uint32_t lo    = (byteOffset >= bound
+                                  && byteOffset - bound < sizeof(wc[0].bytes))
+                                 ? bound
+                                 : (byteOffset & ~15u);
+          const uint32_t want = static_cast<uint32_t>(
+              std::min<size_t>(sizeof(wc[0].bytes), avail - lo));
+          if (want >= need - lo) {
+            // Fill a way, then slice this span out of it. Round-robin
+            // replacement across kWcWays so an alternating buffer order does
+            // not evict the entry it is about to need again.
+            WcWindow& w = wc[wcNext];
+            wcNext = (wcNext + 1u) % kWcWays;
+            memcpyFromWC(w.bytes,
+                         static_cast<const uint8_t*>(mapped.mapPtr) + lo, want);
+            w.buf = b.buffer.ptr();
+            w.lo  = lo;
+            w.len = want;
+            std::memcpy(s.cbBytes.data() + dst,
+                        w.bytes + (byteOffset - lo), byteCount);
+          } else {
+            // Span wider than the window (or too near the end of the buffer).
+            // Read it directly and do NOT cache a partial window, which would
+            // otherwise answer a later containment test with short bytes.
+            memcpyFromWC(s.cbBytes.data() + dst,
+                         static_cast<const uint8_t*>(mapped.mapPtr) + byteOffset,
+                         byteCount);
+          }
+        }
       }
       DrawSnapshot::CbRange& r = s.cbRanges[s.numCbRanges++];
       r.stage      = stage;
@@ -23531,6 +24856,27 @@ namespace dxvk {
       r.byteOffset = byteOffset;
       r.byteCount  = byteCount;
       r.dataOffset = dst;
+    };
+
+    // Would one more span of this size fit? Same arithmetic capture() uses.
+    //
+    // WHY THIS EXISTS: capture() reports an overflow by setting s.overflowed,
+    // and that flag invalidates the ENTIRE record -- drawSnap() returns
+    // nullptr, so the draw loses its identity accessors too, not just the span
+    // that did not fit. That is the right behaviour for a NAMED span, where an
+    // incomplete record must never be derived from. It is the wrong behaviour
+    // for a LEARNED one, which is best-effort by definition: a manifest entry
+    // that cannot fit should simply stay on the live path and cost that draw
+    // nothing else. So learned spans ask first instead of overflowing.
+    auto spanFits = [&s](uint32_t byteCount) -> bool {
+      if (s.numCbRanges >= DrawSnapshot::kMaxCbRanges)
+        return false;
+      const uint32_t prevEnd = (s.numCbRanges == 0)
+          ? 0u
+          : (s.cbRanges[s.numCbRanges - 1].dataOffset
+             + s.cbRanges[s.numCbRanges - 1].byteCount);
+      const uint32_t dst = (prevEnd + 15u) & ~15u;
+      return dst + byteCount <= DrawSnapshot::kCbBytesCap;
     };
 
     // -- the NAMED spans, driven by the VS's resolved layout.
@@ -23552,6 +24898,10 @@ namespace dxvk {
     // constantOffset -- the condition under which the proj-vs-view offset
     // convention divergence documented below stops being harmless.
     uint32_t cbOffNz = 0;
+    // The location entry this draw's spans came from, kept so the LEARNED
+    // manifest can be replayed after the named spans below. Same entry, same
+    // lookup -- not a second map probe.
+    VsCbLocations* capLoc = nullptr;
     {
       const auto* vsPtr = st.vs.shader.ptr();
       const uintptr_t vsKey = (vsPtr != nullptr && vsPtr->GetCommonShader() != nullptr)
@@ -23574,7 +24924,8 @@ namespace dxvk {
         // is resolved by exactly the definition the consumer will apply.
         auto it = sVsCbLocCache.find(vsKey);
         if (it != sVsCbLocCache.end()) {
-          const VsCbLocations& L = it->second;
+          VsCbLocations& L = it->second;
+          capLoc = &L;
           // haveLoc distinguishes a real location from an entry that carries
           // only a negative (no-projection) stamp -- see its declaration.
           if (L.haveLoc) {
@@ -23619,18 +24970,105 @@ namespace dxvk {
                       static_cast<uint32_t>(L.viewOffset), 64u);
           }
         }
+
+        // CBufCommonPerCamera.c_cameraOrigin -- 12 B at the RDEF-resolved
+        // location. Captured OUTSIDE the sVsCbLocCache block on purpose: a VS
+        // can reflect a camera origin without having a resolved projection, and
+        // gating this on haveLoc would silently withhold the span from exactly
+        // the fallback draws that read it most.
+        //
+        // CONVENTION CHECKED AGAINST EVERY CONSUMER, per trap 2. All six
+        // RDEF-resolved readers in ExtractTransforms compute the same base --
+        // cb.constantOffset * 16 + camLoc->offset, 12 bytes:
+        //   ~:15633 camLocM (path-13 replay refresh)  ~:17266 camLocVm (viewmodel)
+        //   ~:17319 camLocP1 (path 1)                 ~:17790 camLocL (VP+origin)
+        //   ~:19811 camLocP13 (path 13)               ~:22287 camLocCap (record capture)
+        // The ONE divergent reader is the hardcoded cb2@4 fallback (~:9600,
+        // src='H'), which is outside this function and is deliberately NOT
+        // served from this span -- it names a different location by definition.
+        if (const D3D11CommonShader* commonCam = vsPtr->GetCommonShader()) {
+          auto camLocCap0 = memoCamOriginLoc(commonCam);
+          if (camLocCap0 && camLocCap0->size >= 12
+              && camLocCap0->slot < st.vs.constantBuffers.size()) {
+            const auto& cbCam = st.vs.constantBuffers[camLocCap0->slot];
+            if (cbCam.buffer != nullptr)
+              capture(st.vs.constantBuffers, 0u, camLocCap0->slot,
+                      static_cast<uint32_t>(cbCam.constantOffset) * 16u
+                        + static_cast<uint32_t>(camLocCap0->offset), 12u);
+          }
+        }
       }
     }
 
-    // VS cb3 -- the object-to-world block, 48 B at constantOffset*16. NOT
-    // layout-derived: this is the per-draw CONTENT read that the replay tier
-    // re-executes on every hit (the cb3->o2w gate, this file ~:19424), so it is
-    // needed whenever cb3 is bound regardless of whether the layout resolved.
-    {
-      const auto& cb3 = st.vs.constantBuffers[3];
-      if (cb3.buffer != nullptr)
-        capture(st.vs.constantBuffers, 0u, 3u,
-                static_cast<uint32_t>(cb3.constantOffset) * 16u, 48u);
+    // VS cb3 -- THE NAMED SPAN AND ITS PREDICTOR ARE BOTH GONE, 2026-08-10.
+    // The manifest owns slot 3 now. Do not re-add either.
+    //
+    // The block that stood here captured a hand-named 48 B object-to-world
+    // span, gated by a per-VS predictor (cb3Want/cb3Draws) that guessed which
+    // shaders reach the cb3->o2w gate. Two mechanisms for one span, and the
+    // predictor was the worse of them: it can only ever guess from a VS's
+    // history, whereas the manifest records what the derivation ACTUALLY read,
+    // per shader, with the offset convention the consumer used.
+    //
+    // The predictor could not simply be deleted before now, because the o2w
+    // consumer kept a private find() (handoff trap 4d) and therefore never
+    // reached noteCbSpanRead -- delete the named span and that consumer would
+    // have missed forever, on the single highest-frequency content read in the
+    // file. Routing it (see the drawCbSpan narrowScratch overload) closed that,
+    // so the consumer now teaches the manifest like every other span and the
+    // named capture is pure duplication.
+    //
+    // WHAT TO WATCH ON THE FIRST RUN. [DrawPure] why{miss=} should spike as
+    // each VS is seen and then return to 0 within seconds -- that is the
+    // manifest converging, and it is the same "being wrong is free" shape the
+    // predictor itself relied on: an unlearned span is served live, which is
+    // correct, just not pure. meanRanges should stay ~5.11 (the learned cb3
+    // entry replaces the named one, it does not add to it) and pure% ~96. A
+    // miss that does NOT decay means the manifest is not learning this span --
+    // check the o2w routing, do not re-add the predictor.
+
+    // -- THE LEARNED SPANS. Everything above is a span someone NAMED; this is
+    // every span this shader's derivation was actually observed to read.
+    //
+    // The four named spans exist because four consumers were converted by hand,
+    // each one a session's worth of checking which offset convention it used.
+    // That does not scale to the ~30 content reads still in ExtractTransforms,
+    // and the list is not knowable in advance -- it depends on which route each
+    // shader takes. So the manifest is filled by drawCbSpan at the moment a
+    // read has to be served live, and replayed here.
+    //
+    // DEDUPED AGAINST WHAT IS ALREADY CAPTURED, using find() itself: if a
+    // learned entry falls inside a named span (the cameraOrigin span inside a
+    // wider block, say) the bytes are already there and re-copying them would
+    // burn a range slot toward kMaxCbRanges for nothing. Using find() rather
+    // than a bespoke compare means the dedupe and the consumer's lookup apply
+    // exactly the same containment rule.
+    //
+    // ORDER MATTERS and it is deliberate: named spans first, so that when the
+    // range budget is tight the spans with a proven consumer win over the
+    // learned ones.
+    if (capLoc != nullptr) {
+      for (uint32_t i = 0; i < capLoc->manifestN; ++i) {
+        const VsCbLocations::CbSpanReq& m = capLoc->manifest[i];
+        if (m.byteCount == 0 || m.slot >= st.vs.constantBuffers.size())
+          continue;
+        const auto& cbM = st.vs.constantBuffers[m.slot];
+        if (cbM.buffer == nullptr)
+          continue;
+        // Re-derive the base from THIS draw's binding -- the reason the
+        // manifest stores relative offsets. A shader whose cbuffer is bound at
+        // a different constantOffset than when the span was learned still gets
+        // the bytes its consumer will ask for.
+        const uint32_t absM =
+            (m.rebase ? uint32_t(cbM.constantOffset) * 16u : 0u) + m.offset;
+        if (s.find(0u, m.slot, absM, m.byteCount) != nullptr)
+          continue;  // already covered by a named span
+        // Best-effort: never let a learned span set `overflowed` and take the
+        // whole record down with it. See spanFits.
+        if (!spanFits(m.byteCount))
+          continue;
+        capture(st.vs.constantBuffers, 0u, m.slot, absM, m.byteCount);
+      }
     }
 
     // -- [DrawSnap] coverage census. This is the number that says whether the
@@ -23640,22 +25078,46 @@ namespace dxvk {
     // live path instead of speeding them up. ovf>0 means a range did not fit
     // and the caps in DrawSnapshot need raising -- never ignore it.
     {
+      // Publish the partition predicate onto the record before the census reads
+      // it. This is the ONLY place it can be set honestly: it is the same
+      // sVsCbLocCache lookup the span capture above just performed, taken at
+      // the instant the bindings were this draw's.
+      s.layoutResolved = layoutResolved;
+
       static thread_local uint32_t sDraws = 0, sResolved = 0, sRanges = 0, sOvf = 0;
       static thread_local uint32_t sCbOff = 0;
+      // Manifest occupancy: how full the six-entry per-VS manifest is on the
+      // draws that have one. It replaces the deleted cb3Skip, which measured a
+      // predictor that no longer exists. THIS is the number that says whether
+      // kMaxCbManifest is the right size -- read it with satN on [DrawPure]:
+      // manN climbing to 6 while satN goes non-zero means shaders are being
+      // truncated and the cap is too small, whereas manN sitting well under 6
+      // means the spans really are few and the cap is fine.
+      static thread_local uint32_t sManN = 0, sManDraws = 0;
       static thread_local std::chrono::steady_clock::time_point sLast{};
       ++sDraws;
       if (layoutResolved) ++sResolved;
+      if (capLoc != nullptr) { sManN += capLoc->manifestN; ++sManDraws; }
       sRanges += s.numCbRanges;
       if (s.overflowed) ++sOvf;
       sCbOff += cbOffNz;
       const auto now = std::chrono::steady_clock::now();
       if (sLast.time_since_epoch().count() == 0) sLast = now;
       if (now - sLast >= std::chrono::seconds(3)) {
+        // Zeroes omitted: 14 slots of which two or three ever reach the WC
+        // path would bury the signal in an already long line.
+        std::string wcSlotStr = " wcMissSlots{";
+        for (uint32_t i = 0; i < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; ++i) {
+          if (s_drawSnapWcMissBySlot[i] != 0)
+            wcSlotStr += str::format("cb", i, "=", s_drawSnapWcMissBySlot[i], " ");
+        }
+        wcSlotStr += "}";
         Logger::warn(str::format(
             "[DrawSnap] draws=", sDraws,
             " resolved=", sResolved,
             " (", (sDraws ? (sResolved * 100u / sDraws) : 0u), "%)",
             " meanRanges=", (sDraws ? (sRanges * 100u / sDraws) : 0u), "/100",
+            " manN=", (sManDraws ? (sManN * 100u / sManDraws) : 0u), "/100",
             " ovf=", sOvf,
             // cbOff counts draws whose captured proj/view cbuffer is bound at a
             // NON-ZERO constantOffset. Expected 0. If it is not 0, the
@@ -23664,6 +25126,25 @@ namespace dxvk {
             // ~:16584 / ~:15024 disagree with each other on those draws --
             // pre-existing, but it would make the view span capture wrong.
             " cbOff=", sCbOff,
+            // WC TRANSACTIONS, the capture's real cost. wcMiss is the number
+            // of write-combined reads actually issued; wcHit is the number of
+            // spans the 256 B window served without one. Before the window,
+            // every span was a transaction, so wcMiss+wcHit is what the old
+            // code would have paid and wcMiss is what this one pays. Cross-check
+            // wcMiss/draw against [Perf.WcCopy]'s narrow-copy call count -- if
+            // they disagree, one of the two is counting something else.
+            " wcMiss=", s_drawSnapWcWinMiss,
+            " wcHit=", s_drawSnapWcWinHit,
+            " (", ((s_drawSnapWcWinMiss + s_drawSnapWcWinHit)
+                   ? (s_drawSnapWcWinHit * 100u
+                      / (s_drawSnapWcWinMiss + s_drawSnapWcWinHit))
+                   : 0u), "% coalesced)",
+            // WHICH cbuffers reach the write-combined path at all. Everything
+            // NOT listed here is being served by the staging ring already, so
+            // it costs nothing and needs no window. If ONE slot dominates,
+            // more ways cannot help -- that slot is read once per draw and the
+            // fix is to stop reading it, not to cache it.
+            wcSlotStr,
             // Do NOT put the literal Perf.Replay tag in this string: it makes
             // every log search for that tag return these lines instead.
             // MEASURED 2026-08-10: resolved=79-80%, meanRanges=2.59 (cb3 ~1.00
@@ -23673,8 +25154,15 @@ namespace dxvk {
             // ~20% that do not resolve are UI/fallback draws with no projection
             // to name. Do not chase the 92% figure -- that is replayed over
             // reachedTier, a different denominator.
-            "  | expect resolved ~80% (reachedTier share), meanRanges ~2.6, ovf 0"));
+            "  | expect resolved ~80% (reachedTier share), meanRanges ~5.1, ovf 0."
+            " 2026-08-10: the named cb3 span + its predictor were deleted and the"
+            " manifest owns slot 3, so meanRanges should be UNCHANGED (the learned"
+            " cb3 entry replaces the named one) -- a drop means the o2w consumer"
+            " stopped teaching the manifest, not that the capture got cheaper"));
         sDraws = sResolved = sRanges = sOvf = sCbOff = 0;
+        sManN = sManDraws = 0;
+        s_drawSnapWcWinHit = s_drawSnapWcWinMiss = 0;
+        for (auto& ws : s_drawSnapWcMissBySlot) ws = 0;
         sLast = now;
       }
     }
@@ -26953,6 +28441,14 @@ namespace dxvk {
   // that only writes a missing field will read as clean. Every field here is
   // one a LATER draw can observe -- per-draw scratch is deliberately excluded,
   // because a stage rewriting scratch creates no ordering dependency.
+  // NV-DXVK [DrawSnapshot] 2026-08-10: carrierFingerprint() -- the folded
+  // single-hash variant of this list -- was DELETED here, not left unused.
+  // DrawSnapshot now keeps the groups apart (DrawSnapshot::carrierGrp), so the
+  // fold had no remaining caller, and a second way to hash the same carriers
+  // is precisely the "two lists to keep in sync" hazard this function's own
+  // contract warns about: the survivor would have gone stale the first time a
+  // group was added. Compare per group; do not reintroduce a fold.
+
   void D3D11Rtx::stageDepCarrierGroups(uint64_t out[kSdepGroupCount]) const {
     uint64_t h = 0xcbf29ce484222325ull;
     const auto mix = [&h](const void* p, size_t n) {
@@ -27017,6 +28513,37 @@ namespace dxvk {
     seal();   // kSdepRoute -- intentionally hashes nothing, see above
 
     // -- the SHARED cb-location state (one set of slots for every VS) --
+    // STILL HASHED, and two attempts to retire it have been measured and
+    // reverted. It is the single largest entry in the carrier set: [DrawPure]
+    // carrierGrp reads cbLoc~5,600 against cam~780 and static~65, i.e. 88% of
+    // all carrier moves, and through safeToDefer() it costs ~3,750 otherwise
+    // eligible draws per 3 s window. It is REAL, not a probe artifact: a draw
+    // whose VS has no cached location inherits the previous draw's slot as its
+    // search seed, and the validate path can ACCEPT that inherited location, so
+    // the draw's result depends on which draw ran before it.
+    //
+    // WHAT WAS TRIED (see the note at the VsLocCache site in ExtractTransforms
+    // for the full account, and do not repeat either):
+    //   1. seed sentinels when the VS has no record -> resolved 79% -> 41%,
+    //      eligible 36% -> 7%. The inheritance is the BOOTSTRAP CHANNEL, not a
+    //      hint: a first-sighting VS borrows a location, validates it, and the
+    //      write-back saves it as that VS's own. Cut the borrow and a VS that
+    //      fails to resolve never acquires a record at all.
+    //   2. seed a frame-scoped hint latched at EndFrame -> resolved 49%, and it
+    //      broke the replay tier: hit/full 302k/22k -> 40k/284k, inelig 5,100 ->
+    //      279,381, FAIL=1.
+    //
+    // WHY BOTH FAILED FOR THE SAME REASON, which neither attempt anticipated:
+    // these members are an INPUT TO THE REPLAY TIER'S KEYING, not just to the
+    // projection search. The record commit copies them (rr.projSlot/projStage/
+    // ...) and the route proof gates on them, so changing what an unresolved
+    // draw holds changes which records exist and which may replay. Retiring
+    // this group needs the tier's view of these fields decoupled first; it is
+    // not reachable by changing where the seed comes from.
+    // NOTE m_viewStage is cross-draw state this list has always MISSED -- a
+    // genuine hole, deliberately left as-is because adding it would only lower
+    // eligibility further while the group is hashed anyway.
+    //
     mix(&m_projSlot, 4); mix(&m_projOffset, sizeof(size_t)); mix(&m_projStage, sizeof(int));
     mix(&m_columnMajor, 1);
     mix(&m_viewSlot, 4); mix(&m_viewOffset, sizeof(size_t));
@@ -27382,7 +28909,11 @@ namespace dxvk {
     // CAVEAT: each mark still costs ~41ns of clock read, which is included in the
     // NEXT bucket. With ~30 marks that is ~1.2us/draw of instrument in a 17us
     // draw â€” fine for ranking, not for absolute leaf costs. See the markFm note.
-    auto markStg = [&tStg, this](int64_t& acc, int64_t& max) {
+    // NV-DXVK [Perf.EligCost] 5a: RETURNS the interval it just billed, so a
+    // caller can re-bill the SAME dNs to a second, finer accumulator without
+    // taking another clock read (~41 ns each, x ~30 marks x ~59k draws is not
+    // free). Every existing call site discards it and is unaffected.
+    auto markStg = [&tStg, this](int64_t& acc, int64_t& max) -> int64_t {
       const auto now = std::chrono::steady_clock::now();
       const int64_t dNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now - tStg).count();
       acc += dNs;
@@ -27402,6 +28933,7 @@ namespace dxvk {
         // timings the rest of the report is read from.
         tStg = std::chrono::steady_clock::now();
       }
+      return dNs;
     };
 
     // NV-DXVK [perf]: markSub â€” a markStg for the OPTIONAL subdivisions of
@@ -31904,7 +33436,18 @@ namespace dxvk {
     dcs.geometryData     = geo;
     markStg(s_perfBtGeoCopyAcc, s_perfBtGeoCopyMax);
     dcs.transformData    = ExtractTransforms();
-    markStg(s_perfBtExtractXformAcc, s_perfBtExtractXformMax);
+    {
+      // NV-DXVK [Perf.EligCost] 5a. ONE interval, billed twice: to the stage
+      // total (byte-for-byte the number every previous run reported) and to the
+      // eligibility split. The verdict was published by XtPurityGuard as
+      // ExtractTransforms returned, one line above. See the accumulators' decl.
+      const int64_t xfNs = markStg(s_perfBtExtractXformAcc, s_perfBtExtractXformMax);
+      if (s_xtEligLast) { s_xfEligNs   += xfNs; ++s_xfEligN;   }
+      else              { s_xfIneligNs += xfNs; ++s_xfIneligN; }
+      // Subset of the eligible bucket, not a third disjoint one -- elig3 implies
+      // elig, so xfElig3 <= xfElig by construction.
+      if (s_xtElig3Last) { s_xfElig3Ns += xfNs; ++s_xfElig3N; }
+    }
 
     // NV-DXVK SESSION-Q: the instanced-hull objectToWorld override was removed from here.
     // The instanced skinned hull is handled by the skinned-char path 11 below (which sets
@@ -52464,12 +54007,22 @@ namespace dxvk {
     }
 
     m_drawCallID = 0;
-    // NV-DXVK [DrawSnapshot]: drop last frame's snapshots. clear() keeps the
-    // reserved capacity, so the arena allocates once for the process lifetime.
-    // Must sit with the m_drawCallID reset: drawIndex is the arena's ordering
-    // key, so the two have to roll over together or a deferred consumer would
-    // index last frame's snapshot.
-    m_drawSnaps.clear();
+    // NV-DXVK [DrawSnapshot]: roll the arena over for the new frame.
+    //
+    // CHANGED 2026-08-10 from clear() to an INDEX RESET, because clear()
+    // destroys the elements and every emplace_back then value-initialises a
+    // fresh ~3 KB record -- drawSnapAlloc_ns measured 1.44 ms/frame of
+    // cache-cold write-allocate traffic doing it. Every one of those stores is
+    // then overwritten by the capture a few lines later: the identity block
+    // assigns vertexBuffers, vsSrvs and vsCbs WHOLESALE, so zeroing 128 SRV
+    // slots and 32 vertex-buffer bindings first is duplicated work, not
+    // safety. Slots are now kept alive and reused; captureDrawSnapshot clears
+    // the five scalars that are NOT unconditionally reassigned.
+    //
+    // Must still sit with the m_drawCallID reset: drawIndex is the arena's
+    // ordering key, so the two have to roll over together or a deferred
+    // consumer would index last frame's snapshot.
+    m_drawSnapNext = 0;
     m_drawSnapCur = nullptr;
     m_drawSnapValid = false;
     m_rawDrawCount = 0;
@@ -52481,6 +54034,14 @@ namespace dxvk {
     // cached location becomes stale.  Resetting every frame would force an
     // O(stages Ã— slots Ã— bufferBytes) scan on the first draw, which hangs
     // emulators with 64KB+ UBOs.
+    //
+    // STILL TRUE, and re-confirmed the hard way on 2026-08-10: two attempts to
+    // stop these members carrying across draws (sentinel seed, then a
+    // frame-scoped hint) both regressed resolved% badly and the second broke
+    // the replay tier with FAIL=1. The carry is the bootstrap channel by which
+    // a first-sighting VS acquires any location at all, and these fields feed
+    // the tier's record keying. See the VsLocCache site in ExtractTransforms.
+    //
     //
     // NV-DXVK: Combined VP (cls 3/4) MUST be re-scanned each frame because
     // (a) the VP content changes with camera movement, and (b) Source only
@@ -52776,6 +54337,32 @@ namespace dxvk {
                                  " bt_dcsCtor=",     s_perfBtDcsCtorAcc,
                                  " bt_geoCopy=",     s_perfBtGeoCopyAcc,
                                  " bt_extractXf=",   s_perfBtExtractXformAcc,
+                                 // [Perf.EligCost] 5a -- bt_extractXf split by
+                                 // the deferral gate, reported IN THE SAME WINDOW
+                                 // as the total above so the ratio against it is
+                                 // exact. ([DrawPure] would have been the obvious
+                                 // home, but its window is 3 s and this one is
+                                 // not, and dividing across two windows is the
+                                 // comparison this project keeps forbidding.)
+                                 //
+                                 // DIVIDE BEFORE CONCLUDING. xfElig/xfEligN vs
+                                 // xfInelig/xfIneligN -- ns per draw -- is the
+                                 // answer; the totals are not, because a big
+                                 // ineligible total is equally consistent with
+                                 // many cheap replayed draws and with a few
+                                 // expensive full-path ones, and those imply
+                                 // opposite decisions about 5d.
+                                 //
+                                 // xfElig3 is the same weighting for the
+                                 // three-axis population. It reads ~0 until the
+                                 // o2w_t31 live read moves onto the record (5b),
+                                 // and that is axis 3 working, not a bug.
+                                 " xfElig=",         s_xfEligNs,
+                                 " xfEligN=",        s_xfEligN,
+                                 " xfInelig=",       s_xfIneligNs,
+                                 " xfIneligN=",      s_xfIneligN,
+                                 " xfElig3=",        s_xfElig3Ns,
+                                 " xfElig3N=",       s_xfElig3N,
                                  // v6.9d REPLAY-PATH BUCKETS. Until these
                                  // existed every xt_* marker sat after the
                                  // replay early-return, so bt_extractXf's
@@ -54315,6 +55902,11 @@ namespace dxvk {
         s_perfBtDcsCtorAcc                    = 0; s_perfBtDcsCtorMax                    = 0;
         s_perfBtGeoCopyAcc                    = 0; s_perfBtGeoCopyMax                    = 0;
         s_perfBtExtractXformAcc               = 0; s_perfBtExtractXformMax               = 0;
+        // [Perf.EligCost] 5a: cleared WITH the stage total, never separately --
+        // the split is only meaningful as a fraction of the same window's
+        // bt_extractXf.
+        s_xfEligNs = 0; s_xfIneligNs = 0; s_xfElig3Ns = 0;
+        s_xfEligN  = 0; s_xfIneligN  = 0; s_xfElig3N  = 0;
         s_perfXtVsLocCacheHits                = 0;
         s_perfXtVsLocCacheMisses              = 0;
         s_perfRpKeyAcc                        = 0; s_perfRpKeyMax                        = 0;
