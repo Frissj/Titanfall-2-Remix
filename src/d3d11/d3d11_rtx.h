@@ -9,8 +9,12 @@
 // file, so there is no cycle.
 #include "d3d11_context_state.h"
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <optional>
+#include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1152,6 +1156,10 @@ namespace dxvk {
     // vertexBuffers[slot] unchecked and every one of them already handles a
     // null buffer, so this is a drop-in that removes an out-of-bounds read.
     const D3D11VertexBufferBinding& drawVertexBuffer(uint32_t slot) const;
+    // NV-DXVK [PhaseB]: identity accessors over already-captured snapshot
+    // fields; record-first, live-fallback. See the .cpp comment.
+    const D3D11IndexBufferBinding&  drawIndexBuffer() const;
+    const Com<D3D11PixelShader>&    drawPixelShaderCom() const;
 
     // NV-DXVK [flicker V8: SubmitDraw-ordered geometry capture]: predictor for
     // "will this draw (re)bake its BLAS inputs?". The real decision
@@ -1216,14 +1224,15 @@ namespace dxvk {
     // transform). Forces SubmitDraw into the TRUE UI branch even when
     // m_foundRealProjThisFrame=true from prior gameplay draws, so UI
     // buttons/HUD always hit native rasterization.
-    bool                                 m_lastClassifierSaidUi = false;
+    // (m_lastClassifierSaidUi moved into XfCarriers -- see the rtx.extractOverlap
+    //  block below the axis-vote fields. The rationale above still applies.)
     // True once ANY draw in the current frame was captured for RT.
     // Once Remix is active, ALL D3D11 rasterization is suppressed (including
     // filtered draws) because the game's native rasterization shares render
     // targets with Remix output → write hazards → corruption → TDR.
     // Reset to false each EndFrame. During menus (no RT captures), this stays
     // false and all draws rasterize normally.
-    bool                                 m_remixActiveThisFrame = false;
+    // (m_remixActiveThisFrame moved into XfCarriers -- see rtx.extractOverlap block.)
     // NV-DXVK [VanishDiag-Raw]: per-VS-hash histogram of OnDraw* entries
     // this frame. Compared at EndFrame against scene_manager's vsHistogram
     // (which counts only draws that reached processDrawCallState) to
@@ -1315,14 +1324,13 @@ namespace dxvk {
     // captures the draw's c_cameraOrigin (cb2 offset 4) into these; SubmitDraw
     // compares against the latched Main camera world position post-extract
     // and rejects draws whose coord space disagrees with Main.
-    Vector3                              m_lastDrawCamOrigin{ 0.0f, 0.0f, 0.0f };
-    bool                                 m_lastDrawCamOriginSet = false;
+    // (m_lastDrawCamOrigin / m_lastDrawCamOriginSet moved into XfCarriers.)
 
     // NV-DXVK: which worldToView assignment path fired for this draw. Set by
     // each `transforms.worldToView = ...` site to a unique small integer.
     // Dumped at Main-camera latch time so we can identify which path is
     // producing the (wrong) latched pose. 0 = not set this draw.
-    uint32_t                             m_lastWtvPathId = 0;
+    // (m_lastWtvPathId moved into XfCarriers.)
     // NV-DXVK: which objectToWorld assignment path fired for this draw.
     //   0 = unset (stayed identity)
     //   1 = non-inst BSP t31 read (new)
@@ -1335,12 +1343,12 @@ namespace dxvk {
     //   8 = cb2@4 cameraOrigin fallback
     //   9 = per-instance override in SubmitDraw(instanceTransform)
     //  10 = bone-instanced: o2w=identity (instancesToObject handles it)
-    uint32_t                             m_lastO2wPathId = 0;
+    // (m_lastO2wPathId moved into XfCarriers.)
     // NV-DXVK [Perf.Replay] v6 path-5/6 widening: the RDEF CBufModelInstance
     // bind slot the rdef o2w site read this draw (paths 5/6/7). Captured into
     // the replay record so the replay can re-read the same 48 bytes and
     // re-evaluate the cb3IsZero mode per draw. UINT32_MAX = not an rdef draw.
-    uint32_t                             m_lastModelCbSlot = UINT32_MAX;
+    // (m_lastModelCbSlot moved into XfCarriers.)
     // NV-DXVK [Perf.Replay] v6.3 path-1/2/3 widening: the camera origin the
     // t31 o2w site (path 1) actually added to its translation this draw, and
     // WHERE it came from. Path 1 prefers the session-latched fanout origin
@@ -1372,10 +1380,8 @@ namespace dxvk {
     //  the v6.4 wtvPath-3 carry proof. They recorded where path 3 read camXYZ
     //  so the proof could decide whether it was provable cb2 content; with the
     //  proof gone they were written every draw and never read.)
-    Vector3                              m_lastO2wCamOrigin{ 0.0f, 0.0f, 0.0f };
-    bool                                 m_lastO2wCamValid = false;
-    bool                                 m_lastO2wCamFromFanout = false;
-    uint32_t                             m_lastO2wCamOff = 0;
+    // (m_lastO2wCamOrigin / m_lastO2wCamValid / m_lastO2wCamFromFanout /
+    //  m_lastO2wCamOff moved into XfCarriers.)
 
     // NV-DXVK: the canonical gameplay camera origin, populated by the
     // bone-fanout RDEF lookup at line ~593. Different VS permutations have
@@ -1665,7 +1671,8 @@ namespace dxvk {
     // Initialized to true so that the EndFrame safety net (which calls
     // ExtractTransforms before any draw on the first frame of a session)
     // correctly treats a never-invoked extract as "no real projection".
-    bool                                 m_lastExtractUsedFallback = true;
+    // (m_lastExtractUsedFallback moved into XfCarriers -- initialized TRUE there,
+    //  see the comment above for why.)
 
     // NV-DXVK: When the scanner locks onto a combined VP (cls 3/4), the
     // cached slot/offset must be re-scanned every frame because (a) the VP
@@ -1675,7 +1682,7 @@ namespace dxvk {
     // This flag is set when the scanner finds a cls 3/4 match and causes
     // m_projSlot to be reset to UINT32_MAX at the top of each EndFrame
     // so the next frame re-scans instead of re-validating the stale location.
-    bool                                 m_projIsCombinedVP = false;
+    // (m_projIsCombinedVP moved into XfCarriers.)
 
     // NV-DXVK: Per-frame flag that becomes true once ANY draw in the
     // current frame successfully finds a real perspective projection
@@ -1703,9 +1710,10 @@ namespace dxvk {
     // either sees the old value, the new value, or a partial update —
     // all of which have non-zero translation once any real proj is
     // latched, so the rejection stays correct. No mutex required.
-    static bool                          m_foundRealProjThisFrame;
-    static bool                          m_hasEverFoundProj;
-    static DrawCallTransforms            m_lastGoodTransforms;
+    // (m_foundRealProjThisFrame / m_hasEverFoundProj / m_lastGoodTransforms moved
+    //  into XfStaticCarriers -- ONE shared instance, s_xfStatics, same
+    //  cross-instance semantics as the statics they replace. Everything the
+    //  comment above says still holds; access is now via xfs().)
     // Mutex for the three static members above. Deferred-context threads
     // (materialsystem_dx11 records most BSP/prop draws on secondary
     // threads) read m_lastGoodTransforms every draw; the immediate
@@ -1844,7 +1852,7 @@ namespace dxvk {
     uint32_t m_fanoutSkyValid         = 0u;   // g_engineSkyCamOriginValid
     uint32_t m_fanoutInSubView        = 0u;   // g_vanishDiagCapturedA3 & 0x10
     // NV-DXVK: Set true during ExtractTransforms for bone draws to skip world matrix scan
-    bool                                 m_currentDrawIsBoneTransformed = false;
+    // (m_currentDrawIsBoneTransformed moved into XfCarriers.)
     // NV-DXVK (TF2 skinned chars): flipped in the skinned-char detection
     // block inside SubmitDraw (RasterGeometry setup), consumed later when
     // `dcs` has been constructed so we can write objectToWorld there.
@@ -1852,7 +1860,7 @@ namespace dxvk {
     // interleaver's camera-relative skinned positions end up in world space.
     bool                                 m_skinnedCharNeedsCamOffset = false;
     // NV-DXVK: Skip view matrix scan but allow world matrix scan
-    bool                                 m_skipViewMatrixScan = false;
+    // (m_skipViewMatrixScan moved into XfCarriers.)
     // NV-DXVK TF2: full bone-matrix cache (393216 bytes, 8192 bones × 48).
     // Populated from both D3D11 UpdateSubresource (lower-half palette
     // slots, via OnUpdateSubresource) and DXVK CopyBuffer (full rigs,
@@ -2019,23 +2027,15 @@ namespace dxvk {
       bool        valid      = false;
       Matrix4     worldToView;
     };
-    CamFallbackCache                     m_camFallbackCache;
+    // (m_camFallbackCache moved into XfCarriers.)
 
     // Cached projection cbuffer location — found on first draw with a perspective
     // matrix and reused for the rest of the frame. Reset to invalid in EndFrame.
-    uint32_t                             m_projSlot   = UINT32_MAX;
-    size_t                               m_projOffset = SIZE_MAX;
-    int                                  m_projStage  = -1;
-    // true when the engine stores matrices in column-major order (Unity, Godot).
-    // Detected during the projection scan — all subsequent reads are transposed.
-    bool                                 m_columnMajor = false;
-
-    // Cached view matrix cbuffer location — mirrors projection caching.
-    // Once a valid view matrix is found at (stage, slot, offset), subsequent
-    // draws re-read from the same location instead of rescanning.
-    uint32_t                             m_viewSlot   = UINT32_MAX;
-    size_t                               m_viewOffset = SIZE_MAX;
-    int                                  m_viewStage  = -1;
+    // (m_projSlot / m_projOffset / m_projStage / m_columnMajor and
+    //  m_viewSlot / m_viewOffset / m_viewStage moved into XfCarriers.
+    //  m_columnMajor: true when the engine stores matrices column-major
+    //  (Unity, Godot), detected during the projection scan; the view triple
+    //  mirrors the projection caching.)
 
     // NV-DXVK [DrawSnapshot] 2026-08-10: the seven members above DO carry
     // across draws, deliberately, and two attempts to stop them were measured
@@ -2054,7 +2054,10 @@ namespace dxvk {
     VsLayoutTable                        m_vsLayoutTable;
     // layoutId of the draw ExtractTransforms just resolved, or UINT32_MAX when
     // the draw is UI-fallback / not injected. Reset per draw; read downstream.
-    uint32_t                             m_currentLayoutId = UINT32_MAX;
+    // (m_currentLayoutId moved into XfCarriers. m_vsLayoutTable itself stays HERE,
+    //  deliberately: it is a per-VS learning cache, exclusively accessed during
+    //  the overlap window, and a discarded draw's learned layout is still valid
+    //  layout data -- see the XfCarriers block for the full rule.)
 
     // NV-DXVK [Phase2]: per-frame capture arena (GPU-driven injection). Filled
     // at the RT commit point when rtx.capturePhase2 is on; consumed by Phase 3.
@@ -2064,25 +2067,183 @@ namespace dxvk {
 
     // Smoothed camera position — exponential moving average dampens
     // micro-jitter from floating-point rounding in cbuffer matrix extraction.
-    Vector3                              m_smoothedCamPos = Vector3(0.0f);
-    bool                                 m_hasPrevCamPos  = false;
+    // (m_smoothedCamPos / m_hasPrevCamPos moved into XfCarriers.)
 
     // Axis convention auto-detection — voting system accumulates evidence
     // from projection and view matrices, then settles once confident.
     // Re-checks during warmup to correct boot/loading screen misdetections.
-    bool                                 m_axisDetected = false;
-    bool                                 m_axisLogged   = false;
+    // (m_axisDetected / m_axisLogged moved into XfCarriers.)
     uint32_t                             m_axisDetectFrame = 0;
 
     // Voting counters for Z-up vs Y-up and LH vs RH.
     // Accumulate votes over multiple frames, settle when |votes| >= threshold.
-    int                                  m_zUpVotes     = 0;  // positive = Z-up, negative = Y-up
-    int                                  m_lhVotes      = 0;  // positive = LH, negative = RH
-    int                                  m_yFlipVotes   = 0;  // positive = flipped, negative = normal
-    bool                                 m_zUpSettled    = false;
-    bool                                 m_lhSettled     = false;
-    bool                                 m_yFlipSettled  = false;
+    // (m_zUpVotes / m_lhVotes / m_yFlipVotes / m_zUpSettled / m_lhSettled /
+    //  m_yFlipSettled moved into XfCarriers.)
     static constexpr int kVoteThreshold  = 5; // votes needed to settle
+
+    // =====================================================================
+    // NV-DXVK [XfOverlap] 2026-08-10: capture-time overlap of ExtractTransforms.
+    //
+    // THE DESIGN (HANDOFF_DEFERRAL_2026-08-10c sec 3c, implemented here with
+    // one upgrade). SubmitDraw's derivation (ExtractTransforms, ~8,600 lines)
+    // is scheduled on a dedicated worker thread right after captureDrawSnapshot
+    // and joined ~1,006 ms/window of frame-thread stages later, immediately
+    // before its result is consumed (`dcs.transformData = ...`). No consumer
+    // code moves; nothing is deferred past the consume point.
+    //
+    // WHY THIS IS SAFE -- three audited facts, each load-bearing:
+    //  1. The stages between capture and consume write NOTHING the derivation
+    //     reads, and read NOTHING the derivation writes (member-level audit
+    //     both directions 2026-08-10, plus [Perf.StageDep] wrote=0% on all 47
+    //     stages, which is value-based and therefore covers their callees).
+    //  2. The game thread is blocked inside SubmitDraw for the whole window,
+    //     so live cbuffer/geometry bytes cannot be remapped under the worker.
+    //     This is what makes overlap fundamentally safer than EndFrame
+    //     deferral -- and why the three-axis safeToDefer() gate does NOT
+    //     constrain overlap: cbSafe/geoBytesStatic guard against remaps that
+    //     cannot happen inside the window. The overlap therefore targets ALL
+    //     draws (~440 ms/window of bt_extractXf), not the gated 37%.
+    //  3. Every helper cache the derivation touches is thread_local (VS
+    //     classifier memo, VsPsHashes memo, cb staging ring, xt counters) or
+    //     mutex-guarded (one-shot diagnostic sets).
+    //
+    // WHY THE CARRIERS ARE PRIVATISED ANYWAY. 26 early-return paths sit
+    // between capture and consume. Serial execution never runs the derivation
+    // for a draw those paths reject -- so a worker that already ran it must be
+    // able to DISCARD its side effects or carrier state diverges from serial.
+    // Hence: every member ExtractTransforms writes lives in XfCarriers below,
+    // reached through xfc(). On the frame thread (no override) xfc() returns
+    // the authoritative m_xfc; on the worker it returns the job's private
+    // copy, seeded at schedule. The join applies the copy back (whole-struct:
+    // nothing else writes these members concurrently); an early return simply
+    // never applies. Globals are untouched during the window, so the
+    // [Perf.StageDep] probe and the capture-time carrierGrp hash stay
+    // truthful, and XtPurityGuard's own carrier hashing reads the override
+    // and stays per-draw-correct on the worker.
+    //
+    // THE STATICS ARE APPLIED CHANGED-FIELDS-ONLY. Deferred-context instances
+    // read AND write s_xfStatics concurrently (see the comment at the old
+    // static declarations). ExtractTransforms only ever writes them on
+    // success (false->true latches, last-good updates), so the join applies a
+    // field only when the worker's copy differs from its seed -- a whole-copy
+    // could regress m_foundRealProjThisFrame true->false and clobber a
+    // deferred context's fresher latch.
+    //
+    // DELIBERATE EXCEPTIONS (direct worker writes, NOT privatised):
+    //  - m_vsLayoutTable, the per-VS span manifest (noteCbSpanRead), and the
+    //    VsLocCache: per-VS LEARNING caches. Exclusive during the window;
+    //    a discarded draw's learning is still valid per-VS data (it only
+    //    affects where bytes come from, and the replay tier's FAIL=0 verify
+    //    continuously proves those bytes). Copying containers per draw would
+    //    cost more than the overlap saves.
+    //  - diagnostic counters/log one-shots: thread_local or mutexed; a
+    //    discarded draw inflates [DrawPure] draws by one (reported as
+    //    xfDiscard on [Perf.XfOverlap] so the delta is explainable).
+    //
+    // THE CONTRACT ON FUTURE EDITS (same shape as drawCbSpan's): a NEW member
+    // write inside ExtractTransforms (or anything it calls) MUST target a
+    // field of XfCarriers via xfc(), or one of XfStaticCarriers via xfs(), or
+    // be a documented learning-cache exception. A raw `this->m_*` write from
+    // the worker is invisible to the discard path and would leak side effects
+    // for early-returned draws.
+    //
+    // Field names keep their m_ prefix so every existing comment, log message
+    // and grep in this file still names them correctly.
+    struct XfCarriers {
+      // -- cam-origin carriers (kSdepCam) --
+      Vector3          m_lastDrawCamOrigin{ 0.0f, 0.0f, 0.0f };
+      bool             m_lastDrawCamOriginSet = false;
+      Vector3          m_lastO2wCamOrigin{ 0.0f, 0.0f, 0.0f };
+      bool             m_lastO2wCamValid = false;
+      bool             m_lastO2wCamFromFanout = false;
+      uint32_t         m_lastO2wCamOff = 0;
+      Vector3          m_smoothedCamPos = Vector3(0.0f);
+      bool             m_hasPrevCamPos  = false;
+      // -- per-draw route scratch (kSdepRoute -- reset at XT top every draw) --
+      uint32_t         m_lastWtvPathId = 0;
+      uint32_t         m_lastO2wPathId = 0;
+      uint32_t         m_lastModelCbSlot = UINT32_MAX;
+      // -- the shared cb-location state (kSdepCbLoc + the m_viewStage hole) --
+      uint32_t         m_projSlot   = UINT32_MAX;
+      size_t           m_projOffset = SIZE_MAX;
+      int              m_projStage  = -1;
+      bool             m_columnMajor = false;
+      bool             m_projIsCombinedVP = false;
+      uint32_t         m_viewSlot   = UINT32_MAX;
+      size_t           m_viewOffset = SIZE_MAX;
+      int              m_viewStage  = -1;
+      // -- per-draw classification scratch --
+      bool             m_lastExtractUsedFallback = true;  // true: EndFrame safety net, see old site
+      bool             m_lastClassifierSaidUi = false;
+      bool             m_skipViewMatrixScan = false;
+      bool             m_currentDrawIsBoneTransformed = false;
+      bool             m_remixActiveThisFrame = false;
+      uint32_t         m_currentLayoutId = UINT32_MAX;
+      // -- the w2v fallback cache --
+      CamFallbackCache m_camFallbackCache;
+      // -- axis-convention voting (cross-draw accumulators) --
+      bool             m_axisDetected = false;
+      bool             m_axisLogged   = false;
+      int              m_zUpVotes     = 0;  // positive = Z-up, negative = Y-up
+      int              m_lhVotes      = 0;  // positive = LH, negative = RH
+      int              m_yFlipVotes   = 0;  // positive = flipped, negative = normal
+      bool             m_zUpSettled    = false;
+      bool             m_lhSettled     = false;
+      bool             m_yFlipSettled  = false;
+    };
+    static_assert(std::is_trivially_copyable<XfCarriers>::value,
+                  "XfCarriers must stay trivially copyable: the overlap seeds and "
+                  "applies it by plain struct copy every scheduled draw.");
+
+    struct XfStaticCarriers {
+      bool               m_foundRealProjThisFrame = false;
+      bool               m_hasEverFoundProj       = false;
+      DrawCallTransforms m_lastGoodTransforms;
+    };
+
+    // The worker's private view: c is applied whole at join, s changed-fields-
+    // only against sSeed (see block comment above).
+    struct XfCarrierCtx {
+      XfCarriers        c;
+      XfStaticCarriers  s;
+      XfStaticCarriers  sSeed;
+    };
+
+    XfCarriers                            m_xfc;         // authoritative per-instance carriers
+    static XfStaticCarriers               s_xfStatics;   // authoritative cross-instance statics
+    // Non-null ONLY on the overlap worker thread while it runs ExtractTransforms.
+    static thread_local XfCarrierCtx*     t_xfOverride;
+
+    XfCarriers&       xfc()       { return t_xfOverride ? t_xfOverride->c : m_xfc; }
+    const XfCarriers& xfc() const { return t_xfOverride ? t_xfOverride->c : m_xfc; }
+    static XfStaticCarriers& xfs()       { return t_xfOverride ? t_xfOverride->s : s_xfStatics; }
+
+    // -- the overlap job: single slot, one worker, one draw in flight --
+    // state machine: 0 idle -> 1 queued (frame) -> 2 running (worker) -> 3 done
+    // (worker) -> 0 idle (frame: consumed or discarded). The frame thread may
+    // also CAS 1->0 to cancel a job the worker never picked up.
+    struct XfOverlapJob {
+      XfCarrierCtx          ctx;
+      DrawCallTransforms    result;
+      bool                  eligLast  = false;  // XtPurityGuard verdicts, read from the
+      bool                  elig3Last = false;  // worker's TLs after XT returns
+      int64_t               workerNs  = 0;
+      uint32_t              drawId    = 0;
+      std::atomic<uint32_t> state { 0 };
+    };
+    XfOverlapJob                          m_xfJob;
+    std::thread                           m_xfWorker;
+    std::atomic<bool>                     m_xfWorkerStop { false };
+    std::mutex                            m_xfWorkerMu;
+    std::condition_variable               m_xfWorkerCv;
+    bool                                  m_xfWorkerStarted = false;
+
+    void ensureXfWorker();
+    void xfWorkerLoop();
+    bool scheduleExtractOverlap();                    // frame thread, post-capture
+    bool joinExtractOverlap(DrawCallTransforms& out); // frame thread, consume site
+    void discardExtractOverlap(const char* why);      // frame thread, EndFrame drain
+    // =====================================================================
     mutable Rc<DxvkSampler>              m_defaultSampler;
 
     Rc<DxvkSampler> getDefaultSampler() const;

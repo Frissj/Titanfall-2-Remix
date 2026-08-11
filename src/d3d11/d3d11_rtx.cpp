@@ -7425,9 +7425,11 @@ namespace dxvk {
   }
 
   // NV-DXVK: static definitions (shared across all D3D11Rtx instances).
-  bool D3D11Rtx::m_foundRealProjThisFrame = false;
-  bool D3D11Rtx::m_hasEverFoundProj       = false;
-  DrawCallTransforms D3D11Rtx::m_lastGoodTransforms = {};
+  // NV-DXVK [XfOverlap]: the three carrier statics now live inside
+  // XfStaticCarriers so the overlap worker can write a private copy and the
+  // join can apply it changed-fields-only. Same sharing semantics as before.
+  D3D11Rtx::XfStaticCarriers D3D11Rtx::s_xfStatics;
+  thread_local D3D11Rtx::XfCarrierCtx* D3D11Rtx::t_xfOverride = nullptr;
   std::mutex D3D11Rtx::m_lastGoodTransformsMutex;
 
   D3D11Rtx::D3D11Rtx(D3D11DeviceContext* pContext)
@@ -7550,7 +7552,7 @@ namespace dxvk {
   // NV-DXVK: return-value helper. True = skip D3D11 native rasterization
   // (RT already owns the output), false = emit native raster via EmitCs.
   // Once Remix is active we normally suppress ALL subsequent raster to avoid
-  // the "shared RT target" write hazards documented on m_remixActiveThisFrame,
+  // the "shared RT target" write hazards documented on xfc().m_remixActiveThisFrame,
   // BUT UI/HUD draws must rasterize natively or they never appear â€” the RT
   // composite doesn't include them. So: if THIS draw was RT-captured, or
   // the frame already had RT activity AND this draw was NOT UI-classified,
@@ -7871,13 +7873,13 @@ namespace dxvk {
     // latches valid even once gameplay draws arrive. Net result: scene
     // black, only HUD visible.
     //
-    // Requiring m_remixActiveThisFrame means we only fire on HUD draws
+    // Requiring xfc().m_remixActiveThisFrame means we only fire on HUD draws
     // that Source emits AFTER the gameplay pass (the VGUI batches at
     // end-of-frame which are the ones the user actually wants to land on
     // top of the RT image).  Frames where no gameplay was captured (menu,
     // loading) never fire early-inject at all â€” same behaviour as the
     // original code before this fix.
-    if (!m_remixActiveThisFrame) {
+    if (!xfc().m_remixActiveThisFrame) {
       static uint64_t sSkipCount = 0;
       if ((sSkipCount++ & 0xFF) == 0) {
         Logger::info(str::format(
@@ -8998,6 +9000,19 @@ namespace dxvk {
   // finding.
   static thread_local int64_t  s_xfEligNs = 0, s_xfIneligNs = 0, s_xfElig3Ns = 0;
   static thread_local uint32_t s_xfEligN  = 0, s_xfIneligN  = 0, s_xfElig3N  = 0;
+  // NV-DXVK [XfOverlap] frame-thread accounting, same window/reset as the
+  // xfElig split above. ovSched = cost of seeding+publishing the job (the
+  // overlap's only unconditional frame-thread cost); ovJoin = time the frame
+  // thread actually blocked at the consume point (the number that says whether
+  // the 2.3x shadow held); ovWorker = derivation time moved OFF the frame
+  // thread (the prize, arrives via the job); ovDiscard = jobs thrown away by
+  // early-returned draws (also explains [DrawPure] draw-count inflation);
+  // ovSerial = consume-point fallbacks to the serial path. 3e's break-even
+  // question is answered by ovSched/ovSchedN + ovJoin/ovJoinN vs
+  // ovWorker/ovJoinN -- ns per draw, not totals.
+  static thread_local int64_t  s_xfOvSchedNs = 0, s_xfOvJoinNs = 0, s_xfOvWorkerNs = 0;
+  static thread_local uint32_t s_xfOvSchedN = 0, s_xfOvJoinN = 0, s_xfOvDiscardN = 0,
+                               s_xfOvSerialN = 0, s_xfOvVerifyOk = 0, s_xfOvVerifyFail = 0;
   // Published by XtPurityGuard at every exit of ExtractTransforms, consumed by the
   // markStg call on the very next line of SubmitDraw. Deliberately NOT cleared
   // between draws: the guard is RAII and writes both on every exit, so a stale
@@ -9096,7 +9111,7 @@ namespace dxvk {
   // `return transforms;` at its tail (verified)". True when written; the replay
   // tier added a second exit and the capture tail a third:
   //   rp_commit  after rp_o2w, before `return rt;` -- the ~35 member restores
-  //              plus the m_lastGoodTransforms mutex, on every replay HIT.
+  //              plus the xfs().m_lastGoodTransforms mutex, on every replay HIT.
   //   xt_cap     after xt_tail, before both `return transforms;` -- the replay
   //              tier's WRITE side: verify adjudication (4x Matrix4 memcmp),
   //              record build/append, eviction scan, quarantine. ~570 lines
@@ -9160,7 +9175,7 @@ namespace dxvk {
   static thread_local uint64_t s_perfXtPvRebuildFires = 0;  // # draws where v2pSrcRebuilt=true (cls 3/4 decompose)
   static thread_local uint64_t s_perfXtPvRescanFires  = 0;  // # draws where v2pSrcRescan=true (stale â†’ full rescan)
   // [Perf.VsLocCache] Per-VS cache of projection + view cb-slot/offset
-  // locations. Without it the shared m_projSlot/m_viewSlot cache thrashes
+  // locations. Without it the shared xfc().m_projSlot/xfc().m_viewSlot cache thrashes
   // every time TF2 swaps VSes (~25% of draws), forcing pv_rescan
   // (~67ms/frame) and xt_projScan1 (~66ms/frame). Each cache hit skips
   // both full-cbuffer scans â€” the existing validate path reads at the
@@ -9200,7 +9215,7 @@ namespace dxvk {
   static thread_local int64_t s_perfXtW2vSmoothAcc   = 0, s_perfXtW2vSmoothMax   = 0;
   static thread_local int64_t s_perfXtW2vWorldAcc    = 0, s_perfXtW2vWorldMax    = 0;
   // w2v_world split (was ~24ms/frame): cb3 fast path (gated on
-  // m_skipViewMatrixScan, R32G32_UINT draws) vs the general world-matrix
+  // xfc().m_skipViewMatrixScan, R32G32_UINT draws) vs the general world-matrix
   // extraction (everything else).
   static thread_local int64_t s_perfXtW2vwCb3Acc     = 0, s_perfXtW2vwCb3Max     = 0;
   static thread_local int64_t s_perfXtW2vwMainAcc    = 0, s_perfXtW2vwMainMax    = 0;
@@ -9774,7 +9789,7 @@ namespace dxvk {
         }
       }
     }
-    // Cached-rotation fallback: reads m_lastGoodTransforms, which is mutable
+    // Cached-rotation fallback: reads xfs().m_lastGoodTransforms, which is mutable
     // cross-draw state and therefore NOT reproducible from a record. The site
     // needs it (requireLiveRot=false); a replay refresh must refuse it and
     // fall back to the full path instead of composing from state that will
@@ -9782,7 +9797,7 @@ namespace dxvk {
     // the bug behind the mats=0 / wtvPath=3/3 verify failures.
     if (!gotLiveRotation) {
       if (requireLiveRot) return false;
-      const Matrix4& cachedView = m_lastGoodTransforms.worldToView;
+      const Matrix4& cachedView = xfs().m_lastGoodTransforms.worldToView;
       Vector3 cRight(cachedView[0][0], cachedView[0][1], cachedView[0][2]);
       Vector3 cUp   (cachedView[1][0], cachedView[1][1], cachedView[1][2]);
       Vector3 cFwd  (cachedView[2][0], cachedView[2][1], cachedView[2][2]);
@@ -9818,9 +9833,9 @@ namespace dxvk {
     const int64_t dUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tD).count();
     s_perfSubmitDrawAccUs += dUs; s_perfSubmitDrawCount++; if (dUs > s_perfSubmitDrawMaxUs) s_perfSubmitDrawMaxUs = dUs;
     recordSubmitStall("Draw", dUs, vertexCount, 1);
-    if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
+    if (m_lastDrawCaptured) xfc().m_remixActiveThisFrame = true;
     if (m_lastDrawFilteredAsUI) return false;
-    return m_remixActiveThisFrame;
+    return xfc().m_remixActiveThisFrame;
   }
 
   bool D3D11Rtx::OnDrawIndexed(UINT indexCount, UINT startIndex, INT baseVertex) {
@@ -9834,7 +9849,7 @@ namespace dxvk {
     const int64_t dUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tD).count();
     s_perfSubmitDrawAccUs += dUs; s_perfSubmitDrawCount++; if (dUs > s_perfSubmitDrawMaxUs) s_perfSubmitDrawMaxUs = dUs;
     recordSubmitStall("DrawIndexed", dUs, indexCount, 1);
-    if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
+    if (m_lastDrawCaptured) xfc().m_remixActiveThisFrame = true;
     // NV-DXVK [HUD-Option5 v4]: rescue-override for TF2's composite-
     // chain VSes. In gameplay, Remix's classifier was capturing these
     // draws for RT (m_lastDrawCaptured=true), so OnDrawIndexed returned
@@ -9862,7 +9877,7 @@ namespace dxvk {
       }
     }
     if (m_lastDrawFilteredAsUI) return false;
-    return m_remixActiveThisFrame;
+    return xfc().m_remixActiveThisFrame;
   }
 
   bool D3D11Rtx::OnDrawInstanced(UINT vertexCountPerInstance, UINT instanceCount, UINT startVertex, UINT startInstance) {
@@ -9876,9 +9891,9 @@ namespace dxvk {
     const int64_t dUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tD).count();
     s_perfSubmitDrawAccUs += dUs; s_perfSubmitDrawCount++; if (dUs > s_perfSubmitDrawMaxUs) s_perfSubmitDrawMaxUs = dUs;
     recordSubmitStall("DrawInstanced", dUs, vertexCountPerInstance, instanceCount);
-    if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
+    if (m_lastDrawCaptured) xfc().m_remixActiveThisFrame = true;
     if (m_lastDrawFilteredAsUI) return false;
-    return m_remixActiveThisFrame;
+    return xfc().m_remixActiveThisFrame;
   }
 
   bool D3D11Rtx::OnDrawIndexedInstanced(UINT indexCountPerInstance, UINT instanceCount, UINT startIndex, INT baseVertex, UINT startInstance) {
@@ -9892,9 +9907,9 @@ namespace dxvk {
     const int64_t dUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tD).count();
     s_perfSubmitDrawAccUs += dUs; s_perfSubmitDrawCount++; if (dUs > s_perfSubmitDrawMaxUs) s_perfSubmitDrawMaxUs = dUs;
     recordSubmitStall("DrawIdxInst", dUs, indexCountPerInstance, instanceCount);
-    if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
+    if (m_lastDrawCaptured) xfc().m_remixActiveThisFrame = true;
     if (m_lastDrawFilteredAsUI) return false;
-    return m_remixActiveThisFrame;
+    return xfc().m_remixActiveThisFrame;
   }
 
   // NV-DXVK [Perf.DrawEntry]: forward declaration â€” the definition sits next to
@@ -10569,7 +10584,7 @@ namespace dxvk {
     // ~68 bytes off every record. They were never read: carry{try=0} in every
     // window of every capture. See the deleted-block note in the carry tier.
     float    projSrc[16] = {};        // proj source bytes at capture
-    uint32_t projSrcOff = 0;          // m_projOffset (relative to constantOffset*16)
+    uint32_t projSrcOff = 0;          // xfc().m_projOffset (relative to constantOffset*16)
     bool     projSrcValid = false;
     uint64_t projHash = 0;            // 64-bit hash of projSrc -- v6 per-camera
                                       // slot SELECTION key (memcmp confirms)
@@ -10624,17 +10639,17 @@ namespace dxvk {
     // same VS with the same location can take wtvPath 5 on one draw and fall
     // through to wtvPath 1 on the next purely on what that slot holds.
     bool     capViewHit = false;
-    bool     foundRealProj = false;   // m_foundRealProjThisFrame contribution
-    bool     wroteLastGood = false;   // the run wrote m_lastGoodTransforms
-    bool     camOriginSet = false;    // m_lastDrawCamOriginSet
+    bool     foundRealProj = false;   // xfs().m_foundRealProjThisFrame contribution
+    bool     wroteLastGood = false;   // the run wrote xfs().m_lastGoodTransforms
+    bool     camOriginSet = false;    // xfc().m_lastDrawCamOriginSet
     bool     applySmooth = false;     // smoothing block executed (wtvPath 1-3)
     bool     columnMajor = false;
     bool     projCombinedVP = false;
     int32_t  projStage = -1, viewStage = -1;
     uint32_t projSlot = 0xFFFFFFFFu, viewSlot = 0xFFFFFFFFu;
     size_t   projOffset = 0, viewOffset = 0;
-    Vector3  camOriginMember { 0.f, 0.f, 0.f };  // m_lastDrawCamOrigin
-    Vector3  smoothedCamPos { 0.f, 0.f, 0.f };   // m_smoothedCamPos (diag-only consumer)
+    Vector3  camOriginMember { 0.f, 0.f, 0.f };  // xfc().m_lastDrawCamOrigin
+    Vector3  smoothedCamPos { 0.f, 0.f, 0.f };   // xfc().m_smoothedCamPos (diag-only consumer)
     // Path-13 compose input: c_cameraOrigin AS READ by the recorded run
     // (bit-exact -- recovered at capture from the same staged cb2 bytes the
     // route read, NOT arithmetically reconstructed, so the replayed
@@ -10885,7 +10900,7 @@ namespace dxvk {
     return h;
   }
   // [Perf.VsLocCache] Per-VS cache of proj + view cb-slot/offset locations.
-  // The m_projSlot/m_viewSlot members are SHARED across all VSes -- when TF2
+  // The xfc().m_projSlot/xfc().m_viewSlot members are SHARED across all VSes -- when TF2
   // swaps shaders (constantly, ~25% of draws), the previous VS's cached offset
   // is read as garbage by the validate path -> cls=0 -> a full 4-stage cbuffer
   // rescan. Caching the discovered location per VS pointer restores the right
@@ -11134,7 +11149,7 @@ namespace dxvk {
   // Single-entry front cache (draws batch by VS).
   static thread_local const void* s_xtReplayLastVs = nullptr;
   static thread_local XtReplayRecSet* s_xtReplayLastRec = nullptr;
-  // Bumped at every m_lastGoodTransforms write INSIDE ExtractTransforms, so
+  // Bumped at every xfs().m_lastGoodTransforms write INSIDE ExtractTransforms, so
   // the record capture can tell whether the recorded run performed that write
   // (entry snapshot vs tail compare on the same thread) -- replay then
   // repeats it with the same content, and only then.
@@ -12030,7 +12045,7 @@ namespace dxvk {
                           // ~18-unit offset from main, and if it leaks into
                           // m_lastFanoutCamOrigin the cachedSave player-cam
                           // filter alternately accepts main and viewmodel
-                          // saves into m_lastGoodTransforms â€” the ray
+                          // saves into xfs().m_lastGoodTransforms â€” the ray
                           // tracer's main camera then flickers between the
                           // two, and the visible-frame camera position
                           // depends on whoever wrote last.
@@ -14879,20 +14894,20 @@ namespace dxvk {
     // block ends up running.  SubmitDraw reads this immediately after the
     // call returns to decide whether the draw is UI (fallback was used =>
     // skip RTX submission, let the native raster path handle it).
-    m_lastExtractUsedFallback = false;
-    m_lastClassifierSaidUi = false;
-    m_currentDrawIsBoneTransformed = false;
-    m_lastDrawCamOriginSet = false;
-    m_lastWtvPathId = 0;
-    m_lastO2wPathId = 0;
-    m_lastModelCbSlot = UINT32_MAX;  // [Perf.Replay] path-5/6 widening
+    xfc().m_lastExtractUsedFallback = false;
+    xfc().m_lastClassifierSaidUi = false;
+    xfc().m_currentDrawIsBoneTransformed = false;
+    xfc().m_lastDrawCamOriginSet = false;
+    xfc().m_lastWtvPathId = 0;
+    xfc().m_lastO2wPathId = 0;
+    xfc().m_lastModelCbSlot = UINT32_MAX;  // [Perf.Replay] path-5/6 widening
 
     // [Perf.VsLocCache] v6.9: resolve the per-VS location entry ONCE, here,
     // above the replay block. Two consumers need it and they must agree:
     //  - the replay tier, to prove the route state a record was captured
     //    under still holds (below);
-    //  - the projection/view site further down, which restores m_projSlot /
-    //    m_viewSlot from it and derives skipExpensiveProjScan.
+    //  - the projection/view site further down, which restores xfc().m_projSlot /
+    //    xfc().m_viewSlot from it and derives skipExpensiveProjScan.
     // Resolving it once also collapses what used to be two hash lookups per
     // full-path draw (locations + neg-cache, separate maps, identical key)
     // into one.
@@ -15239,12 +15254,12 @@ namespace dxvk {
       vsNegProjActive(xtVsLoc, m_context->m_device->getCurrentFrameId());
     // [Perf.Replay] v6.3 path-1 widening: cleared per draw so a record can
     // never inherit the previous draw's camO provenance.
-    m_lastO2wCamValid = false;
-    m_lastO2wCamFromFanout = false;
-    m_lastO2wCamOff = 0;
+    xfc().m_lastO2wCamValid = false;
+    xfc().m_lastO2wCamFromFanout = false;
+    xfc().m_lastO2wCamOff = 0;
     // (v6.4 path-3 provenance reset removed -- the three members existed only
     //  to feed the deleted carry proof and were write-only afterwards.)
-    m_skipViewMatrixScan = false;
+    xfc().m_skipViewMatrixScan = false;
     s_xtCb3StashValid = false;  // [Perf.Replay] cb3 single-read share, per-draw
 
     // NV-DXVK [perf]: the CBufCommonPerCamera.c_cameraOrigin field location is a
@@ -16074,7 +16089,7 @@ namespace dxvk {
             // v7.0 PATH 13 RE-ADMITTED VIA ITS OWN GATE, MIRRORED LIVE.
             // The v6.9h first cut read cb2 at rec->camSrcOff blind and
             // produced three VERIFY-FAILs (VS_7c6a14cb / VS_1953b6e9 /
-            // VS_4798dc2d): o2wPathFull is STICKY (m_lastO2wPathId persists
+            // VS_4798dc2d): o2wPathFull is STICKY (xfc().m_lastO2wPathId persists
             // across draws), so a draw whose live gate did NOT fire still
             // reports path 13 while its o2w never had the origin added --
             // replaying route 13 there is a wrong ROUTE, this tier's
@@ -16158,7 +16173,7 @@ namespace dxvk {
                 && rec->wtvPathId == 3u
                 && o2wRefreshable && camOReady) {
               // FIX: wtvPath 3 has TWO producers. The CamCache hit at ~17268
-              // assigns m_camFallbackCache.worldToView -- a matrix stored by
+              // assigns xfc().m_camFallbackCache.worldToView -- a matrix stored by
               // whichever draw reconstructed it earlier THIS frame -- and also
               // stamps wtvPathId=3. Recomputing unconditionally therefore
               // disagreed with the full path whenever the cache would hit,
@@ -16174,14 +16189,14 @@ namespace dxvk {
               const uint64_t cb2GenRf  = cb2Rf.contentGen;
               const uint32_t cb2OffRf  = cb2Rf.constantOffset;
               const uint32_t camFrameRf = m_context->m_device->getCurrentFrameId();
-              const bool camHitRf = m_camFallbackCache.valid
+              const bool camHitRf = xfc().m_camFallbackCache.valid
                   && cb2BufRf != nullptr
-                  && m_camFallbackCache.cb2Buffer == cb2BufRf
-                  && m_camFallbackCache.cb2Gen    == cb2GenRf
-                  && m_camFallbackCache.cb2Offset == cb2OffRf
-                  && m_camFallbackCache.frameId   == camFrameRf;
+                  && xfc().m_camFallbackCache.cb2Buffer == cb2BufRf
+                  && xfc().m_camFallbackCache.cb2Gen    == cb2GenRf
+                  && xfc().m_camFallbackCache.cb2Offset == cb2OffRf
+                  && xfc().m_camFallbackCache.frameId   == camFrameRf;
               if (camHitRf) {
-                refreshW2v = m_camFallbackCache.worldToView;
+                refreshW2v = xfc().m_camFallbackCache.worldToView;
                 refreshed = true;
                 ++s_xtReplayStats.refreshOk;
                 ++s_xtReplayStats.refreshPath[rec->o2wPathId & 15u];
@@ -16391,7 +16406,7 @@ namespace dxvk {
                   }
                   if (pV != nullptr) {
                     // Mirrors the site's readMatrix lambda: readCbMatrix plus
-                    // the column-major transpose. m_columnMajor is not set for
+                    // the column-major transpose. xfc().m_columnMajor is not set for
                     // this draw yet (the VsLocCache override runs later), so
                     // use the record's -- same VS, same cached location.
                     Matrix4 mV = readCbMatrix(pV, vOffRp, vLenRp);
@@ -16427,7 +16442,7 @@ namespace dxvk {
             // exactly, for the price of one already-staged read.
             //
             // Why the existing witness cannot cover this: a wtvPath-3 record's
-            // projSrc is captured at m_projSlot/m_projOffset, which on such a
+            // projSrc is captured at xfc().m_projSlot/xfc().m_projOffset, which on such a
             // draw is a location the route never read (the draw resolved no
             // projection of its own). So the 64-byte projSrc memcmp proves
             // nothing about the bytes that DECIDE the route -- the same defect
@@ -16479,14 +16494,14 @@ namespace dxvk {
             // viewToProjection. For wtvPath-3 draws the site does not derive
             // it from the projection source at all; both branches (CamCache
             // hit ~17296 and reconstruction ~17301) assign
-            // m_lastGoodTransforms.viewToProjection, which is mutable
+            // xfs().m_lastGoodTransforms.viewToProjection, which is mutable
             // cross-draw state. So the record's 64-byte projSrc memcmp -- the
             // thing the whole proj-witness tier is built on -- proves nothing
             // about it, and a snapshot taken under one cached FOV replays
             // against a later, different one. Read the live member, exactly
             // as the site does.
             if (rec->wtvPathId == 3u) {
-              rt.viewToProjection = m_lastGoodTransforms.viewToProjection;
+              rt.viewToProjection = xfs().m_lastGoodTransforms.viewToProjection;
             }
             bool o2wOk = true;
             // v6 path-5/6 widening: the REPLAYED path id -- for the rdef
@@ -16541,7 +16556,7 @@ namespace dxvk {
                   // v7.0: route 13 is only replayed when the live mirror
                   // gate fired this draw -- the site's own per-draw
                   // condition. A silent gate means the site is on a
-                  // different route right now (the sticky m_lastO2wPathId
+                  // different route right now (the sticky xfc().m_lastO2wPathId
                   // notwithstanding); full path re-records the truth.
                   if (!p13LiveOk) {
                     o2wOk = false;
@@ -17036,42 +17051,42 @@ namespace dxvk {
                   // entry, so leaving it stale would delete the win.
                   setRp->syncHot((size_t) (rec - setRp->recs.data()), *rec);
                 }
-                m_lastO2wPathId = rtPathId;  // v6: mode re-evaled for 5/6
-                m_lastWtvPathId = rec->wtvPathId;
-                m_lastExtractUsedFallback = false;
-                m_lastClassifierSaidUi = false;
-                m_currentDrawIsBoneTransformed = false;
-                m_skipViewMatrixScan = rec->skipViewScan;
-                m_projStage  = rec->projStage;
-                m_projSlot   = rec->projSlot;
-                m_projOffset = rec->projOffset;
-                m_viewStage  = rec->viewStage;
-                m_viewSlot   = rec->viewSlot;
-                m_viewOffset = rec->viewOffset;
-                m_columnMajor = rec->columnMajor;
-                m_projIsCombinedVP = rec->projCombinedVP;
-                m_currentLayoutId = UINT32_MAX;
-                m_lastDrawCamOriginSet = rec->camOriginSet;
+                xfc().m_lastO2wPathId = rtPathId;  // v6: mode re-evaled for 5/6
+                xfc().m_lastWtvPathId = rec->wtvPathId;
+                xfc().m_lastExtractUsedFallback = false;
+                xfc().m_lastClassifierSaidUi = false;
+                xfc().m_currentDrawIsBoneTransformed = false;
+                xfc().m_skipViewMatrixScan = rec->skipViewScan;
+                xfc().m_projStage  = rec->projStage;
+                xfc().m_projSlot   = rec->projSlot;
+                xfc().m_projOffset = rec->projOffset;
+                xfc().m_viewStage  = rec->viewStage;
+                xfc().m_viewSlot   = rec->viewSlot;
+                xfc().m_viewOffset = rec->viewOffset;
+                xfc().m_columnMajor = rec->columnMajor;
+                xfc().m_projIsCombinedVP = rec->projCombinedVP;
+                xfc().m_currentLayoutId = UINT32_MAX;
+                xfc().m_lastDrawCamOriginSet = rec->camOriginSet;
                 if (rec->camOriginSet) {
-                  m_lastDrawCamOrigin = rec->camOriginMember;
+                  xfc().m_lastDrawCamOrigin = rec->camOriginMember;
                 }
                 if (rec->applySmooth) {
-                  m_smoothedCamPos = rec->smoothedCamPos;
-                  m_hasPrevCamPos = true;
+                  xfc().m_smoothedCamPos = rec->smoothedCamPos;
+                  xfc().m_hasPrevCamPos = true;
                 }
                 if (rec->foundRealProj) {
-                  m_foundRealProjThisFrame = true;
-                  m_hasEverFoundProj = true;
+                  xfs().m_foundRealProjThisFrame = true;
+                  xfs().m_hasEverFoundProj = true;
                 }
                 if (rec->wroteLastGood) {
                   std::lock_guard<std::mutex> lkRp(m_lastGoodTransformsMutex);
-                  m_foundRealProjThisFrame = true;
-                  m_hasEverFoundProj = true;
-                  m_lastGoodTransforms = rt;
+                  xfs().m_foundRealProjThisFrame = true;
+                  xfs().m_hasEverFoundProj = true;
+                  xfs().m_lastGoodTransforms = rt;
                   ++s_xtLastGoodWriteN;
                 }
                 // v6.9f: EXIT 1 of 3. Everything since the rp_o2w mark -- the
-                // member restores above and the m_lastGoodTransforms mutex --
+                // member restores above and the xfs().m_lastGoodTransforms mutex --
                 // was outside every bucket because the function returns here.
                 // This is the hottest exit: it fires on every replay hit.
                 ++s_perfRpCommitN;
@@ -17200,7 +17215,7 @@ namespace dxvk {
     // transposing after read normalizes them to row-major for all our checks.
     auto readMatrix = [this](const uint8_t* ptr, size_t offset, size_t bufSize) -> Matrix4 {
       Matrix4 m = readCbMatrix(ptr, offset, bufSize);
-      return m_columnMajor ? transpose(m) : m;
+      return xfc().m_columnMajor ? transpose(m) : m;
     };
 
     // Viewport aspect ratio â€” used to score projection candidates and reject
@@ -17358,15 +17373,15 @@ namespace dxvk {
       ++s_perfXtVsLocCacheHits;
       // Override member-var cache with this VS's known-correct location
       // BEFORE the validate path reads them. Subsequent code reads
-      // m_projSlot/etc. and finds the matrix at the right offset on the
+      // xfc().m_projSlot/etc. and finds the matrix at the right offset on the
       // first try â€” no rescan, no full scan.
-      m_projSlot   = xtVsLoc->projSlot;
-      m_projOffset = xtVsLoc->projOffset;
-      m_projStage  = xtVsLoc->projStage;
-      m_columnMajor = xtVsLoc->columnMajor;
-      m_viewSlot   = xtVsLoc->viewSlot;
-      m_viewOffset = xtVsLoc->viewOffset;
-      m_viewStage  = xtVsLoc->viewStage;
+      xfc().m_projSlot   = xtVsLoc->projSlot;
+      xfc().m_projOffset = xtVsLoc->projOffset;
+      xfc().m_projStage  = xtVsLoc->projStage;
+      xfc().m_columnMajor = xtVsLoc->columnMajor;
+      xfc().m_viewSlot   = xtVsLoc->viewSlot;
+      xfc().m_viewOffset = xtVsLoc->viewOffset;
+      xfc().m_viewStage  = xtVsLoc->viewStage;
     } else if (vsLocKey != 0) {
       ++s_perfXtVsLocCacheMisses;
     }
@@ -17412,9 +17427,9 @@ namespace dxvk {
     const bool skipExpensiveProjScan =
       vsNegProjActive(xtVsLoc, m_context->m_device->getCurrentFrameId());
 
-    uint32_t projSlot   = skipExpensiveProjScan ? UINT32_MAX : m_projSlot;
-    size_t   projOffset = m_projOffset;
-    int      projStage  = m_projStage;
+    uint32_t projSlot   = skipExpensiveProjScan ? UINT32_MAX : xfc().m_projSlot;
+    size_t   projOffset = xfc().m_projOffset;
+    int      projStage  = xfc().m_projStage;
 
     // --- PROJECTION: Source Engine 2 fast-path ---
     // From IDA/shader analysis: CBufCommonPerCamera (cb2) has
@@ -17462,7 +17477,7 @@ namespace dxvk {
         //
         // REBASE=false, and this is the site that MAKES the trap-2 divergence
         // real rather than merely inheriting it: it indexes 16 and 96 as
-        // ABSOLUTE buffer offsets and then stores them into m_projOffset, which
+        // ABSOLUTE buffer offsets and then stores them into xfc().m_projOffset, which
         // the replay tier re-bases by constantOffset*16. The two agree only
         // while constantOffset is 0 -- which is what [DrawSnap]'s cbOff counter
         // watches, and it has read 0 all along. Converting with rebase=false is
@@ -17482,10 +17497,10 @@ namespace dxvk {
             projSlot    = kSourceCamSlot;
             projOffset  = 16;
             projStage   = 0;
-            m_projSlot    = kSourceCamSlot;
-            m_projOffset  = 16;
-            m_projStage   = 0;
-            m_columnMajor = (cls16 == 2);
+            xfc().m_projSlot    = kSourceCamSlot;
+            xfc().m_projOffset  = 16;
+            xfc().m_projStage   = 0;
+            xfc().m_columnMajor = (cls16 == 2);
             usedCls = cls16;
           } else if (const uint8_t* p96 =
                        drawCbSpan(kSourceCamSlot, 96u, 64u, false)) {
@@ -17495,10 +17510,10 @@ namespace dxvk {
               projSlot    = kSourceCamSlot;
               projOffset  = 96;
               projStage   = 0;
-              m_projSlot    = kSourceCamSlot;
-              m_projOffset  = 96;
-              m_projStage   = 0;
-              m_columnMajor = (cls96 == 2);
+              xfc().m_projSlot    = kSourceCamSlot;
+              xfc().m_projOffset  = 96;
+              xfc().m_projStage   = 0;
+              xfc().m_columnMajor = (cls96 == 2);
               usedCls = cls96;
             }
           }
@@ -17550,10 +17565,10 @@ namespace dxvk {
         projSlot   = bestSlot;
         projOffset = bestOff;
         projStage  = bestStage;
-        m_projSlot   = bestSlot;
-        m_projOffset = bestOff;
-        m_projStage  = bestStage;
-        m_columnMajor = bestCol;
+        xfc().m_projSlot   = bestSlot;
+        xfc().m_projOffset = bestOff;
+        xfc().m_projStage  = bestStage;
+        xfc().m_columnMajor = bestCol;
         // NV-DXVK: Track whether the match was a combined VP so EndFrame
         // can invalidate the cache for next frame (combined VP must be
         // re-scanned because it changes with camera movement and is only
@@ -17572,7 +17587,7 @@ namespace dxvk {
             if (ptrCheck) {
               Matrix4 mCheck = readCbMatrix(ptrCheck, bestOff, checkLen);
               int clsCheck = classifyPerspective(mCheck, true);
-              m_projIsCombinedVP = (clsCheck >= 3);
+              xfc().m_projIsCombinedVP = (clsCheck >= 3);
             }
           }
         }
@@ -18012,7 +18027,7 @@ namespace dxvk {
               // was invisible (V^T = V for translation-free rotations around
               // trivial axes), but with a real camera position inverse(V^T)[3]
               // != cameraPos, which is the bug the log shows.
-              m_lastWtvPathId = 1; // path 1: generic VP-decomposition
+              xfc().m_lastWtvPathId = 1; // path 1: generic VP-decomposition
               transforms.worldToView = Matrix4(
                 Vector4(right.x, up.x, fwdV.x, 0.0f),
                 Vector4(right.y, up.y, fwdV.y, 0.0f),
@@ -18103,7 +18118,7 @@ namespace dxvk {
       // where there's no cached projection it doesn't fire â€” those draws
       // contribute 0 Âµs to pv_validate (correct: nothing to validate).
       markXt(s_perfXtPvValidateAcc, s_perfXtPvValidateMax);
-      if (!valid && projSlot == m_projSlot && projStage == m_projStage) {
+      if (!valid && projSlot == xfc().m_projSlot && projStage == xfc().m_projStage) {
         // Cached location is stale (different pass). Re-scan all stages.
         projSlot = UINT32_MAX;
         float bestScore = 0.0f;
@@ -18120,17 +18135,17 @@ namespace dxvk {
         }
         // NV-DXVK [VsLocCache fix]: propagate the rediscovered location back
         // to the member variables. Without this the local projSlot held the
-        // right offset for THIS draw but m_projSlot still held the previous
+        // right offset for THIS draw but xfc().m_projSlot still held the previous
         // (wrong) value, so the [Perf.VsLocCache] write at end of
         // ExtractTransforms stored the wrong location â†’ next same-VS draw
         // hits the wrong cached offset â†’ validate fails â†’ rescan fires
         // again, doubling pv_rescan cost. With this write-back the cache
         // converges after one rescan-discovery per VS.
         if (projSlot != UINT32_MAX) {
-          m_projSlot    = projSlot;
-          m_projOffset  = projOffset;
-          m_projStage   = projStage;
-          m_columnMajor = bestCol;
+          xfc().m_projSlot    = projSlot;
+          xfc().m_projOffset  = projOffset;
+          xfc().m_projStage   = projStage;
+          xfc().m_columnMajor = bestCol;
         }
         // NV-DXVK [Bug #1 fix â€” rescan combined-VP rebuild]:
         // scanStageForProj transposes cls 2/4 to row-major but does NOT
@@ -18209,16 +18224,16 @@ namespace dxvk {
         // objectToWorld transforms (and therefore geometry/spatial hashes)
         // see a consistent coordinate system for the entire session.
         {
-          const bool canVote = !m_yFlipSettled || !m_lhSettled;
+          const bool canVote = !xfc().m_yFlipSettled || !xfc().m_lhSettled;
 
           if (canVote) {
-            m_axisDetected = true;
+            xfc().m_axisDetected = true;
 
             // Y-flip: negative Y scale in projection
-            m_yFlipVotes += (proj[1][1] < 0.0f) ? 1 : -1;
-            if (!m_yFlipSettled && std::abs(m_yFlipVotes) >= kVoteThreshold) {
-              m_yFlipSettled = true;
-              const bool yFlip = m_yFlipVotes > 0;
+            xfc().m_yFlipVotes += (proj[1][1] < 0.0f) ? 1 : -1;
+            if (!xfc().m_yFlipSettled && std::abs(xfc().m_yFlipVotes) >= kVoteThreshold) {
+              xfc().m_yFlipSettled = true;
+              const bool yFlip = xfc().m_yFlipVotes > 0;
               RtCamera::correctProjectionYFlipObject().setDeferred(yFlip);
             }
 
@@ -18226,10 +18241,10 @@ namespace dxvk {
             DecomposeProjectionParams dpp;
             decomposeProjection(proj, dpp);
             if (std::isfinite(dpp.fov) && std::isfinite(dpp.aspectRatio)) {
-              m_lhVotes += dpp.isLHS ? 1 : -1;
-              if (!m_lhSettled && std::abs(m_lhVotes) >= kVoteThreshold) {
-                m_lhSettled = true;
-                const bool isLH = m_lhVotes > 0;
+              xfc().m_lhVotes += dpp.isLHS ? 1 : -1;
+              if (!xfc().m_lhSettled && std::abs(xfc().m_lhVotes) >= kVoteThreshold) {
+                xfc().m_lhSettled = true;
+                const bool isLH = xfc().m_lhVotes > 0;
                 RtxOptions::leftHandedCoordinateSystemObject().setDeferred(isLH);
               }
             }
@@ -18458,7 +18473,7 @@ namespace dxvk {
                 Vector4(right.y, up.y, fwd.y, 0.0f),
                 Vector4(right.z, up.z, fwd.z, 0.0f),
                 Vector4(tR,      tU,   tF,   1.0f));
-              m_lastWtvPathId = 1; // path 1, but cls 1/2 reconstruction branch
+              xfc().m_lastWtvPathId = 1; // path 1, but cls 1/2 reconstruction branch
               static uint32_t sCls12Recon = 0;
               static float sLastCx = 0, sLastCy = 0, sLastCz = 0;
               const float dx = camX - sLastCx, dy = camY - sLastCy, dz = camZ - sLastCz;
@@ -18546,7 +18561,7 @@ namespace dxvk {
           //
           // Pairs with the viewmodel-reject gate at the fanout publish site
           // (search this file for [viewmodel reject â€” REAPPLIED]). Together
-          // they restrict m_lastGoodTransforms saves to only the actual main
+          // they restrict xfs().m_lastGoodTransforms saves to only the actual main
           // pass â€” viewmodel saves alternately writing to the cache caused
           // the ray tracer's per-draw worldToView consume to flicker between
           // two camera positions, which manifested as "the camera lowers to
@@ -18608,9 +18623,9 @@ namespace dxvk {
         }
         if (saveW2vValid && saveIsPlayerCam) {
           std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
-          m_foundRealProjThisFrame = true;
-          m_hasEverFoundProj = true;
-          m_lastGoodTransforms = transforms;
+          xfs().m_foundRealProjThisFrame = true;
+          xfs().m_hasEverFoundProj = true;
+          xfs().m_lastGoodTransforms = transforms;
           ++s_xtLastGoodWriteN;  // NV-DXVK [Perf.Replay]: record-capture signal
           // [cacheWriteAccept] Log every Nth accepted save with VS hash +
           // reconstructed camPos. No std::string / unordered_set / mutex
@@ -18673,13 +18688,13 @@ namespace dxvk {
           }
           // Keep marking projection-found state so consume can still
           // happen with whatever last-good (player) cache exists.
-          m_foundRealProjThisFrame = true;
-          m_hasEverFoundProj = true;
+          xfs().m_foundRealProjThisFrame = true;
+          xfs().m_hasEverFoundProj = true;
         } else {
           // Still mark projection found (viewToProjection IS real),
           // but don't stomp the cache with identity w2v.
-          m_foundRealProjThisFrame = true;
-          m_hasEverFoundProj = true;
+          xfs().m_foundRealProjThisFrame = true;
+          xfs().m_hasEverFoundProj = true;
           // Log when a real perspective draw is REJECTED for w2v-too-small.
           // If real player camera draws are landing here, we're filtering
           // them out and only the cinematic / scripted cam survives. Log
@@ -18706,7 +18721,7 @@ namespace dxvk {
           static float    sLastX   = 0.0f;
           static float    sLastY   = 0.0f;
           static float    sLastZ   = 0.0f;
-          const auto& w = m_lastGoodTransforms.worldToView;
+          const auto& w = xfs().m_lastGoodTransforms.worldToView;
           const float dx = w[3][0] - sLastX;
           const float dy = w[3][1] - sLastY;
           const float dz = w[3][2] - sLastZ;
@@ -18909,7 +18924,7 @@ namespace dxvk {
             const float dotU = -(up.x*Tx    + up.y*Ty    + up.z*Tz);
             const float dotF = -(fwd.x*Tx   + fwd.y*Ty   + fwd.z*Tz);
             // NV-DXVK: store by columns â€” see path 1 fix.
-            m_lastWtvPathId = 2; // path 2: TF2 cb2@96 last-resort VP-decomp
+            xfc().m_lastWtvPathId = 2; // path 2: TF2 cb2@96 last-resort VP-decomp
             // Apply perspSign to fwd in view matrix (same fix as path 1).
             const float perspSign2 = raw[2][3] < 0 ? -1.0f : 1.0f;
             const float fwdSign2 = (perspSign2 < 0.0f) ? -1.0f : 1.0f;
@@ -18945,7 +18960,7 @@ namespace dxvk {
             // cb2@96 is c_cameraRelativeToClipPrevFrame (marked [unused]
             // in every VS â€” the game may never write it). When it's zero
             // or junk, passes-sniff-test data can produce a w2v with
-            // ~zero translation that corrupts m_lastGoodTransforms,
+            // ~zero translation that corrupts xfs().m_lastGoodTransforms,
             // causing downstream "degenerate cached w2v" rejections to
             // filter every BSP draw as UIFallback.
             const bool path2W2vValid =
@@ -18981,15 +18996,15 @@ namespace dxvk {
               if (path2IsPlayerCam) {
                 {
                   std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
-                  m_foundRealProjThisFrame = true;
-                  m_lastGoodTransforms = transforms;
+                  xfs().m_foundRealProjThisFrame = true;
+                  xfs().m_lastGoodTransforms = transforms;
                   ++s_xtLastGoodWriteN;  // NV-DXVK [Perf.Replay]: record-capture signal
                 }
                 {
                   static uint32_t sSave2Log = 0;
                   if (sSave2Log < 20) {
                     ++sSave2Log;
-                    const auto& w = m_lastGoodTransforms.worldToView;
+                    const auto& w = xfs().m_lastGoodTransforms.worldToView;
                     Logger::info(str::format(
                       "[cachedSave] path2 @", m_rawDrawCount,
                       " w2v=(", w[3][0], ",", w[3][1], ",", w[3][2], ")"));
@@ -19000,7 +19015,7 @@ namespace dxvk {
                 // missed it because path1 wasn't writing those entries).
                 {
                   static float sLast2[16] = {};
-                  const auto& w = m_lastGoodTransforms.worldToView;
+                  const auto& w = xfs().m_lastGoodTransforms.worldToView;
                   const float cur[16] = {
                     w[0][0], w[0][1], w[0][2], w[0][3],
                     w[1][0], w[1][1], w[1][2], w[1][3],
@@ -19033,7 +19048,7 @@ namespace dxvk {
     // (main world geometry).  fmt=106 draws that fail projection detection
     // are shadow/depth passes with light-space transforms â†’ applying the
     // main camera VP to them produces extreme BLAS â†’ GPU TDR.
-    if (projSlot == UINT32_MAX && m_hasEverFoundProj) {
+    if (projSlot == UINT32_MAX && xfs().m_hasEverFoundProj) {
       // Check if this draw uses R32G32_UINT position format.
       // NV-DXVK [perf, IlFacts]: was a per-draw scan of the whole semantic
       // vector on ~1000 world draws/frame; now a memoized pure-layout fact.
@@ -19072,21 +19087,21 @@ namespace dxvk {
         const uint64_t cb2Gen     = cb2Bind.contentGen;
         const uint32_t cb2Off     = cb2Bind.constantOffset;
         const uint32_t camFrameId = m_context->m_device->getCurrentFrameId();
-        const bool camHit = m_camFallbackCache.valid
+        const bool camHit = xfc().m_camFallbackCache.valid
             && cb2Buf != nullptr
-            && m_camFallbackCache.cb2Buffer == cb2Buf
-            && m_camFallbackCache.cb2Gen    == cb2Gen
-            && m_camFallbackCache.cb2Offset == cb2Off
-            && m_camFallbackCache.frameId   == camFrameId;
+            && xfc().m_camFallbackCache.cb2Buffer == cb2Buf
+            && xfc().m_camFallbackCache.cb2Gen    == cb2Gen
+            && xfc().m_camFallbackCache.cb2Offset == cb2Off
+            && xfc().m_camFallbackCache.frameId   == camFrameId;
         if (camHit) {
           // Projection (FOV) read fresh every draw â€” cheap copy, never stale.
           // Only the expensive worldToView assembly comes from the cache.
-          transforms.viewToProjection = m_lastGoodTransforms.viewToProjection;
-          transforms.worldToView      = m_camFallbackCache.worldToView;
-          m_lastWtvPathId             = 3;
-          m_skipViewMatrixScan        = true;
+          transforms.viewToProjection = xfs().m_lastGoodTransforms.viewToProjection;
+          transforms.worldToView      = xfc().m_camFallbackCache.worldToView;
+          xfc().m_lastWtvPathId             = 3;
+          xfc().m_skipViewMatrixScan        = true;
         } else {
-        transforms.viewToProjection = m_lastGoodTransforms.viewToProjection;
+        transforms.viewToProjection = xfs().m_lastGoodTransforms.viewToProjection;
         {
           static uint32_t sV2pUintCacheN = 0;
           ++sV2pUintCacheN;
@@ -19215,7 +19230,7 @@ namespace dxvk {
             }
           }
           if (gotW2vP3) {
-            m_lastWtvPathId = 3;
+            xfc().m_lastWtvPathId = 3;
             transforms.worldToView = w2vP3;
           }
           // (path 4 â€” bone-fanout fixed-axis-swap fallback â€” deleted: probe
@@ -19224,19 +19239,19 @@ namespace dxvk {
           // w2v rescue paths handle it like any other identity w2v.)
           // Skip the VIEW matrix scan only â€” worldToView is set.
           // Allow WORLD matrix scan to extract cb3 per-draw transforms.
-          m_skipViewMatrixScan = true;
+          xfc().m_skipViewMatrixScan = true;
         }
         // NV-DXVK [CamCache] store: only cache a successfully reconstructed
         // camera (path 3, non-identity worldToView). A failed derivation leaves
         // worldToView at identity for the downstream cached-w2v rescue paths â€”
         // don't cache that, let the next draw retry.
-        if (m_lastWtvPathId == 3 && !isIdentityExact(transforms.worldToView)) {
-          m_camFallbackCache.cb2Buffer        = cb2Buf;
-          m_camFallbackCache.cb2Gen           = cb2Gen;
-          m_camFallbackCache.cb2Offset        = cb2Off;
-          m_camFallbackCache.frameId          = camFrameId;
-          m_camFallbackCache.worldToView      = transforms.worldToView;
-          m_camFallbackCache.valid            = true;
+        if (xfc().m_lastWtvPathId == 3 && !isIdentityExact(transforms.worldToView)) {
+          xfc().m_camFallbackCache.cb2Buffer        = cb2Buf;
+          xfc().m_camFallbackCache.cb2Gen           = cb2Gen;
+          xfc().m_camFallbackCache.cb2Offset        = cb2Off;
+          xfc().m_camFallbackCache.frameId          = camFrameId;
+          xfc().m_camFallbackCache.worldToView      = transforms.worldToView;
+          xfc().m_camFallbackCache.valid            = true;
         }
         }  // end else (camera reconstruction â€” CamCache miss)
 
@@ -19333,7 +19348,7 @@ namespace dxvk {
           } else if (!t31PathEligible) {
             // Skip the t31 fetch. If cb3 will provide the transform, pre-claim
             // gotBoneTransform so the end-of-block "no bone matrix" check
-            // (line ~2806) doesn't set m_lastExtractUsedFallback=true and
+            // (line ~2806) doesn't set xfc().m_lastExtractUsedFallback=true and
             // cause SubmitDraw to filter this as UIFallback. The cb3 RDEF
             // path further down will write the real objectToWorld.
             if (cb3OwnsTransform) {
@@ -19483,15 +19498,15 @@ namespace dxvk {
                 bool haveCam = false;
                 // NV-DXVK [Perf.Replay] v6.3: record WHICH camO source this
                 // draw used so the replay reproduces the same branch instead
-                // of assuming one. Reset per draw beside m_lastO2wPathId.
-                m_lastO2wCamFromFanout = false;
-                m_lastO2wCamOff = 0;
+                // of assuming one. Reset per draw beside xfc().m_lastO2wPathId.
+                xfc().m_lastO2wCamFromFanout = false;
+                xfc().m_lastO2wCamOff = 0;
                 if (m_hasFanoutCamOrigin) {
                   camOri[0] = m_lastFanoutCamOrigin.x;
                   camOri[1] = m_lastFanoutCamOrigin.y;
                   camOri[2] = m_lastFanoutCamOrigin.z;
                   haveCam = true;
-                  m_lastO2wCamFromFanout = true;
+                  xfc().m_lastO2wCamFromFanout = true;
                 } else {
                   const auto& cb2 = m_context->m_state.vs.constantBuffers[2];
                   if (cb2.buffer != nullptr) {
@@ -19510,13 +19525,13 @@ namespace dxvk {
                         // cb2-sourced: the replay must byte-prove these 12
                         // bytes, so record the offset the site read them at
                         // (+4 here, NOT the RDEF-resolved camSrcOff).
-                        m_lastO2wCamOff = 4u;
+                        xfc().m_lastO2wCamOff = 4u;
                       }
                     }
                   }
                 }
-                m_lastO2wCamValid = haveCam;
-                m_lastO2wCamOrigin = Vector3(camOri[0], camOri[1], camOri[2]);
+                xfc().m_lastO2wCamValid = haveCam;
+                xfc().m_lastO2wCamOrigin = Vector3(camOri[0], camOri[1], camOri[2]);
                 const float tx = haveCam ? (m[3]  + camOri[0]) : m[3];
                 const float ty = haveCam ? (m[7]  + camOri[1]) : m[7];
                 const float tz = haveCam ? (m[11] + camOri[2]) : m[11];
@@ -19526,7 +19541,7 @@ namespace dxvk {
                   Vector4(m[2], m[6], m[10], 0.0f),
                   Vector4(tx,   ty,   tz,    1.0f));
                 gotBoneTransform = true;
-                m_lastO2wPathId = 1;
+                xfc().m_lastO2wPathId = 1;
 
                 // One-shot dump of the full t31 buffer contents the first time
                 // each unique VS hits this path. Helps us see whether a shader
@@ -19711,7 +19726,7 @@ namespace dxvk {
                     Vector4(m[8], m[9], m[10], 0.0f),
                     Vector4(m[3], m[7], m[11], 1.0f));
                   gotBoneTransform = true;
-                  m_lastO2wPathId = 2;
+                  xfc().m_lastO2wPathId = 2;
                   {
                     // NV-DXVK: throttle to one line per unique VS â€” was per-draw.
                     static std::unordered_set<std::string> sT30CpuLog;
@@ -19780,7 +19795,7 @@ namespace dxvk {
                     Vector4(bm[8], bm[9], bm[10], 0.0f),
                     Vector4(bm[3], bm[7], bm[11], 1.0f));
                   gotBoneTransform = true;
-                  m_lastO2wPathId = 3;
+                  xfc().m_lastO2wPathId = 3;
                   if (kDiagLogs) {
                     // NV-DXVK: throttle to one line per unique VS â€” was per-draw.
                     static std::unordered_set<std::string> sT30SliceLog;
@@ -19835,19 +19850,19 @@ namespace dxvk {
         markXt(s_perfXtSfO2wAcc, s_perfXtSfO2wMax);  // [sf_o2w] t31/t30 objectToWorld done
         if (!gotBoneTransform) {
           // No bone matrix available â€” can't position this geometry
-          m_lastExtractUsedFallback = true;
+          xfc().m_lastExtractUsedFallback = true;
         }
-        // NOTE: do NOT set m_foundRealProjThisFrame here â€” that would let
+        // NOTE: do NOT set xfs().m_foundRealProjThisFrame here â€” that would let
         // fmt=106 shadow draws bypass the uiFallback check in SubmitDraw.
       } else {
         // Non-R32G32_UINT draw without camera â€” mark as fallback so it
         // gets filtered as UI in SubmitDraw (shadow/depth pass).
-        m_lastExtractUsedFallback = true;
+        xfc().m_lastExtractUsedFallback = true;
       }
     }
 
-    if (projSlot == UINT32_MAX && !m_hasEverFoundProj) {
-      m_lastExtractUsedFallback = true;
+    if (projSlot == UINT32_MAX && !xfs().m_hasEverFoundProj) {
+      xfc().m_lastExtractUsedFallback = true;
       // NV-DXVK [DrawSnapshot] -- converted consumer. THE viewport fallback
       // HANDOFF sec 3 names among the reads keeping this stage impure: it
       // synthesises a projection when no real one was found, so it is a real
@@ -19894,13 +19909,13 @@ namespace dxvk {
     markXt(s_perfXtSrcFallbackAcc, s_perfXtSrcFallbackMax);
     // --- VIEW MATRIX ---
     // NV-DXVK: Skip if worldToView was already set (cross-frame VP for R32G32_UINT)
-    if (m_skipViewMatrixScan) goto skipViewScan;
+    if (xfc().m_skipViewMatrixScan) goto skipViewScan;
     // Cached fast path: re-read from previously discovered location.
     // Only rescan when the cached location is invalid or doesn't contain
     // a view matrix anymore (shader change, different render pass).
     bool viewCacheHit = false;
-    if (m_viewSlot != UINT32_MAX && m_viewStage >= 0 && m_viewStage < kNumStages) {
-      const auto& cb = (*stageCbs[m_viewStage])[m_viewSlot];
+    if (xfc().m_viewSlot != UINT32_MAX && xfc().m_viewStage >= 0 && xfc().m_viewStage < kNumStages) {
+      const auto& cb = (*stageCbs[xfc().m_viewStage])[xfc().m_viewSlot];
       if (cb.buffer != nullptr) {
         // NV-DXVK [CbStage]: per-draw cached-view re-read from the staged
         // copy â€” this is the w2vs_cached hot path that runs every draw.
@@ -19908,7 +19923,7 @@ namespace dxvk {
         // NV-DXVK [DrawSnapshot] 2026-08-10 -- converted consumer (view).
         // REBASE=false, and this is the trap-2 convention divergence stated as
         // code rather than as a comment: this read has always indexed
-        // m_viewOffset with NO bound-range base, unlike every projection read,
+        // xfc().m_viewOffset with NO bound-range base, unlike every projection read,
         // and the named view span is captured the same way. drawCbSpan carries
         // the convention through to the capture so the two cannot drift.
         //
@@ -19916,16 +19931,16 @@ namespace dxvk {
         // in GS/DS/PS has nothing captured and stays live -- correctly, and it
         // is counted as a live read below so pure% does not flatter itself.
         size_t vLen = 0;
-        size_t vOff = m_viewOffset;
-        const uint8_t* ptr = (m_viewStage == 0 && m_viewSlot != UINT32_MAX)
-            ? drawCbSpan(m_viewSlot, (uint32_t) m_viewOffset, 64u, false)
+        size_t vOff = xfc().m_viewOffset;
+        const uint8_t* ptr = (xfc().m_viewStage == 0 && xfc().m_viewSlot != UINT32_MAX)
+            ? drawCbSpan(xfc().m_viewSlot, (uint32_t) xfc().m_viewOffset, 64u, false)
             : nullptr;
         if (ptr != nullptr) {
           // The span IS the 64 bytes, so the offset into it is 0 -- the same
           // shape the replay tier's converted view read already uses.
           vLen = 64;
           vOff = 0;
-        } else if (m_viewStage != 0) {
+        } else if (xfc().m_viewStage != 0) {
           // Not routable through the record. Count it so the purity census
           // stays honest about why this draw can never be pure.
           ++s_xtCbLiveReads; ++s_xtCbLiveNonVs;
@@ -19938,7 +19953,7 @@ namespace dxvk {
         if (ptr) {
           Matrix4 c = readMatrix(ptr, vOff, vLen);
           if (isViewMatrix(c)) {
-            m_lastWtvPathId = 5; // cached view-matrix slot
+            xfc().m_lastWtvPathId = 5; // cached view-matrix slot
             // NV-DXVK: readCbMatrix stores rows-as-columns (passes raw[i][j]
             // to Matrix4 ctor with rows as args, which dxvk treats as cols).
             // The mathematical matrix in memory ends up stored as M^T in our
@@ -19980,9 +19995,9 @@ namespace dxvk {
             if (projOffset >= 64) {
               Matrix4 c = readMatrix(ptr, projOffset - 64, bufSize);
               if (isViewMatrix(c)) {
-                m_lastWtvPathId = 6; // scan near projection (offset-64)
+                xfc().m_lastWtvPathId = 6; // scan near projection (offset-64)
                 transforms.worldToView = transpose(c); // see path 5 fix comment
-                m_viewStage = projStage; m_viewSlot = projSlot; m_viewOffset = projOffset - 64;
+                xfc().m_viewStage = projStage; xfc().m_viewSlot = projSlot; xfc().m_viewOffset = projOffset - 64;
                 static uint32_t sPath6Log = 0;
                 if (sPath6Log < 30) {
                   ++sPath6Log;
@@ -19999,9 +20014,9 @@ namespace dxvk {
                 if (off >= projOffset && off < projOffset + 64) continue;
                 Matrix4 c = readMatrix(ptr, off, bufSize);
                 if (isViewMatrix(c)) {
-                  m_lastWtvPathId = 7; // scan same-cb as projection
+                  xfc().m_lastWtvPathId = 7; // scan same-cb as projection
                   transforms.worldToView = transpose(c); // see path 5 fix comment
-                  m_viewStage = projStage; m_viewSlot = projSlot; m_viewOffset = off;
+                  xfc().m_viewStage = projStage; xfc().m_viewSlot = projSlot; xfc().m_viewOffset = off;
                   static uint32_t sPath7Log = 0;
                   if (sPath7Log < 30) {
                     ++sPath7Log;
@@ -20038,9 +20053,9 @@ namespace dxvk {
             for (size_t off = csBase; off + 64 <= csEnd; off += 16) {
               Matrix4 c = readMatrix(ptr, off, bufSize);
               if (isViewMatrix(c)) {
-                m_lastWtvPathId = 8; // cross-stage all-cb scan
+                xfc().m_lastWtvPathId = 8; // cross-stage all-cb scan
                 transforms.worldToView = transpose(c); // see path 5 fix comment
-                m_viewStage = si; m_viewSlot = slot; m_viewOffset = off;
+                xfc().m_viewStage = si; xfc().m_viewSlot = slot; xfc().m_viewOffset = off;
                 static uint32_t sPath8Log = 0;
                 if (sPath8Log < 30) {
                   ++sPath8Log;
@@ -20075,12 +20090,12 @@ namespace dxvk {
             for (size_t off = fbBase; off + 64 <= fbEnd; off += 16) {
               if (off >= projOffset && off < projOffset + 64) continue;
               Matrix4 raw = readCbMatrix(ptr, off, bufSize);
-              Matrix4 flipped = m_columnMajor ? raw : transpose(raw);
+              Matrix4 flipped = xfc().m_columnMajor ? raw : transpose(raw);
               if (isViewMatrix(flipped)) {
-                m_lastWtvPathId = 9; // convention-flip fallback
+                xfc().m_lastWtvPathId = 9; // convention-flip fallback
                 transforms.worldToView = transpose(flipped); // see path 5 fix comment
-                m_viewStage = projStage; m_viewSlot = projSlot; m_viewOffset = off;
-                m_columnMajor = !m_columnMajor;
+                xfc().m_viewStage = projStage; xfc().m_viewSlot = projSlot; xfc().m_viewOffset = off;
+                xfc().m_columnMajor = !xfc().m_columnMajor;
                 static uint32_t sPath9Log = 0;
                 if (sPath9Log < 30) {
                   ++sPath9Log;
@@ -20119,9 +20134,9 @@ namespace dxvk {
           for (size_t off = csBase; off + 64 <= csEnd; off += 16) {
             Matrix4 c = readMatrix(ptr, off, bufSize);
             if (isViewMatrix(c)) {
-              m_lastWtvPathId = 10; // fallback-projection branch cross-stage scan
+              xfc().m_lastWtvPathId = 10; // fallback-projection branch cross-stage scan
               transforms.worldToView = transpose(c); // see path 5 fix comment
-              m_viewStage = si; m_viewSlot = slot; m_viewOffset = off;
+              xfc().m_viewStage = si; xfc().m_viewSlot = slot; xfc().m_viewOffset = off;
               static uint32_t sPath10Log = 0;
               if (sPath10Log < 30) {
                 ++sPath10Log;
@@ -20145,30 +20160,30 @@ namespace dxvk {
     // component in row 1 (Y). In a Z-up world, column 1's largest component
     // is in row 2 (Z). Vote on each valid view matrix and settle via threshold.
     if (!isIdentityExact(transforms.worldToView)) {
-      if (!m_zUpSettled) {
+      if (!xfc().m_zUpSettled) {
         const float absY = std::abs(transforms.worldToView[1][1]);
         const float absZ = std::abs(transforms.worldToView[2][1]);
         // Only vote when there's a clear winner (avoid ambiguous 45Â° views)
         if (std::abs(absZ - absY) > 0.3f) {
-          m_zUpVotes += (absZ > absY) ? 1 : -1;
-          if (!m_zUpSettled && std::abs(m_zUpVotes) >= kVoteThreshold) {
-            m_zUpSettled = true;
-            const bool zUp = m_zUpVotes > 0;
+          xfc().m_zUpVotes += (absZ > absY) ? 1 : -1;
+          if (!xfc().m_zUpSettled && std::abs(xfc().m_zUpVotes) >= kVoteThreshold) {
+            xfc().m_zUpSettled = true;
+            const bool zUp = xfc().m_zUpVotes > 0;
             RtxOptions::zUpObject().setDeferred(zUp);
           }
         }
       }
 
       // Log settled axis conventions once.
-      if (m_zUpSettled && m_yFlipSettled && m_lhSettled && !m_axisLogged) {
-        m_axisLogged = true;
+      if (xfc().m_zUpSettled && xfc().m_yFlipSettled && xfc().m_lhSettled && !xfc().m_axisLogged) {
+        xfc().m_axisLogged = true;
         Logger::info(str::format("[D3D11Rtx] Axis detection settled: ",
-          m_lhVotes > 0 ? "LH" : "RH",
-          m_yFlipVotes > 0 ? " Y-flipped" : "",
-          m_zUpVotes > 0 ? " Z-up" : " Y-up",
-          m_columnMajor ? " col-major" : " row-major",
-          " (proj stage=", kStageNames[std::max(0, m_projStage)],
-          " slot=", m_projSlot, " off=", m_projOffset, ")"));
+          xfc().m_lhVotes > 0 ? "LH" : "RH",
+          xfc().m_yFlipVotes > 0 ? " Y-flipped" : "",
+          xfc().m_zUpVotes > 0 ? " Z-up" : " Y-up",
+          xfc().m_columnMajor ? " col-major" : " row-major",
+          " (proj stage=", kStageNames[std::max(0, xfc().m_projStage)],
+          " slot=", xfc().m_projSlot, " off=", xfc().m_projOffset, ")"));
       }
     }
 
@@ -20184,7 +20199,7 @@ namespace dxvk {
     // where float rounding in the row-magnitude normalization + basis
     // re-derivation actually produces jitter. For the cached-slot scan paths
     // (5-10) the translation column is read verbatim from a real view matrix
-    // cbuffer â€” no jitter â€” and smoothing just introduces lag. m_lastWtvPathId
+    // cbuffer â€” no jitter â€” and smoothing just introduces lag. xfc().m_lastWtvPathId
     // lets us gate cleanly. Paths 0 and 11 are also excluded (bone-composite).
     //
     // D3D row-major view matrix layout:
@@ -20193,8 +20208,8 @@ namespace dxvk {
     //   [R20 R21 R22  0]
     //   [tx  ty  tz   1]
     const bool smoothingApplies =
-      m_lastWtvPathId == 1 || m_lastWtvPathId == 2 || m_lastWtvPathId == 3;
-    if (smoothingApplies && !isIdentityExact(transforms.worldToView) && !m_skipViewMatrixScan) {
+      xfc().m_lastWtvPathId == 1 || xfc().m_lastWtvPathId == 2 || xfc().m_lastWtvPathId == 3;
+    if (smoothingApplies && !isIdentityExact(transforms.worldToView) && !xfc().m_skipViewMatrixScan) {
       // NV-DXVK [bob-bug-fix 2026-05-04]: this block USED to EMA-smooth
       // camPos and rebuild the translation column as t' = -VÂ·smoothedCamPos.
       // That is mathematically equivalent to "snap to a slightly-different
@@ -20222,8 +20237,8 @@ namespace dxvk {
         -(V[0][0] * t.x + V[1][0] * t.y + V[2][0] * t.z),
         -(V[0][1] * t.x + V[1][1] * t.y + V[2][1] * t.z),
         -(V[0][2] * t.x + V[1][2] * t.y + V[2][2] * t.z));
-      m_smoothedCamPos = camPos;
-      m_hasPrevCamPos = true;
+      xfc().m_smoothedCamPos = camPos;
+      xfc().m_hasPrevCamPos = true;
       // Diagnostic: log first ~80 events with the would-be rebuild delta so
       // we can see how much the basis-rebuild was perturbing W[3] per frame.
       {
@@ -20234,7 +20249,7 @@ namespace dxvk {
           const float wouldBeTy = -(V[1][0]*camPos.x + V[1][1]*camPos.y + V[1][2]*camPos.z);
           const float wouldBeTz = -(V[2][0]*camPos.x + V[2][1]*camPos.y + V[2][2]*camPos.z);
           Logger::info(str::format(
-            "[bob-bug] path=", m_lastWtvPathId,
+            "[bob-bug] path=", xfc().m_lastWtvPathId,
             " keptT=(", t.x, ",", t.y, ",", t.z, ")",
             " wouldBeT=(", wouldBeTx, ",", wouldBeTy, ",", wouldBeTz, ")",
             " camPos=(", camPos.x, ",", camPos.y, ",", camPos.z, ")"));
@@ -20249,7 +20264,7 @@ namespace dxvk {
     // GetMappedSlice() returns the CPU-mapped pointer with current data.
     // NV-DXVK [perf] 2026-08-08 (w2vw_cb3, 1.82 ms/frame): REORDERED + RANGED.
     // Two measured defects fixed together:
-    //  (1) the cb3 read ran BEFORE the m_lastO2wPathId gate, so every t31/bone
+    //  (1) the cb3 read ran BEFORE the xfc().m_lastO2wPathId gate, so every t31/bone
     //      draw (pathId != 0) paid the read and then discarded it;
     //  (2) cb3 is Map(WRITE_DISCARD)ed per draw, so its content generation
     //      moves every draw and stagedCbBytes could never hit here -- its miss
@@ -20261,10 +20276,10 @@ namespace dxvk {
     // staged this generation), else copy exactly the 48 bytes this block
     // reads. The 10-shot [D3D11Rtx] CB3-read diag that lived here is deleted
     // (answered long ago; it forced an unconditional GetMappedSlice).
-    // The m_lastO2wPathId == 0 gate keeps its original meaning: only run
+    // The xfc().m_lastO2wPathId == 0 gate keeps its original meaning: only run
     // CB3->O2W when no upstream path (t31, legacy t30 bone) already set
     // objectToWorld -- see the clobber history in the git log.
-    if (m_skipViewMatrixScan && m_lastO2wPathId == 0) {
+    if (xfc().m_skipViewMatrixScan && xfc().m_lastO2wPathId == 0) {
       const auto& vsCbs = m_context->m_state.vs.constantBuffers;
       const auto& cb3 = vsCbs[3];
       const float* bm = nullptr;
@@ -20434,7 +20449,7 @@ namespace dxvk {
             Vector4(bm[3]  + p13CamOrigin[0],
                     bm[7]  + p13CamOrigin[1],
                     bm[11] + p13CamOrigin[2], 1.0f));
-          m_lastO2wPathId = 13;
+          xfc().m_lastO2wPathId = 13;
 
           // NV-DXVK [SkyboxNormalProbe] zero-risk diagnostic (logging only, no
           // behaviour change). The line above reads the bone matrix bm as
@@ -20520,7 +20535,7 @@ namespace dxvk {
         } else {
           Matrix4 invView = inverse(transforms.worldToView);
           transforms.objectToWorld = invView * cb3Mat;
-          m_lastO2wPathId = 4;
+          xfc().m_lastO2wPathId = 4;
         }
         // NV-DXVK [Path13Diag]: scalar-only, non-filtered probe â€” confirms
         // whether path 13 fired for each VS and what o2w it produced.
@@ -20557,7 +20572,7 @@ namespace dxvk {
               " frame=", frameP13d,
               " r8bit0x10=", p13R8Bit,
               " cameraRelative=", (p13CameraRelative ? 1 : 0),
-              " o2wPath=", m_lastO2wPathId,
+              " o2wPath=", xfc().m_lastO2wPathId,
               " skyValid=", g_engineSkyCamOriginValid,
               " skyDistSq=", p13SkyDistSq,
               " gateWouldPass=", p13GateWouldPass,
@@ -20636,7 +20651,7 @@ namespace dxvk {
         }
         // NV-DXVK [SkyMtnPsKey]: was here, hoisted to the top of
         // FillMaterialData. The previous nest was inside the R32G32_UINT
-        // m_skipViewMatrixScan branch so it only fired for that draw path
+        // xfc().m_skipViewMatrixScan branch so it only fired for that draw path
         // and missed VSes like 0x2a729f16017d841b that route through other
         // paths. See the SkyMtnPsKey block right after the function entry.
       }
@@ -20647,7 +20662,7 @@ namespace dxvk {
     // then fall back to other stages for emulator compatibility.
     // Gated by useCBufferWorldMatrices â€” disable if CB layout causes wrong detections.
     // NV-DXVK: Skip for R32G32_UINT draws â€” cached cb3 is already set above.
-    if (RtxOptions::useCBufferWorldMatrices() && !m_currentDrawIsBoneTransformed && !m_skipViewMatrixScan) {
+    if (RtxOptions::useCBufferWorldMatrices() && !xfc().m_currentDrawIsBoneTransformed && !xfc().m_skipViewMatrixScan) {
       ++s_perfCbufWorldMatHits;
       // --- Source-engine float3x4 world matrix (translation in column 3) ---
       // IDA analysis of materialsystem_dx11.dll confirms:
@@ -20737,7 +20752,7 @@ namespace dxvk {
           Vector4(R10, R11, R12, 0.0f),
           Vector4(R20, R21, R22, 0.0f),
           Vector4(Tx,  Ty,  Tz,  1.0f));
-        m_lastO2wPathId = 6;
+        xfc().m_lastO2wPathId = 6;
         if (s_xtDiagEnabled) {
           // NV-DXVK: throttle to one line per unique VS â€” was per-draw.
           static std::unordered_set<std::string> sSf3x4Log;
@@ -20792,7 +20807,7 @@ namespace dxvk {
         if (std::abs(candidate[0][3]) > 0.01f || std::abs(candidate[1][3]) > 0.01f || std::abs(candidate[2][3]) > 0.01f)
           return false;
         transforms.objectToWorld = candidate;
-        m_lastO2wPathId = 7;
+        xfc().m_lastO2wPathId = 7;
         if (s_xtDiagEnabled) {
           // NV-DXVK: throttle to one line per unique VS â€” was per-draw.
           static std::unordered_set<std::string> sWorldCbLog;
@@ -20810,7 +20825,7 @@ namespace dxvk {
       // NV-DXVK: sync `found` with the path-id system so the world-matrix
       // scan below (RDEF, trySourceFloat3x4, tryWorldCb) doesn't overwrite
       // an o2w already set by an upstream path (t31=1, t30cpu=2, t30slice=3).
-      bool found = (m_lastO2wPathId != 0);
+      bool found = (xfc().m_lastO2wPathId != 0);
       const auto& vsCbs = m_context->m_state.vs.constantBuffers;
 
       // NV-DXVK: for shaders with a per-vertex BLENDINDICES semantic (skinned
@@ -20994,7 +21009,7 @@ namespace dxvk {
             if (ok) {
               // NV-DXVK [Perf.Replay] path-5/6 widening: record which cb the
               // model block came from, so the replay re-reads the same bytes.
-              m_lastModelCbSlot = sModelCbSlot;
+              xfc().m_lastModelCbSlot = sModelCbSlot;
               // Also fetch c_cameraOrigin from CBufCommonPerCamera (offset 4, 3 floats).
               float camO[3] = { 0.f, 0.f, 0.f };
               bool haveCamO = false;
@@ -21055,7 +21070,7 @@ namespace dxvk {
                 && vsKey.find("VS_bb30826b03dc9a8b") != std::string::npos;
               if (cb3IsZero && isBspWorldVsFanout) {
                 transforms.objectToWorld = Matrix4();  // identity
-                m_lastO2wPathId = 7;
+                xfc().m_lastO2wPathId = 7;
                 {
                   // NV-DXVK: throttle to one line per unique VS â€” was per-draw.
                   static std::unordered_set<std::string> sZeroCb3FanoutLog;
@@ -21071,7 +21086,7 @@ namespace dxvk {
                   Vector4(0.f, 1.f, 0.f, 0.f),
                   Vector4(0.f, 0.f, 1.f, 0.f),
                   Vector4(camOforZeroCb3[0], camOforZeroCb3[1], camOforZeroCb3[2], 1.f));
-                m_lastO2wPathId = 6;
+                xfc().m_lastO2wPathId = 6;
                 // NV-DXVK: throttle â€” was firing unconditionally per-draw
                 // and hitting ~470/sec on loading screens, contributing to
                 // the per-present log storm. One line per unique VS is
@@ -21095,7 +21110,7 @@ namespace dxvk {
                   Vector4(m[1], m[5], m[9],  0.f),
                   Vector4(m[2], m[6], m[10], 0.f),
                   Vector4(tx,   ty,   tz,    1.f));
-                m_lastO2wPathId = 5;
+                xfc().m_lastO2wPathId = 5;
                 // ====================================================================
                 // [O2wDbl] AUTO-TARGET the mangled "far ship" subdraws (no hover).
                 // VS_e7abcf4e / VS_1953b6e9 are generic world shaders reused for BOTH
@@ -21307,7 +21322,7 @@ namespace dxvk {
                   Vector4(0.0f, 0.0f, 1.0f, 0.0f),
                   Vector4(useCamX, useCamY, useCamZ, 1.0f));
                 found = true;
-                m_lastO2wPathId = 8;
+                xfc().m_lastO2wPathId = 8;
                 {
                   // NV-DXVK: throttle to one line per unique VS â€” was per-draw.
                   static std::unordered_set<std::string> sCb2CamLog;
@@ -21319,8 +21334,8 @@ namespace dxvk {
                     " T=(", useCamX, ",", useCamY, ",", useCamZ, ")",
                     " src=", camFromFanout ? "fanout" : "cb2@4"));
                 }
-                m_lastDrawCamOrigin    = Vector3(useCamX, useCamY, useCamZ);
-                m_lastDrawCamOriginSet = true;
+                xfc().m_lastDrawCamOrigin    = Vector3(useCamX, useCamY, useCamZ);
+                xfc().m_lastDrawCamOriginSet = true;
                 static uint32_t sCamFbLog = 0;
                 if (sCamFbLog < 20) {
                   ++sCamFbLog;
@@ -21424,7 +21439,7 @@ namespace dxvk {
     // NV-DXVK: For bone draws, use the worldToView from a fmt=106 draw
     // (which has the correct camera). Reset objectToWorld to identity
     // since the interleaver applies the bone matrix GPU-side.
-    if (m_currentDrawIsBoneTransformed) {
+    if (xfc().m_currentDrawIsBoneTransformed) {
       transforms.objectToWorld = Matrix4();
       // Build worldToView from c_cameraOrigin (cb2@4) with explicit
       // Source Engine coordinate system mapping:
@@ -21447,7 +21462,7 @@ namespace dxvk {
       // Source: X=forward, Y=left, Z=up
       // Use the cached VP's camera direction (fwd from decomposition)
       // but fix the up axis which the VP decomposition negates (Y-flip).
-      const Matrix4& cachedView = m_lastGoodTransforms.worldToView;
+      const Matrix4& cachedView = xfs().m_lastGoodTransforms.worldToView;
       // Extract axes from cached view, fix the Y-flipped up
       Vector3 right(cachedView[0][0], cachedView[0][1], cachedView[0][2]);
       Vector3 up   (cachedView[1][0], cachedView[1][1], cachedView[1][2]);
@@ -21467,7 +21482,7 @@ namespace dxvk {
       const float tR = -(right.x*camX + right.y*camY + right.z*camZ);
       const float tU = -(up.x*camX    + up.y*camY    + up.z*camZ);
       const float tF = -(fwd.x*camX   + fwd.y*camY   + fwd.z*camZ);
-      m_lastWtvPathId = 11; // cached VP + live camX/Y/Z reuse path
+      xfc().m_lastWtvPathId = 11; // cached VP + live camX/Y/Z reuse path
       // NV-DXVK: store by columns â€” see path 1 fix.
       transforms.worldToView = Matrix4(
         Vector4(right.x, up.x, fwd.x, 0),
@@ -21502,19 +21517,19 @@ namespace dxvk {
         " slot=", projSlot, " off=", projOffset,
         " proj diag=(", p[0][0], ",", p[1][1], ",", p[2][2], ")",
         " m[2][3]=", p[2][3],
-        m_columnMajor ? " [column-major]" : " [row-major]"));
+        xfc().m_columnMajor ? " [column-major]" : " [row-major]"));
     }
 
     // DEBUG: dump info for non-bone draws returning identity o2w.
     // Per-frame counter so we don't saturate on drawID=0. Skip fallback draws
     // because those get rejected downstream â€” we want the REAL submissions.
-    if (!m_currentDrawIsBoneTransformed && isIdentityExact(transforms.objectToWorld)
-        && !m_lastExtractUsedFallback) {
+    if (!xfc().m_currentDrawIsBoneTransformed && isIdentityExact(transforms.objectToWorld)
+        && !xfc().m_lastExtractUsedFallback) {
       // NV-DXVK [SILENT-ID steady-state]: the origin-anchored "merged" red
       // draws appear at frame ~2300, long past the old first-3-frames gate, so
       // they were never captured. Fire in gameplay (engineHook>16), once per
       // unique VS hash (capped set), and dump WHY the world matrix wasn't found:
-      // the extraction path id (m_lastWtvPathId), projSlot/Stage, and the bound
+      // the extraction path id (xfc().m_lastWtvPathId), projSlot/Stage, and the bound
       // cb slots so we can see which cbuffer the cb3/world lookup expects.
       const bool inGameplaySilent =
         dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
@@ -21541,7 +21556,7 @@ namespace dxvk {
       if (firstForVs) {
         Logger::warn(str::format(
           "[D3D11Rtx] === SILENT-ID(steady) drawID=", m_drawCallID, " VS=", vsHashStr,
-          " wtvPathId=", m_lastWtvPathId, " projSlot=", projSlot, " projStage=", projStage,
+          " wtvPathId=", xfc().m_lastWtvPathId, " projSlot=", projSlot, " projStage=", projStage,
           " o2wIdentity=1 fallback=0 cbuffer dump ==="));
         for (uint32_t s = 0; s < 8; ++s) {
           const auto& cb = vsCbs[s];
@@ -21642,7 +21657,7 @@ namespace dxvk {
           // legacy cb3-RDEF path (o2wPath=5) already produces the right
           // o2w for real gameplay draws (PIX-verified on VS_6e3e6f28);
           // overriding it here submits draws that RT can't render into
-          // usable pixels, which flipped m_remixActiveThisFrame=true and
+          // usable pixels, which flipped xfc().m_remixActiveThisFrame=true and
           // caused the RT blit to clobber everything the native raster
           // had drawn.
           float m[12];
@@ -21713,7 +21728,7 @@ namespace dxvk {
             // frames â€” cb3 holds identity or zeros, and the gameplay
             // camera origin hasn't been captured yet (camO all zero).
             // If we commit these to RT the BLASes pile up at world
-            // origin, render nothing, and flip m_remixActiveThisFrame=
+            // origin, render nothing, and flip xfc().m_remixActiveThisFrame=
             // true so the RT blit runs and clobbers the native-raster
             // output the UI/menu buttons were drawn into.
             //
@@ -21721,8 +21736,8 @@ namespace dxvk {
             // possible without a real camera. Demote to UI (native
             // raster renders it, RT stays out of this frame).
             if (allZero(camO, 3)) {
-              m_lastExtractUsedFallback = true;
-              m_lastClassifierSaidUi    = true;
+              xfc().m_lastExtractUsedFallback = true;
+              xfc().m_lastClassifierSaidUi    = true;
               static std::unordered_set<std::string> sV2LogUiDemote;
               const std::string& vk = getVsHashShort();
               if (sV2LogUiDemote.insert(vk).second) {
@@ -21737,7 +21752,7 @@ namespace dxvk {
             // w2v is identity (common â€” most BSP draws don't re-extract
             // projection), we DELIBERATELY leave the flag set so that
             // SubmitDraw's path 4 runs and overrides the per-draw w2v with
-            // the frame's cached m_lastGoodTransforms.worldToView. That
+            // the frame's cached xfs().m_lastGoodTransforms.worldToView. That
             // gives the draw a real camera from a prior extraction this
             // frame. If cached is also identity, path 4's own degenerate
             // check rejects as UIFallback (correct â€” no camera to render
@@ -21750,7 +21765,7 @@ namespace dxvk {
               || std::abs(transforms.worldToView[3][1]) > 0.01f
               || std::abs(transforms.worldToView[3][2]) > 0.01f;
             if (haveCam && w2vHasRealTranslation) {
-              m_lastExtractUsedFallback = false;
+              xfc().m_lastExtractUsedFallback = false;
             }
             // NV-DXVK [perf]: same pointer-keyed dedup as the recognized-kind
             // case below â€” this ran getVsHashShort() plus a std::string hash
@@ -21777,11 +21792,11 @@ namespace dxvk {
           // fallback flag false so SubmitDraw's UIFallback filter does not
           // accidentally reject them when a legacy sub-branch hit a
           // per-draw edge case (e.g. t31 entry out of range, cached bone
-          // slice null) and wrote `m_lastExtractUsedFallback = true` at
+          // slice null) and wrote `xfc().m_lastExtractUsedFallback = true` at
           // line ~2806. If legacy produced a bad o2w, the finiteness /
           // magnitude guard in SubmitDraw (line ~5340) still rejects it;
           // we're only undoing the UIFallback class of rejection.
-          m_lastExtractUsedFallback = false;
+          xfc().m_lastExtractUsedFallback = false;
           // NV-DXVK [perf]: dedup on the shader POINTER + kind, not on a
           // constructed string. This is the hottest classifier case (most
           // gameplay geometry), and it previously built `kindName + "|" + vk`
@@ -21804,7 +21819,7 @@ namespace dxvk {
             Logger::info(str::format(
               "[VsClass.v2.", D3D11VsClassifier::kindName(clsV2.kind),
               "] vs=", getVsHashShort(),
-              " fallback_cleared legacy_o2wPath=", m_lastO2wPathId));
+              " fallback_cleared legacy_o2wPath=", xfc().m_lastO2wPathId));
           }
           break;
         }
@@ -21812,12 +21827,12 @@ namespace dxvk {
         case D3D11VsClassification::Kind::Unknown:
           // No recognized transform signals. Force UIFallback so the native
           // raster path handles the draw and RTX skips it. Setting
-          // m_lastClassifierSaidUi = true forces SubmitDraw into the TRUE
-          // UI branch (line ~5880) regardless of m_foundRealProjThisFrame,
+          // xfc().m_lastClassifierSaidUi = true forces SubmitDraw into the TRUE
+          // UI branch (line ~5880) regardless of xfs().m_foundRealProjThisFrame,
           // which is what makes the menu buttons/HUD reach native raster
           // after any gameplay draw has latched a real projection.
-          m_lastExtractUsedFallback = true;
-          m_lastClassifierSaidUi    = true;
+          xfc().m_lastExtractUsedFallback = true;
+          xfc().m_lastClassifierSaidUi    = true;
           break;
         default:
           // Skybox/Viewmodel/Particle/Sprite2D â€” not produced by the
@@ -21873,9 +21888,9 @@ namespace dxvk {
             const auto& wtvZ = transforms.worldToView;
             Logger::info(str::format(
               "[ZigGunD3D] f=", fz,
-              " o2wPathId=", m_lastO2wPathId, " wtvPathId=", m_lastWtvPathId,
-              " boneXf=", (m_currentDrawIsBoneTransformed ? 1 : 0),
-              " fallback=", (m_lastExtractUsedFallback ? 1 : 0),
+              " o2wPathId=", xfc().m_lastO2wPathId, " wtvPathId=", xfc().m_lastWtvPathId,
+              " boneXf=", (xfc().m_currentDrawIsBoneTransformed ? 1 : 0),
+              " fallback=", (xfc().m_lastExtractUsedFallback ? 1 : 0),
               " o2wT=(", tgx, ",", tgy, ",", tgz, ")",
               " wtvT=(", wtvZ[3][0], ",", wtvZ[3][1], ",", wtvZ[3][2], ")",
               " engW2vT=(", g_engineMainW2v[12], ",", g_engineMainW2v[13], ",", g_engineMainW2v[14], ")",
@@ -21884,7 +21899,7 @@ namespace dxvk {
         }
       }
 
-      const bool o2wGarbage = !m_currentDrawIsBoneTransformed && !m_lastExtractUsedFallback
+      const bool o2wGarbage = !xfc().m_currentDrawIsBoneTransformed && !xfc().m_lastExtractUsedFallback
                            && std::isfinite(tgMag2) && tgMag2 > (5.0e5f * 5.0e5f);
       const bool inGameplayGarbage =
         dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
@@ -21908,7 +21923,7 @@ namespace dxvk {
           const auto& o2w = transforms.objectToWorld;
           Logger::warn(str::format(
             "[D3D11Rtx] === GARBAGE-O2W drawID=", m_drawCallID, " VS=", vsHashStrG,
-            " wtvPathId=", m_lastWtvPathId, " o2wPathId=", m_lastO2wPathId,
+            " wtvPathId=", xfc().m_lastWtvPathId, " o2wPathId=", xfc().m_lastO2wPathId,
             " projSlot=", projSlot, " projStage=", projStage,
             " o2wT=(", tgx, ",", tgy, ",", tgz, ")",
             " o2wRow0=(", o2w[0][0], ",", o2w[0][1], ",", o2w[0][2], ",", o2w[0][3], ")",
@@ -22008,9 +22023,9 @@ namespace dxvk {
 
     // [Perf.VsLocCache] Write back the (possibly-rediscovered) location for
     // this VS. Runs only when both proj and view are validly populated â€”
-    // skipping draws that fell through to fallback (m_projSlot=UINT32_MAX)
+    // skipping draws that fell through to fallback (xfc().m_projSlot=UINT32_MAX)
     // so we don't poison the cache with garbage.
-    if (vsLocKey != 0 && m_projSlot != UINT32_MAX) {
+    if (vsLocKey != 0 && xfc().m_projSlot != UINT32_MAX) {
       // Cap cache; level changes can flush ~hundreds of stale VS pointers.
       // NV-DXVK [DrawSnapshot]: the clear DANGLES s_xtVsLocCur, which
       // drawCbSpan appends to and which was resolved at the top of this same
@@ -22031,22 +22046,22 @@ namespace dxvk {
       // Steady state is a no-op, which is what makes this one integer compare
       // on the replay side rather than a re-derivation.
       if (!e.haveLoc
-          || e.projSlot  != m_projSlot  || e.projStage  != m_projStage
-          || e.viewSlot  != m_viewSlot  || e.viewStage  != m_viewStage) {
+          || e.projSlot  != xfc().m_projSlot  || e.projStage  != xfc().m_projStage
+          || e.viewSlot  != xfc().m_viewSlot  || e.viewStage  != xfc().m_viewStage) {
         ++e.gen;
       }
       e.haveLoc     = true;
-      e.projSlot    = m_projSlot;
-      e.projOffset  = m_projOffset;
-      e.projStage   = m_projStage;
-      e.columnMajor = m_columnMajor;
-      e.viewSlot    = m_viewSlot;
-      e.viewOffset  = m_viewOffset;
-      e.viewStage   = m_viewStage;
+      e.projSlot    = xfc().m_projSlot;
+      e.projOffset  = xfc().m_projOffset;
+      e.projStage   = xfc().m_projStage;
+      e.columnMajor = xfc().m_columnMajor;
+      e.viewSlot    = xfc().m_viewSlot;
+      e.viewOffset  = xfc().m_viewOffset;
+      e.viewStage   = xfc().m_viewStage;
     }
 
     // NV-DXVK [neg-cache] maintenance: decide on THIS draw's local projSlot
-    // (m_projSlot can carry a sticky cross-draw value), not the member. If this
+    // (xfc().m_projSlot can carry a sticky cross-draw value), not the member. If this
     // draw resolved a projection, clear any negative mark (positive wins). If a
     // full scan actually ran (skipExpensiveProjScan == false) and still found
     // nothing, stamp/refresh the VS as projection-less so subsequent draws skip
@@ -22111,9 +22126,9 @@ namespace dxvk {
           Logger::warn(str::format(
             "[NoProj] vs=0x", std::hex, npVsHash, std::dec,
             " scanRan=", (skipExpensiveProjScan ? 0 : 1),
-            " everFoundProj=", (m_hasEverFoundProj ? 1 : 0),
-            " wtvPath=", m_lastWtvPathId,
-            " o2wPath=", m_lastO2wPathId,
+            " everFoundProj=", (xfs().m_hasEverFoundProj ? 1 : 0),
+            " wtvPath=", xfc().m_lastWtvPathId,
+            " o2wPath=", xfc().m_lastO2wPathId,
             " w2vIsIdentity=", (isIdentityExact(transforms.worldToView) ? 1 : 0),
             " o2vIsIdentity=", (isIdentityExact(transforms.objectToView) ? 1 : 0),
             " frame=", m_context->m_device->getCurrentFrameId()));
@@ -22135,7 +22150,7 @@ namespace dxvk {
     // bounded â€” no growth. Remove once the transform-reliability fix lands.
     {
       const uint32_t zigFrame = m_context->m_device->getCurrentFrameId();
-      const uint32_t zigPath = m_lastWtvPathId;
+      const uint32_t zigPath = xfc().m_lastWtvPathId;
       static uint32_t s_zigLastFrame = UINT32_MAX;
       static std::array<bool, 16> s_zigSeenPath{};
       if (zigFrame != s_zigLastFrame) {
@@ -22156,7 +22171,7 @@ namespace dxvk {
           " vs=", getVsHashShort(),
           " vp=", int(transforms.viewportWidth), "x", int(transforms.viewportHeight),
           " v2pIdent=", isIdentityExact(transforms.viewToProjection) ? 1 : 0,
-          " fallback=", m_lastExtractUsedFallback ? 1 : 0,
+          " fallback=", xfc().m_lastExtractUsedFallback ? 1 : 0,
           " w2vT=(", tR, ",", tU, ",", tF, ")",
           " camPos=(", camX, ",", camY, ",", camZ, ")"));
       }
@@ -22166,7 +22181,7 @@ namespace dxvk {
     // Phase-0/1 diagnostic + capture bookkeeping below â€” so the split measures
     // the real ExtractTransforms work only. The Phase-0 logging in particular
     // runs solely on non-fallback draws, so timing past it would inflate the
-    // migratable bucket. m_lastExtractUsedFallback is already final at this point.
+    // migratable bucket. xfc().m_lastExtractUsedFallback is already final at this point.
     const int64_t p2ns = p2cpuTiming
         ? std::chrono::duration_cast<std::chrono::nanoseconds>(
               std::chrono::steady_clock::now() - tP2Start).count()
@@ -22181,7 +22196,7 @@ namespace dxvk {
     //   PHASE 1 (always on, behavior-neutral): fold the per-VS layout the
     //     legacy caches produced (classifier kind + vsLocCache proj/view
     //     locations + IlFacts) into the FORMAL VsLayoutDescriptor and record
-    //     it in m_vsLayoutTable under a dense layoutId. m_currentLayoutId is
+    //     it in m_vsLayoutTable under a dense layoutId. xfc().m_currentLayoutId is
     //     this draw's id, consumed later by the Phase-2 capture record.
     //     Nothing reads the table to alter rendering yet â€” write + verify only.
     //
@@ -22197,14 +22212,14 @@ namespace dxvk {
     // Phase-0 correction baked into the descriptor: o2w SOURCE is a per-DRAW
     // property, so it is NOT in the per-VS descriptor. UI-fallback draws are
     // skipped â€” they are filtered out of injection downstream, so they are not
-    // migration targets (m_currentLayoutId stays UINT32_MAX for them).
+    // migration targets (xfc().m_currentLayoutId stays UINT32_MAX for them).
     // Gated so PRODUCTION (both flags off) skips the whole block â€” no classify,
     // no memoIlFacts, no table population, no logging. The Phase-1 table only
     // needs to exist when Phase-2 capture consumes it (capturePhase2) or the
     // Phase-0 diagnostic logs it (logPhase0Descriptor).
-    m_currentLayoutId = UINT32_MAX;
+    xfc().m_currentLayoutId = UINT32_MAX;
     if ((RtxOptions::capturePhase2() || RtxOptions::logPhase0Descriptor())
-        && !m_lastExtractUsedFallback) {
+        && !xfc().m_lastExtractUsedFallback) {
       auto vsPtrP0 = drawVertexShaderCom();
       if (vsPtrP0 != nullptr && vsPtrP0->GetCommonShader() != nullptr) {
         const D3D11CommonShader* commonP0 = vsPtrP0->GetCommonShader();
@@ -22216,19 +22231,19 @@ namespace dxvk {
         // rescan â€” the same caches the real extraction already populated.
         const auto     clsP0     = D3D11VsClassifier::classify(commonP0, semsP0);
         const IlFacts& ilf       = memoIlFacts(semsP0);
-        const bool     projValid = (m_projSlot != UINT32_MAX);
+        const bool     projValid = (xfc().m_projSlot != UINT32_MAX);
 
         // --- PHASE 1: fold the resolved state into the formal descriptor and
         // record it in the layout table under a dense layoutId. ---
         VsLayoutDescriptor vld;
         vld.pathClass         = static_cast<uint32_t>(clsP0.kind);
-        vld.projStage         = m_projStage;
-        vld.projSlot          = m_projSlot;
-        vld.projByteOffset    = (uint32_t) m_projOffset;
-        vld.viewStage         = m_viewStage;
-        vld.viewSlot          = m_viewSlot;
-        vld.viewByteOffset    = (uint32_t) m_viewOffset;
-        vld.columnMajor       = m_columnMajor ? 1u : 0u;
+        vld.projStage         = xfc().m_projStage;
+        vld.projSlot          = xfc().m_projSlot;
+        vld.projByteOffset    = (uint32_t) xfc().m_projOffset;
+        vld.viewStage         = xfc().m_viewStage;
+        vld.viewSlot          = xfc().m_viewSlot;
+        vld.viewByteOffset    = (uint32_t) xfc().m_viewOffset;
+        vld.columnMajor       = xfc().m_columnMajor ? 1u : 0u;
         vld.texcoordEncoding  = (uint32_t) transforms.texcoordEncoding;
         vld.hasUintPos        = ilf.hasUintPos ? 1u : 0u;
         vld.hasInstIdxSem     = ilf.hasInstIdxSem ? 1u : 0u;
@@ -22237,7 +22252,7 @@ namespace dxvk {
         vld.hasBlendIndices   = ilf.hasBlendIndices ? 1u : 0u;
 
         bool layoutChanged = false;
-        m_currentLayoutId = m_vsLayoutTable.getOrAdd(
+        xfc().m_currentLayoutId = m_vsLayoutTable.getOrAdd(
           reinterpret_cast<uintptr_t>(commonP0), vld, projValid, layoutChanged);
 
         // --- PHASE 0: diagnostic logging (gated). Reuses clsP0 / ilf / the
@@ -22252,9 +22267,9 @@ namespace dxvk {
         // a change), so a clean session prints ZERO of these.
         if (layoutChanged) {
           Logger::info(str::format(
-            "[Phase1] LAYOUT-CHANGED layoutId=", m_currentLayoutId,
+            "[Phase1] LAYOUT-CHANGED layoutId=", xfc().m_currentLayoutId,
             " vs=", getVsHashShort(),
-            " mismatchCount=", m_vsLayoutTable.entries[m_currentLayoutId].mismatchCount));
+            " mismatchCount=", m_vsLayoutTable.entries[xfc().m_currentLayoutId].mismatchCount));
         }
 
         // ---- [ProjAmbig] follow-up probe for the ONE flagged VS ----
@@ -22273,17 +22288,17 @@ namespace dxvk {
         // De-duped per (frame, chosen-offset): at most a couple of lines/frame.
         // Targets by table flag, not a hardcoded hash â€” it follows whichever VS
         // is flagged. cm=0 for this VS so raw readCbMatrix == the extractor's read.
-        if (m_currentLayoutId != UINT32_MAX
-            && m_vsLayoutTable.entries[m_currentLayoutId].mismatchCount > 0) {
+        if (xfc().m_currentLayoutId != UINT32_MAX
+            && m_vsLayoutTable.entries[xfc().m_currentLayoutId].mismatchCount > 0) {
           static thread_local uint32_t s_paFrame = UINT32_MAX;
           static thread_local std::array<bool, 1024> s_paSeenOff{};
           const uint32_t paFrame = m_context->m_device->getCurrentFrameId();
           if (paFrame != s_paFrame) { s_paFrame = paFrame; s_paSeenOff.fill(false); }
-          const uint32_t chosenOff = (uint32_t) m_projOffset;
+          const uint32_t chosenOff = (uint32_t) xfc().m_projOffset;
           const uint32_t seenIdx   = (chosenOff / 16u) & 1023u;
           if (!s_paSeenOff[seenIdx]) {
             s_paSeenOff[seenIdx] = true;
-            const uint32_t slot = m_projSlot;
+            const uint32_t slot = xfc().m_projSlot;
             if (slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
               const auto& cb = m_context->m_state.vs.constantBuffers[slot];
               if (cb.buffer != nullptr) {
@@ -22297,10 +22312,10 @@ namespace dxvk {
                 const auto& v2p = transforms.viewToProjection;
                 Logger::info(str::format(
                   "[ProjAmbig] f=", paFrame, " vs=", getVsHashShort(),
-                  " layoutId=", m_currentLayoutId,
+                  " layoutId=", xfc().m_currentLayoutId,
                   " CHOSE off=", chosenOff, " slot=", slot,
                   " cbConstOff=", (uint32_t) cb.constantOffset, " cbBytes=", (uint32_t) len,
-                  " o2wPath=", m_lastO2wPathId, " drawID=", m_drawCallID,
+                  " o2wPath=", xfc().m_lastO2wPathId, " drawID=", m_drawCallID,
                   " v2p[0][0]=", v2p[0][0], " v2p[2][3]=", v2p[2][3], " v2p[3][2]=", v2p[3][2]));
                 auto dumpAt = [&](const char* tag, size_t off) {
                   const size_t abs = base + off;
@@ -22332,9 +22347,9 @@ namespace dxvk {
         // fact, so folding them in here would falsely flag stable layouts.
         const std::string layout = str::format(
           "kind=", D3D11VsClassifier::kindName(clsP0.kind),
-          " proj=", m_projStage, ":", m_projSlot, "@", (uint32_t) m_projOffset,
-          " view=", m_viewStage, ":", m_viewSlot, "@", (uint32_t) m_viewOffset,
-          " cm=", m_columnMajor ? 1 : 0,
+          " proj=", xfc().m_projStage, ":", xfc().m_projSlot, "@", (uint32_t) xfc().m_projOffset,
+          " view=", xfc().m_viewStage, ":", xfc().m_viewSlot, "@", (uint32_t) xfc().m_viewOffset,
+          " cm=", xfc().m_columnMajor ? 1 : 0,
           " texEnc=", (uint32_t) transforms.texcoordEncoding,
           " uintPos=", ilf.hasUintPos ? 1 : 0,
           " instIdx=", ilf.hasInstIdxSem ? 1 : 0, "@", ilf.instSemSlot, ":", ilf.instSemByteOffset,
@@ -22383,7 +22398,7 @@ namespace dxvk {
           e0.draws = 1;
           auto ins = s_p0Map.emplace(vsKey, std::move(e0));
           pe = &ins.first->second;
-          Logger::info(str::format("[Phase0] NEW vs=", vsKey, " layoutId=", m_currentLayoutId, " ", layout));
+          Logger::info(str::format("[Phase0] NEW vs=", vsKey, " layoutId=", xfc().m_currentLayoutId, " ", layout));
         } else {
           pe = &p0it->second;
           ++pe->draws;
@@ -22402,7 +22417,7 @@ namespace dxvk {
         // when a VS that already draws from one source starts drawing from
         // another â€” that VS is genuinely multi-mode (per-draw, not per-VS).
         {
-          const uint32_t cls = o2wSrcClass(m_lastO2wPathId);
+          const uint32_t cls = o2wSrcClass(xfc().m_lastO2wPathId);
           if (pe->srcCount[cls] == 0) {
             const uint32_t wasClasses = pe->srcClasses;
             ++pe->srcClasses;
@@ -22410,7 +22425,7 @@ namespace dxvk {
               Logger::info(str::format(
                 "[Phase0.MultiMode] vs=", vsKey,
                 " added-src=", kSrcName[cls],
-                " (nowClasses=", pe->srcClasses, ", o2wPath=", m_lastO2wPathId, ")"));
+                " (nowClasses=", pe->srcClasses, ", o2wPath=", xfc().m_lastO2wPathId, ")"));
             }
           }
           ++pe->srcCount[cls];
@@ -22484,7 +22499,7 @@ namespace dxvk {
         s_fcFbNs = s_fcMigNs = 0;
         s_fcFbN = s_fcMigN = 0;
       }
-      if (m_lastExtractUsedFallback) { s_fcFbNs  += p2ns; ++s_fcFbN; }
+      if (xfc().m_lastExtractUsedFallback) { s_fcFbNs  += p2ns; ++s_fcFbN; }
       else                          { s_fcMigNs += p2ns; ++s_fcMigN; }
     }
 
@@ -22495,7 +22510,7 @@ namespace dxvk {
     // sat next to [Path13Diag] (~:12890) and emitted ZERO lines across a full
     // run while [SubViewGate] emitted 34612 for the same hash from the same
     // option - so the option was live and the block simply was not reached.
-    // That whole region is inside `if (bm && m_lastO2wPathId == 0)`: it is the
+    // That whole region is inside `if (bm && xfc().m_lastO2wPathId == 0)`: it is the
     // path-13 CANDIDATE block, entered only while no path has been chosen yet.
     // The VS under investigation resolves to path 10 earlier, so it never gets
     // there. A probe that reports "which path was taken" must run where the
@@ -22611,7 +22626,7 @@ namespace dxvk {
           if (g_engineSkyCamOriginValid != 0u) {
             ++a.skyValidN;
           }
-          a.pathMask |= (m_lastO2wPathId < 32) ? (1u << m_lastO2wPathId) : 0u;
+          a.pathMask |= (xfc().m_lastO2wPathId < 32) ? (1u << xfc().m_lastO2wPathId) : 0u;
           a.mn[0] = std::min(a.mn[0], tx); a.mx[0] = std::max(a.mx[0], tx);
           a.mn[1] = std::min(a.mn[1], ty); a.mx[1] = std::max(a.mx[1], ty);
           a.mn[2] = std::min(a.mn[2], tz); a.mx[2] = std::max(a.mx[2], tz);
@@ -22699,12 +22714,12 @@ namespace dxvk {
              pd.t.texcoordEncoding == transforms.texcoordEncoding
           && pd.t.isSubView == transforms.isSubView
           && pd.t.isSubViewSkybox == transforms.isSubViewSkybox
-          && pd.o2wPathId == m_lastO2wPathId
-          && pd.wtvPathId == m_lastWtvPathId
-          && pd.skipViewScan == m_skipViewMatrixScan
-          && !m_lastExtractUsedFallback
-          && !m_lastClassifierSaidUi
-          && !m_currentDrawIsBoneTransformed;
+          && pd.o2wPathId == xfc().m_lastO2wPathId
+          && pd.wtvPathId == xfc().m_lastWtvPathId
+          && pd.skipViewScan == xfc().m_skipViewMatrixScan
+          && !xfc().m_lastExtractUsedFallback
+          && !xfc().m_lastClassifierSaidUi
+          && !xfc().m_currentDrawIsBoneTransformed;
         if (matsSame && flagsSame) {
           ++s_xtReplayStats.verifyOk;
           if (s_xtReplayPending.rec != nullptr) {
@@ -22768,14 +22783,14 @@ namespace dxvk {
             // wtvPath=1/3") that mixes both conventions and describes only 2
             // of the 4 VSes. Naming each side removes the trap instead of
             // silently swapping an order that older logs were read under.
-            " skipVS=", pd.skipViewScan == m_skipViewMatrixScan ? 1 : 0,
-            " skipVSfull=", m_skipViewMatrixScan ? 1 : 0,
+            " skipVS=", pd.skipViewScan == xfc().m_skipViewMatrixScan ? 1 : 0,
+            " skipVSfull=", xfc().m_skipViewMatrixScan ? 1 : 0,
             " skipVSreplay=", pd.skipViewScan ? 1 : 0,
-            " fbNow=", m_lastExtractUsedFallback ? 1 : 0,
-            " uiNow=", m_lastClassifierSaidUi ? 1 : 0,
-            " boneNow=", m_currentDrawIsBoneTransformed ? 1 : 0,
-            " o2wPathFull=", m_lastO2wPathId, " o2wPathReplay=", pd.o2wPathId,
-            " wtvPathFull=", m_lastWtvPathId, " wtvPathReplay=", pd.wtvPathId,
+            " fbNow=", xfc().m_lastExtractUsedFallback ? 1 : 0,
+            " uiNow=", xfc().m_lastClassifierSaidUi ? 1 : 0,
+            " boneNow=", xfc().m_currentDrawIsBoneTransformed ? 1 : 0,
+            " o2wPathFull=", xfc().m_lastO2wPathId, " o2wPathReplay=", pd.o2wPathId,
+            " wtvPathFull=", xfc().m_lastWtvPathId, " wtvPathReplay=", pd.wtvPathId,
             // v6.8 ROOT PROBE for the wtvPath-3 residual class. scanRanFull=0
             // means THIS draw had its projection scan suppressed by the
             // per-VS neg-cache (64-frame TTL); scanRanRec is the same bit as
@@ -22785,7 +22800,7 @@ namespace dxvk {
             // dependent inner gate. -1 = record pointer unavailable.
             " scanRanFull=", skipExpensiveProjScan ? 0 : 1,
             " scanRanRec=", recScanRan,
-            " fb=", m_lastExtractUsedFallback ? 1 : 0,
+            " fb=", xfc().m_lastExtractUsedFallback ? 1 : 0,
             " w2vT_full=(", transforms.worldToView[3][0], ",",
                             transforms.worldToView[3][1], ",",
                             transforms.worldToView[3][2], ")",
@@ -22838,15 +22853,15 @@ namespace dxvk {
           }
         }
         rr.frameId = m_context->m_device->getCurrentFrameId();
-        rr.o2wPathId = m_lastO2wPathId;
-        rr.modelSlot = m_lastModelCbSlot;  // v6 path-5/6 widening
+        rr.o2wPathId = xfc().m_lastO2wPathId;
+        rr.modelSlot = xfc().m_lastModelCbSlot;  // v6 path-5/6 widening
         // v6.3 path-1 widening: the t31 site's camO and its provenance.
-        rr.p1CamValid      = m_lastO2wCamValid;
-        rr.p1CamFromFanout = m_lastO2wCamFromFanout;
-        rr.p1CamOrigin     = m_lastO2wCamOrigin;
-        rr.p1CamOff        = m_lastO2wCamOff;
-        rr.wtvPathId = m_lastWtvPathId;
-        rr.skipViewScan = m_skipViewMatrixScan;
+        rr.p1CamValid      = xfc().m_lastO2wCamValid;
+        rr.p1CamFromFanout = xfc().m_lastO2wCamFromFanout;
+        rr.p1CamOrigin     = xfc().m_lastO2wCamOrigin;
+        rr.p1CamOff        = xfc().m_lastO2wCamOff;
+        rr.wtvPathId = xfc().m_lastWtvPathId;
+        rr.skipViewScan = xfc().m_skipViewMatrixScan;
         // v6.8 root probe: did THIS run actually scan for a projection, or was
         // the scan suppressed by the per-VS neg-cache? See XtReplayRec.
         rr.capScanRan = !skipExpensiveProjScan;
@@ -22859,24 +22874,24 @@ namespace dxvk {
         // v6.9b: read the verdict off the path id, NOT off the `viewCacheHit`
         // local -- the `goto skipViewScan` jumps over that variable's
         // initialiser, so on skip-scan draws its value is indeterminate here.
-        rr.capViewHit = (m_lastWtvPathId == 5u);
-        rr.foundRealProj = m_foundRealProjThisFrame;
+        rr.capViewHit = (xfc().m_lastWtvPathId == 5u);
+        rr.foundRealProj = xfs().m_foundRealProjThisFrame;
         rr.wroteLastGood = (s_xtLastGoodWriteN != xtCtl.lastGoodN0);
-        rr.camOriginSet = m_lastDrawCamOriginSet;
-        rr.camOriginMember = m_lastDrawCamOrigin;
+        rr.camOriginSet = xfc().m_lastDrawCamOriginSet;
+        rr.camOriginMember = xfc().m_lastDrawCamOrigin;
         rr.applySmooth =
-             (m_lastWtvPathId == 1 || m_lastWtvPathId == 2 || m_lastWtvPathId == 3)
+             (xfc().m_lastWtvPathId == 1 || xfc().m_lastWtvPathId == 2 || xfc().m_lastWtvPathId == 3)
           && !isIdentityExact(transforms.worldToView)
-          && !m_skipViewMatrixScan;
-        rr.smoothedCamPos = m_smoothedCamPos;
-        rr.columnMajor = m_columnMajor;
-        rr.projCombinedVP = m_projIsCombinedVP;
-        rr.projStage = m_projStage;
-        rr.projSlot = m_projSlot;
-        rr.projOffset = m_projOffset;
-        rr.viewStage = m_viewStage;
-        rr.viewSlot = m_viewSlot;
-        rr.viewOffset = m_viewOffset;
+          && !xfc().m_skipViewMatrixScan;
+        rr.smoothedCamPos = xfc().m_smoothedCamPos;
+        rr.columnMajor = xfc().m_columnMajor;
+        rr.projCombinedVP = xfc().m_projIsCombinedVP;
+        rr.projStage = xfc().m_projStage;
+        rr.projSlot = xfc().m_projSlot;
+        rr.projOffset = xfc().m_projOffset;
+        rr.viewStage = xfc().m_viewStage;
+        rr.viewSlot = xfc().m_viewSlot;
+        rr.viewOffset = xfc().m_viewOffset;
         rr.t = transforms;
 
         // NV-DXVK [CbLocSrc] 2026-08-10 -- PURE PROBE, NO BEHAVIOUR. Reads
@@ -22927,12 +22942,12 @@ namespace dxvk {
           if (xtVsLoc == nullptr || !xtVsLoc->haveLoc) {
             ++sNoEnt;
           } else {
-            const bool dPSlot  = (xtVsLoc->projSlot   != m_projSlot);
-            const bool dPOff   = (xtVsLoc->projOffset != m_projOffset);
-            const bool dPStage = (xtVsLoc->projStage  != m_projStage);
-            const bool dCol    = (xtVsLoc->columnMajor != m_columnMajor);
-            const bool dVSlot  = (xtVsLoc->viewSlot   != m_viewSlot);
-            const bool dVOff   = (xtVsLoc->viewOffset != m_viewOffset);
+            const bool dPSlot  = (xtVsLoc->projSlot   != xfc().m_projSlot);
+            const bool dPOff   = (xtVsLoc->projOffset != xfc().m_projOffset);
+            const bool dPStage = (xtVsLoc->projStage  != xfc().m_projStage);
+            const bool dCol    = (xtVsLoc->columnMajor != xfc().m_columnMajor);
+            const bool dVSlot  = (xtVsLoc->viewSlot   != xfc().m_viewSlot);
+            const bool dVOff   = (xtVsLoc->viewOffset != xfc().m_viewOffset);
             if (dPSlot)  ++sDPSlot;
             if (dPOff)   ++sDPOff;
             if (dPStage) ++sDPStage;
@@ -22979,7 +22994,7 @@ namespace dxvk {
         // witness/carry-covered) additionally arm p13CamOriginValid. A 5/6
         // record whose site consumed camO from a non-cb2 slot stays
         // ineligible (population check below).
-        if (m_lastO2wPathId == 13 || m_lastO2wPathId == 5 || m_lastO2wPathId == 6) {
+        if (xfc().m_lastO2wPathId == 13 || xfc().m_lastO2wPathId == 5 || xfc().m_lastO2wPathId == 6) {
           const D3D11CommonShader* commonCap =
             (drawVertexShaderCom() != nullptr)
               ? drawVertexShaderCom()->GetCommonShader() : nullptr;
@@ -23036,28 +23051,28 @@ namespace dxvk {
         // xt_cap cost the 08-09 handoff names. The genMiss-recapture
         // population is selected via proj-content identity, so for it the
         // stash hits by construction.
-        if (m_projStage == 0 && m_projSlot < 8u
+        if (xfc().m_projStage == 0 && xfc().m_projSlot < 8u
             && xtCtl.pjCacheValid
-            && xtCtl.pjCacheSlot == (uint32_t) m_projSlot
-            && xtCtl.pjCacheOff  == (uint32_t) m_projOffset) {
+            && xtCtl.pjCacheSlot == (uint32_t) xfc().m_projSlot
+            && xtCtl.pjCacheOff  == (uint32_t) xfc().m_projOffset) {
           std::memcpy(rr.projSrc, xtCtl.pjCache, sizeof(rr.projSrc));
-          rr.projSrcOff = static_cast<uint32_t>(m_projOffset);
+          rr.projSrcOff = static_cast<uint32_t>(xfc().m_projOffset);
           rr.projSrcValid = true;
         } else
-        if (m_projStage == 0 && m_projSlot < 8u) {
-          const auto& cbPj = m_context->m_state.vs.constantBuffers[m_projSlot];
+        if (xfc().m_projStage == 0 && xfc().m_projSlot < 8u) {
+          const auto& cbPj = m_context->m_state.vs.constantBuffers[xfc().m_projSlot];
           if (cbPj.buffer != nullptr) {
             const size_t basePj =
-              static_cast<size_t>(cbPj.constantOffset) * 16 + m_projOffset;
+              static_cast<size_t>(cbPj.constantOffset) * 16 + xfc().m_projOffset;
             size_t lenPj = 0;
-            const uint8_t* pPj = (m_projSlot == 2u)
+            const uint8_t* pPj = (xfc().m_projSlot == 2u)
               ? stagedCbBytes(cbPj.buffer.ptr(), lenPj)
               : stagedCbBytesIfHit(cbPj.buffer.ptr(), lenPj);
             if (pPj && basePj + sizeof(rr.projSrc) <= lenPj) {
               std::memcpy(rr.projSrc, pPj + basePj, sizeof(rr.projSrc));
-              rr.projSrcOff = static_cast<uint32_t>(m_projOffset);
+              rr.projSrcOff = static_cast<uint32_t>(xfc().m_projOffset);
               rr.projSrcValid = true;
-            } else if (m_projSlot != 2u) {
+            } else if (xfc().m_projSlot != 2u) {
               const auto mappedPj = cbPj.buffer->GetMappedSlice();
               if (mappedPj.mapPtr != nullptr
                   && std::min<size_t>(mappedPj.length, cbPj.buffer->Desc()->ByteWidth)
@@ -23065,7 +23080,7 @@ namespace dxvk {
                 memcpyFromWC(rr.projSrc,
                              static_cast<const uint8_t*>(mappedPj.mapPtr) + basePj,
                              sizeof(rr.projSrc));
-                rr.projSrcOff = static_cast<uint32_t>(m_projOffset);
+                rr.projSrcOff = static_cast<uint32_t>(xfc().m_projOffset);
                 rr.projSrcValid = true;
               }
             }
@@ -23083,11 +23098,11 @@ namespace dxvk {
         // reconstruction, whose inputs are cb2@96 rotation + cb2@4 camera
         // origin -- all cb2, all witness-covered (the site's own CamCache at
         // ~16418 keys on exactly the (cb2Buf, cb2Gen, cb2Off) triple).
-        // v6.5 FIX: the `m_viewSlot == 2u` escape admitted wtv paths 5-10 --
+        // v6.5 FIX: the `xfc().m_viewSlot == 2u` escape admitted wtv paths 5-10 --
         // "cached view-matrix slot", "scan near projection", "cross-stage
         // scan", "convention-flip fallback". WHICH of those a draw takes is
         // decided by scan results and by mutable cache state (path 9 even
-        // flips m_columnMajor as a side effect), none of which is in the
+        // flips xfc().m_columnMajor as a side effect), none of which is in the
         // replay key. So two draws with identical keys can legitimately take
         // different view routes, and replaying one record for the other gives
         // a different worldToView -- the wtvPath=5/1 verify failure. Only
@@ -23101,34 +23116,34 @@ namespace dxvk {
         // the mats=0 / wtvPath=5/1 failure, still firing after the first
         // attempt at this fix because the first attempt missed this branch.
         const bool xtViewOk =
-            m_lastWtvPathId <= 3u
-            && (m_skipViewMatrixScan
-                  ? (isIdentityExact(transforms.worldToView) || m_lastWtvPathId == 3)
-                  : (m_lastWtvPathId >= 1 && m_lastWtvPathId <= 3));
+            xfc().m_lastWtvPathId <= 3u
+            && (xfc().m_skipViewMatrixScan
+                  ? (isIdentityExact(transforms.worldToView) || xfc().m_lastWtvPathId == 3)
+                  : (xfc().m_lastWtvPathId >= 1 && xfc().m_lastWtvPathId <= 3));
         // Reason bits instead of one opaque bool, so [Perf.Replay.why] can
         // report WHICH rule keeps draws out of the population.
         uint32_t ineligBits = 0;
-        if (m_lastExtractUsedFallback || m_lastClassifierSaidUi)   ineligBits |= 1u;
-        if (m_currentDrawIsBoneTransformed)                        ineligBits |= 2u;
-        if (!(m_zUpSettled && m_yFlipSettled && m_lhSettled))      ineligBits |= 4u;
+        if (xfc().m_lastExtractUsedFallback || xfc().m_lastClassifierSaidUi)   ineligBits |= 1u;
+        if (xfc().m_currentDrawIsBoneTransformed)                        ineligBits |= 2u;
+        if (!(xfc().m_zUpSettled && xfc().m_yFlipSettled && xfc().m_lhSettled))      ineligBits |= 4u;
         if (transforms.instancesToObject != nullptr
             || transforms.isFanoutBatch)                           ineligBits |= 8u;
-        if (!(m_projStage == 0 && m_projSlot < 8u && rr.projSrcValid)) ineligBits |= 16u;
+        if (!(xfc().m_projStage == 0 && xfc().m_projSlot < 8u && rr.projSrcValid)) ineligBits |= 16u;
         if (!xtViewOk)                                             ineligBits |= 32u;
-        if (!((m_lastO2wPathId == 13 && rr.p13CamOriginValid)
-           || (m_lastO2wPathId == 0 && isIdentityExact(transforms.objectToWorld))
+        if (!((xfc().m_lastO2wPathId == 13 && rr.p13CamOriginValid)
+           || (xfc().m_lastO2wPathId == 0 && isIdentityExact(transforms.objectToWorld))
            // Path 4: o2w = inverse(worldToView) * cb3Mat. cb3 is re-read per
            // draw by the replay; worldToView comes from the snapshot, valid
            // because the wtvPath==3 requirement (enforced via xtViewOk for
            // skipViewScan draws) proves it is pure cb2 content.
-           || (m_lastO2wPathId == 4 && m_skipViewMatrixScan && m_lastWtvPathId == 3)
+           || (xfc().m_lastO2wPathId == 4 && xfc().m_skipViewMatrixScan && xfc().m_lastWtvPathId == 3)
            // v6 widening -- paths 5/6 (rdef CBufModelInstance multi-mode):
            // model block re-read fresh per draw from rr.modelSlot with the
            // cb3IsZero mode RE-EVALUATED; camO either unused by the site
            // (camSrcValid=false) or proven cb2 content (p13CamOriginValid).
            // Fanout draws and the fanout-fallback camO case are rejected at
            // replay time, not here (per-draw conditions).
-           || ((m_lastO2wPathId == 5 || m_lastO2wPathId == 6)
+           || ((xfc().m_lastO2wPathId == 5 || xfc().m_lastO2wPathId == 6)
                && rr.modelSlot < 8u
                && (!rr.camSrcValid || rr.p13CamOriginValid))
            // v6.3 widening -- path 1 (t31 per-instance model matrix). This is
@@ -23149,14 +23164,14 @@ namespace dxvk {
            // camSrcOff the carry tier memcmps, so admitting it would need its
            // own carry proof -- left ineligible, and counted (p1NoFanout) so
            // its real size is measured before that proof gets built.
-           || (m_lastO2wPathId == 1 && rr.p1CamValid && rr.p1CamFromFanout)
+           || (xfc().m_lastO2wPathId == 1 && rr.p1CamValid && rr.p1CamFromFanout)
            // v6.3 widening -- paths 2/3 (legacy t30 bone-0). 12.1% of draws.
            // 48 bytes at the start of the live t30 buffer, re-read per draw;
            // WHICH of the three reads succeeds (buffer slice / direct map /
            // full-bone cache) is re-evaluated at replay exactly as the site
            // does, so the replayed path id is re-derived rather than assumed.
            // No cb2 input at all, so nothing to witness.
-           || m_lastO2wPathId == 2 || m_lastO2wPathId == 3))
+           || xfc().m_lastO2wPathId == 2 || xfc().m_lastO2wPathId == 3))
                                                                    ineligBits |= 64u;
         rr.ineligBits = ineligBits;
         rr.eligible = (ineligBits == 0u);
@@ -23188,7 +23203,7 @@ namespace dxvk {
         // camera state this frame (camera-origin member, lastGood write,
         // smoothing) stays intra-frame only.
         rr.crossOk = rr.eligible
-          && m_skipViewMatrixScan
+          && xfc().m_skipViewMatrixScan
           // v6.4: identity was a PROXY for "nothing outside the memcmp'd
           // ranges fed this matrix". wtvPath 3 satisfies that requirement
           // directly -- its w2v is a closed form over cb2@16 + cb2@camOff,
@@ -23217,11 +23232,11 @@ namespace dxvk {
           // frame's sub-view verdict. Intra-frame is where the population
           // lives anyway (a stream's first draw captures, the rest of the
           // frame hits), so this costs almost nothing and removes the trap.
-          && !(m_lastO2wPathId == 1 || m_lastO2wPathId == 2 || m_lastO2wPathId == 3);
+          && !(xfc().m_lastO2wPathId == 1 || xfc().m_lastO2wPathId == 2 || xfc().m_lastO2wPathId == 3);
         // v6.3 genMiss attribution: same clauses, evaluated individually so a
         // blocked record can say WHICH one refused it.
         rr.crossWhy = 0u;
-        if (!m_skipViewMatrixScan)                        rr.crossWhy |= 1u;
+        if (!xfc().m_skipViewMatrixScan)                        rr.crossWhy |= 1u;
         // Mirrors the crossOk clause exactly, so the attribution can never
         // report "no reason" for a record crossOk actually refused.
         if (!isIdentityExact(transforms.worldToView))      rr.crossWhy |= 2u;
@@ -23956,6 +23971,17 @@ namespace dxvk {
   // if we are torn down mid-frame with items still collected, release them explicitly
   // to avoid leaking the pinned DxvkBuffer references.
   D3D11Rtx::~D3D11Rtx() {
+    // NV-DXVK [XfOverlap]: stop the overlap worker FIRST -- it holds `this` and
+    // may be inside ExtractTransforms. Joining here (before member destructors
+    // run) is what makes that safe; a detached thread would be the quit-freeze
+    // client.dll-unload bug all over again.
+    if (m_xfWorkerStarted) {
+      m_xfWorkerStop.store(true, std::memory_order_release);
+      { std::lock_guard<std::mutex> lk(m_xfWorkerMu); }
+      m_xfWorkerCv.notify_one();
+      if (m_xfWorker.joinable())
+        m_xfWorker.join();
+    }
     if (m_geoBatch) {
       for (auto& it : m_geoBatch->items) {
         it.matSnap.releasePins();
@@ -23965,6 +23991,276 @@ namespace dxvk {
       m_geoBatch->items.clear();
       m_geoBatch->resetPending();
     }
+  }
+
+  // ============================================================
+  // NV-DXVK [XfOverlap]: capture-time overlap of ExtractTransforms.
+  // Design + safety argument live on the XfCarriers block in d3d11_rtx.h;
+  // verification lives on rtx.extractOverlapVerify. Single job slot, single
+  // worker, at most one draw in flight -- the result is consumed in the SAME
+  // SubmitDraw that scheduled it, so draw ordering needs no machinery.
+  // ============================================================
+
+  void D3D11Rtx::ensureXfWorker() {
+    if (m_xfWorkerStarted)
+      return;
+    m_xfWorkerStarted = true;
+    m_xfWorkerStop.store(false, std::memory_order_release);
+    m_xfWorker = std::thread([this]() { xfWorkerLoop(); });
+  }
+
+  void D3D11Rtx::xfWorkerLoop() {
+    env::setThreadName("rtx-xf-overlap");
+    for (;;) {
+      // Spin briefly before sleeping: in steady state the frame thread queues
+      // a job every draw, so the spin almost always wins and the cv sleep only
+      // happens in menus / loading where latency is irrelevant.
+      uint32_t st = m_xfJob.state.load(std::memory_order_acquire);
+      int spins = 0;
+      while (st != 1u && spins < 4096
+             && !m_xfWorkerStop.load(std::memory_order_relaxed)) {
+        if ((++spins & 63) == 0)
+          std::this_thread::yield();
+        st = m_xfJob.state.load(std::memory_order_acquire);
+      }
+      if (m_xfWorkerStop.load(std::memory_order_acquire))
+        return;
+      if (st != 1u) {
+        std::unique_lock<std::mutex> lk(m_xfWorkerMu);
+        m_xfWorkerCv.wait(lk, [this]() {
+          return m_xfWorkerStop.load(std::memory_order_acquire)
+              || m_xfJob.state.load(std::memory_order_acquire) == 1u;
+        });
+        if (m_xfWorkerStop.load(std::memory_order_acquire))
+          return;
+        continue;
+      }
+      // Claim it. A failed CAS means the frame thread cancelled (1 -> 0).
+      uint32_t expect = 1u;
+      if (!m_xfJob.state.compare_exchange_strong(expect, 2u,
+                                                 std::memory_order_acq_rel))
+        continue;
+      const auto t0 = std::chrono::steady_clock::now();
+      // The override routes every xfc()/xfs() access inside the derivation --
+      // including XtPurityGuard's carrier hashing -- to the job's private copy.
+      // Globals stay untouched until the join applies them (or never, if the
+      // draw early-returns and the job is discarded).
+      t_xfOverride = &m_xfJob.ctx;
+      m_xfJob.result = ExtractTransforms();
+      t_xfOverride = nullptr;
+      // XtPurityGuard published its verdicts on THIS thread's TLs; carry them
+      // on the job so the frame thread's xfElig/xfElig3 billing still splits.
+      m_xfJob.eligLast  = s_xtEligLast;
+      m_xfJob.elig3Last = s_xtElig3Last;
+      m_xfJob.workerNs  = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - t0).count();
+      m_xfJob.state.store(3u, std::memory_order_release);
+    }
+  }
+
+  bool D3D11Rtx::scheduleExtractOverlap() {
+    // Reclaim the slot FIRST, even when the option is off: a stale QUEUED job
+    // (left by an early-returned draw just before the option was flipped off)
+    // could otherwise be picked up by the spinning worker while the frame
+    // thread runs the derivation serially, and the two would race on the
+    // per-VS learning caches. Drain unconditionally; schedule conditionally.
+    //
+    // A draw that early-returned between capture and consume left its job
+    // queued (1) or done (3); both are DISCARDED. That is the privatisation
+    // doing its job: serial execution never ran the derivation for that draw,
+    // so its side effects must never be applied.
+    const auto t0 = std::chrono::steady_clock::now();
+    uint32_t st = m_xfJob.state.load(std::memory_order_acquire);
+    if (st == 1u) {
+      uint32_t expect = 1u;
+      if (m_xfJob.state.compare_exchange_strong(expect, 0u,
+                                                std::memory_order_acq_rel)) {
+        ++s_xfOvDiscardN;
+        st = 0u;
+      } else {
+        st = m_xfJob.state.load(std::memory_order_acquire);
+      }
+    }
+    if (st == 2u) {
+      // Worker mid-run on a stale job (only possible after an early return).
+      // The slot cannot be reseeded under a running worker; wait it out.
+      while ((st = m_xfJob.state.load(std::memory_order_acquire)) == 2u)
+        std::this_thread::yield();
+    }
+    if (st == 3u) {
+      ++s_xfOvDiscardN;
+      m_xfJob.state.store(0u, std::memory_order_relaxed);
+    }
+    if (!RtxOptions::extractOverlap())
+      return false;
+    ensureXfWorker();
+    // Seed the private carrier view. These are the values the serial
+    // derivation would read at the consume point -- identical, because the
+    // intervening stages write none of them ([Perf.StageDep] wrote=0% on all
+    // 47 stages + the 2026-08-10 two-direction member audit).
+    m_xfJob.ctx.c = m_xfc;
+    {
+      std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
+      m_xfJob.ctx.s = s_xfStatics;
+    }
+    m_xfJob.ctx.sSeed = m_xfJob.ctx.s;
+    m_xfJob.drawId    = m_drawCallID;
+    m_xfJob.state.store(1u, std::memory_order_release);
+    // Lost-wakeup guard: the worker re-checks the state under this mutex
+    // before sleeping, so an empty lock ahead of the notify is sufficient.
+    { std::lock_guard<std::mutex> lk(m_xfWorkerMu); }
+    m_xfWorkerCv.notify_one();
+    s_xfOvSchedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    ++s_xfOvSchedN;
+    return true;
+  }
+
+  // Field-wise equality for the latched last-good transforms. memcmp over the
+  // whole struct would compare padding and the fanout pointers' identity is
+  // what matters, not their contents.
+  static bool xfLastGoodEqual(const DrawCallTransforms& a, const DrawCallTransforms& b) {
+    return std::memcmp(&a.objectToWorld,    &b.objectToWorld,    sizeof(Matrix4)) == 0
+        && std::memcmp(&a.objectToView,     &b.objectToView,     sizeof(Matrix4)) == 0
+        && std::memcmp(&a.worldToView,      &b.worldToView,      sizeof(Matrix4)) == 0
+        && std::memcmp(&a.viewToProjection, &b.viewToProjection, sizeof(Matrix4)) == 0
+        && std::memcmp(&a.textureTransform, &b.textureTransform, sizeof(Matrix4)) == 0
+        && a.enableClipPlane == b.enableClipPlane
+        && std::memcmp(&a.clipPlane, &b.clipPlane, sizeof(Vector4)) == 0
+        && a.texgenMode == b.texgenMode
+        && a.texcoordEncoding == b.texcoordEncoding
+        && a.instancesToObject == b.instancesToObject;
+  }
+
+  bool D3D11Rtx::joinExtractOverlap(DrawCallTransforms& out) {
+    // Deliberately STATE-driven, not option-driven: if a worker holds a job
+    // for this draw, it must be joined even when rtx.extractOverlap was
+    // flipped off mid-window -- returning early here would run the serial
+    // derivation CONCURRENTLY with the worker's, racing on the per-VS
+    // learning caches.
+    uint32_t st = m_xfJob.state.load(std::memory_order_acquire);
+    if (st == 0u || m_xfJob.drawId != m_drawCallID) {
+      // No job for this draw (mode off / slot was stale): serial fallback,
+      // byte-identical behaviour.
+      if (RtxOptions::extractOverlap())
+        ++s_xfOvSerialN;
+      return false;
+    }
+    const auto tw0 = std::chrono::steady_clock::now();
+    int spins = 0;
+    while ((st = m_xfJob.state.load(std::memory_order_acquire)) != 3u) {
+      if ((++spins & 63) == 0)
+        std::this_thread::yield();
+    }
+    s_xfOvJoinNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - tw0).count();
+    ++s_xfOvJoinN;
+
+    if (RtxOptions::extractOverlapVerify()) {
+      // PROOF MODE. Run the authoritative serial derivation against the real
+      // carriers, compare, count, and use the SERIAL result -- overlap
+      // equivalence is proven the way everything in this project is proven:
+      // FAIL stays 0 or the change is wrong. Costs a double derivation and
+      // double-runs the learning caches / [DrawPure] tallies; measurement
+      // tool, not a shipping mode.
+      DrawCallTransforms serial = ExtractTransforms();
+      const XfCarriers& wc = m_xfJob.ctx.c;
+      const XfCarriers& sc = m_xfc;   // serial run just updated the authoritative state
+      // Non-short-circuiting compare that records WHICH fields diverged --
+      // "carriers=DIFF" alone cannot locate the unrouted write (1c step 4).
+      std::string xfDiffFields;
+      bool carriersSame = true;
+      #define XF_EQ(f) do { \
+        if (std::memcmp(&wc.f, &sc.f, sizeof(wc.f)) != 0) { \
+          carriersSame = false; \
+          if (xfDiffFields.size() < 256) { xfDiffFields += " "; xfDiffFields += #f; } \
+        } } while (0)
+      XF_EQ(m_lastDrawCamOrigin); XF_EQ(m_lastDrawCamOriginSet);
+      XF_EQ(m_lastO2wCamOrigin); XF_EQ(m_lastO2wCamValid);
+      XF_EQ(m_lastO2wCamFromFanout); XF_EQ(m_lastO2wCamOff);
+      XF_EQ(m_smoothedCamPos); XF_EQ(m_hasPrevCamPos);
+      XF_EQ(m_lastWtvPathId); XF_EQ(m_lastO2wPathId); XF_EQ(m_lastModelCbSlot);
+      XF_EQ(m_projSlot); XF_EQ(m_projOffset); XF_EQ(m_projStage);
+      XF_EQ(m_columnMajor); XF_EQ(m_projIsCombinedVP);
+      XF_EQ(m_viewSlot); XF_EQ(m_viewOffset); XF_EQ(m_viewStage);
+      XF_EQ(m_lastExtractUsedFallback); XF_EQ(m_lastClassifierSaidUi);
+      XF_EQ(m_skipViewMatrixScan); XF_EQ(m_currentDrawIsBoneTransformed);
+      XF_EQ(m_remixActiveThisFrame); XF_EQ(m_currentLayoutId);
+      XF_EQ(m_camFallbackCache.cb2Buffer); XF_EQ(m_camFallbackCache.cb2Gen);
+      XF_EQ(m_camFallbackCache.cb2Offset); XF_EQ(m_camFallbackCache.frameId);
+      XF_EQ(m_camFallbackCache.valid); XF_EQ(m_camFallbackCache.worldToView);
+      XF_EQ(m_axisDetected); XF_EQ(m_axisLogged);
+      XF_EQ(m_zUpVotes); XF_EQ(m_lhVotes); XF_EQ(m_yFlipVotes);
+      XF_EQ(m_zUpSettled); XF_EQ(m_lhSettled); XF_EQ(m_yFlipSettled);
+      #undef XF_EQ
+      const bool resultSame = xfLastGoodEqual(serial, m_xfJob.result)
+        && serial.isFanoutBatch == m_xfJob.result.isFanoutBatch;
+      if (resultSame && carriersSame) {
+        ++s_xfOvVerifyOk;
+      } else {
+        ++s_xfOvVerifyFail;
+        if (s_xfOvVerifyFail <= 8) {
+          Logger::warn(str::format("[XfOverlap] VERIFY FAIL draw=", m_drawCallID,
+              " result=", resultSame ? "same" : "DIFF",
+              " carriers=", carriersSame ? "same" : "DIFF",
+              " fields=[", xfDiffFields, " ]",
+              " (worker ran vs pre-window state; serial vs post-window --"
+              " a diff means the window-independence audit has a hole)"));
+        }
+      }
+      out = serial;
+      m_xfJob.state.store(0u, std::memory_order_release);
+      return true;
+    }
+
+    // APPLY. Instance carriers whole-copy: the worker's end-state IS the
+    // serial end-state, because nothing else writes these members (audited;
+    // enforced by them living inside XfCarriers).
+    m_xfc = m_xfJob.ctx.c;
+    // Statics changed-fields-only: deferred-context instances read AND write
+    // these concurrently, and the derivation only writes them on success, so
+    // an unchanged field must not clobber a fresher concurrent latch (a
+    // whole-copy could regress m_foundRealProjThisFrame true -> false).
+    {
+      std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
+      const XfStaticCarriers& seed = m_xfJob.ctx.sSeed;
+      const XfStaticCarriers& got  = m_xfJob.ctx.s;
+      if (got.m_foundRealProjThisFrame != seed.m_foundRealProjThisFrame)
+        s_xfStatics.m_foundRealProjThisFrame = got.m_foundRealProjThisFrame;
+      if (got.m_hasEverFoundProj != seed.m_hasEverFoundProj)
+        s_xfStatics.m_hasEverFoundProj = got.m_hasEverFoundProj;
+      if (!xfLastGoodEqual(got.m_lastGoodTransforms, seed.m_lastGoodTransforms))
+        s_xfStatics.m_lastGoodTransforms = got.m_lastGoodTransforms;
+    }
+    // Mirror the worker's purity verdicts onto THIS thread's TLs so the
+    // xfElig/xfElig3 billing split at the consume site works unchanged.
+    s_xtEligLast   = m_xfJob.eligLast;
+    s_xtElig3Last  = m_xfJob.elig3Last;
+    s_xfOvWorkerNs += m_xfJob.workerNs;
+    out = m_xfJob.result;
+    m_xfJob.state.store(0u, std::memory_order_release);
+    return true;
+  }
+
+  void D3D11Rtx::discardExtractOverlap(const char* why) {
+    uint32_t st = m_xfJob.state.load(std::memory_order_acquire);
+    if (st == 0u)
+      return;
+    if (st == 1u) {
+      uint32_t expect = 1u;
+      if (m_xfJob.state.compare_exchange_strong(expect, 0u,
+                                                std::memory_order_acq_rel)) {
+        ++s_xfOvDiscardN;
+        return;
+      }
+    }
+    while ((st = m_xfJob.state.load(std::memory_order_acquire)) == 2u)
+      std::this_thread::yield();
+    if (st == 3u) {
+      ++s_xfOvDiscardN;
+      m_xfJob.state.store(0u, std::memory_order_relaxed);
+    }
+    (void)why;
   }
 
   // ============================================================
@@ -24062,7 +24358,7 @@ namespace dxvk {
   //
   // WHY THE BYTE CAPTURE IS NARROW. The live consumers call stagedCbBytes(),
   // which hands back the WHOLE buffer, and several of them SCAN it -- "scan
-  // near projection (offset-64)", "cross-stage all-cb scan", the m_viewSlot
+  // near projection (offset-64)", "cross-stage all-cb scan", the xfc().m_viewSlot
   // hunt. A scan cannot be made pure by a narrow copy, and copying whole
   // cbuffers per draw is the ~6.3 KB/call WC staging cost that [Perf.WcCopy]
   // already billed at 91% of pole-thread WC bytes. So we capture only spans we
@@ -24261,6 +24557,23 @@ namespace dxvk {
     if (slot >= vbs.size())
       return kNoVertexBuffer;
     return vbs[slot];
+  }
+
+  // NV-DXVK [PhaseB] 2026-08-10: two identity accessors over fields the capture
+  // already records, same record-first/live-fallback shape as every drawXxx
+  // accessor. Behaviour-neutral today (the snapshot IS this draw's bindings);
+  // load-bearing for the capture-only endgame, where the consumer half must
+  // read no live context state at all.
+  const D3D11IndexBufferBinding& D3D11Rtx::drawIndexBuffer() const {
+    if (const DrawSnapshot* s = drawSnap())
+      return s->indexBuffer;
+    return m_context->m_state.ia.indexBuffer;
+  }
+
+  const Com<D3D11PixelShader>& D3D11Rtx::drawPixelShaderCom() const {
+    if (const DrawSnapshot* s = drawSnap())
+      return s->ps;
+    return m_context->m_state.ps.shader;
   }
 
   // [5b] See the declarations for the contract. The two of them are what move
@@ -24884,7 +25197,7 @@ namespace dxvk {
     // STAGE ENCODING: projStage/viewStage are -1 until resolved and 0 for the
     // VERTEX stage (this file ~:16718, ~:18073). We handle stage 0 only, and
     // that is not a shortcut: the replay tier's own eligibility test requires
-    // m_projStage == 0 (~:22043, ~:22120), so stage 0 IS the replayable
+    // xfc().m_projStage == 0 (~:22043, ~:22120), so stage 0 IS the replayable
     // population by construction. A draw whose projection lives anywhere else
     // was never going to be served off the serial path anyway.
     //
@@ -24933,7 +25246,7 @@ namespace dxvk {
             //
             // THE BASE IS NOT OPTIONAL. projOffset/viewOffset are RELATIVE to
             // constantOffset*16 -- see the XtReplayRec field comment at ~:10381
-            // ("m_projOffset (relative to constantOffset*16)"), and the values
+            // ("xfc().m_projOffset (relative to constantOffset*16)"), and the values
             // are 16 / 96, i.e. the cb2@16 and cb2@96 reads. The consumers
             // compute basePs = constantOffset*16 + off (freshProj, ~:15024), so
             // the capture must add the same base or it copies a different 64
@@ -24953,7 +25266,7 @@ namespace dxvk {
             // VIEW USES A DIFFERENT CONVENTION FROM PROJ. Deliberate, not a
             // slip. The proj consumers add the bound-range base
             // (constantOffset*16 + projSrcOff -- freshProj ~:15024, ~:15620,
-            // ~:15337, with rr.projSrcOff = m_projOffset at ~:22096), but the
+            // ~:15337, with rr.projSrcOff = xfc().m_projOffset at ~:22096), but the
             // view consumer reads rec->viewOffset with NO base
             // (readCbMatrix(pV, rec->viewOffset, ...) ~:15709). Capture must
             // match whichever consumer will call find(), so each span uses its
@@ -24961,7 +25274,7 @@ namespace dxvk {
             //
             // That divergence is PRE-EXISTING and LATENT: the projection scan
             // at ~:16584 iterates absolute buffer offsets and stores the winner
-            // into m_projOffset, which the tier then re-bases -- consistent only
+            // into xfc().m_projOffset, which the tier then re-bases -- consistent only
             // while constantOffset is 0 for these cbuffers. The cbOff counter
             // in the [DrawSnap] census below measures whether that ever breaks.
             if (L.viewStage == 0 && L.viewOffset != SIZE_MAX
@@ -25623,7 +25936,7 @@ namespace dxvk {
     // NV-DXVK [SkyMtnPsKey]: one-shot-per-VS blend-state capture for the
     // path-13 SKY family + observed top-drift VSes. Hoisted to the top of
     // FillMaterialData (was previously nested inside the R32G32_UINT
-    // m_skipViewMatrixScan + m_lastO2wPathId==0 branch at line 6534/6562,
+    // xfc().m_skipViewMatrixScan + xfc().m_lastO2wPathId==0 branch at line 6534/6562,
     // which meant it never fired for non-R32G32_UINT draws â€” VS 0x2a729
     // is on a different path so its blend state was never captured even
     // though it was in the hash list). This location fires for every
@@ -28470,26 +28783,26 @@ namespace dxvk {
     const auto mixM4 = [&mix](const Matrix4& m) { mix(&m, sizeof(Matrix4)); };
 
     // -- camera-origin carriers (read by paths 1/5/6/13 on later draws) --
-    mixV3(m_lastDrawCamOrigin);      mix(&m_lastDrawCamOriginSet, 1);
-    mixV3(m_lastO2wCamOrigin);       mix(&m_lastO2wCamValid, 1);
-    mix(&m_lastO2wCamFromFanout, 1); mix(&m_lastO2wCamOff, 4);
+    mixV3(xfc().m_lastDrawCamOrigin);      mix(&xfc().m_lastDrawCamOriginSet, 1);
+    mixV3(xfc().m_lastO2wCamOrigin);       mix(&xfc().m_lastO2wCamValid, 1);
+    mix(&xfc().m_lastO2wCamFromFanout, 1); mix(&xfc().m_lastO2wCamOff, 4);
     mixV3(m_lastFanoutCamOrigin);    mix(&m_hasFanoutCamOrigin, 1);
     mixV3(m_lastViewmodelCamOrigin); mix(&m_hasViewmodelCamOrigin, 1);
     mixV3(m_lastFanoutVpRow0); mixV3(m_lastFanoutVpRow1); mixV3(m_lastFanoutVpRow2);
     mix(&m_hasFanoutVpRows, 1);
-    mixV3(m_smoothedCamPos);         mix(&m_hasPrevCamPos, 1);
+    mixV3(xfc().m_smoothedCamPos);         mix(&xfc().m_hasPrevCamPos, 1);
     seal();   // kSdepCam
 
     // -- route state: which path the NEXT draw will take --
     // DELIBERATELY EMPTY as of 2026-08-10. The three fields hashed here until
-    // now -- m_lastWtvPathId, m_lastO2wPathId, m_lastModelCbSlot -- are
+    // now -- xfc().m_lastWtvPathId, xfc().m_lastO2wPathId, xfc().m_lastModelCbSlot -- are
     // per-draw scratch, exactly like the six in the block below, so by this
     // list's own contract they are not carriers. The previous note here said
     // "nothing resets them per draw". That was never true; verified:
     //
-    //   m_lastWtvPathId    reset :14559 | set :17224/:18120/:18291/:19098+
-    //   m_lastO2wPathId    reset :14560 | set :18724/:19651/:19857/:31501+
-    //   m_lastModelCbSlot  reset :14561 | set :20089, read :21934
+    //   xfc().m_lastWtvPathId    reset :14559 | set :17224/:18120/:18291/:19098+
+    //   xfc().m_lastO2wPathId    reset :14560 | set :18724/:19651/:19857/:31501+
+    //   xfc().m_lastModelCbSlot  reset :14561 | set :20089, read :21934
     //
     // All three resets are unconditional at the top of ExtractTransforms, and
     // SubmitDraw calls that ONCE, at :31222. So every functional read (:19424,
@@ -28540,13 +28853,13 @@ namespace dxvk {
     // draw holds changes which records exist and which may replay. Retiring
     // this group needs the tier's view of these fields decoupled first; it is
     // not reachable by changing where the seed comes from.
-    // NOTE m_viewStage is cross-draw state this list has always MISSED -- a
+    // NOTE xfc().m_viewStage is cross-draw state this list has always MISSED -- a
     // genuine hole, deliberately left as-is because adding it would only lower
     // eligibility further while the group is hashed anyway.
     //
-    mix(&m_projSlot, 4); mix(&m_projOffset, sizeof(size_t)); mix(&m_projStage, sizeof(int));
-    mix(&m_columnMajor, 1);
-    mix(&m_viewSlot, 4); mix(&m_viewOffset, sizeof(size_t));
+    mix(&xfc().m_projSlot, 4); mix(&xfc().m_projOffset, sizeof(size_t)); mix(&xfc().m_projStage, sizeof(int));
+    mix(&xfc().m_columnMajor, 1);
+    mix(&xfc().m_viewSlot, 4); mix(&xfc().m_viewOffset, sizeof(size_t));
     seal();   // kSdepCbLoc
 
     // -- THE CLASSIFICATION LATCHES ARE DELIBERATELY *NOT* HASHED. --
@@ -28561,9 +28874,9 @@ namespace dxvk {
     //     immediately before SubmitDraw, and consumed by that same OnDraw* the
     //     moment it returns (:9630-:9631, :9646, :9688-:9689, :9704-:9705) to
     //     decide whether the game skips D3D11 rasterization.
-    //   m_lastExtractUsedFallback (reset :14555)
-    //   m_lastClassifierSaidUi    (reset :14556)
-    //   m_skipViewMatrixScan      (reset :14596)
+    //   xfc().m_lastExtractUsedFallback (reset :14555)
+    //   xfc().m_lastClassifierSaidUi    (reset :14556)
+    //   xfc().m_skipViewMatrixScan      (reset :14596)
     //     all reset in ExtractTransforms' per-draw block and read back later in
     //     the SAME draw (:19079, :19424, :20606, :21299, :21796).
     //
@@ -28592,12 +28905,12 @@ namespace dxvk {
     // would change the contention this probe is meant to characterise. A torn
     // read can only manufacture a false "wrote", never a false "clean", so the
     // error is in the conservative direction for a parallelisation decision.
-    mix(&m_foundRealProjThisFrame, 1);
-    mixM4(m_lastGoodTransforms.objectToWorld);
-    mixM4(m_lastGoodTransforms.objectToView);
-    mixM4(m_lastGoodTransforms.worldToView);
-    mixM4(m_lastGoodTransforms.viewToProjection);
-    mixM4(m_lastGoodTransforms.textureTransform);
+    mix(&xfs().m_foundRealProjThisFrame, 1);
+    mixM4(xfs().m_lastGoodTransforms.objectToWorld);
+    mixM4(xfs().m_lastGoodTransforms.objectToView);
+    mixM4(xfs().m_lastGoodTransforms.worldToView);
+    mixM4(xfs().m_lastGoodTransforms.viewToProjection);
+    mixM4(xfs().m_lastGoodTransforms.textureTransform);
     seal();   // kSdepStatic
   }
 
@@ -28985,6 +29298,14 @@ namespace dxvk {
       // Latch only after capture has actually produced a record for THIS draw.
       m_drawSnapValid = (m_drawSnapCur != nullptr);
     }
+
+    // NV-DXVK [XfOverlap]: hand the derivation to the worker NOW. Everything
+    // the frame thread runs from here to the consume point (~1,006 ms/window,
+    // 2.3x the derivation -- HANDOFF_DEFERRAL_2026-08-10c sec 3b) is its
+    // shadow. Deliberately NOT gated on m_drawSnapValid: the overlap is safe
+    // without a snapshot (live bytes are stable while the game thread is
+    // blocked in SubmitDraw); with one, the worker's reads are record-served.
+    scheduleExtractOverlap();
 
     // NV-DXVK [perf]: stall-immune CPU measurement of the whole SubmitDraw.
     // RAII so it fires on every return path (early filter rejects included).
@@ -33435,7 +33756,12 @@ namespace dxvk {
     std::memcpy(dcs.studioModelName, m_curStudioName, sizeof(dcs.studioModelName));
     dcs.geometryData     = geo;
     markStg(s_perfBtGeoCopyAcc, s_perfBtGeoCopyMax);
-    dcs.transformData    = ExtractTransforms();
+    // NV-DXVK [XfOverlap]: consume the overlapped derivation when a worker ran
+    // it (bt_extractXf then bills the JOIN WAIT + apply -- the true residual
+    // frame-thread cost -- and the elig split below bills the verdicts the job
+    // carried over). Serial fallback is byte-identical behaviour.
+    if (!joinExtractOverlap(dcs.transformData))
+      dcs.transformData  = ExtractTransforms();
     {
       // NV-DXVK [Perf.EligCost] 5a. ONE interval, billed twice: to the stage
       // total (byte-for-byte the number every previous run reported) and to the
@@ -33593,7 +33919,7 @@ namespace dxvk {
           if (zbFrame != s_zbLastFrame) {
             s_zbLastFrame = zbFrame;
             uint32_t rdefSlot = UINT32_MAX;
-            auto vsP = m_context->m_state.vs.shader;
+            auto vsP = drawVertexShaderCom();
             if (vsP != nullptr && vsP->GetCommonShader() != nullptr)
               rdefSlot = memoBoneMatrixSlot(vsP->GetCommonShader());
             // Viewmodel skinning uses the conventional t30 bone SRV slot, not a
@@ -33602,7 +33928,7 @@ namespace dxvk {
             const uint32_t useSlot = (rdefSlot != UINT32_MAX) ? rdefSlot : 30u;
             ID3D11ShaderResourceView* bsrv =
               (useSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT)
-                ? m_context->m_state.vs.shaderResources.views[useSlot].ptr()
+                ? drawVsSrv(useSlot)
                 : nullptr;
             const uint8_t* bp = nullptr;
             size_t blen = 0;
@@ -33712,8 +34038,8 @@ namespace dxvk {
         }
         if (!haveMainW2v) {
           std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
-          if (!isIdentityExact(m_lastGoodTransforms.worldToView)) {
-            mainW2v = m_lastGoodTransforms.worldToView;
+          if (!isIdentityExact(xfs().m_lastGoodTransforms.worldToView)) {
+            mainW2v = xfs().m_lastGoodTransforms.worldToView;
             haveMainW2v = true;
           }
         }
@@ -33725,10 +34051,10 @@ namespace dxvk {
           dcs.transformData.objectToWorld = inverse(dcs.transformData.worldToView);
         }
         dcs.transformData.objectToView = Matrix4(); // identity (already view-space)
-        m_lastO2wPathId = 12; // viewmodel: o2w = mainViewToWorld (BLAS in view space)
+        xfc().m_lastO2wPathId = 12; // viewmodel: o2w = mainViewToWorld (BLAS in view space)
 
         // NV-DXVK [ZigVmO2w]: prove the gun-jitter ROOT and the FIX in one log.
-        // The o2w just set = inverse(m_lastGoodTransforms.worldToView) â€” the
+        // The o2w just set = inverse(xfs().m_lastGoodTransforms.worldToView) â€” the
         // cached PER-DRAW view that wobbles Â±1u (path1/path3 last-wins). The
         // engine-hook view g_engineMainW2v (same stable source as engineEye)
         // would place the gun jitter-free. o2w translation == recovered camera
@@ -33736,7 +34062,7 @@ namespace dxvk {
         //   cur = o2w[3] actually used (expect Â±1u wobble in .x â†’ the bug)
         //   eng = camPos from g_engineMainW2v via -R^T*t (expect flat â†’ the fix)
         // If cur.x wobbles while eng.x is steady, the fix is: use g_engineMainW2v
-        // here (when capCnt>0) instead of m_lastGoodTransforms.worldToView.
+        // here (when capCnt>0) instead of xfs().m_lastGoodTransforms.worldToView.
         {
           const uint32_t zvFrame = m_context->m_device->getCurrentFrameId();
           static uint32_t s_zvLastFrame = UINT32_MAX;
@@ -33762,7 +34088,7 @@ namespace dxvk {
 
         // NV-DXVK [ZigMtxDiff]: RAW element-wise comparison of the engine-hook
         // main view (E = g_engineMainW2v) against the cached per-draw main view
-        // (G = m_lastGoodTransforms.worldToView), with NO -(R^T*t) camPos
+        // (G = xfs().m_lastGoodTransforms.worldToView), with NO -(R^T*t) camPos
         // recovery. That recovery is ill-conditioned and inflated the earlier
         // [ZigVmO2w]/[ZigW2v] "lag" numbers (the handoff already flagged the
         // [ZigW2v] +/-18u as a recovery artifact). Both matrices are worldToView
@@ -33797,8 +34123,8 @@ namespace dxvk {
             bool haveG = false;
             {
               std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
-              if (!isIdentityExact(m_lastGoodTransforms.worldToView)) {
-                G = m_lastGoodTransforms.worldToView;
+              if (!isIdentityExact(xfs().m_lastGoodTransforms.worldToView)) {
+                G = xfs().m_lastGoodTransforms.worldToView;
                 haveG = true;
               }
             }
@@ -33934,12 +34260,12 @@ namespace dxvk {
         bool didW2vRescue = false;
         if (w2vTMag2 < 1.0f) {
           std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
-          const auto& cached = m_lastGoodTransforms.worldToView;
+          const auto& cached = xfs().m_lastGoodTransforms.worldToView;
           const float cachedTMag2 =
             cached[3][0]*cached[3][0] + cached[3][1]*cached[3][1] + cached[3][2]*cached[3][2];
           if (cachedTMag2 >= 1.0f) {
             dcs.transformData.worldToView      = cached;
-            dcs.transformData.viewToProjection = m_lastGoodTransforms.viewToProjection;
+            dcs.transformData.viewToProjection = xfs().m_lastGoodTransforms.viewToProjection;
             didW2vRescue = true;
             {
               static uint32_t sV2pVmRescueN = 0;
@@ -33985,7 +34311,7 @@ namespace dxvk {
           dcs.transformData.objectToView = dcs.transformData.worldToView * dcs.transformData.objectToWorld;
         else
           dcs.transformData.objectToView = dcs.transformData.objectToWorld;
-        m_lastO2wPathId = 11; // skinned char: identity (BLAS in world)
+        xfc().m_lastO2wPathId = 11; // skinned char: identity (BLAS in world)
         static std::unordered_set<std::string> sSkinPath11Logged;
         const std::string vk = m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u));
         if (sSkinPath11Logged.insert(vk).second) {
@@ -34029,7 +34355,7 @@ namespace dxvk {
         // the ones that matter for the threading plan: draws the classifier
         // accepted as real geometry (not UI) but whose o2w came out degenerate.
         ++s_gateBRejects;
-        if (!m_lastClassifierSaidUi) {
+        if (!xfc().m_lastClassifierSaidUi) {
           ++s_gateBRealGeoRejects;
           // Name the offenders once per VS so we know WHICH meshes would need a
           // synchronous validity probe if the rate turns out non-trivial.
@@ -34207,7 +34533,7 @@ namespace dxvk {
         SceneDump::writeCameraMarker();
       }
       if (SceneDump::g_obj.is_open()) {
-        const auto& pvb = m_context->m_state.ia.vertexBuffers[posSem->inputSlot];
+        const auto& pvb = drawVertexBuffer(posSem->inputSlot);
         const uint8_t* posData = nullptr; size_t posLen = 0;
         if (pvb.buffer != nullptr) {
           const auto& imm = pvb.buffer->GetImmutableData();
@@ -34219,7 +34545,7 @@ namespace dxvk {
         const uint8_t* idxData = nullptr; size_t idxLen = 0;
         VkIndexType ixType = VK_INDEX_TYPE_UINT16;
         if (indexed) {
-          const auto& ib = m_context->m_state.ia.indexBuffer;
+          const auto& ib = drawIndexBuffer();
           if (ib.buffer != nullptr) {
             const auto& imm = ib.buffer->GetImmutableData();
             if (!imm.empty()) {
@@ -34336,7 +34662,7 @@ namespace dxvk {
     // content pass through injectRTX() unchanged (it no-ops when the
     // camera is invalid), matching exactly what D3D9 Remix does via
     // isRenderingUI() + RtxGeometryStatus::Rasterized.
-    if (m_lastExtractUsedFallback) {
+    if (xfc().m_lastExtractUsedFallback) {
       // NV-DXVK: If a previous draw in this frame already found a real
       // VP, reuse those transforms instead of filtering this draw as UI.
       // Source only populates the VP cbuffer on draws 250+ (main opaque
@@ -34348,7 +34674,7 @@ namespace dxvk {
       // reuse would put a 2D NDC quad into the world TLAS where it
       // renders as nothing. Force the TRUE UI branch so native raster
       // gets to draw the HUD/menu.
-      // Use m_hasEverFoundProj (session-latched) instead of only the
+      // Use xfs().m_hasEverFoundProj (session-latched) instead of only the
       // per-frame flag. Early draws of a frame (pre-projection-extraction,
       // e.g. drawID 0-169 before the main VP cbuffer is bound) would
       // otherwise hit the "TRUE UI-class" branch and get filtered as
@@ -34356,7 +34682,7 @@ namespace dxvk {
       // the last frame's extraction are a better fallback than rejecting
       // the draw entirely â€” the gameplay camera doesn't teleport between
       // frames, so reusing last frame's w2v is visually indistinguishable.
-      if ((m_foundRealProjThisFrame || m_hasEverFoundProj) && !m_lastClassifierSaidUi) {
+      if ((xfs().m_foundRealProjThisFrame || xfs().m_hasEverFoundProj) && !xfc().m_lastClassifierSaidUi) {
         // NV-DXVK: Take a consistent snapshot of cached transforms under
         // the mutex. Writes happen on the immediate-context thread; reads
         // happen on deferred-context threads. Without the lock, deferred
@@ -34367,7 +34693,7 @@ namespace dxvk {
         DrawCallTransforms cachedSnap;
         {
           std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
-          cachedSnap = m_lastGoodTransforms;
+          cachedSnap = xfs().m_lastGoodTransforms;
         }
         const auto& cached = cachedSnap.worldToView;
         // NV-DXVK [diag]: log what value is actually being CONSUMED at
@@ -34428,9 +34754,9 @@ namespace dxvk {
                 "[UIFallback.reason] vs=", vkd,
                 " drawID=", m_drawCallID,
                 " site=degenerate_cached_w2v",
-                " hasEverFoundProj=", m_hasEverFoundProj ? 1 : 0,
-                " foundRealProjThisFrame=", m_foundRealProjThisFrame ? 1 : 0,
-                " addr=", reinterpret_cast<uintptr_t>(&m_lastGoodTransforms),
+                " hasEverFoundProj=", xfs().m_hasEverFoundProj ? 1 : 0,
+                " foundRealProjThisFrame=", xfs().m_foundRealProjThisFrame ? 1 : 0,
+                " addr=", reinterpret_cast<uintptr_t>(&xfs().m_lastGoodTransforms),
                 " thisRtx=", reinterpret_cast<uintptr_t>(this)));
             }
           }
@@ -34440,11 +34766,11 @@ namespace dxvk {
         // NV-DXVK: Only reuse the CAMERA transforms (viewToProjection,
         // worldToView) â€” NOT objectToWorld which is per-object and was
         // already extracted for THIS draw by ExtractTransforms.  The
-        // previous version copied the entire m_lastGoodTransforms
+        // previous version copied the entire xfs().m_lastGoodTransforms
         // including objectToWorld from draw #251, which gave every
         // subsequent draw the same world transform â†’ all objects at
         // the same position â†’ overlapping degenerate BLAS â†’ GPU hang.
-        // Use the snapshot taken under lock above (not m_lastGoodTransforms)
+        // Use the snapshot taken under lock above (not xfs().m_lastGoodTransforms)
         // so we don't re-read the cross-thread static here.
         dcs.transformData.viewToProjection = cachedSnap.viewToProjection;
         dcs.transformData.worldToView      = cachedSnap.worldToView;
@@ -34522,9 +34848,9 @@ namespace dxvk {
               "[UIFallback.reason] vs=", vkt,
               " drawID=", m_drawCallID,
               " site=true_ui",
-              " foundRealProjThisFrame=", m_foundRealProjThisFrame ? 1 : 0,
-              " classifierSaidUi=", m_lastClassifierSaidUi ? 1 : 0,
-              " hasEverFoundProj=", m_hasEverFoundProj ? 1 : 0));
+              " foundRealProjThisFrame=", xfs().m_foundRealProjThisFrame ? 1 : 0,
+              " classifierSaidUi=", xfc().m_lastClassifierSaidUi ? 1 : 0,
+              " hasEverFoundProj=", xfs().m_hasEverFoundProj ? 1 : 0));
           }
         }
         m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
@@ -34535,7 +34861,7 @@ namespace dxvk {
     // Apply per-instance world transform when submitting instanced draws.
     if (instanceTransform) {
       dcs.transformData.objectToWorld = *instanceTransform;
-      m_lastO2wPathId = 9;  // per-instance override (fanout tforms)
+      xfc().m_lastO2wPathId = 9;  // per-instance override (fanout tforms)
       // Recompute objectToView with the per-instance world matrix.
       dcs.transformData.objectToView = dcs.transformData.objectToWorld;
       if (!isIdentityExact(dcs.transformData.worldToView))
@@ -34612,9 +34938,9 @@ namespace dxvk {
     // Logger call on a per-draw path froze gameplay once already (trap 7.1).
     {
       uint64_t vsXxhAll = 0;
-      if (m_context->m_state.vs.shader != nullptr
-          && m_context->m_state.vs.shader->GetCommonShader() != nullptr) {
-        const auto& shAll = m_context->m_state.vs.shader->GetCommonShader()->GetShader();
+      if (drawVertexShaderCom() != nullptr
+          && drawVertexShaderCom()->GetCommonShader() != nullptr) {
+        const auto& shAll = drawVertexShaderCom()->GetCommonShader()->GetShader();
         if (shAll != nullptr) {
           vsXxhAll = static_cast<uint64_t>(shAll->getHash());
         }
@@ -34711,7 +35037,7 @@ namespace dxvk {
       // actually decided, and NOTHING had ever measured it for the flicker VS.
       // [O2wPath] cannot: it samples at the tail of ExtractTransforms, and the
       // assignment below REPLACES that transform with identity. Its pathMask
-      // cannot see it either - m_lastO2wPathId=10 is set here, after
+      // cannot see it either - xfc().m_lastO2wPathId=10 is set here, after
       // ExtractTransforms has already returned and already sampled, which is
       // why that probe reads pathMask=0x2 (path 1) on every frame and why
       // path 10 was wrongly ruled out from it.
@@ -34738,9 +35064,9 @@ namespace dxvk {
       // Same getHash() space as subViewGateProbeVsHashes either way (:24314
       // sources it from this identical expression).
       uint64_t vsXxhSb = 0;
-      if (m_context->m_state.vs.shader != nullptr
-          && m_context->m_state.vs.shader->GetCommonShader() != nullptr) {
-        const auto& shSb = m_context->m_state.vs.shader->GetCommonShader()->GetShader();
+      if (drawVertexShaderCom() != nullptr
+          && drawVertexShaderCom()->GetCommonShader() != nullptr) {
+        const auto& shSb = drawVertexShaderCom()->GetCommonShader()->GetShader();
         if (shSb != nullptr) {
           vsXxhSb = static_cast<uint64_t>(shSb->getHash());
         }
@@ -34918,7 +35244,7 @@ namespace dxvk {
         const float ox = float(o2w[3][0]), oy = float(o2w[3][1]), oz = float(o2w[3][2]);
 
         // [InvW2v]: computed BEFORE sSbMu is taken. Path 12 reads
-        // m_lastGoodTransforms under its own mutex (:23267), so doing this
+        // xfs().m_lastGoodTransforms under its own mutex (:23267), so doing this
         // inside sSbMu would nest two unrelated locks in an order nothing else
         // in the file uses - a deadlock waiting for a second writer.
         //
@@ -34940,8 +35266,8 @@ namespace dxvk {
           bool haveMainSb = false;
           {
             std::lock_guard<std::mutex> lkMain(m_lastGoodTransformsMutex);
-            if (!isIdentityExact(m_lastGoodTransforms.worldToView)) {
-              mainW2vSb = m_lastGoodTransforms.worldToView;
+            if (!isIdentityExact(xfs().m_lastGoodTransforms.worldToView)) {
+              mainW2vSb = xfs().m_lastGoodTransforms.worldToView;
               haveMainSb = true;
             }
           }
@@ -35190,7 +35516,7 @@ namespace dxvk {
       // t31 is already the full world-space model transform.
       // objectToWorld = identity, instancesToObject = t31[i], done.
       dcs.transformData.objectToWorld = Matrix4();
-      m_lastO2wPathId = 10;  // bone-instanced fanout: identity o2w
+      xfc().m_lastO2wPathId = 10;  // bone-instanced fanout: identity o2w
 
       // NV-DXVK [BoneStablePropId path-10 fanout]: bone-instanced fanout
       // â€” o2w is identity, but t31 instance matrices and bone palette
@@ -35228,9 +35554,9 @@ namespace dxvk {
       // real-world geometry at (-5179, 279, 92). Fall back to the last
       // good cached w2v so the fanout path always has a real camera.
       if (isIdentityExact(dcs.transformData.worldToView)
-          && !isIdentityExact(m_lastGoodTransforms.worldToView)) {
-        dcs.transformData.worldToView      = m_lastGoodTransforms.worldToView;
-        dcs.transformData.viewToProjection = m_lastGoodTransforms.viewToProjection;
+          && !isIdentityExact(xfs().m_lastGoodTransforms.worldToView)) {
+        dcs.transformData.worldToView      = xfs().m_lastGoodTransforms.worldToView;
+        dcs.transformData.viewToProjection = xfs().m_lastGoodTransforms.viewToProjection;
         static uint32_t sPath10W2vRestore = 0;
         if (sPath10W2vRestore < 10) {
           ++sPath10W2vRestore;
@@ -35286,7 +35612,7 @@ namespace dxvk {
     // the interleaver applies the bone transform. Set objectToWorld to identity.
     else if (m_attachBoneBuffers && geo.boneMatrixBuffer.defined()) {
       dcs.transformData.objectToWorld = Matrix4();
-      m_lastO2wPathId = 10;  // bone-instanced (N-draw path): identity o2w
+      xfc().m_lastO2wPathId = 10;  // bone-instanced (N-draw path): identity o2w
 
       // NV-DXVK [BoneStablePropId path-10 N-draw]: same identity-anchor
       // as path-10 fanout, minus the i2o[0] translation input (no
@@ -35313,9 +35639,9 @@ namespace dxvk {
       }
       // Same camera-rescue as the fanout branch above.
       if (isIdentityExact(dcs.transformData.worldToView)
-          && !isIdentityExact(m_lastGoodTransforms.worldToView)) {
-        dcs.transformData.worldToView      = m_lastGoodTransforms.worldToView;
-        dcs.transformData.viewToProjection = m_lastGoodTransforms.viewToProjection;
+          && !isIdentityExact(xfs().m_lastGoodTransforms.worldToView)) {
+        dcs.transformData.worldToView      = xfs().m_lastGoodTransforms.worldToView;
+        dcs.transformData.viewToProjection = xfs().m_lastGoodTransforms.viewToProjection;
         {
           static uint32_t sV2pBoneNDrawN = 0;
           ++sV2pBoneNDrawN;
@@ -35335,8 +35661,8 @@ namespace dxvk {
     // Let processCameraData() classify the camera from the matrices.
     // Hardcoding Main would bypass Remix's sky/portal/shadow detection.
     dcs.cameraType       = CameraType::Unknown;
-    dcs.usesVertexShader = (m_context->m_state.vs.shader != nullptr);
-    dcs.usesPixelShader  = (m_context->m_state.ps.shader != nullptr);
+    dcs.usesVertexShader = (drawVertexShaderCom() != nullptr);
+    dcs.usesPixelShader  = (drawPixelShaderCom() != nullptr);
 
     // NV-DXVK: Deterministic pass classifier â€” pass the current D3D11 viewport
     // to Remix so camera_manager can distinguish gameplay draws (viewport ==
@@ -35355,9 +35681,9 @@ namespace dxvk {
     // post / UI draws use different ones even when they share a projection shape.
     // Keying Main-camera classification off this hash eliminates the need for
     // matrix-property heuristics (aspect/tinyScale/maxZ/w2vT).
-    dcs.transformData.worldToViewPathId = m_lastWtvPathId;
-    if (m_context->m_state.vs.shader != nullptr) {
-      auto* common = m_context->m_state.vs.shader->GetCommonShader();
+    dcs.transformData.worldToViewPathId = xfc().m_lastWtvPathId;
+    if (drawVertexShaderCom() != nullptr) {
+      auto* common = drawVertexShaderCom()->GetCommonShader();
       if (common != nullptr) {
         const auto& dxvkShader = common->GetShader();
         if (dxvkShader != nullptr) {
@@ -35368,8 +35694,8 @@ namespace dxvk {
     }
     // NV-DXVK: mirror the VS-hash capture for the pixel shader so the Coverage
     // red-pixel readback can name the exact FS to decompile.
-    if (m_context->m_state.ps.shader != nullptr) {
-      auto* commonPs = m_context->m_state.ps.shader->GetCommonShader();
+    if (drawPixelShaderCom() != nullptr) {
+      auto* commonPs = drawPixelShaderCom()->GetCommonShader();
       if (commonPs != nullptr) {
         const auto& dxvkPsShader = commonPs->GetShader();
         if (dxvkPsShader != nullptr) {
@@ -35401,7 +35727,7 @@ namespace dxvk {
       Logger::info(str::format(
         "[VMHunt.result] count=", m_vmHuntIndexCount,
         " vs=", m_currentVsHashCache.substr(0, 19),
-        " verdict=PASS o2wPathId=", m_lastO2wPathId,
+        " verdict=PASS o2wPathId=", xfc().m_lastO2wPathId,
         " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")"));
       m_vmHuntIsSuspect = false; // consumed
     }
@@ -36003,7 +36329,7 @@ namespace dxvk {
     // identify the world-projection vectors (likely two 4-vectors holding
     // U-axis and V-axis world-space coefficients, or a 4x2 matrix).
     {
-      if (const auto* vsShader = m_context->m_state.vs.shader.ptr()) {
+      if (const auto* vsShader = drawVertexShaderCom().ptr()) {
         if (const auto* vsCs = vsShader->GetCommonShader()) {
           XXH64_hash_t vsH_dump = 0, psH_dump = 0;
           GetCurrentVsPsHashes(vsH_dump, psH_dump);
@@ -36046,7 +36372,7 @@ namespace dxvk {
                 uint32_t modelInstSlot = memoModelInstSlot(vsCs);
                 if (modelInstSlot != UINT32_MAX
                     && modelInstSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
-                  auto* srv = m_context->m_state.vs.shaderResources.views[modelInstSlot].ptr();
+                  auto* srv = drawVsSrv(modelInstSlot);
                   if (srv) {
                     Com<ID3D11Resource> resCom;
                     srv->GetResource(&resCom);
@@ -36085,14 +36411,14 @@ namespace dxvk {
               // expects, plus the bound vertex buffer for each input slot.
               // If we see 2+ TEXCOORDs from different slots, Remix's
               // texcoordBuffer might be reading the wrong UV stream.
-              if (auto* il = m_context->m_state.ia.inputLayout.ptr()) {
+              if (auto* il = drawInputLayout()) {
                 const auto& sems = il->GetRtxSemantics();
                 for (const auto& s : sems) {
                   uint64_t vbHandle = 0;
                   uint64_t vbLen = 0;
                   uint32_t vbStride = 0;
                   if (s.inputSlot < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) {
-                    const auto& vb = m_context->m_state.ia.vertexBuffers[s.inputSlot];
+                    const auto& vb = drawVertexBuffer(s.inputSlot);
                     if (vb.buffer != nullptr) {
                       vbHandle = reinterpret_cast<uint64_t>(vb.buffer.ptr());
                       vbLen = vb.buffer->Desc()->ByteWidth;
@@ -36149,7 +36475,7 @@ namespace dxvk {
                 for (const auto& s : sems) {
                   if (std::strncmp(s.name, "TEXCOORD", 8) != 0) continue;
                   if (s.inputSlot >= D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) continue;
-                  const auto& vb = m_context->m_state.ia.vertexBuffers[s.inputSlot];
+                  const auto& vb = drawVertexBuffer(s.inputSlot);
                   if (vb.buffer == nullptr || vb.stride == 0) continue;
                   auto* d3dBuf = vb.buffer.ptr();
                   if (d3dBuf == nullptr) continue;
@@ -36254,7 +36580,7 @@ namespace dxvk {
     // input-semantic loops + mutex throttle-set checks on EVERY BSP-class draw. Gate
     // behind RTX_D3D11_DIAG; no functional side effects (reads VBs and logs only).
     if (s_d3d11DiagEnabled) {
-      if (const auto* vsShader = m_context->m_state.vs.shader.ptr()) {
+      if (const auto* vsShader = drawVertexShaderCom().ptr()) {
         if (const auto* vsCs = vsShader->GetCommonShader()) {
           XXH64_hash_t vsH_decode = 0, psH_decode = 0;
           GetCurrentVsPsHashes(vsH_decode, psH_decode);
@@ -36266,7 +36592,7 @@ namespace dxvk {
             || vsH_decode == 0xe7abcf4ea24b0fa7ull
             || vsH_decode == 0x448e372f6d5e78e1ull;
           if (isBspVsDecode) {
-            if (auto* il = m_context->m_state.ia.inputLayout.ptr()) {
+            if (auto* il = drawInputLayout()) {
               const auto& sems = il->GetRtxSemantics();
               // NV-DXVK: dump POSITION0 too. The interleaver decodes
               // R32G32_UINT positions via a hardcoded 21|21|22-bit layout
@@ -36281,7 +36607,7 @@ namespace dxvk {
                 const uint32_t fmt = uint32_t(s.format);
                 if (fmt != 101u) continue;  // R32G32_UINT only â€” float positions are fine
 
-                const auto& vb = m_context->m_state.ia.vertexBuffers[s.inputSlot];
+                const auto& vb = drawVertexBuffer(s.inputSlot);
                 if (vb.buffer == nullptr || vb.stride == 0) continue;
                 auto* d3dBuf = vb.buffer.ptr();
                 if (d3dBuf == nullptr) continue;
@@ -36399,7 +36725,7 @@ namespace dxvk {
                 const bool isFloatTexcoord = (fmt == 103u);
                 if (!isUintTexcoord && !isFloatTexcoord) continue;
 
-                const auto& vb = m_context->m_state.ia.vertexBuffers[s.inputSlot];
+                const auto& vb = drawVertexBuffer(s.inputSlot);
                 if (vb.buffer == nullptr || vb.stride == 0) continue;
                 auto* d3dBuf = vb.buffer.ptr();
                 if (d3dBuf == nullptr) continue;
@@ -36519,7 +36845,7 @@ namespace dxvk {
     markSub(s_perfCruDecodeAcc, s_perfCruDecodeMax);  // [cru_decode] POS/UV decode head
 
     {
-      if (const auto* psShader = m_context->m_state.ps.shader.ptr()) {
+      if (const auto* psShader = drawPixelShaderCom().ptr()) {
         if (const auto* cs = psShader->GetCommonShader()) {
           // NV-DXVK [perf]: cache the CBufUberStatic UV-transform RDEF lookups per PS.
           // These were 6 uncached string-keyed RDEF scans (FindCBField x3 +
@@ -37048,7 +37374,7 @@ namespace dxvk {
       const uint32_t kBoneSrvSlot = 30;
       ID3D11ShaderResourceView* boneSrv = nullptr;
       if (kBoneSrvSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT)
-        boneSrv = m_context->m_state.vs.shaderResources.views[kBoneSrvSlot].ptr();
+        boneSrv = drawVsSrv(kBoneSrvSlot);
 
       if (boneSrv) {
         // NV-DXVK PERF (2026-08-08d): [Perf.SrvCache] probe instead of
@@ -37265,7 +37591,7 @@ namespace dxvk {
                 && geo.boneIndexBase == 0u
                 && !geo.boneBaseBuffer.defined()
                 && biSem->inputSlot < m_context->m_state.ia.vertexBuffers.size()) {
-              const auto& biVb = m_context->m_state.ia.vertexBuffers[biSem->inputSlot];
+              const auto& biVb = drawVertexBuffer(biSem->inputSlot);
               D3D11Buffer* biBuf = biVb.buffer.ptr();
               if (biBuf != nullptr && biVb.stride >= 4u) {
                 // Immutable CPU shadow only â€” see the dynamic-VB rule above.
@@ -37986,8 +38312,8 @@ namespace dxvk {
           " firstIdx=", params.firstIndex,
           " vtxOff=", params.vertexOffset,
           " stride=", posBuffer.stride(),
-          " idxFmt=", indexed ? uint32_t(m_context->m_state.ia.indexBuffer.format) : 0,
-          " idxOff=", indexed ? m_context->m_state.ia.indexBuffer.offset : 0));
+          " idxFmt=", indexed ? uint32_t(drawIndexBuffer().format) : 0,
+          " idxOff=", indexed ? drawIndexBuffer().offset : 0));
       }
     }
 
@@ -38010,7 +38336,7 @@ namespace dxvk {
         const bool o2wIdentity = isIdentityExact(T.objectToWorld);
         // VS hash
         std::string vsHash = "?";
-        auto vsShaderCom = m_context->m_state.vs.shader;
+        auto vsShaderCom = drawVertexShaderCom();
         if (vsShaderCom != nullptr && vsShaderCom->GetCommonShader() != nullptr) {
           auto& s = vsShaderCom->GetCommonShader()->GetShader();
           if (s != nullptr) vsHash = s->getShaderKeyStr();
@@ -38072,8 +38398,8 @@ namespace dxvk {
         if (sTimelineLog < 400) {
           Logger::info(str::format(
             "[debobTimeline] vs=", vsKey,
-            " w2vPath=", m_lastWtvPathId,
-            " o2wPath=", m_lastO2wPathId,
+            " w2vPath=", xfc().m_lastWtvPathId,
+            " o2wPath=", xfc().m_lastO2wPathId,
             " w2vT=(", T.worldToView[3][0], ",", T.worldToView[3][1], ",", curTz, ")",
             " Î”Tz=", delta));
         }
@@ -38123,7 +38449,7 @@ namespace dxvk {
       // NV-DXVK: bump per-frame histogram using the path tag set by
       // whichever site most recently wrote to transforms.objectToWorld.
       {
-        const uint32_t pid = (m_lastO2wPathId < 16) ? m_lastO2wPathId : 15;
+        const uint32_t pid = (xfc().m_lastO2wPathId < 16) ? xfc().m_lastO2wPathId : 15;
         ++m_o2wPathCounts[pid];
         if (!m_currentVsHashCache.empty()) {
           const std::string vsKey = m_currentVsHashCache.substr(0, 19);
@@ -38148,9 +38474,9 @@ namespace dxvk {
             " stride=", G.positionBuffer.stride(),
             " bone=", G.boneMatrixBuffer.defined() ? 1 : 0,
             " inst=", G.boneInstanceIndex,
-            " o2wPath=", m_lastO2wPathId,
-            " w2vPath=", m_lastWtvPathId,
-            " boneTfd=", m_currentDrawIsBoneTransformed ? 1 : 0,
+            " o2wPath=", xfc().m_lastO2wPathId,
+            " w2vPath=", xfc().m_lastWtvPathId,
+            " boneTfd=", xfc().m_currentDrawIsBoneTransformed ? 1 : 0,
             " o2wT=(", T.objectToWorld[3][0], ",", T.objectToWorld[3][1], ",", T.objectToWorld[3][2], ")",
             " w2vT=(", T.worldToView[3][0], ",", T.worldToView[3][1], ",", T.worldToView[3][2], ")",
             " o2vT=(", T.objectToView[3][0], ",", T.objectToView[3][1], ",", T.objectToView[3][2], ")",
@@ -38238,8 +38564,8 @@ namespace dxvk {
             if (p) { outLen = dvk->info().size; return reinterpret_cast<const uint8_t*>(p); }
             return nullptr;
           };
-          const auto& vb = m_context->m_state.ia.vertexBuffers[0];
-          const auto& ib = m_context->m_state.ia.indexBuffer;
+          const auto& vb = drawVertexBuffer(0);
+          const auto& ib = drawIndexBuffer();
           size_t vbLen = 0, ibLen = 0;
           const uint8_t* vbase = (vb.buffer != nullptr) ? cpuBase(vb.buffer.ptr(), vbLen) : nullptr;
           const uint8_t* ibase = (ib.buffer != nullptr) ? cpuBase(ib.buffer.ptr(), ibLen) : nullptr;
@@ -38794,7 +39120,7 @@ namespace dxvk {
             // â‰¤612u edges = clean, while rays hit 29k-extent slivers).
             uint32_t gwMinIdx = 0xFFFFFFFFu, gwMaxIdx = 0; uint32_t gwScanned = 0;
             {
-              const auto& ibGw = m_context->m_state.ia.indexBuffer;
+              const auto& ibGw = drawIndexBuffer();
               const uint8_t* ibGwBase = nullptr; size_t ibGwLen = 0;
               if (ibGw.buffer != nullptr) {
                 const auto& imm = ibGw.buffer->GetImmutableData();
@@ -38863,16 +39189,16 @@ namespace dxvk {
               // the spike (wrong connectivity over the right vertex pool). If
               // sameIB=0 the indices were copied/processed -> verify that copy.
               " | idxAbsOff=", geo.indexBuffer.offset(),
-              " expectIdxAbs=", (size_t(m_context->m_state.ia.indexBuffer.offset)
-                + size_t(start) * ((m_context->m_state.ia.indexBuffer.format == DXGI_FORMAT_R32_UINT) ? 4u : 2u)),
-              " sameIB=", ((m_context->m_state.ia.indexBuffer.buffer != nullptr
-                && geo.indexBuffer.buffer().ptr() == m_context->m_state.ia.indexBuffer.buffer->GetBuffer().ptr()) ? 1 : 0),
+              " expectIdxAbs=", (size_t(drawIndexBuffer().offset)
+                + size_t(start) * ((drawIndexBuffer().format == DXGI_FORMAT_R32_UINT) ? 4u : 2u)),
+              " sameIB=", ((drawIndexBuffer().buffer != nullptr
+                && geo.indexBuffer.buffer().ptr() == drawIndexBuffer().buffer->GetBuffer().ptr()) ? 1 : 0),
               " posAbsOff=", geo.positionBuffer.offset(),
               " samePosVB=", ((posSem != nullptr
                 && posSem->inputSlot < m_context->m_state.ia.vertexBuffers.size()
-                && m_context->m_state.ia.vertexBuffers[posSem->inputSlot].buffer != nullptr
+                && drawVertexBuffer(posSem->inputSlot).buffer != nullptr
                 && geo.positionBuffer.buffer().ptr()
-                   == m_context->m_state.ia.vertexBuffers[posSem->inputSlot].buffer->GetBuffer().ptr()) ? 1 : 0)));
+                   == drawVertexBuffer(posSem->inputSlot).buffer->GetBuffer().ptr()) ? 1 : 0)));
           }
         }
       }
@@ -38970,7 +39296,7 @@ namespace dxvk {
           if (mapped.mapPtr) { outLen = mapped.length; return reinterpret_cast<const uint8_t*>(mapped.mapPtr); }
           return nullptr;
         };
-        const auto& ibSk = m_context->m_state.ia.indexBuffer;
+        const auto& ibSk = drawIndexBuffer();
         size_t ibLenSk = 0;
         const uint8_t* ibaseSk = (ibSk.buffer != nullptr) ? cpuBaseSk(ibSk.buffer.ptr(), ibLenSk) : nullptr;
         const uint8_t* pbase = nullptr; size_t pLen = 0; uint32_t pStride = 0; size_t pOff0 = 0;
@@ -39389,8 +39715,8 @@ namespace dxvk {
           const auto& W = T.worldToView;
           Logger::info(str::format(
             "[boneW2vTrace] vs=", vsKey,
-            " w2vPath=", m_lastWtvPathId,
-            " boneTfd=", m_currentDrawIsBoneTransformed ? 1 : 0,
+            " w2vPath=", xfc().m_lastWtvPathId,
+            " boneTfd=", xfc().m_currentDrawIsBoneTransformed ? 1 : 0,
             " row0=(", W[0][0], ",", W[0][1], ",", W[0][2], ",", W[0][3], ")",
             " row1=(", W[1][0], ",", W[1][1], ",", W[1][2], ",", W[1][3], ")",
             " row2=(", W[2][0], ",", W[2][1], ",", W[2][2], ",", W[2][3], ")",
@@ -39464,7 +39790,7 @@ namespace dxvk {
       const auto tTcVsHash0 = std::chrono::steady_clock::now();
       uint64_t vsXxhRt = 0;
       // NV-DXVK PERF (2026-08-08d): reference, not Com copy — per-draw AddRef.
-      const auto& vsPtrRt = m_context->m_state.vs.shader;
+      const auto& vsPtrRt = drawVertexShaderCom();
       if (vsPtrRt != nullptr && vsPtrRt->GetCommonShader() != nullptr) {
         auto& shRt = vsPtrRt->GetCommonShader()->GetShader();
         if (shRt != nullptr) vsXxhRt = static_cast<uint64_t>(shRt->getHash());
@@ -39650,7 +39976,7 @@ namespace dxvk {
           Logger::info(str::format(
             "[MtnPlace] vsXxh=0x", std::hex, vsXxhRt, std::dec,
             " frame=", frameRt,
-            " o2wPath=", m_lastO2wPathId,
+            " o2wPath=", xfc().m_lastO2wPathId,
             " inSubView=", ((g_vanishDiagCapturedA3 & 0x10u) != 0u ? 1 : 0),
             " nInst=", nInstRt,
             " postReproj.o2w.T=(", float(T.objectToWorld[3][0]), ",",
@@ -39849,7 +40175,7 @@ namespace dxvk {
     sdStallMark(5);  // [SdStall] seg5 "capture": sky classify + sun/lights/probe capture
     // [NaNGuard] Final transforms.sanitize() before handing dcs to the CS
     // thread. ExtractTransforms calls sanitize() at its exit, but several
-    // SubmitDraw paths above (m_lastGoodTransforms cache restore at
+    // SubmitDraw paths above (xfs().m_lastGoodTransforms cache restore at
     // lines ~11454/11923/12069/12129, viewmodel/skinned overrides, sky
     // category stamping) re-assign dcs.transformData.viewToProjection
     // AFTER that. Re-running sanitize here closes the window in which a
@@ -39870,7 +40196,7 @@ namespace dxvk {
       // AddRef/Release pair per draw.
       static thread_local const void* s_vsKeyMemoPtr = reinterpret_cast<const void*>(uintptr_t(-1));
       static thread_local std::string s_vsKeyMemoStr = "?";
-      const auto& vsPtrDiag = m_context->m_state.vs.shader;
+      const auto& vsPtrDiag = drawVertexShaderCom();
       if (static_cast<const void*>(vsPtrDiag.ptr()) != s_vsKeyMemoPtr) {
         s_vsKeyMemoPtr = vsPtrDiag.ptr();
         s_vsKeyMemoStr = "?";
@@ -39938,8 +40264,8 @@ namespace dxvk {
             Logger::warn(str::format(
               "[D3D11Rtx] === GARBAGE-O2W(census) vs=", vsKeyDiag,
               " o2wT=(", o2wTx, ",", o2wTy, ",", o2wTz, ")",
-              " o2wPathId=", m_lastO2wPathId, " wtvPathId=", m_lastWtvPathId,
-              " usedFallback=", m_lastExtractUsedFallback ? 1 : 0,
+              " o2wPathId=", xfc().m_lastO2wPathId, " wtvPathId=", xfc().m_lastWtvPathId,
+              " usedFallback=", xfc().m_lastExtractUsedFallback ? 1 : 0,
               " o2wRow0=(", float(o2w[0][0]), ",", float(o2w[0][1]), ",", float(o2w[0][2]), ",", float(o2w[0][3]), ")",
               " cbuffer dump ==="));
             const auto& vsCbsC = m_context->m_state.vs.constantBuffers;
@@ -40385,7 +40711,7 @@ namespace dxvk {
             baseLen   = posBuf.length();
           } else if (posSem != nullptr
                   && posSem->inputSlot < m_context->m_state.ia.vertexBuffers.size()) {
-            const auto& vb = m_context->m_state.ia.vertexBuffers[posSem->inputSlot];
+            const auto& vb = drawVertexBuffer(posSem->inputSlot);
             if (vb.buffer != nullptr) {
               const auto& imm = vb.buffer->GetImmutableData();
               if (!imm.empty()) {
@@ -40422,7 +40748,7 @@ namespace dxvk {
                 size_t immSize = 0;
                 if (hasPosSem
                     && posSem->inputSlot < m_context->m_state.ia.vertexBuffers.size()) {
-                  const auto& vb = m_context->m_state.ia.vertexBuffers[posSem->inputSlot];
+                  const auto& vb = drawVertexBuffer(posSem->inputSlot);
                   hasD3DBuf = (vb.buffer != nullptr);
                   if (hasD3DBuf) immSize = vb.buffer->GetImmutableData().size();
                 }
@@ -40868,7 +41194,7 @@ namespace dxvk {
                     bbIdxBytes = bbIb.length();
                     bbIdxSrc = "mapPtr";
                   } else {
-                    const auto& d3dIb = m_context->m_state.ia.indexBuffer;
+                    const auto& d3dIb = drawIndexBuffer();
                     if (d3dIb.buffer != nullptr) {
                       const auto& imm = d3dIb.buffer->GetImmutableData();
                       if (!imm.empty()
@@ -41113,7 +41439,7 @@ namespace dxvk {
                         idxBase = static_cast<const uint8_t*>(im);
                         idxBytes = ibR.length();
                       } else {
-                        const auto& d3dIb = m_context->m_state.ia.indexBuffer;
+                        const auto& d3dIb = drawIndexBuffer();
                         if (d3dIb.buffer != nullptr) {
                           const auto& imm = d3dIb.buffer->GetImmutableData();
                           if (!imm.empty()
@@ -41200,7 +41526,7 @@ namespace dxvk {
               // (writesColor=true) â†’ if VS pointer or common-shader is
               // missing for any reason, do NOT promote.
               bool writesColor = true;
-              const auto vsPtrAabb = m_context->m_state.vs.shader;
+              const auto vsPtrAabb = drawVertexShaderCom();
               if (vsPtrAabb != nullptr
                   && vsPtrAabb->GetCommonShader() != nullptr) {
                 writesColor =
@@ -41390,7 +41716,7 @@ namespace dxvk {
       // has depth-write ON, so this skips the RDEF lookup per ordinary draw.
       bool tspVsHasModelInst = true;  // pessimistic default
       if (tspDepthWriteOff && tspPsHasCubeSrv) {
-        const auto& tspVsPtr = m_context->m_state.vs.shader;
+        const auto& tspVsPtr = drawVertexShaderCom();
         if (tspVsPtr != nullptr && tspVsPtr->GetCommonShader() != nullptr) {
           tspVsHasModelInst = tspVsPtr->GetCommonShader()
                                 ->ReadsCBField("CBufModelInstance", "c_modelInst");
@@ -41530,7 +41856,7 @@ namespace dxvk {
     // showed o2w ALTERNATES between identity (a skinned/bone path won) and a
     // sheared+translated matrix (the cb3 fallback path 4 = inverse(worldToView)
     // * cb3Mat, which fires when no bone path pre-set o2w). This pins WHICH
-    // path produced each frame's o2w via m_lastO2wPathId, so we can see the
+    // path produced each frame's o2w via xfc().m_lastO2wPathId, so we can see the
     // flip directly. Pair with [ShipSrcVB.cb3] for the raw cb3 source.
     // Requires rtx.tf2DetectWidow (m_curDrawIsWidow). Capped 16/frame
     // (~12 Widow sub-meshes).
@@ -41548,8 +41874,8 @@ namespace dxvk {
           "[WidowO2W] f=", wo2wFid,
           " name=", (m_curStudioName[0] ? m_curStudioName : "(none)"),
           " vtx=", dcs.geometryData.vertexCount,
-          " pathId=", uint32_t(m_lastO2wPathId),
-          " skipVMScan=", (m_skipViewMatrixScan ? 1 : 0),
+          " pathId=", uint32_t(xfc().m_lastO2wPathId),
+          " skipVMScan=", (xfc().m_skipViewMatrixScan ? 1 : 0),
           " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
           " o2w_r0=(", o2w[0][0], ",", o2w[0][1], ",", o2w[0][2], ")",
           " o2w_r1=(", o2w[1][0], ",", o2w[1][1], ",", o2w[1][2], ")",
@@ -41582,7 +41908,7 @@ namespace dxvk {
         const auto& w2v = dcs.transformData.worldToView;
         Logger::warn(str::format(
           "[CrowPlace] f=", cpFid, " name=", m_curStudioName,
-          " vtx=", dcs.geometryData.vertexCount, " pathId=", uint32_t(m_lastO2wPathId),
+          " vtx=", dcs.geometryData.vertexCount, " pathId=", uint32_t(xfc().m_lastO2wPathId),
           " camOffNeeded=", (m_skinnedCharNeedsCamOffset ? 1 : 0),
           " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
           " o2w_r0=(", o2w[0][0], ",", o2w[0][1], ",", o2w[0][2], ")",
@@ -41635,7 +41961,7 @@ namespace dxvk {
           const Matrix4& m0 = (*i2o)[0];
           Logger::warn(str::format(
             "[FinalPos] f=", fpFid, " vtx=", dcs.geometryData.vertexCount,
-            " vs=", vsHF, " pathId=", uint32_t(m_lastO2wPathId),
+            " vs=", vsHF, " pathId=", uint32_t(xfc().m_lastO2wPathId),
             " widow=", (m_curDrawIsWidow ? 1 : 0), " src=i2o nInst=", n,
             " w2vIdent=", (w2vIdent ? 1 : 0),
             " nearInst=", bestI, " nearViewDist=", bestDist,
@@ -41653,7 +41979,7 @@ namespace dxvk {
           const float viewDist = std::sqrt(vc.x*vc.x + vc.y*vc.y + vc.z*vc.z);
           Logger::warn(str::format(
             "[FinalPos] f=", fpFid, " vtx=", dcs.geometryData.vertexCount,
-            " vs=", vsHF, " pathId=", uint32_t(m_lastO2wPathId),
+            " vs=", vsHF, " pathId=", uint32_t(xfc().m_lastO2wPathId),
             " widow=", (m_curDrawIsWidow ? 1 : 0), " src=o2w",
             " viewDist=", viewDist, " w2vIdent=", (w2vIdent ? 1 : 0),
             " bbDeg=", (bbDeg ? 1 : 0),
@@ -41948,7 +42274,7 @@ namespace dxvk {
       // the bone buffers, which the key deliberately does not hash (12KB+ per
       // draw), so exclusion is the correct scope, mirroring the fanout guard.
       // Same tri-source check the host-side hasBoneTransform wiring uses.
-      const bool dfSkinned = m_currentDrawIsBoneTransformed
+      const bool dfSkinned = xfc().m_currentDrawIsBoneTransformed
         || dcs.skinningData.numBones > 0u
         || (dcs.geometryData.boneMatrixBuffer.defined()
             && dcs.geometryData.boneIndexBuffer.defined());
@@ -42126,11 +42452,11 @@ namespace dxvk {
       };
 
       DrawCaptureRecord rec;
-      rec.layoutId         = m_currentLayoutId;
+      rec.layoutId         = xfc().m_currentLayoutId;
       rec.drawCallID       = m_drawCallID;
-      rec.o2wPathId        = m_lastO2wPathId;
-      rec.o2wSrcClass      = o2wSrcClassOf(m_lastO2wPathId);
-      rec.usedFallback     = m_lastExtractUsedFallback;
+      rec.o2wPathId        = xfc().m_lastO2wPathId;
+      rec.o2wSrcClass      = o2wSrcClassOf(xfc().m_lastO2wPathId);
+      rec.usedFallback     = xfc().m_lastExtractUsedFallback;
       rec.vsHash           = dcs.transformData.vertexShaderHash;
       rec.objectToWorld    = dcs.transformData.objectToWorld;
       rec.worldToView      = dcs.transformData.worldToView;
@@ -42139,9 +42465,9 @@ namespace dxvk {
       // Snapshot the raw camera cbuffer inputs from the descriptor-pointed
       // locations (copy by value â€” Â§7: never keep the mapped address). Only
       // possible when this draw carried a layoutId.
-      if (m_currentLayoutId != UINT32_MAX
-          && m_currentLayoutId < m_vsLayoutTable.entries.size()) {
-        const VsLayoutDescriptor& d = m_vsLayoutTable.entries[m_currentLayoutId].desc;
+      if (xfc().m_currentLayoutId != UINT32_MAX
+          && xfc().m_currentLayoutId < m_vsLayoutTable.entries.size()) {
+        const VsLayoutDescriptor& d = m_vsLayoutTable.entries[xfc().m_currentLayoutId].desc;
         auto snapCb = [&](uint32_t slot, uint32_t off, float out[16]) -> bool {
           if (slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) return false;
           const auto& cb = m_context->m_state.vs.constantBuffers[slot];
@@ -43578,7 +43904,7 @@ namespace dxvk {
                   float(dcs.transformData.objectToWorld[3][1]), ",",
                   float(dcs.transformData.objectToWorld[3][2]), ")",
                 " subT=(", subTx, ",", subTy, ",", subTz, ")",
-                " o2wPath=", m_lastO2wPathId,
+                " o2wPath=", xfc().m_lastO2wPathId,
                 " nInst=", dcs.transformData.instancesToObject
                              ? dcs.transformData.instancesToObject->size() : 0u,
                 " propId=0x", std::hex, propId, std::dec));
@@ -47014,6 +47340,12 @@ namespace dxvk {
     // (executes later on the CS thread), so we time only the main-thread synchronous portion
     // here. The OnDraw* accumulators (s_perfSubmitDraw*) cover the per-draw cost separately.
     const auto tEndFrameStart = std::chrono::steady_clock::now();
+
+    // NV-DXVK [XfOverlap]: drain the job slot at the frame boundary. A job
+    // left by the frame's last early-returned draw must not survive into the
+    // next frame -- m_drawCallID resets to 0, so a stale job could collide
+    // with a new draw's id and hand it last frame's transforms.
+    discardExtractOverlap("endframe");
 
     // NV-DXVK [Perf.Report]: the report's frame clock and its emit trigger.
     // Placed at the very top of EndFrame on the frame thread, which is the one
@@ -54026,9 +54358,9 @@ namespace dxvk {
     m_drawSnapCur = nullptr;
     m_drawSnapValid = false;
     m_rawDrawCount = 0;
-    m_remixActiveThisFrame = false;
-    m_foundRealProjThisFrame = false;
-    // Projection cache (m_projSlot, m_projOffset, m_projStage, m_columnMajor)
+    xfc().m_remixActiveThisFrame = false;
+    xfs().m_foundRealProjThisFrame = false;
+    // Projection cache (xfc().m_projSlot, xfc().m_projOffset, xfc().m_projStage, xfc().m_columnMajor)
     // is NOT reset for pure projections (cls 1/2) â€” the validation path at
     // the start of ExtractTransforms re-reads and re-scans only when the
     // cached location becomes stale.  Resetting every frame would force an
@@ -54049,10 +54381,10 @@ namespace dxvk {
     // not during early shadow/depth-prepass draws.  If we cached a false
     // positive from an early draw on the previous frame, resetting here gives
     // the next frame's late-draw scan a chance to find the real VP.
-    if (m_projIsCombinedVP) {
-      m_projSlot   = UINT32_MAX;
-      m_projOffset = SIZE_MAX;
-      m_projStage  = -1;
+    if (xfc().m_projIsCombinedVP) {
+      xfc().m_projSlot   = UINT32_MAX;
+      xfc().m_projOffset = SIZE_MAX;
+      xfc().m_projStage  = -1;
     }
     ++m_axisDetectFrame;
 
@@ -54363,6 +54695,25 @@ namespace dxvk {
                                  " xfIneligN=",      s_xfIneligN,
                                  " xfElig3=",        s_xfElig3Ns,
                                  " xfElig3N=",       s_xfElig3N,
+                                 // NV-DXVK [XfOverlap] -- same window as the
+                                 // split above. THE READ: ovWorker is
+                                 // derivation time moved off the frame thread;
+                                 // what the frame thread still paid is
+                                 // ovSched + ovJoin + (bt_extractXf, which now
+                                 // bills join-wait for overlapped draws). The
+                                 // 3e break-even test is per draw:
+                                 // (ovSched+ovJoin)/ovJoinN vs
+                                 // ovWorker/ovJoinN. ovDiscard also explains
+                                 // any [DrawPure] draw-count inflation.
+                                 " ovSched=",        s_xfOvSchedNs,
+                                 " ovSchedN=",       s_xfOvSchedN,
+                                 " ovJoin=",         s_xfOvJoinNs,
+                                 " ovJoinN=",        s_xfOvJoinN,
+                                 " ovWorker=",       s_xfOvWorkerNs,
+                                 " ovDiscard=",      s_xfOvDiscardN,
+                                 " ovSerial=",       s_xfOvSerialN,
+                                 " ovVerifyOk=",     s_xfOvVerifyOk,
+                                 " ovVerifyFAIL=",   s_xfOvVerifyFail,
                                  // v6.9d REPLAY-PATH BUCKETS. Until these
                                  // existed every xt_* marker sat after the
                                  // replay early-return, so bt_extractXf's
@@ -55907,6 +56258,9 @@ namespace dxvk {
         // bt_extractXf.
         s_xfEligNs = 0; s_xfIneligNs = 0; s_xfElig3Ns = 0;
         s_xfEligN  = 0; s_xfIneligN  = 0; s_xfElig3N  = 0;
+        s_xfOvSchedNs = 0; s_xfOvJoinNs = 0; s_xfOvWorkerNs = 0;
+        s_xfOvSchedN = 0; s_xfOvJoinN = 0; s_xfOvDiscardN = 0;
+        s_xfOvSerialN = 0; s_xfOvVerifyOk = 0; s_xfOvVerifyFail = 0;
         s_perfXtVsLocCacheHits                = 0;
         s_perfXtVsLocCacheMisses              = 0;
         s_perfRpKeyAcc                        = 0; s_perfRpKeyMax                        = 0;
