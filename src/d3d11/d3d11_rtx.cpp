@@ -9675,6 +9675,58 @@ namespace dxvk {
   // This is the counter.
   static thread_local uint32_t
     s_drawSnapWcMissBySlot[D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT] = { };
+  // NV-DXVK [ManifestPath] 2026-08-13: learned spans the per-path filter
+  // WITHHELD, against the ones it let through. Reported on [DrawSnap] as
+  // mfSkip/mfCap. This is the direct count of what the filter is removing --
+  // read it against deadWc/f on [Perf.SplitXf.CbWaste], which is what those
+  // withheld spans were costing.
+  static thread_local uint32_t s_mfSkipped  = 0;
+  static thread_local uint32_t s_mfCaptured = 0;
+  // NV-DXVK [ManifestPath] 2026-08-13: DID THE PREDICTION MATCH THE PATH THIS
+  // DRAW ACTUALLY TOOK? Predicted vs m_lastO2wPathId, per draw.
+  //
+  // THIS IS A DIFFERENT QUESTION FROM o2wPath{agree/disagree} AND THE FILTER
+  // TURNS ON THIS ONE. That counter asks whether the STORED ENTRY's path
+  // matches the prediction, which is about serving; this asks whether the
+  // prediction matched what the derivation then did, which is what decides
+  // whether a withheld span was withheld correctly. They can differ widely.
+  //
+  // IT IS THE FEATURE'S GATE. 55% of draws are on a VS that takes more than one
+  // o2w path (measured 2026-08-12). If those shaders alternate SLOWLY -- the
+  // p0/p1 neg-proj TTL flip, which is a per-shader state change every ~64
+  // frames -- the prediction is right almost always and the filter is nearly
+  // free. If they alternate PER DRAW, the prediction is a coin flip, every
+  // withheld span becomes a live read and a refused store, and the filter costs
+  // more serve than it saves transactions. Nothing in the existing counters
+  // separates those two, so this is the one to read first.
+  static thread_local uint32_t s_mfPredHit  = 0;
+  static thread_local uint32_t s_mfPredMiss = 0;
+  static thread_local uint32_t s_mfPredCold = 0;
+  // The prediction THIS draw's capture actually filtered on, stashed so the
+  // end-of-derivation check scores the decision that was made rather than a
+  // similar-looking value computed elsewhere. Deliberately NOT
+  // s_o2wPathPredicted: that one is written by drawSplitKeys, so on any draw
+  // that does not reach it the comparison would silently score the previous
+  // draw's prediction. UINT32_MAX means the filter had nothing to act on --
+  // no manifest, no entry for this (vs, il) yet, or the option is off.
+  static thread_local uint32_t s_mfPredCur = UINT32_MAX;
+  // NV-DXVK [NamedWithhold] 2026-08-13 -- THE PROBE THAT SETTLES THE COUPLING.
+  //
+  // Withholding a named proj/view span was measured to take FAILcarrier from 0
+  // to ~100/window with grp{cbLoc}. The mechanism is ARGUED (their consumers
+  // maintain exactly the six members kSdepCbLoc hashes, so a live read that
+  // resolves differently rewrites them) but not yet MEASURED, and this file's
+  // history is a list of arguments that turned out to name the wrong cause.
+  //
+  // So: per draw, did we withhold one of those spans, and did this draw then
+  // move the cbLoc carrier? If nsCbLoc tracks grp{cbLoc}, the coupling is
+  // proven and localised to these spans. If nsCbLoc is ~0 while grp{cbLoc}
+  // stays high, the carrier moves come from somewhere else entirely and the
+  // whole proj/view theory is wrong -- which is the reading that matters most,
+  // because it is the one that would otherwise cost another blind fix.
+  static thread_local bool     s_nsWithheld = false;
+  static thread_local uint32_t s_nsDraws    = 0;
+  static thread_local uint32_t s_nsCbLoc    = 0;
   // NV-DXVK [perf] 2026-08-10: SPLIT THE tail_emit REMAINDER.
   //
   // tail_emit is 212 ms per 5 s window = ~1.91 ms/frame, 64% of the whole
@@ -11065,15 +11117,143 @@ namespace dxvk {
     // compare; a capture hint cannot change any derivation result, and folding
     // it into `gen` would invalidate replay records for a field that means
     // nothing to them.
+    // NV-DXVK [ManifestPath] 2026-08-13 -- PER-PATH USE COUNTERS FOR ONE SPAN.
+    //
+    // WHY ANY OF THIS EXISTS. The capture is keyed per VS, but whether a span
+    // is read is decided by the o2w PATH, and 55% of draws sit on a VS that
+    // takes more than one. [Perf.SplitXf.CbWaste] priced it: 49% of all
+    // captured bytes were never read, and 37% of every write-combined
+    // transaction the capture issued was for a span nothing reads.
+    //
+    // SHARED BY THE LEARNED AND THE NAMED SPANS, and the second is not an
+    // afterthought -- it is where the remaining cost turned out to live.
+    // Measured 23:31 after the learned-span filter shipped: wcMiss/draw fell
+    // 1.702 -> 1.157 and cb2 collapsed 0.667 -> 0.301, while cb3 did not move
+    // at all (0.795). The arithmetic said why: p1's residual cb3 waste is
+    // 1,739,200 B over 27,175 spans = EXACTLY 64.000 B/span at 1.87 spans per
+    // draw. The learned o2w block is 48 B, so the filter had removed it; what
+    // was left is the NAMED 64 B projection and view spans, captured outside
+    // the manifest loop and therefore never filtered -- on shaders whose
+    // derivation reads its proj/view from cb2, per [CbRead] p1{cb 2=14530}.
+    struct PathUse {
+      uint8_t draws[16] = { };
+      uint8_t reads[16] = { };
+
+      // draws==0 means NOT YET MEASURED and captures for everyone: spans in
+      // use before this shipped, and draws whose path is out of range, must
+      // never be silently withheld.
+      bool wantedBy(uint32_t path) const {
+        if (path >= 16u)      return true;
+        if (draws[path] == 0) return true;
+        // MAJORITY, AND IT IS THE COST MODEL RATHER THAN A TUNED THRESHOLD.
+        // Capturing costs one write-combined transaction unconditionally. Not
+        // capturing costs the same transaction as a live read, but only on the
+        // draws that actually read it, plus a refused store on those. So
+        // capturing wins exactly when the path reads it on most of its draws.
+        return uint32_t(reads[path]) * 2u >= uint32_t(draws[path]);
+      }
+      void notePathDraw(uint32_t path, bool wasRead) {
+        if (path >= 16u) return;
+        if (draws[path] == 255u) {            // halve, keep the ratio
+          draws[path] = 128u;
+          reads[path] = uint8_t(reads[path] / 2u);
+        }
+        ++draws[path];
+        if (wasRead && reads[path] < 255u) ++reads[path];
+        if (wasRead)               noRead[path] = 0u;
+        else if (noRead[path] < 255u) ++noRead[path];
+      }
+
+      // CONSECUTIVE draws on this path that did NOT read the span, saturating.
+      // Any single read resets it, so it is monotone and cannot flap the way a
+      // ratio does around its boundary.
+      uint8_t noRead[16] = { };
+
+      // THE STRICT RULE, for spans whose consumer WRITES CROSS-DRAW STATE.
+      //
+      // The majority rule above is right when the only cost of being wrong is a
+      // live read. It is NOT right for the named proj/view spans: their
+      // consumers maintain m_projSlot/m_projOffset/m_projStage/m_columnMajor/
+      // m_viewSlot/m_viewOffset, which is EXACTLY what kSdepCbLoc hashes
+      // (~:32289). A live read there can resolve differently from the captured
+      // bytes -- the capture/derivation skew this record exists to remove -- and
+      // a different resolution rewrites those members, which IS a carrier move.
+      // Measured when the majority rule was applied to them: FAILcarrier 0 ->
+      // 99..156 with grp{cbLoc} every window.
+      //
+      // So for those, withhold only after a full saturating run of draws on the
+      // path with not one read. 255 is the counter's own width, not a tuned
+      // number, and one read re-enables the span for another full run.
+      bool neverReadBy(uint32_t path) const {
+        if (path >= 16u) return false;
+        return noRead[path] == 255u;
+      }
+    };
+
     struct CbSpanReq {
       uint32_t offset    = 0;      // RELATIVE -- see the rebase note above
       uint16_t byteCount = 0;
       uint8_t  slot      = 0;
       bool     rebase    = false;
+      // A BOOLEAN UNION WAS THE FIRST VERSION AND IT LATCHED. Measured
+      // 2026-08-13 23:11, one run after it shipped: cb1 transactions collapsed
+      // 94% (p1 never reads cb1, so the bit was never set) while cb3 did not
+      // move at all -- 0.794 -> 0.796 per draw. [Perf.SplitXf.CbRead] named the
+      // reason on the same line:
+      //     p1{n=14685 cb 2=14677 3=8}   <- 8 draws in 14,685 read cb3
+      //     p1{n=12317 cb 2=12317}       <- other windows, none at all
+      // One draw in ~1800 set bit 1 permanently and re-enabled the capture for
+      // every p1 draw thereafter. "Has this path ever read it" is not the
+      // question the capture is asking.
+      //
+      // SO COUNT INSTEAD, AND DECIDE ON THE COST. Capturing costs one
+      // write-combined transaction unconditionally. NOT capturing costs a live
+      // read -- which is the same transaction -- but only on the draws that
+      // actually read it, plus a refused store on those draws. So capturing
+      // wins exactly when the path reads the span on MOST of its draws, and the
+      // rule below is that comparison rather than a tuned threshold: at 8 in
+      // 14,685 the arithmetic is not close.
+      //
+      // Saturating 8-bit, halved together on overflow, so the pair is a decaying
+      // ratio rather than a lifetime tally -- a span read constantly during
+      // loading does not hold a path hostage for the rest of the session, which
+      // is the same failure the boolean version had in slower motion.
+      //
+      // Paths 0-15 only. A path outside that range leaves the counters at zero,
+      // which reads as "never measured" and captures -- the conservative side.
+      PathUse use;
+      bool wantedBy(uint32_t path) const  { return use.wantedBy(path); }
+      void notePathDraw(uint32_t p, bool r) { use.notePathDraw(p, r); }
     };
-    static constexpr uint32_t kMaxCbManifest = 6;
+    // RAISED 6 -> 10, 2026-08-14, on measurement rather than headroom-anxiety.
+    // satN went 750 -> 4,687 -> 18,504 as the per-path filter shipped, with
+    // manN 3.07 -> 4.48 of 6: a named span the filter withholds gets RE-LEARNED
+    // here when some path does read it, and it then coexists with the named
+    // span instead of replacing it. Saturated shaders stop learning new spans
+    // entirely, which is the one failure mode of this cache that no counter
+    // downstream would name.
+    //
+    // SAFE AGAINST THE RANGE BUDGET WITHOUT TOUCHING IT. 3 named + 10 learned
+    // exceeds kMaxCbRanges (12), but learned spans go through spanFits() and
+    // decline gracefully rather than setting `overflowed` -- so the worst case
+    // is a span staying live, not a record invalidated. Measured meanRanges is
+    // 2.54 with ovf=0, so the budget is nowhere near binding in practice and
+    // kMaxCbRanges/kCbBytesCap (both in the header) stay where they are.
+    //
+    // Cost is ~56 B per entry against a map bounded by the shader count (76
+    // live), i.e. tens of kB.
+    static constexpr uint32_t kMaxCbManifest = 10;
     CbSpanReq manifest[kMaxCbManifest] = { };
     uint8_t   manifestN = 0;
+
+    // NV-DXVK [ManifestPath] 2026-08-13 -- THE NAMED SPANS, SAME TREATMENT.
+    // proj / view / cameraOrigin are captured by hand above the manifest loop
+    // and were therefore exempt from the per-path filter. Measurement said that
+    // exemption is where the whole remaining cost sits (see PathUse). These are
+    // scored and gated identically; the recorded slot/offset are untouched, so
+    // a withheld span is a find() miss and the consumer's own live path, which
+    // is exactly what it did before any of this existed.
+    PathUse projUse, viewUse, camUse;
   };
   static constexpr uint32_t kVsNegProjTtlFrames = 64;
   static thread_local std::unordered_map<uintptr_t, VsCbLocations> sVsCbLocCache;
@@ -11102,6 +11282,43 @@ namespace dxvk {
   // clear site MUST do the same. It is also cleared per draw at the top, so a
   // draw whose VS has no entry cannot append to the previous draw's shader.
   static thread_local VsCbLocations* s_xtVsLocCur = nullptr;
+
+  // NV-DXVK [ManifestPath] 2026-08-13 -- which manifest entries THIS draw's
+  // derivation consumed, as a bitmask over manifest indices (kMaxCbManifest=6,
+  // so six bits are ever used).
+  //
+  // IT EXISTS BECAUSE THE PATH IS NOT KNOWN WHEN THE SPAN IS READ. noteCbSpanRead
+  // is called from ~30 sites inside ExtractTransforms, and m_lastO2wPathId is
+  // assigned by whichever o2w site runs -- so the projection and view reads
+  // happen BEFORE the path exists, and attributing at read time would file them
+  // under the previous draw's path. So the reads are remembered here and
+  // committed in one place at the end of the derivation, where the path is
+  // final. Same reason and same site as the s_o2wPathByVsIl write.
+  //
+  // THE ACTUAL PATH, NOT THE PREDICTED ONE. The capture FILTERS on a prediction
+  // because that is all it can know at SubmitDraw entry, but learning on the
+  // prediction would close the loop on itself: a shader wrongly predicted p1
+  // would file its p13 reads under p1 and then keep capturing them for p1
+  // forever. Learning on what actually ran is what lets a misprediction correct
+  // itself instead of persisting.
+  static thread_local uint32_t s_xtManifestTouched = 0u;
+
+  // NV-DXVK [ViewKey.Path] / [ManifestPath]: the (vs, il) identity the per-VS
+  // path caches are keyed on.
+  //
+  // FACTORED OUT because it now has two callers at two different points in the
+  // draw -- drawMemoComponents publishes it as comp[kMcVsIl] before the
+  // derivation, and captureDrawSnapshot needs the SAME value at SubmitDraw
+  // entry to look up this draw's predicted path. Two copies of a 16-byte struct
+  // hash is exactly how the cache and its consumer would come to disagree about
+  // what "the same shader" means, which is the thing the comment at the
+  // publish site was already guarding against.
+  static inline uint64_t vsIlIdentity(const void* vs, const void* il) {
+    struct E { uint64_t vs, il; };
+    static_assert(sizeof(E) == 16, "E must have no implicit padding");
+    const E e { reinterpret_cast<uint64_t>(vs), reinterpret_cast<uint64_t>(il) };
+    return XXH64(&e, sizeof(e), 0xC0A11D01ull);
+  }
 
   // NV-DXVK [DrawSnapshot] 2026-08-10: per-draw content-read purity tally.
   // Incremented by drawCbSpan, published onto the record at the end of the
@@ -11190,16 +11407,30 @@ namespace dxvk {
       const VsCbLocations::CbSpanReq& e = L->manifest[i];
       if (e.slot == slot && e.rebase == rebase
           && relOffset >= e.offset
-          && relOffset + byteCount <= uint32_t(e.offset) + e.byteCount)
-        return;  // already covered
+          && relOffset + byteCount <= uint32_t(e.offset) + e.byteCount) {
+        // [ManifestPath]: covered, and THIS draw is the one covering it. Mark
+        // the entry so the end-of-derivation commit can attribute it to the
+        // path that actually ran. Noted on the covering entry rather than on an
+        // exact match, because containment is what the capture and find() both
+        // use -- an entry that serves this read is an entry this path needs.
+        if (i < 32u) s_xtManifestTouched |= (1u << i);
+        return;
+      }
     }
     if (L->manifestN >= VsCbLocations::kMaxCbManifest)
       return;  // saturated: this span stays live, which is correct-but-slow
+    const uint32_t idx = L->manifestN;
     VsCbLocations::CbSpanReq& n = L->manifest[L->manifestN++];
     n.slot      = static_cast<uint8_t>(slot);
     n.offset    = relOffset;
     n.byteCount = static_cast<uint16_t>(byteCount);
     n.rebase    = rebase;
+    // pathDraws/pathReads stay zero here: a brand-new entry is UNMEASURED, and
+    // wantedBy() reads that as "capture for everyone" until the commit has seen
+    // enough draws to say otherwise. Seeding it from the draw that happened to
+    // create it would let one sighting decide the entry's whole future, which
+    // is the latch the boolean version had.
+    if (idx < 32u) s_xtManifestTouched |= (1u << idx);
   }
 
   static thread_local std::unordered_map<const void*, XtReplayRecSet> s_xtReplayMap;
@@ -15115,6 +15346,85 @@ namespace dxvk {
         s_vkPathByVsIl[s_vkVsIlCur]  = self->m_lastWtvPathId;
         s_o2wPathByVsIl[s_vkVsIlCur] = self->m_lastO2wPathId;   // [DropByPath]
 
+        // NV-DXVK [ManifestPath]: ATTRIBUTE THIS DRAW'S SPAN READS TO THE PATH
+        // THAT ACTUALLY RAN. Here for the same reason the two writes above are:
+        // it is the one point where m_lastO2wPathId is final and every exit
+        // passes through it, so no hand-placed update can be missed by the next
+        // early return someone adds.
+        //
+        // [ManifestPath] the gate counter. Taken here because this is the only
+        // point where BOTH the prediction the capture filtered on and the path
+        // the derivation actually took are in hand. Counted on every draw, not
+        // just filtered ones, so the rate is over the population the filter
+        // applies to rather than over the subset it already got right.
+        if (s_mfPredCur == UINT32_MAX)                     ++s_mfPredCold;
+        else if (s_mfPredCur == self->m_lastO2wPathId)     ++s_mfPredHit;
+        else                                               ++s_mfPredMiss;
+
+        // EVERY ENTRY IS SCORED, NOT JUST THE ONES THIS DRAW READ. The counters
+        // are a ratio, so the denominator has to advance on the draws that did
+        // NOT read the span -- that is the entire signal. Scoring only touched
+        // entries would pin reads/draws at 1.0 forever and reproduce exactly
+        // the boolean latch this replaced.
+        //
+        // "READ" MEANS EITHER WAY IT COULD HAVE BEEN READ:
+        //   from the record -- rangeToManifest maps a captured range back to
+        //     its entry and m_xtCbRangesRead says the range was consumed.
+        //     noteCbSpanRead NEVER sees these; it only runs on the live path.
+        //   live -- s_xtManifestTouched, which is also what a draw the filter
+        //     withheld the span from produces.
+        // Missing the first would score every successfully-captured span as
+        // unread and drive the manifest into withholding its own working set --
+        // a self-reinforcing collapse, and the reason this is not just
+        // s_xtManifestTouched.
+        if (s_xtVsLocCur != nullptr && self->m_lastO2wPathId < 16u) {
+          const uint32_t path = self->m_lastO2wPathId;
+          const uint32_t n = s_xtVsLocCur->manifestN;
+          uint32_t readMask = s_xtManifestTouched;
+          bool projRead = false, viewRead = false, camRead = false;
+          if (const DrawSnapshot* sn = self->m_drawSnapCur) {
+            const uint32_t nr = std::min<uint32_t>(
+                sn->numCbRanges, uint32_t(sn->rangeToManifest.size()));
+            for (uint32_t r = 0; r < nr && r < 16u; ++r) {
+              if ((self->m_xtCbRangesRead & (1u << r)) == 0u)
+                continue;
+              const uint8_t mi = sn->rangeToManifest[r];
+              if      (mi < 32u)   readMask |= (1u << mi);
+              else if (mi == 0xFEu) projRead = true;
+              else if (mi == 0xFDu) viewRead = true;
+              else if (mi == 0xFCu) camRead  = true;
+            }
+          }
+          for (uint32_t i = 0; i < n && i < 32u; ++i)
+            s_xtVsLocCur->manifest[i].notePathDraw(
+                path, (readMask & (1u << i)) != 0u);
+          // THE NAMED SPANS, scored on the same terms, with ONE asymmetry that
+          // is deliberate and worth stating.
+          //
+          // A withheld named span the derivation then needs is read live, and
+          // that live read goes through noteCbSpanRead -- so it is LEARNED as a
+          // manifest entry rather than crediting projUse/viewUse/camUse back.
+          // The named counters therefore do not recover, and the span comes
+          // back on the next draw through the MANIFEST instead, where it
+          // carries its own per-path counters.
+          //
+          // That is the desired end state, not a leak: the named spans are four
+          // consumers converted by hand, each an unfiltered per-VS capture, and
+          // the manifest is the general mechanism that can express "this path
+          // reads it, that one does not". Migration collapses two mechanisms
+          // into one. It is also self-correcting in a single draw, and it stays
+          // inside the same store-refusal safety as everything else here.
+          //
+          // THE TRIPWIRE IS MANIFEST SATURATION, not correctness: six entries
+          // per VS, currently averaging manN=3.07. If proj/view migrating in
+          // pushes shaders to the cap, satN on [DrawPure] goes non-zero and the
+          // spans past six stay live. Watch manN/satN on the next run; if it
+          // saturates, kMaxCbManifest (and kMaxCbRanges with it) is the knob.
+          s_xtVsLocCur->projUse.notePathDraw(path, projRead);
+          s_xtVsLocCur->viewUse.notePathDraw(path, viewRead);
+          s_xtVsLocCur->camUse .notePathDraw(path, camRead);
+        }
+
         DrawSnapshot* snap = self->m_drawSnapCur;
         bool elig = false, carrierMoved = false;
         // Axis 1 alone (content pure + layout resolved + not overflowed),
@@ -15216,6 +15526,13 @@ namespace dxvk {
         if (cbSafe) ++sCbSafe;
         for (uint32_t g = 0; g < kSdepGroupCount; ++g) {
           if (cmask & (1u << g)) ++sGrp[g];
+        }
+        // NV-DXVK [NamedWithhold]: pair this draw's withhold decision with its
+        // carrier outcome. Placed after cmask is final, so it names what
+        // actually happened rather than what the capture intended.
+        if (s_nsWithheld) {
+          ++s_nsDraws;
+          if (cmask & (1u << kSdepCbLoc)) ++s_nsCbLoc;
         }
         // Draws that pass axis 1 and moved nothing but the non-cam groups.
         //
@@ -15426,6 +15743,21 @@ namespace dxvk {
     m_lastO2wCamValid = false;
     m_lastO2wCamFromFanout = false;
     m_lastO2wCamOff = 0;
+    // NV-DXVK [CbSlotRead]: per-draw reset, HERE because this is the block
+    // every other m_last* probe is reset in and the two that were not cost a
+    // run each by reporting the previous draw's value.
+    m_xtCbSlotsRead = 0u;
+    // NV-DXVK [CbSpanWaste]: its span-exact sibling, reset in the same place
+    // for the same reason -- a stale mask here would score the PREVIOUS draw's
+    // reads against this draw's captured ranges, which is worse than no probe:
+    // the indices are dense and small, so a stale mask hits by coincidence and
+    // reports the waste as already-used.
+    m_xtCbRangesRead = 0u;
+    // NV-DXVK [ManifestPath]: same reset, same reason, one axis over -- a stale
+    // touched-mask would attribute the PREVIOUS draw's span reads to this
+    // draw's path, which is how a span that only p13 reads would acquire p1's
+    // bit and never be filtered again.
+    s_xtManifestTouched = 0u;
     // NV-DXVK [T31Skip]: reset per draw so a draw cannot inherit the previous
     // draw's reason and make the FAIL line name a cause belonging elsewhere.
     //
@@ -24610,6 +24942,25 @@ namespace dxvk {
     if (byteCount == 0)
       return nullptr;
 
+    // NV-DXVK [CbSlotRead] 2026-08-13 -- WHICH SLOTS DOES THIS PATH ACTUALLY
+    // READ? This is THE accessor for constant-buffer content, so a bit set
+    // here is a record that the derivation genuinely consumed that slot on
+    // this draw -- not an inference from reading one block.
+    //
+    // IT EXISTS TO SETTLE p3. p3's site (~:20086) builds objectToWorld from
+    // BONE 0, so its cb3 contribution to the object validity hash looks like
+    // dead weight -- and "looks like" is exactly the standard that produced
+    // three per-path drop masks that had to be deleted. If p3 draws never set
+    // bit 3 here, removing cb3 from p3's hash is a fact about the derivation.
+    // If they do, the inference was wrong and nothing should have been done.
+    //
+    // Free: one OR per content read, no branch, no allocation. Reset per draw
+    // in ExtractTransforms beside m_lastO2wCamValid, which is where every
+    // other m_last* probe is reset and where forgetting to do it has bitten
+    // twice.
+    if (slot < 32u)
+      m_xtCbSlotsRead |= (1u << slot);
+
     // The BINDING comes from the record when this draw has one. That is not a
     // micro-optimisation: constantOffset participates in the address, so
     // reading it live while the bytes come from the record would mix two
@@ -24630,9 +24981,16 @@ namespace dxvk {
       // uint32 narrowing is safe because a cbuffer offset that does not fit 32
       // bits cannot address a D3D11 constant buffer in the first place.
       if (absOff <= UINT32_MAX) {
-        if (const uint8_t* p = s->find(0u, slot, uint32_t(absOff), byteCount)) {
+        // findIndex rather than find: the pointer answers the caller, the INDEX
+        // answers [CbSpanWaste]. Same lookup, same containment rule, no second
+        // walk -- see the findIndex note on the declaration.
+        const uint32_t rIdx = s->findIndex(0u, slot, uint32_t(absOff), byteCount);
+        if (rIdx != UINT32_MAX) {
+          const DrawSnapshot::CbRange& r = s->cbRanges[rIdx];
+          if (rIdx < 16u)
+            m_xtCbRangesRead = uint16_t(m_xtCbRangesRead | (1u << rIdx));
           ++s_xtCbRecordReads;
-          return p;
+          return s->cbBytes.data() + r.dataOffset + (uint32_t(absOff) - r.byteOffset);
         }
       }
     }
@@ -25266,11 +25624,7 @@ namespace dxvk {
       *outGeoCCamCorr = 0ull;
 
     {
-      struct E { uint64_t vs, il; };
-      static_assert(sizeof(E) == 16, "E must have no implicit padding");
-      const E e { reinterpret_cast<uint64_t>(s.vs.ptr()),
-                  reinterpret_cast<uint64_t>(s.inputLayout.ptr()) };
-      out[kMcVsIl] = XXH64(&e, sizeof(e), 0xC0A11D01ull);
+      out[kMcVsIl] = vsIlIdentity(s.vs.ptr(), s.inputLayout.ptr());
       // NV-DXVK [ViewKey.Path]: publish the identity the per-VS path cache is
       // keyed on. Taken from HERE so the cache and the view key can never
       // disagree about what "the same shader" means.
@@ -25730,7 +26084,11 @@ namespace dxvk {
     // Spans, split by slot. slot 2 is the view/projection buffer; slots 0 and 1
     // are near-constant per frame (perFrameDistinct cb0=4 cb1=2) and go into
     // both accumulators; everything else is object state.
-    uint64_t accView = 0ull, accObj = 0ull;
+    // NV-DXVK [CamRelSpans] 2026-08-13: slot 3 is accumulated SEPARATELY so the
+    // camera-relative re-base below can replace it wholesale. Folding it into accObj first
+    // and trying to subtract it out would depend on the accumulator being a
+    // sum, which is an implementation detail nothing else relies on.
+    uint64_t accView = 0ull, accObj = 0ull, accObjCb3 = 0ull;
     for (uint32_t i = 0; i < s.numCbRanges; ++i) {
       const DrawSnapshot::CbRange& r = s.cbRanges[i];
       struct RngE { uint32_t stage, slot, off, cnt; };
@@ -25759,8 +26117,134 @@ namespace dxvk {
       // Nothing about objectToWorld should read a per-frame global, and if
       // something does, verify says so: FAIL will name it with fld{o2w}.
       if (isView || isShared)    accView += rh;
-      if (!isView && !isShared)  accObj  += rh;
+      if (!isView && !isShared) {
+        if (r.slot == 3u) accObjCb3 += rh;
+        else              accObj    += rh;
+      }
     }
+
+    // ==================================================================
+    // NV-DXVK [CamRelSpans] 2026-08-13 -- HASH THE OUTPUT, NOT THE INPUT.
+    // rtx.splitTransformCamRelObjSpans.
+    //
+    // APPLIES TO EVERY PATH WHOSE SITE BUILDS transpose3x3(cb3) + camOrigin,
+    // which is p13 and p5. Both were read before this was written, and they
+    // are the same expression:
+    //   p13 (~:20803)  Vector4(bm[3] + camO[0], bm[7] + camO[1],
+    //                          bm[11] + camO[2], 1) over a transposed 3x3
+    //   p5  (~:21463)  tx = m[3] + camO[0], ty = m[7] + camO[1],
+    //                  tz = m[11] + camO[2], same transpose
+    // So one correction covers both, and it is keyed on WHAT THE SITE
+    // COMPUTES rather than on a per-path table. p5's measurement corroborates
+    // rather than motivates: spurPct=100 with chgR{} EMPTY is exactly what a
+    // hash tracking camera motion on a static object looks like.
+    //
+    // p3 IS DELIBERATELY NOT HERE. Its site (~:20086) builds o2w from BONE 0,
+    // not from cb3, so its cb3 contribution is dead weight -- but "dead
+    // weight" is an inference from reading one block, and p3 is 119 spurious
+    // stales a window. Removing a component on an inference is how the drop
+    // masks happened. Read p3's site properly, or leave it.
+    //
+    // THE DEFECT, read off the derivation rather than inferred from counters.
+    // The p13 site (~:20803) builds
+    //     objectToWorld = rot3x3(bm) , translation (bm[3],bm[7],bm[11]) + camO
+    // where bm is drawCbSpan(3, 0, 48) and camO is c_cameraOrigin. Its own
+    // comment says what cb3 holds: objectToCameraRelative. So when the camera
+    // moves and the object does NOT, bm's translation moves by -delta and camO
+    // moves by +delta and THE SUM IS UNCHANGED -- the world transform is
+    // stable, which is the whole reason this entry is worth caching.
+    //
+    // The validity hash was over the RAW cb3 bytes. Those move on every camera
+    // step, so every static object in the 3D skybox was invalidated on every
+    // camera step while its cached transform stayed perfectly correct. That is
+    // the mechanism behind p13's spurious staleness, and p13 is 87% of all
+    // recoverable staleness in the feature ([Perf.SplitXf.Stale]: p13 spur=3439
+    // real=1646, against p1 spur=7).
+    //
+    // THIS IS THE SAME REPAIR AS OBJECT-KEY BITS 20 AND 22, a third time: an
+    // input the derivation reads that the key modelled wrongly. Bit 20 routed
+    // bone 0 through the snapshot, bit 22 put the neg-proj cache state in the
+    // key, and this hashes the camera-corrected transform instead of the
+    // camera-relative bytes it is built from.
+    //
+    // IT IS ALSO A NARROWING. p13 reads cb3[0,48) and nothing else, while
+    // accObj hashed EVERY captured cb3 range -- [Perf.SplitXf.Bytes] shows
+    // s0c3+0, s0c3+48 and s0c3+64 all in p13's population, two of which the
+    // site never touches. Replacing the slot-3 accumulator with a hash of the
+    // twelve floats this path actually consumes drops them by construction.
+    //
+    // FAILURE MODE IS A LOST HIT, NOT A WRONG SERVE, and that is what makes it
+    // safe to try. If drawCamOriginForCorrection resolves a different origin
+    // than the site adds, the correction simply fails to cancel the camera
+    // motion and the entry stales exactly as it does today. Two DIFFERENT
+    // world transforms still hash differently, because the corrected value IS
+    // the world transform. The one way to serve wrong is the quantum below
+    // absorbing a genuine sub-quantum move, which is why it defaults off.
+    bool camRelRebased = false;
+    if (RtxOptions::splitTransformCamRelObjSpans()
+        && (s_o2wPathPredicted == 13u || s_o2wPathPredicted == 5u)) {
+      // The 48 bytes by CONTAINMENT, not by an exact offset match -- the span
+      // manifest coalesces ranges, so the block can sit inside a wider one.
+      // Same reasoning drawCamOriginForCorrection uses for cb2@4.
+      const uint8_t* bmSrc = nullptr;
+      for (uint32_t i = 0; i < s.numCbRanges; ++i) {
+        const DrawSnapshot::CbRange& r = s.cbRanges[i];
+        if (r.stage != 0u || r.slot != 3u) continue;
+        if (r.byteOffset != 0u || r.byteCount < 48u) continue;
+        if (size_t(r.dataOffset) + 48u > s.cbBytes.size())    continue;
+        bmSrc = s.cbBytes.data() + r.dataOffset;
+        break;
+      }
+      float camO[3] = { 0.f, 0.f, 0.f };
+      if (bmSrc != nullptr && drawCamOriginForCorrection(s, camO)) {
+        // memcpy, not a reinterpret_cast: cbBytes is a byte buffer and the
+        // range start carries no float alignment guarantee.
+        float bm[12];
+        std::memcpy(bm, bmSrc, sizeof(bm));
+        // WORLD TRANSFORM, laid out exactly as the site builds it: the 3x3 is
+        // untouched (rotation is world-space already; only the translation is
+        // camera-relative) and the translation column is corrected.
+        float w[12] = {
+          bm[0], bm[1], bm[2],
+          bm[4], bm[5], bm[6],
+          bm[8], bm[9], bm[10],
+          bm[3] + camO[0], bm[7] + camO[1], bm[11] + camO[2]
+        };
+        // THE QUANTUM, and it is the only wrong-serve mechanism here.
+        // bm_t and camO are large and opposite, so their sum cancels to a
+        // small residue and the last bits are where float cancellation lands
+        // -- a static object can still jitter by an ULP and stale. Rounding
+        // the translation absorbs that. It also absorbs a GENUINE move
+        // smaller than the quantum, which is exactly how the p1 attempt
+        // FAILed with chg{t31Ent} (see the geoC quantum at ~:25492). Powers
+        // of two so the rounding is exact in float and adds no error of its
+        // own. Read [Perf.SplitXf.Bytes] quant{maxSpur= minRealRot=} for p13
+        // and pick strictly between them; default 0 = off, no rounding.
+        const uint32_t camRelQ = RtxOptions::splitTransformCamRelSpansQuantum();
+        if (camRelQ != 0u) {
+          const float q = 1.0f / float(1u << (camRelQ - 1u));
+          for (uint32_t k = 9; k < 12; ++k)
+            w[k] = std::round(w[k] / q) * q;
+        }
+        accObj += XXH64(w, sizeof(w), 0x9130C0EEull);
+        camRelRebased = true;
+      }
+    }
+    // Every path that was not successfully re-based keeps the raw slot-3
+    // ranges, unchanged. A p13/p5 draw whose cb3 block or camera could not be
+    // resolved lands here too, which is the safe direction: it stales as
+    // before rather than hashing something the site did not build.
+    //
+    // ONE ASYMMETRY, AND IT IS HARMLESS. Both sites apply the camera term
+    // CONDITIONALLY -- p5 on haveCamO (~:21463), p13 on p13CameraRelative
+    // (~:20803) -- while this adds it whenever drawCamOriginForCorrection
+    // resolves. On a draw where the site would NOT have corrected, the hash is
+    // still a deterministic function of the same bytes, so two different world
+    // transforms still hash differently; the correction simply fails to cancel
+    // camera motion and the entry stales as it does today. A lost hit, never a
+    // wrong serve -- the direction everything here is required to fail in.
+    if (!camRelRebased)
+      accObj += accObjCb3;
 
     // ==================================================================
     // THE OBJECT KEY, AND WHAT IT MUST NOT CONTAIN.
@@ -25994,6 +26478,7 @@ namespace dxvk {
         if (d & 4u) hk.geoS  = 0ull;
         appliedDrop = d;
       }
+
       // The mask AS APPLIED to this draw, not as configured. Two draws sharing
       // an identity can take different branches of the predicate and therefore
       // different masks, which is the hazard the entry records it for.
@@ -26092,8 +26577,11 @@ namespace dxvk {
       struct IdentHead {
         uint64_t vbPtr, ibPtr, vsIl;
         uint32_t vbOffset, vbStride, ibOffset, _pad;
+        uint32_t drawStart, drawCount;
+        int32_t  drawBase;
+        uint32_t _pad2;
       };
-      static_assert(sizeof(IdentHead) == 40, "IdentHead must have no implicit padding");
+      static_assert(sizeof(IdentHead) == 56, "IdentHead must have no implicit padding");
       // NV-DXVK [RtvKey] 2026-08-13 -- BIT 21 (2097152): COLOUR-RTV PRESENCE.
       // The _pad word, spent on the input the o2w path selection actually reads.
       //
@@ -26181,13 +26669,65 @@ namespace dxvk {
             vsNegProjActive(locK, m_context->m_device->getCurrentFrameId())
             ? 2u : 0u;
       }
+      // NV-DXVK [RangeKey] 2026-08-13 -- BIT 23 (8388608): THE DRAW RANGE, and
+      // it is the OTHER HALF OF AN ADDRESS THIS KEY ALREADY HALF-COVERED.
+      //
+      // THE DEFECT. The comment above says why vbOffset/vbStride/ibOffset are
+      // in the key: "TF2 sub-allocates many meshes out of one pooled buffer and
+      // the pointer alone would merge them." True, and incomplete. D3D11 picks
+      // a sub-mesh inside a bound buffer by EITHER the IASetVertexBuffers
+      // offset OR the draw call's StartIndexLocation/BaseVertexLocation, and
+      // Source uses the second heavily -- it binds the pool once and moves the
+      // range per draw. So two entirely different meshes hashed to one object
+      // key, shared one cache entry, and overwrote each other on every draw.
+      //
+      // THIS IS THE COLLISION N-WAY WAS BUILT FOR. That change gave one key
+      // several ways and measured serve 68% -> 77%, objStale 3979 -> 2350 --
+      // i.e. it worked, by holding N entries under a key that should have been
+      // N keys. It cost obj x kXfWaysMax x ~200 B (~12.6 MB at 4 ways) because
+      // the way array is inline, and it needed an eviction policy for a
+      // problem that had none. Splitting the key removes the collision at the
+      // source, and the entries it creates are exactly as many as there are
+      // distinct meshes.
+      //
+      // WIDENING A KEY IS THE SAFE DIRECTION, and the block comment above
+      // states the invariant it rests on: "THIS KEY CANNOT CAUSE A WRONG
+      // SERVE, however coarse it is. A collision costs a hit, never
+      // correctness, because outObjVal above still has to match." A wider key
+      // can only ever SPLIT entries -- it can never move a draw onto a
+      // stranger's -- which is the same argument bits 21 and 22 shipped on.
+      //
+      // COUNT IS IN, and the churn objection does not apply. A static mesh's
+      // slice is fixed for its buffer's lifetime, so count is constant there.
+      // Geometry whose count really does vary per draw is dynamic, rebuilt
+      // through Map(WRITE_DISCARD), and its vbPtr is renamed every frame -- so
+      // those draws were already re-keyed every frame and count adds no churn
+      // they were not paying. ident{new/f} on the report line is the tripwire:
+      // if it climbs with this bit on, that reasoning is wrong.
+      //
+      // MEASURED BY: serve% and objStale on [Perf.SplitXf], and instanceable on
+      // [Perf.SplitXf.Merge] -- which is built FROM this key, so its 433/4
+      // frames (9.9%, the number §6 used to rule out instancing) counted
+      // different sub-meshes as instances of one another. Compare the new
+      // reading against 433 to see how much of that population was this bug.
+      const bool rangeKey =
+          (RtxOptions::splitTransformObjKeyMask() & 8388608u) != 0u;
+      // indexed rides in the flags word: it says how to READ the other three
+      // (DrawIndexed's base is meaningless for Draw), so it belongs with them
+      // and not on its own.
+      const uint32_t indexedKeyBit = (rangeKey && s.drawIndexed) ? 4u : 0u;
       const IdentHead ih {
         (vb0.buffer != nullptr) ? reinterpret_cast<uint64_t>(vb0.buffer.ptr()) : 0ull,
         (s.indexBuffer.buffer != nullptr)
             ? reinterpret_cast<uint64_t>(s.indexBuffer.buffer.ptr()) : 0ull,
         comp[kMcVsIl],
         uint32_t(vb0.offset), uint32_t(vb0.stride),
-        uint32_t(s.indexBuffer.offset), (rtvKeyBit | negProjKeyBit)
+        uint32_t(s.indexBuffer.offset),
+        (rtvKeyBit | negProjKeyBit | indexedKeyBit),
+        rangeKey ? s.drawStart : 0u,
+        rangeKey ? s.drawCount : 0u,
+        rangeKey ? s.drawBase  : 0,
+        0u
       };
       outObjKey = XXH64(&ih, sizeof(ih), 0x1DEA7117ull);
     }
@@ -27120,7 +27660,9 @@ namespace dxvk {
     sCurMap[key] = row;
   }
 
-  void D3D11Rtx::captureDrawSnapshot(uint32_t drawIndex) {
+  void D3D11Rtx::captureDrawSnapshot(uint32_t drawIndex, bool indexed,
+                                     uint32_t count, uint32_t start,
+                                     int32_t base) {
     // Arena slot for this draw. Reserved once and never grown mid-frame:
     // m_drawSnapCur points into the vector, so a reallocation would dangle it
     // and every already-captured snapshot with it. Past the cap we simply stop
@@ -27155,6 +27697,18 @@ namespace dxvk {
       // one that would corrupt silently: a stale count would make find()
       // return the PREVIOUS draw's captured bytes as this draw's transforms.
       m_drawSnapCur->numCbRanges    = 0;
+      // NV-DXVK [CbSpanWaste]: cleared with numCbRanges, and for the same
+      // reason it is on this list at all -- it is OR-ed into and never
+      // assigned, so a stale mask would mark this draw's ranges as having paid
+      // a write-combined transaction the PREVIOUS draw paid. The indices are
+      // dense and small, so that mis-attribution would hit almost every time
+      // rather than occasionally, and the waste census reads it as cost.
+      m_drawSnapCur->cbRangeWcMiss  = 0;
+      // [ManifestPath]: on the same list and for the same reason -- it is
+      // written only by the learned-span capture, so a named span or a skipped
+      // entry would otherwise leave the previous draw's mapping in place and
+      // credit this draw's reads to a stranger's manifest entry.
+      m_drawSnapCur->rangeToManifest.fill(0xFFu);
       m_drawSnapCur->overflowed     = false;
       m_drawSnapCur->layoutResolved = false;
       m_drawSnapCur->cbLiveReads    = 0;
@@ -27187,6 +27741,13 @@ namespace dxvk {
     }
     s.frameId   = g_remixFrameId.load(std::memory_order_relaxed);
     s.drawIndex = drawIndex;
+    // THE DRAW RANGE. Unconditional, like every other field on the arena-reuse
+    // list: these come from the call arguments, so there is no "this draw does
+    // not have one" case to leave behind the previous occupant's slice.
+    s.drawIndexed = indexed;
+    s.drawCount   = count;
+    s.drawStart   = start;
+    s.drawBase    = base;
     // Carrier axis, baseline half. Taken HERE, at the same instant as every
     // other input, so the comparison at the derivation's exit measures the
     // derivation and nothing else. See DrawSnapshot::carrierGrp for why this
@@ -27700,6 +28261,12 @@ namespace dxvk {
       // of this draw. See the WcWindow note above for why the window replaced a
       // per-span read: the cost is transaction count, and [Perf.WcCopy] measured
       // ~2,894 of them per frame before it.
+      // NV-DXVK [CbSpanWaste]: did THIS span cost a write-combined transaction?
+      // Recorded per range because the waste census has to distinguish a dead
+      // span that was free (ring hit / window hit -- deleting it saves a memcpy)
+      // from a dead span that paid the transaction the [DrawSnap] wcMissSlots
+      // line bills at 92% cb3. Only the second kind is worth the whole exercise.
+      bool wcMissed = false;
       size_t len = 0;
       if (const uint8_t* p = stagedCbBytesIfHit(b.buffer.ptr(), len)) {
         // A short buffer is NOT an error: it means this draw does not have that
@@ -27732,6 +28299,7 @@ namespace dxvk {
           if (avail < need)
             return;
           ++s_drawSnapWcWinMiss;
+          wcMissed = true;
           if (slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
             ++s_drawSnapWcMissBySlot[slot];
           // ANCHOR THE WINDOW AT THE BOUND RANGE, NOT AT THIS SPAN.
@@ -27782,6 +28350,11 @@ namespace dxvk {
           }
         }
       }
+      // NV-DXVK [CbSpanWaste]: stamp the transaction bit against THIS range's
+      // index. Taken here, after every early return above, so a span that was
+      // declined never claims a transaction it did not cause.
+      if (wcMissed && s.numCbRanges < 16u)
+        s.cbRangeWcMiss = uint16_t(s.cbRangeWcMiss | (1u << s.numCbRanges));
       DrawSnapshot::CbRange& r = s.cbRanges[s.numCbRanges++];
       r.stage      = stage;
       r.slot       = slot;
@@ -27850,6 +28423,74 @@ namespace dxvk {
     // projection has not been validly resolved even once. Both are correct
     // outcomes, not failures: we only ever capture spans we can name.
     bool layoutResolved = false;
+    // NV-DXVK [ManifestPath]: resolved BEFORE the named spans, because they are
+    // filtered too now. See PathUse for why: after the learned-span filter
+    // shipped, every remaining dead cb3 transaction was a named 64 B proj/view
+    // span. Reserved rangeToManifest codes, so one array covers both kinds.
+    static constexpr uint8_t kRtmProj = 0xFEu;
+    static constexpr uint8_t kRtmView = 0xFDu;
+    static constexpr uint8_t kRtmCam  = 0xFCu;
+    const bool mfFilter = RtxOptions::splitTransformManifestPathFilter();
+    uint32_t mfPredPath = UINT32_MAX;
+    if (mfFilter) {
+      const auto itMf = s_o2wPathByVsIl.find(
+          vsIlIdentity(s.vs.ptr(), s.inputLayout.ptr()));
+      if (itMf != s_o2wPathByVsIl.end())
+        mfPredPath = itMf->second;
+      s_mfPredCur = mfPredPath;   // scored at the end of the derivation
+    }
+    // THE NAMED proj/view SPANS ARE NOT FILTERED, AND THIS IS A MEASUREMENT.
+    //
+    // Filtering them was tried (v3, 23:47) and it works spectacularly on cost:
+    // wcMiss/draw 1.157 -> 0.523, cb3 0.795 -> 0.377, wasteB/f 125,791 -> 140,
+    // deadWcAll/f 620 -> 1. It also broke a correctness gate:
+    //   FAILcarrier 0 -> 99..156, grp{cbLoc=99..156} every window
+    //   satN ~750 -> 4,687 and manN 3.07 -> 4.64
+    //
+    // WHY, AND IT IS STRUCTURAL RATHER THAN TUNABLE. kSdepCbLoc hashes exactly
+    // m_projSlot / m_projOffset / m_projStage / m_columnMajor / m_viewSlot /
+    // m_viewOffset (~:32289) -- the location members the proj/view consumers
+    // themselves maintain. Withholding the span makes the derivation re-resolve
+    // them, and re-resolving them IS a cbLoc carrier move by definition. So
+    // this class of span cannot be withheld without moving the carrier, whereas
+    // the LEARNED spans have no such coupling and held FAILcarrier=0 across
+    // both of their runs.
+    //
+    // The saturation is the same cause one step downstream: a withheld named
+    // span is re-learned as a manifest entry, and proj+view migrating in pushed
+    // shaders past the six-entry cap.
+    //
+    // cameraOrigin is NOT in that hash -- its location comes from
+    // memoCamOriginLoc, a per-shader memo -- so it stays filtered, and it is
+    // worth having: p13's dead cb0 ran ~2,138 draws/window.
+    //
+    // RE-ENABLED ON THE STRICT RULE. The majority rule is wrong for these two
+    // spans specifically -- see PathUse::neverReadBy -- so they now withhold
+    // only after 255 consecutive draws on the path without a single read, where
+    // one read re-enables them for another full run. That bounds the exposure
+    // to at most one re-resolution per (VS, path) per 255 draws instead of the
+    // sustained ~100/window the majority rule produced, and [NamedWithhold]
+    // below measures whether even that is zero.
+    static constexpr bool kMfFilterNamedProjView = true;
+
+    // One place for the rule, so the named spans and the learned ones can never
+    // drift apart on what "this path wants it" means.
+    const auto mfWant = [&](const VsCbLocations::PathUse& u) -> bool {
+      if (!mfFilter || mfPredPath >= 16u) return true;
+      if (u.wantedBy(mfPredPath))         return true;
+      ++s_mfSkipped;
+      return false;
+    };
+    // The STRICT rule, for the two spans whose consumers write cbLoc state.
+    // Scoring still happens either way, so the counters stay warm and the A/B
+    // is one constant apart.
+    const auto mfWantNamed = [&](const VsCbLocations::PathUse& u) -> bool {
+      if (!kMfFilterNamedProjView || !mfFilter || mfPredPath >= 16u) return true;
+      if (!u.neverReadBy(mfPredPath)) return true;
+      ++s_mfSkipped;
+      s_nsWithheld = true;   // [NamedWithhold], scored at the derivation's exit
+      return false;
+    };
     // Non-zero when a captured proj/view cbuffer is bound at a non-zero
     // constantOffset -- the condition under which the proj-vs-view offset
     // convention divergence documented below stops being harmless.
@@ -27901,10 +28542,23 @@ namespace dxvk {
                 && L.projSlot < st.vs.constantBuffers.size()) {
               const auto& cbP = st.vs.constantBuffers[L.projSlot];
               if (cbP.constantOffset != 0) cbOffNz = 1;
-              capture(st.vs.constantBuffers, 0u, L.projSlot,
-                      static_cast<uint32_t>(cbP.constantOffset) * 16u
-                          + static_cast<uint32_t>(L.projOffset), 64u);
+              // SET BEFORE THE FILTER, AND THIS IS LOAD-BEARING. layoutResolved
+              // is the deferral partition predicate -- it says this draw's VS
+              // had a resolved location and therefore skips the cold-start
+              // scans. It is NOT a statement about whether the span was
+              // captured. Clearing it on a withheld span would clear
+              // cbSafeToDefer() for every draw the filter touches and refuse
+              // every one of their stores, trading the whole serve rate for a
+              // transaction.
               layoutResolved = true;
+              if (mfWantNamed(L.projUse)) {
+                const uint32_t rIdxP = s.numCbRanges;
+                capture(st.vs.constantBuffers, 0u, L.projSlot,
+                        static_cast<uint32_t>(cbP.constantOffset) * 16u
+                            + static_cast<uint32_t>(L.projOffset), 64u);
+                if (s.numCbRanges > rIdxP && rIdxP < s.rangeToManifest.size())
+                  s.rangeToManifest[rIdxP] = kRtmProj;
+              }
             }
             // VIEW USES A DIFFERENT CONVENTION FROM PROJ. Deliberate, not a
             // slip. The proj consumers add the bound-range base
@@ -27921,9 +28575,14 @@ namespace dxvk {
             // while constantOffset is 0 for these cbuffers. The cbOff counter
             // in the [DrawSnap] census below measures whether that ever breaks.
             if (L.viewStage == 0 && L.viewOffset != SIZE_MAX
-                && L.viewSlot < st.vs.constantBuffers.size())
+                && L.viewSlot < st.vs.constantBuffers.size()
+                && mfWantNamed(L.viewUse)) {
+              const uint32_t rIdxV = s.numCbRanges;
               capture(st.vs.constantBuffers, 0u, L.viewSlot,
                       static_cast<uint32_t>(L.viewOffset), 64u);
+              if (s.numCbRanges > rIdxV && rIdxV < s.rangeToManifest.size())
+                s.rangeToManifest[rIdxV] = kRtmView;
+            }
           }
         }
 
@@ -27947,10 +28606,19 @@ namespace dxvk {
           if (camLocCap0 && camLocCap0->size >= 12
               && camLocCap0->slot < st.vs.constantBuffers.size()) {
             const auto& cbCam = st.vs.constantBuffers[camLocCap0->slot];
-            if (cbCam.buffer != nullptr)
+            // capLoc may be null here -- this block is deliberately outside the
+            // sVsCbLocCache guard -- so the counters only apply when there IS
+            // an entry to hold them. No entry means no filtering, which is the
+            // conservative side and matches the pre-existing behaviour.
+            if (cbCam.buffer != nullptr
+                && (capLoc == nullptr || mfWant(capLoc->camUse))) {
+              const uint32_t rIdxC = s.numCbRanges;
               capture(st.vs.constantBuffers, 0u, camLocCap0->slot,
                       static_cast<uint32_t>(cbCam.constantOffset) * 16u
                         + static_cast<uint32_t>(camLocCap0->offset), 12u);
+              if (s.numCbRanges > rIdxC && rIdxC < s.rangeToManifest.size())
+                s.rangeToManifest[rIdxC] = kRtmCam;
+            }
           }
         }
       }
@@ -28003,10 +28671,61 @@ namespace dxvk {
     // ORDER MATTERS and it is deliberate: named spans first, so that when the
     // range budget is tight the spans with a proven consumer win over the
     // learned ones.
+    // NV-DXVK [ManifestPath] 2026-08-13 -- CAPTURE FOR THE PATH THIS DRAW WILL
+    // TAKE, not for every path this shader has ever taken.
+    // rtx.splitTransformManifestPathFilter.
+    //
+    // THE MEASUREMENT THAT MOTIVATES IT, [Perf.SplitXf.CbWaste]:
+    //   49% of ALL captured bytes are never read by any drawCbSpan call
+    //   p1  cap{3=8184/979968b} dead{3=8184/8063}  -- cb3 captured on 100% of
+    //       p1's draws, READ ON ZERO, and 98% of them paid a write-combined
+    //       transaction for it
+    //   p3  the same shape, dead{3=2198/2162}
+    //   37% of every WC transaction the capture issues is for a dead span, and
+    //   65% of the cb3 transactions specifically
+    // The manifest is per VS; whether cb3 is read is decided by the PATH; and
+    // 55% of draws are on a VS that takes more than one. So the manifest was
+    // replaying p13's cb3 span onto p1's draws, every draw, all frame.
+    //
+    // THE PREDICTION IS THE SAME ONE [DropByPath] ALREADY SHIPS, off the same
+    // (vs, il) -> last-derived-path cache. It is NOT exact: measured
+    // o2wPath{agree=17491-22699 disagree=58-73 cold=0}, i.e. ~0.35% wrong.
+    //
+    // AND BEING WRONG IS FREE HERE, WHICH IS THE WHOLE REASON THIS IS SAFE AND
+    // THE DELETED DROP MASKS WERE NOT. Withholding a span the derivation turns
+    // out to need makes find() return nullptr, so the consumer takes its
+    // original live path -- correct bytes, just not pure -- and that live read
+    // increments cbLiveReads, which clears contentPure(), which clears
+    // cbSafeToDefer(), which REFUSES THE STORE. So a mispredicted draw cannot
+    // create a cache entry whose validity hash is missing the span it actually
+    // read. That is the exact hole DropExt fell into: it narrowed the hash and
+    // stored anyway, and FAILcarrier grp{cbLoc} went 0 -> 337. Here the store
+    // gate closes it structurally, with no new mechanism.
+    //
+    // It also self-heals: the live read teaches the manifest this path's bit,
+    // so the next draw of that (vs, il, path) captures it.
+    //
+    // WATCH: refuse{unsafe (cb=)} on [Perf.SplitXf] is the cost of
+    // mispredictions -- it should move by roughly the disagree rate, not more.
+    // [DrawPure] why{miss=} should spike at each VS's first sighting and decay.
+    // deadWc/f on [Perf.SplitXf.CbWaste] is the win and should collapse.
+    // FAIL and FAILcarrier must stay 0, as ever.
+    // mfPredPath / mfFilter / mfWant are resolved once above the NAMED spans --
+    // both kinds share the rule, so there is one lookup per draw, not two.
     if (capLoc != nullptr) {
       for (uint32_t i = 0; i < capLoc->manifestN; ++i) {
         const VsCbLocations::CbSpanReq& m = capLoc->manifest[i];
         if (m.byteCount == 0 || m.slot >= st.vs.constantBuffers.size())
+          continue;
+        // THREE WAYS TO DECLINE THE FILTER, all of them the conservative
+        // direction (capture anyway):
+        //   filter off                 -- the option
+        //   use.draws[p] == 0          -- never measured for this path: an
+        //                                 entry learned before this shipped, or
+        //                                 one whose draws had no usable path
+        //   prediction cold            -- this (vs, il) has not derived yet
+        // Only a measured minority withholds -- see PathUse::wantedBy.
+        if (!mfWant(m.use))
           continue;
         const auto& cbM = st.vs.constantBuffers[m.slot];
         if (cbM.buffer == nullptr)
@@ -28023,7 +28742,15 @@ namespace dxvk {
         // whole record down with it. See spanFits.
         if (!spanFits(m.byteCount))
           continue;
+        ++s_mfCaptured;
+        // Remember which range this entry became, BEFORE capture() appends it:
+        // s.numCbRanges is the index it is about to take. capture() can still
+        // decline (null buffer, short mapping), in which case the slot is
+        // simply never written and stays 0xFF from the per-draw clear.
+        const uint32_t rIdxM = s.numCbRanges;
         capture(st.vs.constantBuffers, 0u, m.slot, absM, m.byteCount);
+        if (s.numCbRanges > rIdxM && rIdxM < s.rangeToManifest.size())
+          s.rangeToManifest[rIdxM] = static_cast<uint8_t>(i);
       }
     }
 
@@ -28089,6 +28816,29 @@ namespace dxvk {
             // code would have paid and wcMiss is what this one pays. Cross-check
             // wcMiss/draw against [Perf.WcCopy]'s narrow-copy call count -- if
             // they disagree, one of the two is counting something else.
+            // [ManifestPath]: what the per-path filter withheld this window.
+            // mfSkip climbing while wcMiss falls is the intended shape; mfSkip
+            // climbing while refuse{unsafe cb=} also climbs means the
+            // prediction is wrong more often than o2wPath{disagree} says and
+            // the filter is costing stores.
+            " mfSkip=", s_mfSkipped, " mfCap=", s_mfCaptured,
+            // [NamedWithhold] THE COUPLING, MEASURED. nsDraws = draws where a
+            // named proj/view span was withheld; nsCbLoc = how many of those
+            // then moved the cbLoc carrier. Compare nsCbLoc against
+            // [Perf.SplitXf] FAILcarrier grp{cbLoc}: tracking it proves the
+            // coupling and localises it here, while nsCbLoc~0 with grp{cbLoc}
+            // still high means the carrier moves are somebody else's and the
+            // proj/view theory is wrong.
+            " ns{draws=", s_nsDraws, " cbLoc=", s_nsCbLoc, "}",
+            // THE GATE ON THE WHOLE FILTER -- predicted path vs the path the
+            // derivation actually took, per draw. High miss means shaders
+            // alternate paths per draw, every withheld span becomes a live read
+            // and a refused store, and the filter should come back out.
+            " mfPred{hit=", s_mfPredHit, " miss=", s_mfPredMiss,
+            " cold=", s_mfPredCold,
+            " (", ((s_mfPredHit + s_mfPredMiss)
+                   ? (s_mfPredMiss * 100u / (s_mfPredHit + s_mfPredMiss))
+                   : 0u), "% miss)}",
             " wcMiss=", s_drawSnapWcWinMiss,
             " wcHit=", s_drawSnapWcWinHit,
             " (", ((s_drawSnapWcWinMiss + s_drawSnapWcWinHit)
@@ -28118,6 +28868,9 @@ namespace dxvk {
         sDraws = sResolved = sRanges = sOvf = sCbOff = 0;
         sManN = sManDraws = 0;
         s_drawSnapWcWinHit = s_drawSnapWcWinMiss = 0;
+        s_mfSkipped = s_mfCaptured = 0;
+        s_mfPredHit = s_mfPredMiss = s_mfPredCold = 0;
+        s_nsDraws = s_nsCbLoc = 0;
         for (auto& ws : s_drawSnapWcMissBySlot) ws = 0;
         sLast = now;
       }
@@ -32094,9 +32847,16 @@ namespace dxvk {
     // Clear FIRST: if the option is off this draw, every consumer must see
     // "no snapshot" rather than the previous draw's record.
     m_drawSnapValid = false;
+    // NV-DXVK [ManifestPath]: cleared HERE, before the capture that sets it,
+    // because it is read at the END of the derivation -- clearing it in
+    // ExtractTransforms (where every other per-draw probe is reset) would wipe
+    // the capture's decision before the check that scores it. A draw that never
+    // captures therefore scores as cold rather than inheriting a prediction.
+    s_mfPredCur = UINT32_MAX;
+    s_nsWithheld = false;   // [NamedWithhold], set by the capture, read at exit
     if (RtxOptions::useDrawSnapshot()) {
       const auto tSnap0 = std::chrono::steady_clock::now();
-      captureDrawSnapshot(m_drawCallID);
+      captureDrawSnapshot(m_drawCallID, indexed, count, start, base);
       const int64_t dSnapNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now() - tSnap0).count();
       s_perfDrawSnapAccNs += dSnapNs;
@@ -37071,6 +37831,88 @@ namespace dxvk {
       };
       static thread_local uint64_t xFld[kSxFldCount] = { };
       static thread_local uint64_t xCarGrp[kSdepGroupCount] = { };
+      // THE POPULATION FAILcarrier SUBTRACTS -- carrier moves on a served draw
+      // that the replay reproduced AND REPLAYFAIL confirmed byte-identical.
+      // It exists so the subtraction is auditable rather than silent: before
+      // it, grp{cbLoc=727} and replay{serve=727} were the same 727 draws and
+      // nothing on the line said so. fgv + grp is the old FAILcarrier.
+      static thread_local uint64_t xCarFgv[kSdepGroupCount] = { };
+
+      // ---- NV-DXVK [CbSlotRead] 2026-08-13. -----------------------------
+      // Per o2w path, how many draws took it and how many of them READ each
+      // cbuffer slot, recorded by drawCbSpan rather than inferred. Answers
+      // "does p3 read cb3 at all" as a fact.
+      static thread_local uint64_t xCbrDraws[kXfPathMax] = { };
+      static thread_local uint64_t xCbrSlot [kXfPathMax][8] = { };
+
+      // ---- NV-DXVK [CbSpanWaste] 2026-08-13 -- THE OTHER HALF. -----------
+      // CbSlotRead above says which slots a path READ. These say which it
+      // CAPTURED. The waste is the difference, and until it is a number rather
+      // than an argument nothing should be built on it.
+      //
+      // WHY THE DIFFERENCE IS EXPECTED TO BE LARGE. The span manifest is keyed
+      // per VS (captureDrawSnapshot's learned-span replay), but whether cb3 is
+      // read is decided by the o2w PATH -- and 55% of draws sit on a VS that
+      // takes more than one path (the note above xPathDraws). So a shader whose
+      // p13 draws read cb3 replays that span on its p1 draws too, which
+      // CbSlotRead measured as reading cb3 on 8 of 1818.
+      //
+      // FOUR COUNTERS, EACH ANSWERING SOMETHING THE OTHERS CANNOT:
+      //   capBytes  bytes copied into the record for that slot
+      //   wasteByt  of those, bytes no drawCbSpan call ever consumed. The
+      //             floor on what a per-path manifest would stop copying.
+      //   deadDraws draws where the slot was captured and NOTHING on it was
+      //             read -- the population whose capture could be skipped
+      //             ENTIRELY, transaction included, rather than trimmed.
+      //   deadWc    of those, the ones that actually paid a write-combined
+      //             transaction. THIS is the number that converts to
+      //             milliseconds, because [DrawSnap] bills the capture in
+      //             wcMiss transactions (cb3 = 92% of them), not in bytes.
+      //
+      // deadWc is deliberately per-SLOT-per-DRAW and not per span: the 256 B
+      // window is shared across every span on one buffer for the rest of the
+      // draw, so deleting one span of two on a slot moves the transaction to
+      // its sibling and saves nothing. Only a draw whose whole slot is dead
+      // gives the transaction back, and that is what this counts.
+      static thread_local uint64_t xCbcDraws[kXfPathMax][8] = { };
+      static thread_local uint64_t xCbcBytes[kXfPathMax][8] = { };
+      static thread_local uint64_t xCbwBytes[kXfPathMax][8] = { };
+      static thread_local uint64_t xCbwSpans[kXfPathMax][8] = { };
+      static thread_local uint64_t xCbdDraws[kXfPathMax][8] = { };
+      static thread_local uint64_t xCbdWc   [kXfPathMax][8] = { };
+
+      // ---- NV-DXVK [MergeProbe] 2026-08-13 -- §3 item 2's OPEN CHECK. ----
+      // "how much duplicate commit survives the existing fanout/instancing
+      // path is unknown. First move is measuring that, not writing code."
+      //
+      // THE CRITERION IS UE'S, NOT A PROXY FOR IT. bDynamicInstancing merges
+      // commands that agree on everything a single draw call fixes -- mesh
+      // bindings, shader pair, render state, topology -- and differ only in
+      // the per-instance transform. So the merge key is the object identity
+      // (which is vb/ib + vs/il) folded with ps, state and topology, and two
+      // draws sharing one are mergeable IF their objectToWorld differs.
+      //
+      // WITHIN ONE FRAME, deliberately. Instancing is a per-frame submission
+      // decision; a cross-frame number would be hostage to a static scene,
+      // which is the mistake §3 of the plan spends a page on.
+      //
+      // THE SPLIT IS THE POINT. Draws with the SAME transform too are what
+      // filterDupSameDraws already drops (drawsIn 1338 -> drawsCommit 1042),
+      // so counting them as a merge win would be double-counting work already
+      // done. Draws with a DIFFERENT transform are the ones that can only be
+      // recovered by real instancing, and that number is what decides whether
+      // merging is worth building at all -- and whether it is a better answer
+      // than widening the object cache, which is the same population.
+      // Two sets and a counter, all per-frame: draws by merge key, and the
+      // distinct (merge key, transform) pairs. Cardinalities alone give the
+      // whole answer -- no per-key bookkeeping and no approximation.
+      static thread_local std::unordered_map<uint64_t, uint32_t> sMerge;
+      static thread_local std::unordered_set<uint64_t> sMergeXf;
+      static thread_local uint64_t sMergeDrawsF = 0;
+      static thread_local uint32_t sMergeFrame = UINT32_MAX;
+      static thread_local uint64_t xMgDraws = 0, xMgKeys = 0;
+      static thread_local uint64_t xMgDupSameXf = 0, xMgInstanceable = 0;
+      static thread_local uint64_t xMgFrames = 0, xMgMaxPerKey = 0;
       static thread_local int64_t  xSavedNs = 0;
       static thread_local std::chrono::steady_clock::time_point xLast { };
 
@@ -37791,6 +38633,116 @@ namespace dxvk {
             const uint32_t xPid =
                 (m_lastO2wPathId < kXfPathMax) ? m_lastO2wPathId : (kXfPathMax - 1u);
             ++xPathDraws[xPid];
+
+            // NV-DXVK [CbSlotRead]: which cb slots this path's derivation
+            // actually read, recorded by drawCbSpan on the way through. Slots
+            // 0-7 only -- the derivation has never touched a higher one and a
+            // row of zeroes past 7 would just be noise on the line.
+            ++xCbrDraws[xPid];
+            for (uint32_t sl = 0; sl < 8u; ++sl)
+              if (m_xtCbSlotsRead & (1u << sl)) ++xCbrSlot[xPid][sl];
+
+            // NV-DXVK [CbSpanWaste]: the capture side of the same cross-tab.
+            // Read HERE and not at capture time because the o2w path is not
+            // known until the derivation has run -- capture happens ~15k lines
+            // and one full ExtractTransforms earlier, which is precisely why
+            // the manifest is keyed per VS in the first place.
+            //
+            // Dereferenced unchecked, as drawSplitKeys and xFillSub do in this
+            // same scope: a null record here would already have faulted there.
+            {
+              const DrawSnapshot& sc = *m_drawSnapCur;
+              const uint32_t nR = (sc.numCbRanges < 16u) ? sc.numCbRanges : 16u;
+              uint32_t capMask = 0u, usedMask = 0u, wcMask = 0u;
+              for (uint32_t i = 0; i < nR; ++i) {
+                const DrawSnapshot::CbRange& r = sc.cbRanges[i];
+                if (r.slot >= 8u)
+                  continue;
+                const bool used = (m_xtCbRangesRead & (1u << i)) != 0u;
+                capMask |= (1u << r.slot);
+                if (used)
+                  usedMask |= (1u << r.slot);
+                if (sc.cbRangeWcMiss & (1u << i))
+                  wcMask |= (1u << r.slot);
+                xCbcBytes[xPid][r.slot] += r.byteCount;
+                if (!used) {
+                  xCbwBytes[xPid][r.slot] += r.byteCount;
+                  ++xCbwSpans[xPid][r.slot];
+                }
+              }
+              for (uint32_t sl = 0; sl < 8u; ++sl) {
+                if (((capMask >> sl) & 1u) == 0u)
+                  continue;
+                ++xCbcDraws[xPid][sl];
+                if (((usedMask >> sl) & 1u) != 0u)
+                  continue;
+                ++xCbdDraws[xPid][sl];
+                if (((wcMask >> sl) & 1u) != 0u)
+                  ++xCbdWc[xPid][sl];
+              }
+            }
+
+            // NV-DXVK [MergeProbe]: the bDynamicInstancing criterion, counted.
+            // Lazy per-frame flush -- the map is the CURRENT frame's, so when
+            // the frame id moves, fold what it accumulated into the window
+            // totals and start over. Doing it here rather than at the frame
+            // boundary keeps the whole probe in one place.
+            if (sMergeFrame != xFid) {
+              if (sMergeFrame != UINT32_MAX) {
+                // EXACT, by set cardinality, no per-key approximation:
+                //   drawsF   draws this frame
+                //   keys     distinct (mesh, shader, state, topo)
+                //   pairs    distinct (that, transform)
+                // A merge collapses every draw beyond the first on a key, so
+                //   mergeable   = drawsF - keys
+                //   dupSameXf   = drawsF - pairs   (same transform too -- the
+                //                 population filterDupSameDraws already drops)
+                //   instanceable= pairs  - keys    (differ only in transform,
+                //                 recoverable ONLY by real instancing)
+                // and the three satisfy mergeable = dupSameXf + instanceable
+                // by construction, which is the arithmetic check on the line.
+                // draws counted HERE, not per draw, so every field on the line
+                // covers the same set of COMPLETED frames -- otherwise the
+                // in-flight frame's draws are in the total while its keys are
+                // not, and mergeable = draws - keys stops closing.
+                ++xMgFrames;
+                xMgDraws += sMergeDrawsF;
+                xMgKeys  += sMerge.size();
+                const uint64_t pairs = sMergeXf.size();
+                xMgInstanceable += (pairs - sMerge.size());
+                xMgDupSameXf    += (sMergeDrawsF - pairs);
+                for (const auto& kv : sMerge)
+                  if (kv.second > xMgMaxPerKey) xMgMaxPerKey = kv.second;
+              }
+              sMerge.clear();
+              sMergeXf.clear();
+              sMergeDrawsF = 0;
+              sMergeFrame = xFid;
+            }
+            {
+              // MESH + SHADER + STATE + TOPOLOGY. objKey is already vb/ib plus
+              // vs/il, i.e. the mesh and the vertex stage; ps/state/topo are
+              // the rest of what one draw call fixes. Two draws sharing this
+              // could be submitted as one instanced draw.
+              //
+              // THE 433 READING WAS INFLATED, and this line inherits the fix
+              // rather than restating it. objKey did not carry the draw range
+              // until 2026-08-13, so "same mesh" here meant "same pooled
+              // buffer" and two different sub-meshes counted as instances of
+              // one another -- which is exactly the population instanceable is
+              // supposed to isolate. With objKeyMask bit 23 on, objKey carries
+              // Start/Base/Count and this becomes the honest number. Compare
+              // against the recorded 433/4 frames (9.9%): the drop is how much
+              // of §6's "recoverable only by real instancing" was this bug.
+              const uint64_t mk[4] = { objKey, objComps[kXcPs],
+                                       objComps[kXcState], objComps[kXcTopo] };
+              const uint64_t mergeKey = XXH64(mk, sizeof(mk), 0x1145E12Eull);
+              const uint64_t xfH = XXH64(&dcs.transformData.objectToWorld,
+                                         sizeof(Matrix4), 0x1145E13Full);
+              ++sMergeDrawsF;
+              ++sMerge[mergeKey];
+              sMergeXf.insert(XXH64(&xfH, sizeof(xfH), mergeKey));
+            }
             // The pre-derivation predicates, tallied against the path that was
             // actually taken. All four are read from the snapshot, i.e. from
             // state that exists BEFORE ExtractTransforms runs -- that is the
@@ -38323,10 +39275,14 @@ namespace dxvk {
             // other groups by design -- cam on ~780 draws a window -- and
             // comparing those would report a failure of something nobody
             // claimed.
+            // HOISTED OUT OF THE BLOCK BELOW so the carrier accounting can read
+            // it. A group that was replayed WRONGLY is not forgiven -- it is
+            // worse than one that was never written -- so FAILcarrier needs to
+            // know which of the replayed groups reproduced and which did not.
+            uint32_t rmask = 0u;
             if (xReplayedGroups != 0u) {
               uint64_t grpPost[kSdepGroupCount];
               stageDepCarrierGroups(grpPost);
-              uint32_t rmask = 0u;
               for (uint32_t g = 0; g < kSdepGroupCount; ++g) {
                 if ((xReplayedGroups & (1u << g)) != 0u
                  && grpPost[g] != xGrpReplayed[g]) {
@@ -38407,27 +39363,66 @@ namespace dxvk {
             // meant and still means. Read FAILcarrier with REPLAYFAIL beside
             // it: the first says a write was skipped, the second says a write
             // was reproduced wrongly, and they are different bugs.
-            if (m_drawSnapCur->wroteCarrier()) {
+            //
+            // THE COUNTER NOW SUBTRACTS THE REPLAYED GROUPS, and until
+            // 2026-08-13 it did not -- which made the ship gate UNSATISFIABLE
+            // BY CONSTRUCTION. The paragraph above was written and then not
+            // implemented: the predicate stayed a bare wroteCarrier(), so every
+            // draw the replay handled was counted as a failure of the thing the
+            // replay had just done. Measured: FAILcarrier=727 grp{cbLoc=727}
+            // against replay{serve=727 FAIL=0} -- EXACTLY EQUAL in 8 of 8
+            // windows, i.e. the whole population was the replay working. With
+            // rtx.splitTransformCarrierReplay on, "FAILcarrier must be 0 before
+            // turning verify off" could never be reached no matter how correct
+            // the feature was, and the next reader duly recorded the carrier
+            // axis as outstanding correctness debt.
+            //
+            // A GROUP IS ONLY FORGIVEN IF IT WAS REPLAYED **AND** REPRODUCED.
+            // rmask is REPLAYFAIL's per-group verdict on this same draw, taken
+            // by fingerprinting after the replay and again after the
+            // derivation, so a group replayed wrongly stays counted here. That
+            // is why this subtracts (xReplayedGroups & ~rmask) and not
+            // xReplayMask: the option says what MAY be replayed, the entry's
+            // carGroups says what WAS, and only the fingerprint says it landed.
+            // Nothing is hidden by the subtraction -- fgv{} below reports the
+            // forgiven population per group beside grp{}.
+            const uint32_t xCarMoved  = m_drawSnapCur->carrierMask;
+            const uint32_t xCarFgvMsk = uint32_t(xReplayedGroups) & ~rmask;
+            const uint32_t xCarResid  = xCarMoved & ~xCarFgvMsk;
+            for (uint32_t g = 0; g < kSdepGroupCount; ++g)
+              if (xCarMoved & xCarFgvMsk & (1u << g)) ++xCarFgv[g];
+            if (xCarResid != 0u) {
               ++xFailCarrier;
               // PER GROUP. The fused memo's carrier failures were 100%
               // kSdepCbLoc; this feature's first run read 100% kSdepCam, a
               // different group needing a different answer. A bare count would
               // have hidden that they are not the same bug.
               for (uint32_t g = 0; g < kSdepGroupCount; ++g)
-                if (m_drawSnapCur->carrierMask & (1u << g)) ++xCarGrp[g];
+                if (xCarResid & (1u << g)) ++xCarGrp[g];
               if (xFailCarrier <= 4u) {
                 Logger::warn(str::format(
                     "[Perf.SplitXf.FAIL] CARRIER o2wPath=", m_lastO2wPathId,
-                    " mask=", uint32_t(m_drawSnapCur->carrierMask),
+                    // THREE MASKS, NOT ONE. moved is what the derivation did,
+                    // fgv is what the replay reproduced and REPLAYFAIL
+                    // confirmed, and resid is what is left -- the only part
+                    // this line is reporting. Printing moved alone is what let
+                    // a replayed group read as a defect.
+                    " moved=", uint32_t(m_drawSnapCur->carrierMask),
+                    " fgv=", xCarFgvMsk, " resid=", xCarResid,
+                    " repFail=", rmask,
                     // kSdepCam is "camera origins / fanout latches", and the
                     // documented flow is draw N writes m_lastFanoutCamOrigin,
                     // N+1 reads it. So the question these two answer is
                     // whether the offenders are the FANOUT draws.
                     " instIdx=", m_currentInstanceIndex,
                     " t31=", (m_drawSnapCur->t31Valid ? 1 : 0),
-                    "  | a served draw re-derived and moved cross-draw state."
-                    " With verify OFF that write would not happen. Both"
-                    " producers were carrier-free, so a key is incomplete."));
+                    "  | a served draw re-derived and moved cross-draw state"
+                    " that NOTHING replayed. With verify OFF that write would"
+                    " not happen. Read resid{}: a group in it is either outside"
+                    " rtx.splitTransformCarrierReplayMask (so the store gate"
+                    " should have refused this draw -- a key is incomplete) or"
+                    " it is in repFail (so the replay wrote the wrong value --"
+                    " take its bit OUT of the mask)."));
               }
             }
           }
@@ -38534,17 +39529,14 @@ namespace dxvk {
                 // the replay then writes a value that was never written.
                 //
                 // carGroups records what this draw actually moved, not what the
-                // mask allows, so an entry cannot replay a group that its own
-                // producer never touched. It is also why narrowing the mask
-                // later is safe: the serve ANDs the two.
+                // replay mask permits: an entry stored under the all-clean rule
+                // carries 0 and therefore replays nothing.
+                //
                 // insert_or_assign, NOT emplace. With an identity key a second
                 // store on the same key is the NORMAL case -- it is the object
                 // moving, or any input the validity hash covers changing -- and
                 // emplace would silently no-op, leaving the stale record in
-                // place so that identity could never serve again. Under the old
-                // byte key a repeat store was impossible by construction (a
-                // changed input meant a changed key), which is why emplace was
-                // correct then and is a permanent-miss bug now.
+                // place so that identity could never serve again.
                 // Carry the restore count across the replacement -- it is a
                 // property of the IDENTITY, not of the record being written,
                 // and resetting it would make every thrashing identity look
@@ -38693,9 +39685,20 @@ namespace dxvk {
                 " above wrong/match, the per-draw mask against a shared stored"
                 " hash IS the wrong-serve mechanism and the fix is to store the"
                 " mask beside valHash. reHist: mostly 1 means identities are"
-                " stable and N-way associativity would buy nothing; a fat 4-7"
-                " or 8+ tail means several live instances are fighting over one"
-                " slot and N-way is the fix."));
+                " stable; a fat 4-7 or 8+ tail means several live instances are"
+                " fighting over one slot. THAT TAIL IS NOT AN ARGUMENT FOR"
+                " N-WAY -- it was, and the answer was the key. Until 2026-08-13"
+                " the identity key covered the IA binding but not the draw's"
+                " Start/BaseVertexLocation, so different meshes sub-allocated"
+                " out of one pooled buffer shared a key by construction; bit 23"
+                " (8388608) of splitTransformObjKeyMask splits them. Read sameF"
+                " WITH THAT BIT ON before concluding anything: a same-frame"
+                " replacement that survives it is a genuine duplicate instance"
+                " of ONE mesh, which is the only population associativity could"
+                " ever have been for. reHist also cannot size a way count -- it"
+                " buckets restoreCount over the whole window, so one object"
+                " re-stored once a frame lands in 8+ identically to eight"
+                " objects contending."));
             for (uint32_t p = 0; p < kXfPathMax; ++p) {
               xStSpur[p] = xStReal[p] = 0;
               xStFldO2w[p] = xStFldOther[p] = 0;
@@ -39024,10 +40027,151 @@ namespace dxvk {
             }
             xChurnStr += " }";
           }
+          // ---- [CbSlotRead] one row per path that drew anything. ----------
+          std::string xCbrStr;
+          for (uint32_t p = 0; p < kXfPathMax; ++p) {
+            if (xCbrDraws[p] == 0u) continue;
+            xCbrStr += str::format(" p", p, "{n=", xCbrDraws[p], " cb");
+            for (uint32_t sl = 0; sl < 8u; ++sl)
+              if (xCbrSlot[p][sl] != 0u)
+                xCbrStr += str::format(" ", sl, "=", xCbrSlot[p][sl]);
+            xCbrStr += "}";
+          }
+
+          // ---- [CbSpanWaste] the capture side, same rows, same buckets. ----
+          std::string xCbwStr;
+          uint64_t xWbTot = 0, xWb3 = 0, xDwcTot = 0, xDwc3 = 0, xDd3 = 0;
+          uint64_t xCbTot = 0;
+          for (uint32_t p = 0; p < kXfPathMax; ++p) {
+            for (uint32_t sl = 0; sl < 8u; ++sl) {
+              xCbTot  += xCbcBytes[p][sl];
+              xWbTot  += xCbwBytes[p][sl];
+              xDwcTot += xCbdWc   [p][sl];
+            }
+            xWb3 += xCbwBytes[p][3];
+            xDwc3 += xCbdWc   [p][3];
+            xDd3 += xCbdDraws[p][3];
+            if (xCbrDraws[p] == 0u) continue;
+            xCbwStr += str::format(" p", p, "{n=", xCbrDraws[p], " cap{");
+            for (uint32_t sl = 0; sl < 8u; ++sl)
+              if (xCbcDraws[p][sl] != 0u)
+                xCbwStr += str::format(sl, "=", xCbcDraws[p][sl],
+                                       "/", xCbcBytes[p][sl], "b ");
+            xCbwStr += "} waste{";
+            for (uint32_t sl = 0; sl < 8u; ++sl)
+              if (xCbwBytes[p][sl] != 0u)
+                xCbwStr += str::format(sl, "=", xCbwBytes[p][sl],
+                                       "b/", xCbwSpans[p][sl], "s ");
+            xCbwStr += "} dead{";
+            for (uint32_t sl = 0; sl < 8u; ++sl)
+              if (xCbdDraws[p][sl] != 0u)
+                xCbwStr += str::format(sl, "=", xCbdDraws[p][sl],
+                                       "/", xCbdWc[p][sl], " ");
+            xCbwStr += "}}";
+          }
+          const uint64_t xWf = (xFrames != 0u) ? xFrames : 1u;
+
+          std::string xCarFgvStr;
           for (uint32_t g = 0; g < kSdepGroupCount; ++g) {
             if (xCarGrp[g] != 0u)
               xFailGrpStr += str::format(" ", kSdepName[g], "=", xCarGrp[g]);
+            if (xCarFgv[g] != 0u)
+              xCarFgvStr += str::format(" ", kSdepName[g], "=", xCarFgv[g]);
           }
+          // ---- [Perf.SplitXf.CbRead] ITS OWN LINE, because it is a table. --
+          // A path whose row has NO cb3 entry never read slot 3, and that is a
+          // fact about the derivation rather than an inference from one block.
+          // It is the gate on removing cb3 from that path's validity hash --
+          // the thing three deleted drop masks did on a statistics table.
+          Logger::warn(str::format(
+              "[Perf.SplitXf.CbRead] frames=", xFrames, xCbrStr,
+              "  | n= draws that took the path; cb<slot>= how many of them the"
+              " derivation actually READ that slot on, recorded in drawCbSpan."
+              " A slot ABSENT from a path's row is dead weight in that path's"
+              " object validity hash. p3 is the open question: its o2w site"
+              " builds from bone 0, so cb3 absent here settles it."));
+
+          // ---- [Perf.SplitXf.CbWaste] THE CROSS-TAB. -----------------------
+          // CbRead above is what each path READ; this is what was CAPTURED for
+          // it. Read the two together: a slot with a big cap{} and a small or
+          // absent entry in CbRead's row is the manifest copying bytes for a
+          // path that does not want them.
+          //
+          // THE ONE NUMBER THIS LINE EXISTS FOR is cb3 deadWc/frame. Bytes are
+          // the visible waste but the cheap half; the capture is billed in
+          // write-combined transactions ([DrawSnap] wcMissSlots, cb3 = 92% of
+          // them) and a transaction is only given back when a draw's WHOLE
+          // slot is dead, because the 256 B window is shared across that
+          // buffer's spans for the rest of the draw. dead{} counts exactly
+          // those draws; waste{} counts bytes, which is the floor.
+          //
+          // IF cb3 deadWc/frame IS SMALL, STOP. The premise of §3.1 is that the
+          // per-VS manifest over-captures cb3 for the paths that never read it.
+          // A small number here means it already declines those spans and there
+          // is nothing to delete -- say so and do not key the manifest on path.
+          // That verdict is worth as much as the other one; it is the reading
+          // that three deleted drop masks did not wait for.
+          //
+          // "NEVER READ" IS NOT "INERT", AND THE DIFFERENCE IS LOAD-BEARING.
+          // drawSplitKeys hashes EVERY captured range into the object or view
+          // accumulator (~:25774) -- it walks s.cbRanges directly and does not
+          // go through drawCbSpan, so a dead span here is still in the validity
+          // hash. Declining to capture it therefore does two things, not one:
+          // it stops the copy AND it removes the span from the key.
+          //
+          // That second effect is a WIN and not a hazard, but only on an
+          // argument that has to hold: a span no drawCbSpan call consumed
+          // cannot have influenced the derived transform, so it cannot make two
+          // objects with different transforms compare equal -- PROVIDED the
+          // derivation read nothing live behind the accessor's back, which is
+          // exactly what cbSafeToDefer/cbLiveReads already certify per draw.
+          // Where it differs from the deleted DropExt masks: those dropped a
+          // component from the HASH while the entry still replayed it, so an
+          // entry stored with carGroups=0 replayed nothing and FAILcarrier
+          // grp{cbLoc} went 0 -> 337. Removing the CAPTURE removes both sides
+          // at once, which is why it has no carrier axis to get wrong. Verify
+          // it the way everything else here is verified: FAIL=0 and
+          // FAILcarrier=0 across a camera-moving session.
+          Logger::warn(str::format(
+              "[Perf.SplitXf.CbWaste] frames=", xFrames, xCbwStr,
+              "  capB/f=", (xCbTot / xWf),
+              " wasteB/f=", (xWbTot / xWf),
+              " (", (xCbTot ? (xWbTot * 100u / xCbTot) : 0u), "% of captured)",
+              "  cb3{wasteB/f=", (xWb3 / xWf),
+              " deadDraws/f=", (xDd3 / xWf),
+              " deadWc/f=", (xDwc3 / xWf), "}",
+              " deadWcAll/f=", (xDwcTot / xWf),
+              "  | cap{slot=draws/bytes} waste{slot=bytes/spans, captured and"
+              " never consumed by any drawCbSpan call} dead{slot=draws/"
+              "ofWhichPaidAWcTransaction, draws where NOTHING captured on that"
+              " slot was read}. Cross-check deadWcAll/f against [DrawSnap]"
+              " wcMiss/draws: it is the share of that transaction count a"
+              " path-keyed manifest could stop paying. wasteB is the floor,"
+              " deadWc is the millisecond. NOTE a dead span is still hashed"
+              " into the object key by drawSplitKeys, so not capturing it also"
+              " narrows the key -- a second win, and the reason this is not the"
+              " DropExt mistake."));
+
+          // ---- [Perf.SplitXf.Merge] THE PLAN'S §3 ITEM 2 OPEN CHECK. -------
+          Logger::warn(str::format(
+              "[Perf.SplitXf.Merge] frames=", xMgFrames, " draws=", xMgDraws,
+              " keys=", xMgKeys,
+              " mergeable=", (xMgDupSameXf + xMgInstanceable),
+              " (dupSameXf=", xMgDupSameXf,
+              " instanceable=", xMgInstanceable, ")",
+              " maxPerKey=", xMgMaxPerKey,
+              " perFrame{draws=", (xMgFrames ? (xMgDraws / xMgFrames) : 0u),
+              " keys=", (xMgFrames ? (xMgKeys / xMgFrames) : 0u), "}",
+              "  | UE bDynamicInstancing's criterion, measured: a key is (mesh"
+              " + shader pair + blend/depth/raster + topology), i.e. everything"
+              " one draw call fixes. mergeable = draws - keys is what merging"
+              " would remove. dupSameXf ALSO share the transform -- that is"
+              " filterDupSameDraws' existing population and counting it as a"
+              " win double-counts. instanceable differ ONLY in the transform"
+              " and are recoverable by nothing except real instancing; that is"
+              " the number that decides whether to build it, and it is the"
+              " SAME population an N-way object cache was widening for."));
+
           Logger::warn(str::format(
               "[Perf.SplitXf] frames=", xFrames, " draws=", xDraws,
               " (", (xFrames ? (xDraws / xFrames) : 0u), "/frame)",
@@ -39122,7 +40266,14 @@ namespace dxvk {
               " evict{sweeps=", xSweeps, " aged=", xAged, " wipes=", xWipes,
               " rung=", xRung, "}",
               " FAIL=", xFail, " fld{", xFailFieldStr, "}",
+              // grp{} is the RESIDUE -- carrier moves nothing replayed. fgv{}
+              // is what the replay covered and REPLAYFAIL confirmed. The two
+              // together are the old (pre-2026-08-13) FAILcarrier, which
+              // counted both and therefore could not reach 0 while the replay
+              // was on. If fgv{} is large and grp{} is 0, the carrier axis is
+              // WORKING, not outstanding.
               " FAILcarrier=", xFailCarrier, " grp{", xFailGrpStr, "}",
+              " fgv{", xCarFgvStr, " }",
               (RtxOptions::splitTransformVerify()
                  ? "  | VERIFY ON: derived twice, frame time is meaningless."
                    " BOTH FAIL and FAILcarrier must be 0 over a real session"
@@ -39158,7 +40309,23 @@ namespace dxvk {
           }
           xFail = xFailCarrier = 0;
           for (uint32_t f = 0; f < kSxFldCount; ++f)      xFld[f] = 0;
-          for (uint32_t g = 0; g < kSdepGroupCount; ++g)  xCarGrp[g] = 0;
+          for (uint32_t p = 0; p < kXfPathMax; ++p) {
+            xCbrDraws[p] = 0;
+            for (uint32_t sl = 0; sl < 8u; ++sl) {
+              xCbrSlot[p][sl] = 0;
+              // [CbSpanWaste] cleared with its read-side twin: the two rows are
+              // only comparable while they cover the same window of draws.
+              xCbcDraws[p][sl] = 0; xCbcBytes[p][sl] = 0;
+              xCbwBytes[p][sl] = 0; xCbwSpans[p][sl] = 0;
+              xCbdDraws[p][sl] = 0; xCbdWc   [p][sl] = 0;
+            }
+          }
+          xMgDraws = xMgKeys = xMgDupSameXf = xMgInstanceable = 0;
+          xMgFrames = xMgMaxPerKey = 0;
+          for (uint32_t g = 0; g < kSdepGroupCount; ++g) {
+            xCarGrp[g] = 0;
+            xCarFgv[g] = 0;
+          }
           for (uint32_t v = 0; v < kOvCount; ++v) {
             xVarNew[v] = xVarHit[v] = xVarSame[v] = xVarNear[v] = xVarFar[v] = 0;
           }
