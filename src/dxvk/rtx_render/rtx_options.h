@@ -700,7 +700,12 @@ namespace dxvk {
                "THE OUT ROW IS THE REAL CEILING. It keys on the derived transforms themselves, so its distinct/frame is the number of genuinely different transforms in a frame -- the floor no key can go below and the number that settles whether the 81% figure (from wholeDraw=254 of 1367) or the 40-50% downgrade (from geo=620) was right. Nothing else in this tree measures it.\n"
                "COSTS: ~16 component hashes plus ~20 small folds and ~20 hash-map probes per draw, and it holds ~20 maps of a frame's keys. That is a diagnostic budget, not a shipping one. It also SKIPS any draw whose transforms were served from the memo rather than derived (reported as served=), because an ablation of a value the derivation did not produce measures the memo, not the derivation -- which is why verify should be on.");
 
-    RTX_OPTION("rtx", bool, splitTransformCache, false,
+    // DEFAULT FLIPPED false -> true on 2026-08-13. Measured FAIL=0 across every
+    // window at ~51% serve with the mask defaults below, camera moving. Safe to
+    // enable only BECAUSE those defaults changed in the same commit -- at the
+    // old ObjKeyMask=2047 this flag serves wrong transforms. Keep the two
+    // together; do not backport this flag alone.
+    RTX_OPTION("rtx", bool, splitTransformCache, true,
                "[Perf.SplitXf] THE OPTIMISATION PLAN Phase 3 proper -- cache the OBJECT half of the derivation across frames and the VIEW half per frame, then compose. DEFAULT OFF. Requires rtx.useDrawSnapshot.\n"
                "WHY THE FUSED MEMO CANNOT GET THERE, MEASURED 2026-08-12. [Perf.MemoXf.Ablate] OUT dist/f=378 against 1091 draws/frame: there are only 378 genuinely distinct DrawCallTransforms in a frame, so a key over the whole struct caps at 65% hit no matter how it is narrowed (the full key sits at 1010 distinct, and stripping every removable identity field reaches 907 -- 5% -> 13%). The remaining fragmentation is inside the cbuffer bytes and the t31/COLOR1 entry, which the derivation genuinely reads. No key change reaches it.\n"
                "WHY THE SPLIT DOES. The output is ALREADY factored -- d3d11_rtx.cpp:21532 computes objectToView = worldToView * objectToWorld -- and the two factors have completely different lifetimes. [DrawRedund] perFrameDistinct{cb2=10} says the view/projection takes TEN distinct values across 1091 draws, because a frame has ~10 views (main, 3D-skybox sub-view, shadow/cube passes, UI), not 1091. [Perf.FastInst] xformMiss=250 of calls=15476 says the OBJECT transform moves on 1.6% of instances per frame. Fused, the camera moving invalidates everything every frame (bytes=19% cross-frame identical); split, the camera invalidates only the ten view entries.\n"
@@ -715,13 +720,31 @@ namespace dxvk {
                "FAILcarrier IS THE SECOND GATE and it is the one that caught the fused memo. bt_extractXf is the only stage that moves cross-draw state (~14% of draws). Under verify the derivation still runs on a serve so those writes still happen; with verify off a serve skips them and a LATER draw derives from state that was never moved. The transform comparison cannot see that. Both counters must be 0 before this ships.\n"
                "COSTS A FULL SECOND DERIVATION ON EVERY SERVE, so frame time under this flag is meaningless by construction.");
 
-    RTX_OPTION("rtx", uint32_t, splitTransformO2wPathMask, 0x0000060Fu,
+    // DEFAULT RAISED 0x60F -> 0x7FFFFFFE on 2026-08-13, matching the measured
+    // session: every o2w path except p0 is cacheable. 0x60F admitted only a
+    // subset, so a build shipping the new key defaults with the old path mask
+    // would silently cache far fewer paths than the ~51% figure was taken on.
+    RTX_OPTION("rtx", uint32_t, splitTransformO2wPathMask, 0x7FFFFFFEu,
                "[Perf.SplitXf] Bitmask of m_lastO2wPathId values whose objectToWorld may enter the CROSS-FRAME object cache. Bit N = path N is camera-free. DEFAULT 0x60F = paths 0,1,2,3,9,10.\n"
                "THE PATHS (d3d11_rtx.h ~:1450): 0 identity, 1 non-instanced BSP t31, 2 t30 CPU bone, 3 t30 bone-slice, 4 CB3->O2W (invView*cb3Mat), 5 RDEF, 6 trySourceFloat3x4, 7 tryWorldCb generic scan, 8 cb2@4 cameraOrigin fallback, 9 per-instance fanout override, 10 bone-instanced identity, 11 cached VP + live cam, 13 camera-relative.\n"
                "WHY THE DEFAULT IS NARROW. 4, 5, 6, 8, 11 and 13 all derive objectToWorld FROM the camera in some form, so their object half is not view-independent and caching it across a camera move is a wrong-position bug -- silent, and exactly the class this project has paid for before. 7 is a generic matrix scan whose source is not established, so it is excluded until it is.\n"
                "WIDEN IT WITH VERIFY ON, ONE BIT AT A TIME. If FAIL stays 0 for a bit over a real session including camera movement, that path is genuinely camera-free and the bit stays. If FAIL goes non-zero, the bit comes back out -- that is the measurement, and it is cheaper than the argument.");
 
-    RTX_OPTION("rtx", uint32_t, splitTransformObjKeyMask, 2047u,
+    // DEFAULT RAISED 2047 -> 5705727 on 2026-08-13, and two of the added bits
+    // are CORRECTNESS, not tuning. At 2047 the cache serves wrong transforms:
+    //   bit 20 (1048576) routes o2w path 3's bone-0 read through the snapshot.
+    //                    Without it the key hashes bytes captured at snapshot
+    //                    time while the deferred derivation reads them live,
+    //                    ~850 bone-cache merges later. Measured 133 FAIL/run.
+    //   bit 22 (4194304) puts the per-VS neg-proj cache state in the object
+    //                    key. Without it one shader's o2w path depends on how
+    //                    many frames ago a TTL was stamped, and nothing in the
+    //                    snapshot separates the two cases. Measured 12 FAIL/run.
+    // Also on: 11 (drop uncaptured t31Entry), 16/17 (shipping camCorr + path
+    // gate), 18 (bone0 bytes -- load-bearing, A/B off = 168 FAIL).
+    // Deliberately NOT on: 19 (path-private drops) and 21 (rtv presence), both
+    // measured redundant once bit 22 landed. See HANDOFF_SPLITXF_OBJKEY.md.
+    RTX_OPTION("rtx", uint32_t, splitTransformObjKeyMask, 5705727u,
                "[Perf.SplitXf] Which components go into the CROSS-FRAME object key. Bitmask, default 2047 = all 11 bits. THE POINT IS TO SWEEP THIS FROM rtx.conf WITHOUT REBUILDING.\n"
                "BITS: 1 vsIl, 2 ps, 4 state(blend/depth/raster), 8 topology, 16 numCbRanges, 32 layoutResolved, 64 geoContent(t31Entry+instSem), 128 geoSel(slots/indices), 256 instanceIndex, 512 cbLoc carrier, 1024 objectSpans(cb3 bytes).\n"
                "WHY IT EXISTS. The object cache is measured CORRECT and COLD: whole windows of FAIL with o2w absent, while newObj/frame runs 381-646 against the ~4-13 objects [Perf.FastInst] says actually move. The churn ablation cleared instIdx (549 vs 562 baseline) and cbLoc (541 vs 562) and convicted two components of comparable weight -- geoContent and objectSpans, each roughly halving the count, with geoContent collapsing 85 -> 12 in a quiet window. 12/frame is exactly the predicted range, so the ceiling is real and the shipping key is what fails to reach it.\n"
@@ -737,28 +760,42 @@ namespace dxvk {
                "***MOVE THE CAMERA THROUGHOUT.*** Churn is a camera-motion phenomenon -- newObj/frame runs 15-21 standing still against ~730 moving -- so a stationary sweep scores every rung identically and tells you nothing.\n"
                "READ THE SUMMARY AS: lowest newObj/f with FAIL=0 wins. FAIL is the gate, not serve% -- a rung that raises serve and FAIL together broke the key, which is exactly what predicate=1 dropFalse=6 did (serve 12%->32-39%, FAIL 0->96-193). Check the two baseline rows against each other first: if they disagree the scene moved and the table is a cross-scene comparison, the error this sweep exists to prevent.");
 
-    RTX_OPTION("rtx", uint32_t, splitTransformKeyPredicate, 0u,
+    // DEFAULTS RAISED on 2026-08-13 to the configuration FAIL=0 was measured on:
+    // predicate 1 (t31Valid), dropTrue 1 (spans), dropFalse 6 (geoC+geoSel).
+    // Leaving these at 0 is SAFE but slow -- no drops means a fuller hash and
+    // fewer serves. They are what the ~51% figure was taken with, so a build
+    // that ships the mask defaults without these will read correct and slower.
+    RTX_OPTION("rtx", uint32_t, splitTransformKeyPredicate, 1u,
                "[Perf.SplitXf] Which snapshot predicate selects the object key's component set per draw. 0 = off (full key, the safe default). SWEEPABLE FROM rtx.conf WITHOUT A REBUILD -- that is the point of it.\n"
                "VALUES: 1 t31Valid, 2 geoDynSrvT31, 3 instSemValid, 4 geoDynVsSrv, 5 geoDynSrvOther, 6 geoDynIb, 7 geoDynVbMask!=0, 8 layoutResolved, 9 instSemSlot!=UINT32_MAX, 10 t31CharIdx!=0.\n"
                "All are DrawSnapshot state, i.e. readable BEFORE the derivation runs, which is what makes a key selected from them free of the blind spot a learned per-VS mask has (a narrowed key that HITS never derives, so it never observes that the o2w path changed -- and 55% of draws are on shaders that take more than one path).\n"
                "WHAT IT IS FOR. [Perf.SplitXf.Path] measured that geo is read by p1 alone and spans by p13 alone, so most draws carry a component their path never reads -- that dead weight is the churn. Predicate 1 with dropFalse=6 was built and FAILED (96-193 FAIL/window, 206 of 216 on o2wPath=0): geo is also what separates p0, whose objectToWorld is always identity, from p13, whose is not, for the SAME shader. Judge a candidate by TOTAL far, never by farS -- a cross-path collision is still a wrong serve.\n"
                "SWEEP IT WITH VERIFY ON AND REQUIRE FAIL=0. far only ever compared objectToWorld; an entry also carries textureTransform, clipPlane, stablePropId, texgenMode, texcoordEncoding and the subView flags, so FAIL is the real gate and fld{} names the field.");
 
-    RTX_OPTION("rtx", uint32_t, splitTransformKeyDropTrue, 0u,
+    RTX_OPTION("rtx", uint32_t, splitTransformKeyDropTrue, 1u,
                "[Perf.SplitXf] Components dropped from the object key when rtx.splitTransformKeyPredicate evaluates TRUE. Bits: 1 objectSpans, 2 geoContent, 4 geoSel. Default 0 = drop nothing.");
 
-    RTX_OPTION("rtx", uint32_t, splitTransformKeyDropFalse, 0u,
+    RTX_OPTION("rtx", uint32_t, splitTransformKeyDropFalse, 6u,
                "[Perf.SplitXf] Components dropped from the object key when rtx.splitTransformKeyPredicate evaluates FALSE. Bits: 1 objectSpans, 2 geoContent, 4 geoSel. Default 0 = drop nothing.\n"
                "NOTE geoSel IS FREE TO KEEP: the ablation measured -geoSel changing dist/f by ZERO, so it contributes no churn. Prefer dropping 2 (geoContent alone) over 6 (both) -- geoSel may be carrying the p0-vs-p13 separation that dropping 6 destroyed.");
 
-    RTX_OPTION("rtx", uint32_t, splitTransformKeyDropByPath, 0u,
+    // DEFAULT RAISED 0 -> 512 on 2026-08-13: p3 drops objectSpans, nothing else.
+    // A pure serve lever and the clean case -- p3's chgR{} is empty, so spans
+    // are never real there. p1's field is deliberately 0: spans ARE real on p1
+    // (chgR spans=3786/window), and the p0/p1 collision that made them look
+    // load-bearing is fixed properly by ObjKeyMask bit 22.
+    RTX_OPTION("rtx", uint32_t, splitTransformKeyDropByPath, 512u,
                "[Perf.SplitXf] PER-PATH object-key drops, packed 3 bits per o2w path: bits (3*p) .. (3*p+2) hold path p's mask, same meaning as KeyDropTrue (1 objectSpans, 2 geoContent, 4 geoSel). Paths 0-9 fit; 0 = disabled, fall back to the predicate.\n"
                "WHY THIS EXISTS, AND WHY THE PREDICATE COULD NOT DO IT. [Perf.SplitXf.Bytes] sets{} measured p3 as 100% recoverable -- EVERY set R=0, dominated by [+spans]{S=2407 R=0} -- while p13's [+geoC+spans+t31Ent] reads {S=1737 R=2897}, i.e. spans changes there are REAL 63% of the time. Both sit on t31Valid=FALSE, so any predicate that drops spans for p3 also drops them for p13 and serves wrong transforms. The paths disagree, so the mask has to be indexed by path.\n"
                "IT IS APPLIED ON A PREDICTED PATH. m_lastO2wPathId is written BY the derivation and the key is built before it, so the path is predicted per (vs, inputLayout) from that shader's last derivation -- the same mechanism proven for the w2v path, which measured agree=48047 disagree=0 in one session. A misprediction is a WRONG SERVE, not a missed hit, because the drop changes what the validity hash covers. That is why the applied mask is recorded on the entry and mask{mismatch/wrong} on the report line is the gate.\n"
                "SWEEP IT WITH rtx.splitTransformVerify ON AND REQUIRE FAIL=0. Judge by TOTAL far, never farS -- a cross-path collision is still a wrong serve. Suggested first step: p3 only, i.e. (1 << (3*3)) = 512, which drops spans for path 3 and nothing else.\n"
                "OVERRIDES the predicate for any path whose 3-bit field is non-zero; paths left at 0 keep the predicate result, so the two can coexist while one path at a time is qualified.");
 
-    RTX_OPTION("rtx", uint32_t, splitTransformKeyNoDropByPath, 0u,
+    // DEFAULT RAISED 0 -> 64 on 2026-08-13: p6 fully keyed, nothing else.
+    // p6 measured spur=0 with a populated chgR, so masking it could only lose.
+    // Bit 0 (p0) is deliberately NOT set: it was tried and measured inert,
+    // because this option keys on the PREDICTED path and those draws predict p1.
+    RTX_OPTION("rtx", uint32_t, splitTransformKeyNoDropByPath, 64u,
                "[Perf.SplitXf] Bit N forces o2w path N to drop NOTHING -- full validity hash, predicate and KeyDropByPath both overridden. Default 0.\n"
                "WHY A SECOND OPTION INSTEAD OF A FIELD IN KeyDropByPath. That option's 3-bit field already spends all eight of its values on real masks (0-7 = the eight combinations of spans/geoContent/geoSel), and it reads 0 as 'inherit the predicate'. There is no bit pattern left that means 'drop nothing', so 'leave this path alone' and 'leave this path FULLY KEYED' are not expressible in the same field. This says the second one.\n"
                "IT EXISTS BECAUSE A PATH CAN BE PURE LOSS. [Perf.SplitXf.Stale] measured p6 at stale{spur=0 real=47 spurPct=0} with chgR{geoC=47 spans=47 t31Ent=37} -- ZERO spurious stales, so dropping recovers nothing, while every component it drops is genuinely read. The predicate handed p6 mask=6 anyway (geoContent+geoSel) and the result was the session's only surviving plain FAIL, twice, both at t31skip=ran. A path whose spur is 0 has nothing to win and its whole hash to lose.\n"
@@ -771,14 +808,21 @@ namespace dxvk {
                "THE LADDER REPLACED A FIXED 300-FRAME BOUND THAT COULD NOT FIRE. At the measured store rate of 597-663 new entries/frame the cap is reached in ~25 frames, so nothing in the map was ever 300 frames old, the sweep freed zero every time, and it fell through to the flat wipe it was written to replace -- roughly every 25 frames, taking the stable working set with it. A fixed bound only works if the store rate is under cap/bound (~55/frame here), which is the standing-still case that was never in trouble. Read evict{} on the report line: wipes must be 0, and rung names which bound did the freeing.\n"
                "RAISING THIS trades memory for hits. Each entry is ~200 bytes, so 16384 is ~3 MB and 131072 is ~26 MB. If raising it stops moving serve%, the working set fits and the remaining cost is churn (rtx.splitTransformObjKeyMask) or the store gate (rtx.splitTransformCarrierReplay), not capacity.");
 
-    RTX_OPTION("rtx", bool, splitTransformCarrierReplay, false,
+    // DEFAULT FLIPPED false -> true on 2026-08-13. This option's own doc sets
+    // the gate -- "REPLAYFAIL is the count of draws where the replayed write did
+    // not match the derived one ... It must be 0 before this ships" -- and it is
+    // met: replay{store=1319 serve=727 FAIL=0}, every window of a camera-moving
+    // session. Without it, refuse{unsafe} blocks ~30% of draws from storing at
+    // all and the serve ceiling drops hard. Paired with ReplayMask 5 below.
+    RTX_OPTION("rtx", bool, splitTransformCarrierReplay, true,
                "[Perf.SplitXf] Let draws that MOVED A CROSS-DRAW CARRIER store into the object cache, by recording what they wrote and reproducing that write on every serve. DEFAULT OFF. Requires rtx.splitTransformCache.\n"
                "THIS IS THE STORE GATE'S BIGGEST SINGLE COST. refuse{unsafe} is ~30% of all draws and carrier is ~86% of it (9558 of 11168 per 3 s window, ~270 draws/frame). A refused draw stores NEITHER half, so it also starves the per-frame view cache -- which is why miss{view} reads 34% of draws once `both` is counted, not the <1% that reading the `view=` field alone suggests. Those draws derive correctly every frame forever, and no amount of key work reaches them: with churn at zero the ceiling is (draws-refused)/draws = ~71%, which is why standing still measures 62% and stops.\n"
                "WHY REPLAY IS SOUND WHERE RETIRING THE GROUP WAS NOT. Two previous attempts took cbLoc OUT of the carrier set -- a seed sentinel, then a frame-scoped hint -- and both were reverted, the second breaking the replay tier with FAIL=1. Those attempts CHANGED what an unresolved draw holds, and those members are an input to the replay tier's keying. This does the opposite: it honours the dependency by writing exactly the values the derivation would have written. Downstream readers see the same state either way.\n"
                "IT IS ONLY SOUND PER GROUP, WHICH IS WHY THE MASK EXISTS. Recording a value and replaying it is correct only when that value is a pure function of THIS draw's inputs. kSdepCbLoc qualifies: the resolved proj/view slot+offset is a property of the shader, and the object key contains vs+il, so an entry serves exactly the shader that produced it. kSdepCam does NOT: m_smoothedCamPos is an accumulator whose new value depends on its old one, so replaying a value recorded N frames ago writes a stale camera position. See rtx.splitTransformCarrierReplayMask.\n"
                "VERIFY IT. With rtx.splitTransformVerify on, every served draw replays, then derives anyway, then re-hashes the carrier groups and compares. REPLAYFAIL is the count of draws where the replayed write did not match the derived one, per group. It must be 0 before this ships.");
 
-    RTX_OPTION("rtx", uint32_t, splitTransformCarrierReplayMask, 4u,
+    // DEFAULT RAISED 4 -> 5 on 2026-08-13, matching the measured session.
+    RTX_OPTION("rtx", uint32_t, splitTransformCarrierReplayMask, 5u,
                "[Perf.SplitXf] Which carrier groups rtx.splitTransformCarrierReplay may reproduce. Bit N = SdepGroup N. DEFAULT 4 = kSdepCbLoc only.\n"
                "BITS: 1 kSdepCam (camera origins / fanout latches / smoothing), 2 kSdepRoute (hashes nothing by construction, so it can never fire), 4 kSdepCbLoc (shared proj/view cb slot+offset), 8 kSdepBone (bone/cb3 caches, measured at ZERO moves per window), 16 kSdepStatic (m_lastGoodTransforms + m_foundRealProjThisFrame fallback latches).\n"
                "A draw may store when every group it moved is in this mask. Groups outside it still refuse the store exactly as before, so widening this mask is the only thing that changes behaviour and each bit can be measured on its own.\n"
@@ -789,7 +833,11 @@ namespace dxvk {
                "BIT 16 IS PROBABLY FREE AND UNMEASURED: kSdepStatic is a last-known-good fallback latch at ~48 draws/window, order-affecting but not consumed as this draw's answer. Not worth a build on its own; turn it on only if refuse{carGrp} says it matters.\n"
                "REPLAYFAIL IS THE ARBITER FOR EVERY BIT HERE. It fingerprints the carrier groups after the replay, derives anyway, fingerprints again, and compares per group -- so a group whose recorded value is not reproducible names itself. cam is the bit most likely to fail, being the one whose members track something outside the draw; if it does, check whether the offenders are fanout draws (the CARRIER line prints instIdx= and t31=).");
 
-    RTX_OPTION("rtx", uint32_t, splitTransformViewKeyMask, 255u,
+    // DEFAULT RAISED 255 -> 767 on 2026-08-13: adds bit 512, the view-half
+    // serve gate. 255 alone leaves one viewKey able to serve two different
+    // worldToView fixups (measured: w2vPath 1->3, fields{o2v w2v v2p w2vPath}
+    // with o2w absent). Bit 256 stays OFF -- it is a wrong-serve mechanism.
+    RTX_OPTION("rtx", uint32_t, splitTransformViewKeyMask, 767u,
                "[Perf.SplitXf] Which components go into the PER-FRAME view key. Bitmask, default 255 = all 8. Sweepable from rtx.conf without a rebuild.\n"
                "BITS: 1 viewport, 2 carCam, 4 carStatic, 8 cbLoc, 16 viewSpans, 32 boneDraw, 64 rtv, 128 vsIl. Bit 128 is ANDed with rtx.splitTransformViewKeyVsIl.\n"
                "BIT 256 SUBSTITUTES the PREDICTED fixup path for vsIl in the key, collapsing ~4,000 (shader, view) pairs onto (fixup, view) pairs. It is a WRONG-SERVE mechanism when the prediction misses: measured 12 FAIL/run reading fld{o2v w2v v2p w2vPath} with o2w absent and w2vPath 1->3. It also makes the vkPath census circular -- the key IS the prediction, so a lookup can only find entries whose prediction already agreed, and disagree reads 0 while draws render wrong. Leave it OFF.\n"
