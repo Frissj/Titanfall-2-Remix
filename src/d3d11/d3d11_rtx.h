@@ -143,6 +143,30 @@ namespace dxvk {
                                 //   live-path reads (constantOffset * 16 + n)
       uint32_t byteCount  = 0;
       uint32_t dataOffset = 0;  // where the bytes start in `cbBytes`
+      // NV-DXVK [PinDefer probe] 2026-08-13, RTX_D3D11_PINDEFER=1 only.
+      //
+      // THE ADDRESS THESE BYTES WERE READ FROM. The span copy out of
+      // write-combined memory is ~31% of SubmitDraw and is paid on the frame
+      // thread on every draw, served or not. It only has to be paid there if
+      // the SOURCE cannot be read later -- Map(WRITE_DISCARD) does not
+      // overwrite the old slice, it renames to a new one, so in principle the
+      // read could move to a worker and the frame thread would only record
+      // this pointer.
+      //
+      // Two things can break that, and neither is settleable by argument:
+      //   1. Map(D3D11_MAP_WRITE_NO_OVERWRITE) hands the game back the SAME
+      //      mapPtr and it writes in place, bumping neither the pointer nor
+      //      contentGen (documented at d3d11_buffer.h, the T31Cache note).
+      //   2. A renamed-away slice may return to the allocator and be handed
+      //      out again within the same frame.
+      // Either makes a deferred read return different bytes than the draw
+      // actually used -- silently, and as a wrong transform.
+      //
+      // So the probe records where it read, re-reads at frame end (exactly
+      // when a deferred reader would have run) and bit-compares. A mismatch
+      // NAMES the slot and buffer instead of leaving the idea a guess.
+      // Null when the probe is off, which is also the "nothing to check" value.
+      const uint8_t* srcPtr = nullptr;
     };
 
     // -- ordering. drawIndex IS the sort key: it is the draw's position in the
@@ -229,6 +253,21 @@ namespace dxvk {
     // Com<D3D11RenderTargetView, false>, i.e. already non-owning, and because
     // nothing here ever dereferences it.
     D3D11RenderTargetView* rtv0 = nullptr;
+
+    // -- PS shader-resource slots 0-7. IDENTITY ONLY, and bare pointers for the
+    // same reason rtv0 is: the one consumer (filterDupSameDraws' material key)
+    // reinterpret_casts them to uint64_t and hashes them, and never
+    // dereferences. Bare pointers make this 8 stores per draw instead of 8
+    // atomic refcount pairs.
+    //
+    // WHY 8 AND NOT 128. The two remaining PS-SRV consumers SCAN all 128 slots
+    // looking for a TextureCube, and a scan cannot be made pure by a narrow
+    // copy -- the same rule that leaves the cbuffer scans on the live path.
+    // Capturing all 128 would cost roughly what the VS-side 128-slot walk was
+    // measured at (~900 ns/draw) on every draw, to serve two consumers that are
+    // already gated behind a depth-write test. Those two stay live; see the
+    // note at their call sites.
+    D3D11ShaderResourceView* psSrv0to7[8] = { };
 
     // -- viewport state. Plain POD, copied whole: the viewport fallback path
     // reads it to synthesise a projection when no real one is found.
@@ -474,6 +513,47 @@ namespace dxvk {
     // the write-combined pointer it replaces. Same reason cbBytes is aligned.
     alignas(16) float t31Entry[12] = { };
 
+    // NV-DXVK [Bone0] 2026-08-13 -- BONE 0, THE OTHER TWELVE FLOATS.
+    //
+    // o2w path 3 builds objectToWorld out of bone 0 and nothing else
+    // (d3d11_rtx.cpp ~:19940-19955), exactly as path 1 builds it out of
+    // t31Entry. t31Entry is captured and hashed; bone 0 was neither, and that
+    // asymmetry IS the "chg{ } empty yet o2w differs" FAIL -- a validity hash
+    // cannot notice a matrix it never looked at.
+    //
+    // Captured here rather than hashing the bone palette, which is deliberately
+    // excluded at 12 KB+ per draw ([DrawRedund]), and rather than the
+    // m_fullBoneCacheGen counter that shipped first: the counter bumps on ANY
+    // bone write, so it re-keyed all ~120 p3 draws/frame and MEASURED
+    // spurPct=100 real=0 -- 3866 invalidations per window, not one of them
+    // needed. These 48 bytes are the ones path 3 actually reads.
+    //
+    // Two flags, because "no bone buffer" and "bone buffer I could not map"
+    // need different answers. bone0Bound alone means the draw IS a bone draw
+    // whose bytes escaped capture, and only that case falls back to the
+    // conservative counter; a draw with no SRV at slot 30 mixes nothing.
+    bool     bone0Bound   = false;  // an SRV was bound at the bone slot (30)
+    bool     bone0Valid   = false;  // and the 48 bytes below were captured
+    alignas(16) float bone0[12] = { };
+
+    // NV-DXVK [Bone0Cmp] 2026-08-13 -- PROVENANCE OF THE BYTES ABOVE.
+    //
+    // [Bone0Cmp] measured capT frozen at one value on every line while drawT
+    // moved, with BOTH sides reporting src=cache -- so the capture and the
+    // derivation read the same m_fullBoneCache at offset 0 and still disagree.
+    // Exactly three things can do that, and these three fields separate them:
+    //   different owner/data pointer -> not the same vector at all (a deferred
+    //                                   context has its own D3D11Rtx, so its
+    //                                   cache is not the one the draw reads)
+    //   same pointer, different gen  -> a merge landed in between; the capture
+    //                                   is simply upstream of MergeBoneCacheMirror
+    //   same pointer, same gen       -> someone writes the cache without
+    //                                   bumping the generation
+    // Diagnostic only; never hashed. Kept next to the bytes they describe.
+    const void* bone0Owner = nullptr;  // the D3D11Rtx that captured
+    const void* bone0Src   = nullptr;  // m_fullBoneCache.data() at capture
+    uint64_t    bone0Gen   = 0;        // m_fullBoneCacheGen at capture
+
     // ==================================================================
     // AXIS 3 AS A READ CERTIFICATE. The masks above are properties of the
     // BINDINGS -- "is anything bound here rename-capable". That is the wrong
@@ -612,6 +692,16 @@ namespace dxvk {
       return nullptr;
     }
 
+    // NV-DXVK [PinDefer probe]: one strong ref per distinct bound cbuffer,
+    // taken at capture and released after the frame-end compare. DXVK
+    // suballocates renamed slices out of one mapped allocation owned by the
+    // DxvkBuffer, so holding the buffer keeps srcPtr READABLE even if the
+    // slice was renamed away or recycled -- which is the point: the probe
+    // wants to observe changed CONTENT, not to fault on a freed mapping.
+    // Empty unless RTX_D3D11_PINDEFER=1.
+    std::array<Rc<DxvkBuffer>,
+               D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT> pinDeferRefs = { };
+
     void reset() {
       numCbRanges = 0;
       overflowed  = false;
@@ -622,10 +712,12 @@ namespace dxvk {
       geoDynSrvT31 = false; geoDynSrvOther = false;
       instSemValid = false; instSemSlot = UINT32_MAX;
       t31Valid = false; t31CharIdx = 0;
+      bone0Bound = false; bone0Valid = false;  // [Bone0], reset with its sibling
       geoLiveReads = 0; geoRecordReads = 0;
       vs = nullptr; ps = nullptr; inputLayout = nullptr;
       blendState = nullptr; depthState = nullptr; rasterState = nullptr;
       rtv0 = nullptr;
+      for (auto& s : psSrv0to7) s = nullptr;
       for (auto& c : vsCbs) c = { };
       indexBuffer = { };
       for (auto& v : vertexBuffers) v = { };
@@ -944,6 +1036,11 @@ namespace dxvk {
     // No-op when the arena is empty. Called at the top of EndFrame (before its own
     // camera/inject EmitCs work) so all geometry is committed before injectRTX.
     void flushGeometryBatch();
+    // NV-DXVK [PinDefer probe]: frame-end bit-compare answering whether the
+    // captured cbuffer spans could have been read LATER instead of copied on
+    // the frame thread. Gated on RTX_D3D11_PINDEFER=1; no-op otherwise. See
+    // the comment block at the s_pinDeferProbe definition in the .cpp.
+    void pinDeferVerifyFrame();
 
     // NV-DXVK [DrawSnapshot]: the current draw's captured inputs. See the
     // DrawSnapshot struct at the top of this header for the design and, more
@@ -1118,7 +1215,23 @@ namespace dxvk {
       kMcCarStatic,   // carrierGrp[kSdepStatic]
       kMcCount
     };
-    void drawMemoComponents(const DrawSnapshot& s, uint64_t out[kMcCount]) const;
+    // outGeoCCamCorr, when non-null, additionally receives the kMcGeoContent
+    // hash rebuilt with the t31 translation column camera-corrected. It is a
+    // SECOND hash written to an out-param rather than a new kMc component on
+    // purpose: the component enum is the memo key's alphabet, drawMemoKey and
+    // [Perf.MemoXf.Ablate]'s masks are indexed off it, and adding a member
+    // there would silently re-key the fused memo. Nothing reads this except the
+    // kOvCamCorr variant. See that enumerator for what it measures.
+    void drawMemoComponents(const DrawSnapshot& s, uint64_t out[kMcCount],
+                            uint64_t* outGeoCCamCorr = nullptr) const;
+
+    // NV-DXVK [CamCorr] 2026-08-13 -- the camera origin the p1 o2w site would
+    // add, resolved from the snapshot BEFORE the derivation runs. Returns false
+    // when neither source is available, which is the site's own no-correction
+    // case. Shared by the shipping key (splitTransformObjKeyMask bit 65536) and
+    // the kOvCamCorr measurement variant so the two cannot diverge.
+    bool drawCamOriginForCorrection(const DrawSnapshot& s,
+                                    float outCamO[3]) const;
 
     // ==================================================================
     // NV-DXVK [Perf.SplitXf.Stale] 2026-08-12 -- THE VALIDITY-HASH COMPONENTS,
@@ -1386,6 +1499,20 @@ namespace dxvk {
       // stay that way: a field hashed there and missing here means the replay
       // writes a subset, the group still reads clean to carrierMask, and
       // REPLAYFAIL is the only thing that would catch it.
+      //
+      // TWO DELIBERATE EXCEPTIONS as of 2026-08-13, and the asymmetry is the
+      // safe direction. camO2wValid and camO2wFromFanout are still recorded and
+      // still replayed here, but are NO LONGER HASHED in stageDepCarrierGroups
+      // -- see the note at its kSdepCam block. The dangerous case the paragraph
+      // above describes is hashed-but-not-replayed (a subset write that reads
+      // clean); this is replayed-but-not-hashed, which can only write a value
+      // nothing cross-draw reads and which the re-derivation resets anyway.
+      //
+      // They were the ENTIRE cam REPLAYFAIL: camRep{runs=6089 o2wValid=3620
+      // o2wFanout=3620} against replay{FAIL=3620 grp{cam=3620}}, every other
+      // field at 0. Do not re-add them to the hash to "restore the contract" --
+      // that reinstates ~3960 REPLAYFAIL/window and the store refusals that
+      // come with it.
       Vector3  camLastDrawOrigin;      bool camLastDrawOriginSet;
       Vector3  camO2wOrigin;           bool camO2wValid;
       bool     camO2wFromFanout;       uint32_t camO2wOff;
@@ -1434,6 +1561,31 @@ namespace dxvk {
       // is what the age sweep reads, so a stationary camera's entries survive
       // being hit for hundreds of frames.
       uint32_t lastUsed;
+
+      // NV-DXVK [ViewKey.Path] 2026-08-13 -- THE PRODUCING SHADER.
+      // MEASUREMENT ONLY. It gates nothing, and the reason is worth recording
+      // because the obvious gate is wrong.
+      //
+      // Mask bit 256 substitutes the predicted w2v fixup path for vsIl in the
+      // view key, so two DIFFERENT shaders that share a fixup now share one
+      // entry. That is the intent, and it worked: miss{view} fell from 13.7%
+      // to 0.02-0.07%.
+      //
+      // THE HYPOTHESIS THAT LOOKED OBVIOUS AND IS REFUTED. FAILcarrier rose to
+      // 1,352-3,926 per window with grp{cbLoc} ~70% of it, and the natural
+      // story was "merged shaders now replay each other's per-shader cbLoc".
+      // They cannot. kXfObjReplayable is cbLoc and kXfViewReplayable is cam:
+      // the cbLoc VALUES are read from the OBJECT entry (o.carProjSlot and
+      // friends), and the object key still contains vsIl. Only kSdepCam comes
+      // off the view entry, and camera state is not shader-specific. So
+      // whatever is driving the cbLoc carrier failures, it is not this.
+      //
+      // WHAT THIS FIELD IS FOR. It makes "how often does a served view entry
+      // come from a DIFFERENT shader" a measured number (xViewXShader) instead
+      // of an assumption, so the next person can test a cross-shader story
+      // against data rather than re-derive the wrong one. Gate on it only if
+      // that counter turns out to correlate with a failure.
+      uint64_t vsIl;
     };
 
     // Splits the captured cbuffer spans by SLOT: slot 2 is the view/projection
@@ -1464,6 +1616,68 @@ namespace dxvk {
       kOvNoGeo,      // minus geoContent + geoSel
       kOvNoInstIdx,  // minus m_currentInstanceIndex
       kOvNoCbLoc,    // minus the cbLoc carrier fingerprint
+      // NV-DXVK [CamCorr] 2026-08-13 -- geoContent with the t31 TRANSLATION
+      // COLUMN camera-corrected before hashing. Not an ablation: nothing is
+      // dropped, the same twelve floats are hashed with e3/e7/e11 replaced by
+      // e3+camO.x, e7+camO.y, e11+camO.z -- the exact adds the p1 derivation
+      // performs at d3d11_rtx.cpp:19704-19706.
+      //
+      // WHY. [Perf.SplitXf.Bytes] measures p1's spurious misses at e3/e7/e11
+      // ONLY (S=13539/13539/9550) with all nine rotation elements at S=0, and
+      // "spurious" is a BIT comparison of the derived objectToWorld (:37048).
+      // A 1.46-unit move in e3 that leaves the derived matrix bit-identical is
+      // only possible if camO moved by exactly the compensating amount: the
+      // engine uploads camera-relative translations and the derivation adds the
+      // origin back. So the object key hashes a quantity that is meaningless
+      // without the camera, while the camera itself is hashed into the VIEW
+      // key. Neither half is stable alone; only the sum is.
+      //
+      // THIS SUPERSEDES THE QUANTUM QUESTION, which the same line answers NO:
+      // p1 quant{maxSpur=1.46143 minRealRot=0.03125} overlap by 47x. They
+      // overlap because magnitude was never the discriminator -- what separates
+      // spurious from real is whether the camera cancels the move, not how big
+      // it is. No quantum can express that; an exact add can, with no tolerance.
+      //
+      // READ IT AS: `same` is the recoverable population and `far` MUST be 0.
+      // A non-zero far means a correction that would have served a moved object,
+      // and that is the number this variant exists to expose BEFORE the shipping
+      // key is touched. `near` means the residual is jitter after all.
+      //
+      // SCOPE -- p1 ONLY, AND A FLAT p13/p5 COLUMN IS NOT A NEGATIVE RESULT.
+      // The correction is applied to t31Entry, so it can only express anything
+      // where t31 is what the derivation read. pred%{} reads t31Valid=100 on p1
+      // and 0 on p3/p5/p13: those paths take their translation from cb3 (bm[]
+      // at :20618, m[] at :21273), which this variant does not touch, so they
+      // will report identically to `full` BY CONSTRUCTION. Their correction is
+      // the same add against a different source and a different origin
+      // (p13CamOrigin via the RDEF-resolved c_cameraOrigin at :20588, camO at
+      // :21273); it is deliberately not folded in here, because one variant
+      // that silently means two different things on different paths is how the
+      // marginal-column trap gets re-run. Land p1 first, then widen.
+      kOvCamCorr,
+      // NV-DXVK [CamCorr] 2026-08-13 -- THE ONE THAT CAN ACTUALLY ANSWER IT.
+      //
+      // kOvCamCorr alone measured nothing (camCorr == full to within one draw)
+      // and it was never going to: it corrects geoC while leaving `spans` --
+      // the raw cb3 bytes -- in the key, and p1's churn set is
+      // [+geoC+spans+t31Ent], i.e. spans moves on the SAME misses. A key that
+      // still carries a component churning every frame cannot merge anything,
+      // no matter how stable the component next to it became. The first run
+      // measured that arithmetic, not the hypothesis.
+      //
+      // So: corrected geoC AND spans dropped. Its control is -spans, which is
+      // the same key with RAW geoC {new/f=547 same=15793 near=244 far=1531}.
+      //   new/f well below 547  -> the corrected translation is the stable
+      //                            identity the raw one was not
+      //   far well below 1531   -> corrected geoC re-catches the real motion
+      //                            that dropping spans alone would have served
+      //                            wrongly, which is the whole safety case
+      //   indistinguishable from -spans -> the camera add is not what makes
+      //                            p1's key move, and the exact-cancellation
+      //                            reading of maxSpur is wrong
+      // That is a three-way outcome with a real refutation branch, which is
+      // what kOvCamCorr should have been.
+      kOvCamCorrNoSpans,
       kOvCount
     };
     // outObjKey is the object cache's IDENTITY key and outObjVal the validity
@@ -1498,6 +1712,8 @@ namespace dxvk {
     // default-constructed viewport when numViewports was 0.
     // Defined in the .cpp: D3D11DeviceContext is incomplete in this header.
     bool drawViewport0(D3D11_VIEWPORT& out) const;
+    // Existence half of the above, for sites that only gate on it.
+    bool drawHasViewport0() const;
 
     // The replay tier's packed viewport key, (Width << 32) | Height. Three
     // sites computed this independently -- the entry key build, the keyMiss
@@ -1542,6 +1758,16 @@ namespace dxvk {
 
     D3D11InputLayout*        drawInputLayout() const;
     D3D11ShaderResourceView* drawVsSrv(uint32_t slot) const;
+    // NV-DXVK [PhaseB batch 2]: the three pipeline state objects. The record
+    // already captures all three (see DrawSnapshot::blendState and friends);
+    // these are the read side. Identity/decode only -- every consumer either
+    // compares the pointer or calls Desc() on it, and both are immutable for
+    // the object's lifetime, which is why a bare pointer is the right shape.
+    D3D11BlendState*         drawBlendState() const;
+    D3D11DepthStencilState*  drawDepthState() const;
+    D3D11RasterizerState*    drawRasterState() const;
+    // PS SRV identity, slots 0-7 only. See DrawSnapshot::psSrv0to7.
+    D3D11ShaderResourceView* drawPsSrv0to7(uint32_t slot) const;
     D3D11RenderTargetView*   drawRtv0() const;
     // Binding identity for a VS constant-buffer slot. Out-of-range yields an
     // empty binding (null buffer, UINT64_MAX generation), matching the
@@ -1663,6 +1889,10 @@ namespace dxvk {
     // vertexBuffers[slot] unchecked and every one of them already handles a
     // null buffer, so this is a drop-in that removes an out-of-bounds read.
     const D3D11VertexBufferBinding& drawVertexBuffer(uint32_t slot) const;
+    // NV-DXVK [PhaseB]: identity accessors over already-captured snapshot
+    // fields; record-first, live-fallback. See the .cpp comment.
+    const D3D11IndexBufferBinding&  drawIndexBuffer() const;
+    const Com<D3D11PixelShader>&    drawPixelShaderCom() const;
 
     // NV-DXVK [flicker V8: SubmitDraw-ordered geometry capture]: predictor for
     // "will this draw (re)bake its BLAS inputs?". The real decision
@@ -1883,6 +2113,19 @@ namespace dxvk {
     //  the v6.4 wtvPath-3 carry proof. They recorded where path 3 read camXYZ
     //  so the proof could decide whether it was provable cb2 content; with the
     //  proof gone they were written every draw and never read.)
+    // NV-DXVK [T31Skip] 2026-08-13 -- why the t31 o2w site did not run on this
+    // draw, as the derivation itself decided it. Static string literal or null;
+    // null means the site DID run. Reset per draw beside m_lastO2wPathId.
+    // Read by the [Perf.SplitXf.FAIL] line -- see the publish site (~:19767).
+    const char*                          m_lastT31SkipReason = nullptr;
+    // NV-DXVK [CamGate] 2026-08-13 -- what the `isUintPosLayout || hasColorRt`
+    // gate above the t31 block decided for this draw, or "gate_not_reached" if
+    // the draw never got that far. Reset per draw beside m_lastT31SkipReason.
+    const char*                          m_lastCamGate = "gate_not_reached";
+    // [CamGate] the projection slot this draw resolved to, UINT32_MAX for none.
+    // Printed beside camgate so a FAIL line says both WHICH branch turned the
+    // draw away and the value that decided it.
+    uint32_t                             m_lastProjSlot = UINT32_MAX;
     Vector3                              m_lastO2wCamOrigin{ 0.0f, 0.0f, 0.0f };
     bool                                 m_lastO2wCamValid = false;
     bool                                 m_lastO2wCamFromFanout = false;
