@@ -1290,8 +1290,36 @@ namespace dxvk {
       return false;
 
     // NV-DXVK start: skip whitespaces at start of number strings
+    //
+    // HEX ACCEPTED, AND THE OLD BEHAVIOUR WAS SILENT -- fixed 2026-08-12.
+    // std::stol parses base 10, so "0x0000060F" consumed the leading "0",
+    // stopped at 'x', and returned 0 WITHOUT throwing. The parse therefore
+    // reported success and the option took the value 0. That is the worst
+    // possible failure mode for a bitmask: it does not warn, it does not fall
+    // back to the default, it silently means "nothing is enabled", and the
+    // feature reading it looks broken rather than misconfigured.
+    // Cost: two full [Perf.SplitXf] runs read refuse{noPath}=100% of eligible
+    // draws and were misread as a fact about the game's o2w paths, when the
+    // allowlist had simply parsed to zero.
+    //
+    // std::stol was also the wrong width. long is 32 bits on Windows, so any
+    // value above 2^31-1 -- half the range of the uint32_t being filled --
+    // threw out_of_range and failed the parse. stoul covers the full range.
     try {
-      result = std::stol(value);
+      size_t   pos  = 0u;
+      int      base = 10;
+      // Prefix detection rather than base 0, deliberately: base 0 also enables
+      // C octal, so a leading zero ("010") would silently mean 8. Config files
+      // are hand-written and zero-padded decimals are common in them.
+      const size_t f = value.find_first_not_of(" \t");
+      if (f != std::string::npos
+          && value[f] == '0' && f + 1u < value.size()
+          && (value[f + 1u] == 'x' || value[f + 1u] == 'X'))
+        base = 16;
+      const unsigned long v = std::stoul(value, &pos, base);
+      if (v > 0xFFFFFFFFul)
+        return false;
+      result = static_cast<uint32_t>(v);
       return true;
     }
     catch (...) {

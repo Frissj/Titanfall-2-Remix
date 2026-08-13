@@ -1,7 +1,7 @@
 # THE OPTIMISATION PLAN
 
 **Written:** 2026-08-11
-**Branch:** `parallel-clean` @ `4681ecca` (the XfOverlap work is on `stable` @ `470eaf4b`, pushed, message "broken")
+**Branch:** `architecture-overhaul` @ `4681ecca` (the XfOverlap work is on `stable` @ `470eaf4b`, pushed, message "broken")
 **Goal:** 30 fps = 33.3 ms/frame
 **Source of every number below:** `[Perf.Report]` block at 02:47:54 in `remix-dxvk.log`, unless stated otherwise.
 
@@ -237,13 +237,186 @@ No architecture, no risk.
 ### Phase 1 — MEASURE. **BLOCKING. Do not skip.**
 Three unknowns decide whether 30 fps is reachable at all:
 
-1. **`pfs_guard` sub-buckets** — 14.92 ms, 19% of the pole, contents unknown. `markStg` split.
-   **Hypothesis `[I]`, unverified: it is largely the `DrawSnapshot` capture.** `drawSnap_ns` reads
-   very large in the raw accumulator yet appears in no named leaf. This matters because capture is
-   the *floor* of the whole caching approach — if capture is 15 ms, "skip unchanged draws" bottoms
-   out at 15 ms and the arithmetic below fails.
+1. ~~**`pfs_guard` sub-buckets**~~ — **RESOLVED 2026-08-11 22:35 `[M]`. The hypothesis was right,
+   and it is the bad answer.** From `[Perf.SubmitDraw.acc]` at 22:35:09.734, same window, ns:
+
+   ```
+   pfs_guard        = 960,495,300
+   drawSnap_ns      = 916,767,200   <- 95.4% of pfs_guard IS captureDrawSnapshot
+     drawSnapId_ns  = 146,741,900   <- 16.0% of capture
+     drawSnapAlloc  =   7,421,600   <-  0.8%
+     (remainder)    = 762,603,700   <- 83.2%, the named-cbuffer-span copy
+   ```
+
+   Scaled to that report's `pfs_guard` 13.77 ms/frame: **capture ~13.1 ms/frame**, of which span
+   copy ~10.9, identity/stream/viewport copies ~2.1, arena alloc ~0.11.
+
+   **Consequence: the capture floor is ~13 ms, not small.** This is exactly the failure case this
+   item was written to detect. Phase 3 ("skip derivation for unchanged draws") cannot go below it,
+   and §6's `-14.92 pfs_guard IF recoverable` line is now mostly **NOT** recoverable — capture is
+   the mechanism Phase 3 runs on, not overhead sitting beside it. See §6 for the corrected sum.
+
+   Two cheap leads fall out, neither of which needs new instrumentation:
+   - `drawSnapId_ns` ~2.1 ms/frame copies identity/stream/viewport fields that the source comment
+     at `d3d11_rtx.cpp:9539` says **no consumer reads yet**. Verify, then stop copying them.
+   - the 10.9 ms span copy is poorly coalesced: `[DrawSnap] wcMiss=52867 wcHit=56268 (51%)`,
+     with `cb3=44513` of the misses. The manifest is the lever, not the capture code.
+
+   The timers that answered this (`drawSnap_ns` / `drawSnapAlloc_ns` / `drawSnapId_ns`) were added
+   2026-08-10 at `d3d11_rtx.cpp:9519` and were already live in the log. Nothing needed building.
+   They only print while the leaf split is on, which is `RTX_D3D11_SUBMARK=1` in the environment —
+   the source default is **off** (`d3d11_rtx.cpp:8774-8779`). Lose that env var and the whole named
+   leaf table, `pfs_guard` included, goes dark.
 2. **Draw-level redundancy** — hash `DrawSnapshot` frame to frame and report the % identical.
    Instance-level is measured at 97%; draw-level is `[I]` and everything in Phase 3 depends on it.
+
+   **PROBE BUILT 2026-08-11. `rtx.perfDrawRedundancy=True` → `[DrawRedund]`, every 3 s.**
+   Nothing is measured yet — this is the instrument, not the answer. Turn it on with
+   `useDrawSnapshot=True` (it has nothing to hash otherwise), take a window, turn it off before
+   any frame-time number. Code: `D3D11Rtx::noteDrawRedundancy`, called from `SubmitDraw` right
+   after the capture, outside `drawSnap_ns` and with `tStg` re-stamped so it is billed to no
+   bucket — `pfs_guard` and every leaf around it stay comparable with prior logs.
+
+   **FIRST RUN 2026-08-12 00:06 — the probe was WRONG, not the scene. `[M]`**
+   49 windows, ~1,360 draws/frame, and every field read zero:
+   `pos{in=74832 ident=0% same=0%} key{hit=0} cheap{ok=0 WRONG=0 miss=0}`.
+   The same log window says `static=97% REDUNDANT=97%`, `matNew=0`, `uniqueBlas` flat, and a
+   healthy record (`[DrawSnap] resolved=79% ovf=0`, `[DrawPure] pure=98% geoStatic=96%`), so a
+   0% draw-identity match is not credible. `pos{in}` ≈ `draws` proves the frame-to-frame
+   bookkeeping works — last frame's rows are found. **One folded `ident` hash contained a
+   per-frame nonce, and a fold can only ever say "something moved":** the nonce took the whole
+   measurement to zero and hid every other answer behind itself. Same defect class as the
+   carrier fold that became `carrierGrp[kSdepGroupCount]`, for the same reason.
+
+   **Probe rewritten 2026-08-12 — SIX identity components, tallied separately**, so a lone
+   noisy field is named instead of silencing the other five: `sh` (shaders / layout / blend /
+   depth / raster / topology), `rtv` (bound RTV — split out because an N-buffer swapchain makes
+   it a period-N nonce unrelated to the draw), `dp` (draw params + record flags), `vb`
+   (vertex+index bindings), `srv` (mask + SRV pointers), `vp` (viewports); plus `bind` (cbuffer
+   bindings **and `contentGen`**), `bytes` (captured cbuffer bytes), `geo` (t31 + COLOR1).
+
+   Two independent readouts, and a raw dump:
+   - **`pos{...}`** — the Nth capture of consecutive frames, per component. No key, no
+     threshold; **read this first.** A component near 0% while its neighbours are high *is* the
+     nonce.
+   - **`key{...}`** — keyed on the *stable subset* `sh+dp+vb` + occurrence ordinal, with the
+     three excluded components reported over the hits. Keying on the full identity resolved zero
+     times, which is why it was narrowed. A keyed hit is **not** proof of "same draw" — only of
+     same mesh, shader and range. Judge it against `pos`.
+   - **`[DrawRedund.Raw]`** — up to 6 lines/window, fired only where `sh` matched, printing the
+     actual before→after values. A percentage cannot distinguish "differs" from "alternates
+     between two back buffers", and those want different fixes.
+
+   **SECOND RUN 2026-08-12 00:22 — the split worked and it settles §6. `[M]`**
+
+   ```
+   posIn=27081 pos{sh=69% rtv=97% dp=58% vb=42% srv=0% vp=98%
+                   bind=0% bytes=20% geo=84% ALL=0%}
+   key{hit=16979 (62% of draws) rtv=100% srv=0% vp=100%
+       bind=0% bytes=15% geo=85% SAME=0}
+   cheap{ok=0 WRONG=0 miss=5508}
+   ```
+
+   Three results, in descending order of consequence.
+
+   **(a) THE CHEAP TEST IS DEAD, and this revokes §6's last escape route.**
+   `cheap{ok=0 WRONG=0}` on every window. `WRONG=0` means `contentGen` is *sound* — it never
+   says "same" when the bytes differ. `ok=0` means it **never fires**: TF2 `Map(WRITE_DISCARD)`s
+   its constant buffers every frame as a matter of course, so the generation bumps whether or
+   not a byte changed. **It is a rename detector, not a change detector.** Therefore any Phase 3
+   skip must compare actual bytes → must copy them → **cannot go below the ~13 ms capture
+   floor.** §6's "either draw-level redundancy turns out to skip the capture itself…" is
+   answered: it does not. Do not spend more time looking for a pre-test on generations.
+
+   **(b) `srv=0%` was a per-frame GLOBAL, not draw churn.** `[DrawRedund.Raw]` named it: slot 30,
+   the bone-matrix SRV, whose *object pointer* TF2 rotates each frame (~7 pointers cycling) and
+   binds on essentially every draw — every draw in a frame shows the identical `old->new`
+   transition. It carries zero per-draw information and took the whole component to zero.
+   `vb0`/`ib`/`rtv`/`vp`/`cnt`/`start`/`base` are byte-identical frame to frame: **the geometry
+   bindings are stable.**
+
+   **(c) `bytes=15-20%` vs `geo=85%` — the fold mistake, one level down.** `geo` is pure object
+   data (t31/COLOR1) and holds still on 85% of draws; `bytes` folds all ~4.9 captured spans of a
+   draw together, so **one view-dependent span poisons the answer for a draw whose object data
+   never moved.** Since the camera is in nearly every draw's span set, "is this draw unchanged"
+   was being answered by the camera every time.
+
+   > **This is the structural finding, and it reframes Phase 3.** Our record conflates
+   > view-dependent and object-dependent inputs. UE's `FMeshDrawCommand` is camera-INDEPENDENT by
+   > construction — view state is applied once per view, not baked per draw — which is *why* it
+   > can be cached at `AddToScene` time and ours cannot be cached at all. If the per-slot split
+   > shows cb3 (object-to-world) static while cb2 (proj/view) moves, then Phase 3 is not "skip
+   > unchanged draws" but **"cache the object-space half, recompute the view half"** — a
+   > different mechanism with a different and much larger ceiling.
+
+   **Probe extended again 2026-08-12** to answer exactly that: `bytes` is now tallied **per
+   cbuffer slot** (`bytesSlot{cb2=… cb3=…}`), `bind` is split into `bindPtr` (buffer identity +
+   offsets) vs `bindGen` (generations only), `srv` gains `srvNS` (the same question with the two
+   stream slots t30/t31 held out), and a second cross-tab `ptr{ok/WRONG/miss}` asks whether
+   binding identity alone predicts the bytes now that generations are known useless.
+
+   **THE WITHIN-FRAME QUESTION — added 2026-08-12, and it is the one that matters most.**
+
+   Everything above is a CROSS-FRAME question, and every cross-frame answer is hostage to the
+   scene standing still — it collapses in combat, which is where frame rate matters most. The
+   probe now also reports `perFrameDistinct{cb2=… cb3=… wholeDraw=…}`: across the ~1,360 draws
+   of **one** frame, how many *distinct* byte values does each cbuffer slot take?
+
+   Expected shape if the view/object split is real:
+
+   | slot | content | expected distinct / frame |
+   |---|---|---|
+   | cb3 | object-to-world | ~one per object — genuinely per-draw |
+   | cb2 | projection / view | **a handful** — main view, viewmodel, 3D-skybox sub-view, sky probe |
+
+   **If cb2 reads ~3 against 1,360 draws, then 1,357 of those captures copied bytes the frame had
+   already produced.** That is redundant work *inside a single frame* — it needs no cache, no
+   cross-frame identity, and no static-scene assumption to remove. It is precisely UE applying
+   view state once per view instead of baking it into every `FMeshDrawCommand`, and unlike
+   everything else in this plan **it holds under combat load.**
+
+   **The data model is already shaped for this.** `DrawCallTransforms` (`rtx_types.h:848`) already
+   keeps `objectToWorld` apart from `worldToView` / `viewToProjection`, and `m_lastGoodTransforms`
+   is already a frame-level latch for the view pair (it is `kSdepStatic` in the carrier census,
+   measured at ~65 moves/window — i.e. it already almost never changes per draw). **What is
+   per-draw is the DERIVATION, not the data.** So the restructure is:
+
+   - **per view, once per frame** — resolve `worldToView` / `viewToProjection` for each distinct
+     camera. `perFrameDistinct{cb2}` is literally the count of how many that is.
+   - **per draw** — derive `objectToWorld` from cb3 only.
+   - **per draw, trivial** — `objectToView = worldToView * objectToWorld`, one matrix multiply.
+
+   That is `FMeshDrawCommand` + view state, reached by narrowing what the per-draw path reads
+   rather than by rewriting the pipeline. **Do not start it before the number is in hand** — the
+   whole point of Phase 1 is that this plan has already been wrong twice about which half is
+   expensive, and `[DrawSnap] wcMissSlots{cb2=1157 cb3=21708}` is a live hint that the *capture*
+   cost is concentrated in the object half, not the view half. If so the win is on the
+   **derivation** (`bt_extractXf`) rather than on the capture, which is a smaller but still real
+   prize, and the honest version of this section must say which.
+
+   **Read it in this order, and stop at the first one that fails:**
+
+   | field | what it decides |
+   |---|---|
+   | **`bytesSlot{cb2= cb3=}`** | **THE QUESTION NOW.** cb3 high + cb2 low ⇒ object data is static and the churn is the camera ⇒ Phase 3 becomes "cache the object-space half". cb3 also low ⇒ the object data genuinely moves and there is nothing to cache. |
+   | `bindGen=` vs `bindPtr=` | expected ~0% and high respectively. Confirms `contentGen` is a rename detector; if `bindPtr` is *also* low the bindings really do churn and (b) above is wrong. |
+   | `ptr{WRONG=}` | whether binding identity alone can stand in for the bytes. Expected large and nonzero (the game rewrites the same buffer) — which would close the last route to skipping the copy. |
+   | `srv=` vs `srvNS=` | `srv` ~0 with `srvNS` high confirms the whole SRV churn is the two stream slots and nothing per-draw. |
+   | `key{hit=}` | whether a cross-frame key exists **at all**. Reads 62%; `sh=69%` positionally, so keyed is the sounder mechanism. |
+   | `pos{ALL=}` / `key{SAME=}` | the ceiling on skipping the *derivation* (capture is paid regardless — see (a)). Bounded by `bt_extractXf` + the unnamed hook residual. |
+   | `sameNoSrv` | the sound floor — see the caveat below. |
+
+   The positional ordinal is counted by the probe, **not** `DrawSnapshot::drawIndex` — that is
+   `m_drawCallID`, which only advances for draws surviving the filters, so several captures
+   share one value.
+
+   **`key{SAME=}` IS A CEILING, NOT A POPULATION.** The hash covers what `DrawSnapshot` covers,
+   so it is blind to bone palettes, vertex/index buffer contents and PS state. That is the exact
+   blindness that shipped the viewmodel flicker under `filterDupSameDraws` v1 (see the box in
+   Phase 3). `sameNoSrv` — redundant draws with no VS SRV bound at all, hence no bone or
+   model-instance stream — is the part that is sound without further work. The gap between them
+   is the work Phase 3 has to do before it can claim the ceiling.
+
 3. **`rtx.perfSceneObjSplit`** — attributes the ~5.2 ms of find/mid/add. Note: the old handoff
    names `rtx.perfUpdateInstSplit` for this; that is the **wrong switch** — it splits the `update`
    quarter, which is already attributed. `perfSceneObjSplit` is declared at `rtx_options.h:675`.
@@ -299,10 +472,224 @@ of the full function body settles it — do that before writing any code here.
 **Order relative to Phase 2:** redundancy first. Deleting work beats moving it, and moving work
 you were about to delete is wasted effort. Phase 2b applies to the residue.
 
-### Phase 3 — skip derivation for unchanged draws. **-11 to -35 ms on the pole**
-Same test, other thread. If a draw's captured inputs are byte-identical to last frame's, do not
-derive it: no `bt_extractXf` (11.07), no material fill, no hashing, no bbox. Emit a keep-alive
-instead of a commit. Ceiling depends entirely on Phase 1.1.
+### Phase 3 — RESTATED 2026-08-12 on measured data. **WITHIN-frame, not cross-frame.**
+
+> **The original Phase 3 was "if a draw's captured inputs are byte-identical to LAST FRAME's, do
+> not derive it". Phase 1.2 measured that and it is the weaker half of the truth.** Cross-frame
+> whole-draw agreement is 19% (`bytes`), and it is 19% only because the fold drags the object
+> half down to the view half — per slot it is cb3 81-87% against cb2 17%. Worse, every
+> cross-frame number is hostage to the scene standing still and collapses in combat.
+>
+> **The within-frame number does not have that weakness, and it is much larger.**
+
+#### 3.0 THE MEASUREMENT `[M]` — `[DrawRedund]`, 2026-08-12 00:41
+
+```
+drawsPerFrame = 1367
+perFrameDistinct{ cb0=4  cb1=2  cb2=10  cb3=215  wholeDraw=254 }
+bytesSlot (cross-frame){ cb0=93%  cb1=92%  cb2=17%  cb3=81-87% }
+cheap{ok=0 WRONG=0}          ptr{ok=6604 WRONG=20288 miss=1468}
+```
+
+Read across one frame, ~1,367 draws:
+
+| slot | content | distinct/frame | reading |
+|---|---|---|---|
+| cb2 | projection / view | **10** | not per-draw data at all — main view, viewmodel, 3D-skybox sub-view, sky probe, a few more. ~1,357 of 1,367 captures reproduce a value the frame already holds. |
+| cb3 | object-to-world | **215** | the object half, and even it is 6.4:1 redundant. |
+| — | whole draw input set | **254** | **the frame contains 254 unique draw inputs and we capture and derive 1,367. 5.4x, inside one frame, with no static-scene assumption.** |
+
+#### 3.1 BOTH CHEAP PRE-TESTS ARE MEASURED DEAD
+
+- `contentGen` — `cheap{ok=0 WRONG=0}` on every window. **Sound but never fires:**
+  `Map(WRITE_DISCARD)` bumps the generation every frame regardless of content. Rename detector,
+  not change detector.
+- binding identity — `ptr{ok=6604 WRONG=20288}`. Predicts the bytes 25% of the time, wrong 3x
+  more often than right. The game rewrites the same buffer with new contents; that is the
+  expected case, not an anomaly.
+
+**Therefore any correctness-preserving skip must compare actual BYTES.** Do not spend more time
+looking for a shortcut around that — two candidates have now been measured and both are dead.
+
+#### 3.2 WHAT TO BUILD
+
+The data model is already shaped for this. `DrawCallTransforms` (`rtx_types.h:848`) keeps
+`objectToWorld` apart from `worldToView` / `viewToProjection`, and `m_lastGoodTransforms` is
+already a frame-level latch for the view pair (`kSdepStatic`, ~65 moves/window). **What is
+per-draw is the DERIVATION, not the data.**
+
+- **3.2a — resolve the view once per view, not once per draw.** `perFrameDistinct{cb2}` is
+  literally the count of distinct views: 10. Derive `worldToView`/`viewToProjection` per view id,
+  then per draw do only `objectToView = worldToView * objectToWorld` — one matrix multiply.
+  This is UE applying view state once per view instead of baking it into every
+  `FMeshDrawCommand`.
+- **3.2b — memoise the derivation within the frame, keyed on the input bytes.** 254 distinct
+  input sets against 1,367 draws is an **81% cut on `bt_extractXf`** and it holds in combat.
+  The natural key is `(viewId, objectKey)` where `objectKey` covers cb3's 48-byte o2w block —
+  far cheaper to compute than the full span set, which matters because the key must be produced
+  *before* the work it is trying to avoid.
+
+**Capture cost is NOT where the prize is, and the earlier draft of this section implied it was.**
+`[DrawSnap] wcMissSlots{cb2=16467 cb3=36045}` over 45,761 draws: cb3 is 2.2x cb2, so
+deduplicating the view spans recovers roughly a third of the span copy. The prize is the
+**derivation**, via 3.2b.
+
+#### 3.3 THE REPLAY TIER'S GATE — ANSWERED 2026-08-12 `[M]`. It was the gate.
+
+**3.2b is the deleted replay tier's idea** (§Phase 7, Appendix A.9), which shipped **0 hits in
+6,542,782 draws at 99.94% INELIGIBLE**. That looked like a reason to be careful. It is not: the
+tier gated on **ROUTE**, and a route gate is not a duplicate test.
+
+`rr.ineligBits` (`d3d11_rtx.cpp:23151-23203`) is seven rules — `1` fallback/UI, `2` bone,
+`4` unsettled axis votes, `8` instanced/fanout, `16` projSlot, `32` viewOk, `64` o2wPath — and
+`eligible` requires **all seven clean**. It asks "did this draw take one of a small set of
+blessed code paths", never "are these inputs a duplicate". With TF2 binding the bone SRV on
+essentially every draw and the fanout path carrying the hulls, near-total rejection is what that
+conjunction *should* produce. **The tier did not fail to find duplicates. It never looked.**
+
+**And the gate it needed now exists.** `safeToDefer()` — the three-axis DrawSnapshot purity gate,
+built 2026-08-10, *after* the tier was written and never retrofitted to it. Live from
+`[Perf.SubmitDraw.acc]`, same window as the `[DrawRedund]` capture above:
+
+```
+bt_extractXf = 698,085,600 ns
+xfElig       = 474,838,900 ns   xfEligN   = 33,257     -> 14,278 ns/draw
+xfInelig     = 223,246,700 ns   xfIneligN = 13,811     -> 16,165 ns/draw
+xfElig3      = 474,838,900 ns   xfElig3N  = 33,257     -> elig3 == elig exactly
+```
+
+**70.7% of draws pass, and they carry 68% of all `bt_extractXf` time.** The accumulator's own
+comment warns that a big bucket cannot distinguish "many cheap draws" from "few expensive ones"
+and that the ns/draw is the answer — so: eligible draws cost **14.3 us** against ineligible
+**16.2 us**, i.e. **88% as expensive each**. They are not the cheap tail. This is the world that
+comment says makes the work worth doing.
+
+Two gates, same function, measured on the same build:
+
+| gate | admits | asks |
+|---|---|---|
+| replay tier `ineligBits` (7 route rules, ANDed) | **0.06%** | did this draw take a blessed route |
+| `safeToDefer()` (3 purity axes) | **70.7%**, carrying 68% of the time | is the derivation a pure function of the record |
+
+**So 3.2b is not the replay tier rebuilt. It is the memo the tier could not have: keyed on
+CONTENT, gated on PURITY.** Do not reuse `ineligBits`.
+
+#### 3.3a SIZING IT HONESTLY — and one limit of the 254 figure
+
+`wholeDraw=254` counts distinct **cbuffer-content** sets, not distinct draws: it hashes
+`hBytes` only, so two draws with the same object-to-world and camera but *different meshes*
+collide in that number.
+
+**For `ExtractTransforms` specifically that is the correct denominator**, because its output
+(`DrawCallTransforms`) is a function of the cbuffer content and route state, not of which mesh is
+bound. It is the wrong denominator for anything mesh-dependent — material fill, geometry hashing,
+bbox — and those are already in the frame-end batch (A.5) anyway.
+
+So the arithmetic, stated with its assumptions visible:
+
+```
+bt_extractXf (clean machine, [Perf.Report] 2026-08-12 00:07)      9.11 ms/frame
+  x 0.707   passes safeToDefer(), carrying 68% of the time     ~= 6.2  ms
+  x 0.81    within-frame duplicate share (254 distinct / 1367) ~= 5.0  ms/frame recoverable
+```
+
+**~5 ms/frame on the pole, and it does NOT need a static scene** — that is the whole point of
+using the within-frame number. Validate against a combat frame before believing it holds, but
+unlike the cross-frame form there is no reason in the mechanism why it should not.
+
+#### 3.3b BUILT 2026-08-12 — `rtx.memoExtractTransforms` / `rtx.memoExtractVerify`
+
+`[Perf.MemoXf]`. The memo sits at the single `dcs.transformData = ExtractTransforms()` call site
+(`d3d11_rtx.cpp:~34500`), between the `bt_geoCopy` and `bt_extractXf` marks, so the existing leaf
+timings keep their meaning.
+
+- **Key** — `D3D11Rtx::drawMemoKey`. Hashes the whole record: shader/layout/state identity,
+  topology, rtv0, all VB/IB/SRV bindings, viewports, cbuffer binding identity, the captured
+  cbuffer **bytes**, the t31/COLOR1 entry, **the five carrier-group fingerprints**, and
+  `m_currentInstanceIndex`. The carrier fingerprints are what make it sound rather than plausible:
+  `ExtractTransforms` *reads* cross-draw state, so two draws with identical D3D11 inputs still
+  derive differently if something moved a carrier between them — folding `carrierGrp` in turns
+  that into a key change, which costs a hit rather than correctness.
+  `contentGen` is deliberately **not** hashed (it bumps every frame, so it would make every key
+  unique and the memo would never fire); the bytes subsume it.
+- **Scope** — cleared at frame rollover. Within-frame only, which is what makes the key simple
+  enough to be complete: the bone-SRV pointer that `[DrawRedund]` showed rotating every frame is
+  a *constant* inside the map's lifetime.
+- **Store** — on the way **out**, requiring `s_xtEligLast` (`safeToDefer()`). That verdict is a
+  statement about what the derivation *did*, so it cannot be consulted beforehand — and that is
+  the correct order anyway: a stored entry has a proven-pure, carrier-free producer.
+- **Refusals** — any draw whose transforms carry `instancesToObject` / `prevInstancesToObject`
+  (or their `shared_ptr` owners) or `isFanoutBatch` is **never stored**. Memoising those would
+  serve one draw's per-instance array to another. Counted as `miss{instPtr=}`, not silently
+  dropped.
+- **One invariant this change breaks, and repairs.** `s_xtEligLast`'s declaration states it is
+  never cleared between draws because "the guard is RAII and writes both on every exit, so a
+  stale value cannot outlive a draw that ran the derivation". The memo is the **first code that
+  can skip the derivation entirely**, so the hit path republishes the verdict explicitly;
+  otherwise a memoised draw would bill its `xfNs` to whatever the previous draw was.
+
+**RUN WITH `memoExtractVerify=True` FIRST.** It derives anyway on every hit and bit-compares 17
+POD fields, logging `[Perf.MemoXf.FAIL]` with the draw's VS hash and the diverging path ids.
+**`FAIL` must be 0 over a real session before the verify flag comes off.** `FAIL>0` means the key
+is incomplete — the derivation read an input `drawMemoKey` does not cover — and the failure mode
+is a silently wrong transform, i.e. an object in the wrong place. Frame time under verify is
+meaningless by construction (two derivations per hit).
+
+#### 3.3c FIRST VERIFY RUN 2026-08-12 01:12 `[M]` — key sound, key too WIDE
+
+```
+[Perf.MemoXf] draws=46013 hit=822 (1%) store=31882
+              miss{unsafe=13309 (cb=748 carrier=11458 geo=1596) instPtr=0 noSnap=0}
+              FAIL=0        (41 windows, ~45k draws each, zero failures)
+```
+
+- **`FAIL=0`** — the key is COMPLETE. No draw's derivation read an input `drawMemoKey` misses.
+  The verify path works and is the thing that makes the rest of this safe to iterate on.
+- **`instPtr=0`** — the ordering tripwire is quiet, as predicted (see 3.3b).
+- **`store=69%`** — matches `safeToDefer()`'s measured 70.7%. The gate behaves.
+- **`hit=1%` — the key was too WIDE, and §3.3a said so before it was built.** The first version
+  hashed the vertex and index buffer bindings, making the key *mesh* identity. There are far more
+  meshes per frame than transforms, so every mesh forked the key and the memo degenerated to
+  ~unique entries — storing 31,882 to serve 822.
+
+**NARROWED 2026-08-12.** `DrawCallTransforms` is a function of cbuffer content and route state,
+not of which mesh is bound — that is exactly why `wholeDraw=254` is the right denominator.
+
+| removed from key | basis | risk |
+|---|---|---|
+| index buffer | the tree already states `ExtractTransforms` never reads it (`geoBytesStatic` comment: the max-index scan is in `bt_cullVtx`, a different stage) | none |
+| vertex buffers | its 5 converted reads exist to produce the COLOR1 per-instance semantic, and that RESULT is hashed as `instSem` — the binding is an input to something already in the key | **judgement call** |
+| `rtv0` pointer → presence bit | both consumers only test "is anything bound" | none |
+
+**The vertex-buffer removal is an argument, not a proof, and is not trusted as one.** That is what
+verify is for: if a binding feeds the transforms by an uncovered route, `FAIL` goes non-zero and
+names the draw. **Keep `memoExtractVerify=True` for the next run.** If FAIL stays 0, the narrowing
+ships; if not, restore the VB loop — never weaken the comparison instead.
+
+**SECOND NARROWING 2026-08-12 01:20.** With mesh bindings out: `FAIL=0` held (36 windows) but
+`hit` only reached **4-5%**, ~756 distinct keys/frame against a 254 ceiling. Cause found in the
+tree rather than guessed: the key hashed all five carrier groups, and `[DrawPure]` sizes
+`kSdepCbLoc` at **~5,600 moves/window against cam ~780 and static ~65 — 88% of all carrier
+movement**. Every move invalidates every key taken before it, so a *cache* was shredding the memo.
+Key now hashes `kSdepCam` + `kSdepStatic` only. `kSdepRoute` seals empty by construction and
+`kSdepBone` measures zero, so both were dead weight; dropping `cbLoc` is sound **for the key**
+because what it decides is which spans the capture takes — and the span descriptors and their
+bytes are already hashed, by a more direct route than the cache's own fingerprint.
+**This is a claim about the KEY, not about `safeToDefer()`** — the two reverted attempts to retire
+cbLoc from the *carrier set* stay reverted and the gate still requires all five clean.
+
+**NEXT LEVER, sized by this run: `carrier=11458` is 86% of the 13,309 refusals.** The other two
+axes are noise (cb 748, geo 1596). If `safeToDefer`'s carrier requirement is over-strict *for a
+memo specifically* — draw A wrote carrier X, draw B with an identical key would write the same X,
+and anything that moved X between them changes `carrierGrp` and so changes the key — then
+relaxing it reaches most of the remaining 29.3%. **Do not relax it on that reasoning.** Publish
+the split (done, above), then test it behind its own flag with verify on, the same way this step
+was done.
+
+#### 3.4 THE ORIGINAL CROSS-FRAME FORM — keep, demoted
+
+Still worth having for the static case (`cb3` 81-87% frame to frame), but it is now the
+*secondary* mechanism: it needs the scene to hold still, and 3.2 does not.
 
 > **READ THIS BEFORE WRITING THE TEST — there is a precedent and it shipped a visible bug.**
 > `rtx.filterDupSameDraws` is the same idea at a smaller scale, and its v1 key was too weak
@@ -333,15 +720,39 @@ may be gating most batches out.
 reporting `created=0` and a flat `uniqueBlas=457`.** That is suspicious on its face and worth a
 look independent of everything else.
 
-### Phase 6 — batch/parallel for the residue
-The batch system is **already built and running** — see **Appendix A** for its full anatomy,
-current contents, and the exact conversion work still outstanding. It runs 1055 items in 6 ms on
-30 workers today, carrying four of the six per-draw stages.
+### Phase 6 — Phase B purity: finish the half-built batch. **frame thread**
+The batch is **built, running, and half-populated**: 1055 items in 6 ms on 30 workers, carrying
+**four of the six** per-draw stages. Full anatomy in **Appendix A**. The two missing stages are
+transforms (here) and instance/scene work (Phase 2b). Concrete steps:
 
-After redundancy elimination it becomes the vehicle for whatever genuinely dynamic work remains
-(the dirty 1-3%), plus the once-per-frame `prepareSceneData` chunk (14.75 ms). **It is no longer
-the headline** — but it is the thing that makes the dirty-set work cheap, and Phase 3's
-"skip unchanged draws" test is only sound *because* the snapshot exists to hash.
+- **6a. Cherry-pick Phase B batch 1 from `stable`. THIS IS THE FIRST CODE ACTION ON THIS BRANCH.**
+  45 sites already converted, independent of the crashing worker, behaviour-neutral. At
+  `4681ecca` `drawIndexBuffer` and `drawPixelShaderCom` have **zero** uses — the work exists only
+  on `stable`/`470eaf4b`. Do not rewrite what is already written.
+- **6b. Batch 2 — identity reads.** Need new snapshot fields/accessors: `rs.viewports` x9 +
+  `rs.numViewports` x4, `om.cbState` x3, `om.dsState` x2, `rs.state` x1, `ps.shaderResources` x2,
+  `ps.constantBuffers` x2, and `GetCurrentVsPsHashes` x12 (one snapshot-hash accessor covers all 12).
+- **6c. Batch 3 — content reads, the careful class.** 14 `GetMappedSlice` sites + 4
+  `vs.constantBuffers` binding+content sites, routed through `drawCbSpan` / the manifest.
+  **Never convert a binding without its bytes** (A.7).
+- **6d. Add `ExtractTransforms` to the batch.** One more stage in `DrawWorkItem`, one
+  `rtx.batchExtractTransforms` sub-flag beside `batchHashes`/`batchBoundingBox`/`batchSkinning`.
+  Dispatch/join/emit unchanged. `[DrawPure]`'s `cbLive`/`geoLive` reaching 0 is the progress meter.
+
+**Relationship to Phase 3 — do not double-count.** Both target `bt_extractXf` (11.07 ms), by
+different means: Phase 3 stops deriving the static 97%; Phase 6 parallelises whatever is left.
+You do not get 11.07 ms twice. Phase 3 first if draw-redundancy is high, because deleting work
+beats moving it.
+
+**But Phase 6 is not optional, and here is why:** `REDUNDANT=97%` is a measurement of **this
+scene, standing still**. In combat — explosions, particles, many moving actors, animated
+viewmodels — the dirty fraction will be far higher, and Phase 3's win shrinks in exactly the
+frames where frame rate matters most. **Redundancy elimination is the win for the common case;
+the batch is the insurance for the worst case.** Ship both.
+
+Phase 6 also gives the batch its residue role: the dirty 1-3% in a static scene, plus the
+once-per-frame `prepareSceneData` chunk (14.75 ms). And Phase 3's test is only sound *because*
+the snapshot exists to hash — the two systems are mutually enabling, not alternatives.
 
 ### Phase 7 — delete
 - **Replay tier** (~957 lines, 78 regions). 0 hits in 6.5M draws across a full session; tax
@@ -355,29 +766,88 @@ the headline** — but it is the thing that makes the dirty-set work cheap, and 
   meter until purity work is done, then delete. Nothing gates on it at runtime.
 - **Spatial-map fallback in `findSimilarInstance`** — vestigial (9.6 calls/frame). Hygiene only.
 
+### Phase 8 — bind-time SRV bound-mask. **OPTIONAL. ~-0.9 ms on the pole. `[M]`**
+
+**A decision, not a queued task.** Everything else in this plan is local to the RTX injection;
+this one reaches into DXVK's D3D11 state tracking, which is why it is written down rather than done.
+
+**What is left after the 2026-08-11 fix.** `captureDrawSnapshot` walked the 128-slot VS SRV array
+three times per draw (`reset()`, the wholesale `Com<>` array copy, the rename scan). The copy and
+the scan are now fused into one pass that does refcount work only on slots that changed. Measured,
+per draw: `dsi_ident` 1153 -> 466 ns, `dsi_scan` 696 -> 903 ns (it absorbed the copy), net
+**-480 ns/draw on the pair, -561 ns on `drawSnapId_ns` (-23%), ~-0.60 ms/frame.** All rename
+verdicts unchanged (`geoStatic` 96.5%, `elig3` 100% of eligible, `dynSrvSlots{t4,t31}`).
+
+**The residue is the traversal itself, not the refcounting** — ~903 ns/draw for ~160 fixed
+iterations (128 SRV + 32 VB), ~5.6 ns each, a dependent load plus a branch. Fusing removed one of
+three walks; it cannot remove the remaining one, because capture has no way to know which slots are
+bound without looking at all of them.
+
+**The move:** maintain a bound-slot bitmask where the game *binds* (`VSSetShaderResources` and
+friends) instead of discovering it at capture. Capture then iterates set bits — 2, per
+`dynSrvSlots{t4=432 t31=65215}` — instead of 128.
+
+**Why it is a decision:**
+- it modifies DXVK's D3D11 context state, the one area this project has otherwise left alone;
+- every bind path must maintain it or the mask silently under-reports, and an SRV missing from the
+  record is the silent-carry class (`DrawSnapshot::vsSrvMask` documents the same trap on the
+  capture side);
+- ~0.9 ms/frame against a frame-thread gap of ~21 ms. It does not change whether the plan closes.
+
+**Do it only if the frame thread is already close and this is the remainder.** Do not do it before
+Phase 1.2, which decides whether any of the frame-thread arithmetic holds.
+
 ---
 
 ## 6. DOES IT CLOSE?
 
+**Do not double-count.** Phase 3 and Phase 6 both target `bt_extractXf`; Phase 2 and Phase 2b
+both target `processSceneObject`. In each pair the first deletes the work and the second moves
+whatever survives, so only the larger of the two is counted below.
+
 ```
-frame thread  74.76
-  Phase 0     -2.60
-  Phase 4     -4.90
-  Phase 3    -11.07  (bt_extractXf alone; more if draw redundancy is high)
-  subtotal    56.19   (~17 fps)
-  pfs_guard  -14.92   IF recoverable
-  target      41.27   -> still short of 33.3
+FRAME THREAD                                  DXVK-CS
+  74.76  start                                  45.45  start
+  -2.60  Phase 0  diagnostics                   -7.00  Phase 2   push-not-poll (7-10)
+  -4.90  Phase 4  fanout                        -5.66  Phase 5   BLAS (if recoverable)
+ -11.07  Phase 3  bt_extractXf                  ------
+         (Phase 6 parallelises the residue,     32.79  -> MEETS 33.3
+          not counted again)                           Phase 2b in reserve (up to -21)
+  ------
+  56.19  (~17 fps)  -> still short
+ -14.92  pfs_guard  IF recoverable   <- REVOKED 2026-08-11, see below
+  ------
+  41.27  -> still short of 33.3
 ```
 
-**It does not close on the numbers currently in hand.** Reaching 33.3 ms on the frame thread needs
-Phase 3 to take not just `bt_extractXf` but most of the 53 ms hook — which is exactly what
-draw-level redundancy would deliver *if* it matches the instance-level 97%, and *if* the capture
-floor (`pfs_guard`) is small.
+**CORRECTION 2026-08-11 `[M]`: strike the `pfs_guard` line.** Phase 1.1 resolved it — 95.4% of
+`pfs_guard` is `captureDrawSnapshot`, the machinery Phase 3 is built on. It is not overhead that
+can be removed; removing it removes Phase 3. At most ~2.1 ms (`drawSnapId_ns`, fields no consumer
+reads) plus whatever manifest coalescing recovers from the 10.9 ms span copy is available here,
+not 14.92.
 
-dxvk-cs closes comfortably: 45.45, needs -12.2, and Phase 2 alone targets 7-10 with Phase 5 on top.
+So the frame thread bottoms out around **54 ms (~18.5 fps)** on everything currently identified,
+against a 33.3 ms target. **The gap is ~21 ms and there is no line item for it.** Either draw-level
+redundancy (Phase 1.2, still `[U]`) turns out to skip the capture itself — which means the skip test
+must run on something cheaper than the snapshot it is trying to avoid building, a harder problem
+than the plan has anywhere acknowledged — or 30 fps is not reachable on this architecture and the
+honest target is ~20 fps. **Settle Phase 1.2 before writing any more code.**
 
-**Both unknowns are in Phase 1. That is why Phase 1 is blocking and everything else is
-provisional.**
+**dxvk-cs closes.** Phase 2 alone very nearly does it; Phase 5 gives margin; Phase 2b is held in
+reserve and would take it far below target.
+
+**The frame thread does not close on the numbers currently in hand.** Reaching 33.3 ms needs
+Phase 3 to take not just `bt_extractXf` but most of the 53.01 ms `OnDraw*` hook — which is exactly
+what draw-level redundancy delivers *if* it matches the instance-level 97%, and *if* the capture
+floor (`pfs_guard`) is small. The ~8.5 ms of unnamed residual inside the hook has to come with it.
+
+**Both of those unknowns are in Phase 1. That is why Phase 1 is blocking and every number on the
+frame-thread side is provisional.**
+
+**And note what the arithmetic assumes: a static scene.** These are steady-state numbers with
+`REDUNDANT=97%`, `created=0`, `matNew=0`. Under combat load the Phase 3 line shrinks toward zero
+and the Phase 6 line has to carry it. Neither column above is a worst-case budget — validate
+against a heavy frame before believing 30 fps is held rather than merely reached.
 
 ---
 
@@ -409,7 +879,20 @@ Dead ends, off:
 `replayExtractTransforms=False` · `replayExtractVerify=False` · `perfStageDepCensus=False` ·
 `extractOverlap` / `extractOverlapVerify` keys removed (do not exist at `4681ecca`)
 
+**`RTX_D3D11_SUBMARK=1` MUST BE IN THE ENVIRONMENT or the named leaf table is a lie. `[M]`**
+The 2026-08-12 00:06 run reports `pfs_guard 0.28 ms` against 12.73 the run before. Nothing got
+faster: `pfs_guard` is marked with `markSub`, which early-returns when the sub-markers are off,
+so the span silently falls into the next `markStg` bucket. The whole named-leaf table
+(`pfs_guard`, `bt_extractXf`, `tail_emit`, …) goes dark with it, and the frame time drops ~10 ms
+because ~30 clock reads per draw stop happening. **A leaf reading near zero is the signature of
+a lost env var, not of a win** — check this before believing any leaf number, including a
+regression.
+
 Still to change when taking measurements:
+`perfDrawRedundancy=True` for the Phase 1.2 capture (built 2026-08-11, never yet run) — needs
+`useDrawSnapshot=True`, which is already on. It costs four hashes and two map operations per
+draw and is billed to no bucket, so it does not move the leaf table — but it is real time on the
+pole, so take the redundancy window and the frame-time window separately, never the same one.
 `perfUpdateInstSplit=True` -> the counters have served their purpose (REDUNDANT=97% is captured
 above); swap to `perfSceneObjSplit=True` for Phase 1.3. The broader diagnostic set
 (`logSubmitStall`, `perfThreadCensus`, `logPrepSceneSplit`, `sceneCull.logStats`,
@@ -726,6 +1209,30 @@ constant of minutes and does not recover for a single sample. This is scatter fr
 calibration thread being **descheduled** under contention (`busySum=280%core`, 6 active threads),
 not clock drop. Corroborated: the GPU is *idle* (56.86 ms), not busy-and-slow.
 
+## C.3b `clkNs` IS THE MACHINE-STATE CHECK. Read it before believing ANY absolute time `[M]`
+
+The 2026-08-12 00:22 run reads `FRAME 186-239 ms (4-5 fps)` against 56-62 ms fifteen minutes
+earlier, **on the same scene** (`inst=15454 drawsIn=1331 uniqueBlas=456` vs `15463/1328/462`).
+It is not a regression and it is not any probe. `[Perf.SessionState]` reads **`clkNs=104-144`
+against the 41 ns this project has always measured** — the cost of a single `steady_clock::now()`
+tripled — with `xMin=3.18-4.25` and `cpuSlowX` at 2.8 / 3.1 / 4.0 / 5.25.
+
+Everything scaled together, including things no local change can touch:
+
+| | 00:07 | 00:22 | x |
+|---|---|---|---|
+| `bt_extractXf` | 9.11 | 25.90 | 2.8 |
+| `SubmitInstancedDraw` | 19.94 | 66.90 | 3.4 |
+| `commitGeometryToRT` (dxvk-cs) | 24.98 | 88.50 | 3.5 |
+| `between entry points` (Source engine) | 17.83 | 38.79 | 2.2 |
+| **GPU** | **15.71** | **16.06** | **1.0** |
+
+The GPU is a second clock and did not move, which is what proves it is the CPU and not the work.
+**The rule: `clkNs` far above ~41 is a machine-state flag, and every absolute millisecond in that
+window is void.** Counts and ratios (`[DrawRedund]`, `REDUNDANT%`, `resolved%`) survive it
+untouched, because they are tallies rather than timings — take those from any window, take times
+only from a window where `clkNs` is sane.
+
 ## C.4 Probes that are currently unreliable
 
 - **`[Perf.SdThreads]` is degenerate.** It reports `cpuUs=0 stallUs=2045802` with `stall == wall`.
@@ -797,10 +1304,11 @@ the missing piece; purity was.
 
 ## D.3 Branches
 
-- **`parallel-clean` @ `4681ecca`** — current. Clean tree, no XfOverlap. Work here.
+- **`architecture-overhaul` @ `4681ecca`** — current. Clean tree, no XfOverlap. Work here.
+  (Created 2026-08-11; the short-lived `parallel-clean` at the same commit has been deleted.)
 - **`stable` @ `470eaf4b`** — the XfOverlap commit, message "broken". **Already pushed to
-  `origin/stable`**, so do not rewind it without a force-push decision. Contains Phase B batch 1
-  (the 45 accessor conversions), which is wanted — cherry-pick, don't discard.
+  `origin/stable`**, so do not rewind it without a force-push decision. **Contains Phase B batch 1
+  (the 45 accessor conversions), which is wanted — cherry-pick, do not discard. See Phase 6a.**
 - `main` @ `62378bcf` — "broken", stale.
 
 ## D.4 Per-commit subsystem attribution `[M]`

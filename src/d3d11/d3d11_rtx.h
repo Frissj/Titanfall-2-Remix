@@ -55,6 +55,23 @@ namespace dxvk {
     kSdepCbLoc,     // shared proj/view cb slot+offset locations
     kSdepBone,      // bone + cb3 caches a later draw reuses
     kSdepStatic,    // m_foundRealProjThisFrame + m_lastGoodTransforms
+    // SPLIT OUT OF kSdepCam 2026-08-12, and APPENDED rather than inserted so
+    // every existing group index -- and therefore every replay-mask bit value
+    // already written into rtx.conf -- stays what it was.
+    //
+    // WHY IT IS ITS OWN GROUP. kSdepCam was made replayable from the VIEW entry
+    // on the argument that the view cache is per-frame, so a recording cannot
+    // go stale. That is true of the LATCHES and false of m_smoothedCamPos,
+    // which is an ACCUMULATOR: its exit value is a function of its own previous
+    // value, so it depends on the SEQUENCE of draws and not merely on the state
+    // the draw entered with. Being same-frame is not enough. Measured:
+    // REPLAYFAIL grp{cam=1..29} per window against ~7-10k replay serves, plus
+    // residual FAIL fld{o2v w2v v2p} where the replayed camera perturbed the
+    // view derivation.
+    //
+    // Splitting it lets the latches stay replayable while the accumulator goes
+    // back to refusing the store, which is what it always needed.
+    kSdepCamSmooth, // m_smoothedCamPos + m_hasPrevCamPos (accumulator)
     kSdepGroupCount
   };
 
@@ -159,6 +176,25 @@ namespace dxvk {
     // slot, and their bytes go through the staging path).
     std::array<Com<D3D11ShaderResourceView>,
                D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> vsSrvs = { };
+
+    // NV-DXVK [perf] 2026-08-11: which vsSrvs slots THIS RECORD currently holds
+    // a ref in. 128 bits, one per slot.
+    //
+    // NOT an optimisation hint -- it is what makes the narrow update CORRECT.
+    // Arena slots are reused by index and are NOT reset() (see the acquisition
+    // comment in captureDrawSnapshot): reuse is safe only because every field
+    // is unconditionally reassigned. The old `vsSrvs = views` wholesale assign
+    // satisfied that by overwriting all 128 slots, including nulling the ones
+    // this draw does not bind. Copying only the bound slots would leave the
+    // PREVIOUS occupant's refs behind in the rest, and drawVsSrv(30) would hand
+    // a consumer another draw's SRV -- the silent-carry class that comment
+    // exists to prevent.
+    //
+    // So the capture walks the union of (slots this record holds) and (slots
+    // the draw binds): assign the bound ones, clear the stale ones, skip the
+    // ~126 that are null in both. Measured motivation: dynSrvSlots{t4 t31} --
+    // exactly two slots of 128 ever carry a dynamic buffer.
+    uint32_t vsSrvMask[4] = { };
 
     // -- VS constant-buffer BINDINGS. Identity and generation, never contents.
     //
@@ -594,6 +630,7 @@ namespace dxvk {
       indexBuffer = { };
       for (auto& v : vertexBuffers) v = { };
       for (auto& s : vsSrvs)        s = nullptr;
+      vsSrvMask[0] = vsSrvMask[1] = vsSrvMask[2] = vsSrvMask[3] = 0;
       numViewports = 0;
     }
   };
@@ -972,6 +1009,480 @@ namespace dxvk {
     // it. Frame thread only, called at SubmitDraw entry while every binding is
     // still the one this draw uses.
     void captureDrawSnapshot(uint32_t drawIndex);
+
+    // NV-DXVK [DrawRedund] 2026-08-11 -- THE OPTIMISATION PLAN, Phase 1.2.
+    //
+    // Hashes the just-captured record into four components and compares them
+    // against the same draw's components last frame, so the plan's single
+    // largest unknown -- what fraction of draws are UNCHANGED frame to frame --
+    // is a number rather than an inference from the instance-side REDUNDANT=97%.
+    //
+    // DELIBERATELY NOT INSIDE captureDrawSnapshot, for two reasons that are
+    // both about not corrupting the thing being measured:
+    //   - captureDrawSnapshot is timed by drawSnap_ns, which is 95.4% of
+    //     pfs_guard, which is the largest row in the whole report. Folding a
+    //     probe into it would inflate exactly the leaf Phase 1.1 just resolved.
+    //   - the draw PARAMETERS (indexed/count/start/base) are not in the record
+    //     and are only in scope at the SubmitDraw call site. Two draws sharing
+    //     every binding but drawing a different index range are different
+    //     draws, and a redundancy figure that conflated them would be wrong in
+    //     the optimistic direction.
+    // The call site re-stamps the stage marker afterwards so the probe is
+    // billed to no bucket at all -- same discipline as the StageDep census
+    // inside markStg.
+    //
+    // Frame thread only (it is called from SubmitDraw, where the record is
+    // valid); all state is function-local static thread_local, so a deferred
+    // context gets its own tallies rather than racing these.
+    void noteDrawRedundancy(const DrawSnapshot& s, bool indexed,
+                            uint32_t count, uint32_t start, int32_t base);
+
+    // NV-DXVK [Perf.MemoXf] 2026-08-12 -- THE OPTIMISATION PLAN Phase 3.2b.
+    //
+    // The memo key for ExtractTransforms: a hash over EVERY input the
+    // derivation is certified to read. Not a similarity key and not a route
+    // key -- a completeness claim. If the derivation reads something this does
+    // not cover, two draws that differ in that thing collide and the second
+    // gets the first's transforms, silently and wrongly.
+    //
+    // COVERS: shader / input-layout / state-object identity, topology, rtv0,
+    // all vertex+index+SRV bindings, viewports, cbuffer BINDING identity, the
+    // captured cbuffer BYTES, the t31/COLOR1 entry, the five carrier-group
+    // fingerprints, and m_currentInstanceIndex.
+    //
+    // THE CARRIER FINGERPRINTS ARE THE NON-OBVIOUS PART and they are what make
+    // the memo sound rather than merely plausible. ExtractTransforms READS
+    // cross-draw state (m_last*, the per-VS cb-location cache). Two draws with
+    // identical D3D11 inputs still derive differently if another draw moved a
+    // carrier between them. DrawSnapshot::carrierGrp is sampled at capture, so
+    // folding it into the key makes any such move a key change -- the entry is
+    // not invalidated, it simply stops being found, which is the failure
+    // direction that costs a hit rather than correctness.
+    //
+    // DELIBERATELY WITHIN-FRAME. The map is cleared at frame rollover, so a
+    // per-frame-rotating input (the bone SRV pointer, which [DrawRedund] showed
+    // takes a new value every frame and is bound on ~100% of draws) is a
+    // CONSTANT inside the window the memo lives in. Extending this across
+    // frames would need that input excluded and re-proven, and the measured
+    // within-frame redundancy (254 distinct of 1367) is the larger prize
+    // anyway.
+    uint64_t drawMemoKey(const DrawSnapshot& s) const;
+
+    // NV-DXVK [Perf.MemoXf.Ablate] 2026-08-12 -- drawMemoKey, split.
+    //
+    // WHY A SECOND FUNCTION AND NOT A REFACTOR OF THE FIRST. drawMemoKey's
+    // exact bits are the thing FAIL=0 was measured against; rebuilding it out
+    // of these components would change those bits and silently invalidate that
+    // history. So this MIRRORS it instead, and the mirror is checked rather
+    // than asserted: the FULL candidate's distinct count is reported next to
+    // the production store count, and a drift between them means this function
+    // and drawMemoKey have diverged. Re-read both when they disagree.
+    //
+    // THE SPLIT IS THE WHOLE VALUE. [DrawRedund] already learned this lesson
+    // twice -- once when a single `ident` hash read 0% everywhere because one
+    // per-frame nonce swamped it, once when `bytes` folded all spans and hid
+    // the object/view split -- and the handoff then repeated it a third time by
+    // reading the geo FOLD as a single irreducible input. A fold can only say
+    // "something moved". These sixteen can say which.
+    //
+    // kMcGeoContent / kMcGeoSel is the split that motivated the probe. The geo
+    // component hashes six fields, and three of them are SELECTORS rather than
+    // content: instSemSlot is "the vertex-buffer slot it came from",
+    // t31CharIdx is "the entry index they were read at", and instSem[0] IS that
+    // charIdx (COLOR1 .x), i.e. the selector is in the key twice over,
+    // alongside the entry it selects. Content is instSem[1..3] (.y = boneIdx,
+    // which really does pick the bone base and must stay) and t31Entry[12].
+    enum MemoComp : uint32_t {
+      kMcVsIl = 0,    // vertex shader + input layout
+      kMcPs,          // pixel shader
+      kMcState,       // blend / depth / raster state objects
+      kMcRtv,         // rtv0 PRESENCE (not identity -- see drawMemoKey)
+      kMcTopo,        // primitive topology
+      kMcVp,          // viewport count + contents
+      kMcInstIdx,     // m_currentInstanceIndex
+      kMcNumCb,       // numCbRanges
+      kMcLayout,      // layoutResolved
+      kMcSrv,         // vsSrvMask + every bound VS SRV pointer
+      kMcCbPtr,       // every bound cbuffer's buffer pointer + slot
+      kMcBytes,       // captured cb span descriptors + their BYTES
+      kMcGeoContent,  // instSem[1..3] + t31Entry[12] + both valid flags
+      kMcGeoSel,      // instSemSlot + t31CharIdx + instSem[0] (charIdx)
+      // ALL FIVE CARRIER GROUPS, one component each -- widened 2026-08-12
+      // after [Perf.MemoXf] FAILcarrier read mask=4 (kSdepCbLoc) on 100% of
+      // failures. The component set has to be able to express every group, or
+      // a key built from it inherits the same blind spot by construction.
+      kMcCarCam,      // carrierGrp[kSdepCam]
+      kMcCarRoute,    // carrierGrp[kSdepRoute]
+      kMcCarCbLoc,    // carrierGrp[kSdepCbLoc]
+      kMcCarBone,     // carrierGrp[kSdepBone]
+      kMcCarStatic,   // carrierGrp[kSdepStatic]
+      kMcCount
+    };
+    void drawMemoComponents(const DrawSnapshot& s, uint64_t out[kMcCount]) const;
+
+    // ==================================================================
+    // NV-DXVK [Perf.SplitXf.Stale] 2026-08-12 -- THE VALIDITY-HASH COMPONENTS,
+    // named individually so a stale miss can say WHICH input changed.
+    //
+    // WHY THIS EXISTS. Every masking decision in this feature so far has been
+    // argued from the churn ablation's far columns, and two of them were wrong
+    // in a way that cost a run each: geo-on-p1 (refuted, 368 of 368 sampled
+    // FAILs were p1) and the p0/p13 merge before it. The far columns cannot
+    // settle those questions because they measure a DIFFERENT cache -- variant
+    // maps keyed the old byte way, with no identity and no validity hash.
+    //
+    // These do measure the shipping thing. The first eleven are ObjHead field
+    // for field, i.e. exactly what the validity hash is built from. The last
+    // four decompose geo, because geo is the component that has cost the most
+    // and "geo" is not one thing: kMcGeoContent hashes t31Entry[12] -- twelve
+    // floats that ARE a 3x4 transform -- together with instSem[1..3] and two
+    // valid flags, and kMcGeoSel hashes three selectors. A path whose
+    // objectToWorld is BUILT from t31Entry can never have geo dropped, and a
+    // path that merely has t31 bound can. Nothing in the current instrument
+    // tells those two apart, and that distinction is the whole p1 question.
+    enum XfComp : uint32_t {
+      kXcVsIl = 0, kXcPs, kXcState, kXcTopo, kXcNumCb, kXcLayout,
+      kXcGeoC, kXcGeoS, kXcInstIdx, kXcCbLoc, kXcSpans,
+      // ---- geo, decomposed. Not in the hash; measured alongside it.
+      kXcT31Entry,     // t31Entry[12] alone -- the per-instance transform
+      kXcInstSem123,   // instSem[1..3] (.y = boneIdx)
+      kXcGeoFlags,     // instSemValid + t31Valid
+      kXcGeoSelParts,  // instSemSlot + t31CharIdx + instSem[0]
+      kXcCount
+    };
+
+    // ==================================================================
+    // NV-DXVK [Perf.SplitXf] 2026-08-12 -- THE OPTIMISATION PLAN Phase 3,
+    // the version the measurements actually support.
+    //
+    // THE FUSED MEMO IS CAPPED AT 65% AND THAT IS NOT A KEY PROBLEM.
+    // [Perf.MemoXf.Ablate] measured OUT dist/f=378 against 1091 draws: a frame
+    // contains only 378 genuinely distinct DrawCallTransforms, so ANY key over
+    // the whole struct tops out at (1091-378)/1091. Narrowing the key from
+    // 1010 distinct to 907 moved hit 5% -> 13% and there is nothing left to
+    // take out -- the residue is cbuffer bytes and the t31 entry, both of which
+    // the derivation reads for real.
+    //
+    // THE OUTPUT IS ALREADY FACTORED. The derivation's own tail computes
+    //     objectToView = worldToView * objectToWorld            (~:21532)
+    // and the two factors have completely different lifetimes:
+    //   VIEW   perFrameDistinct{cb2=10} -- ten distinct view/projections in a
+    //          frame of 1091 draws, because a frame has ~10 VIEWS.
+    //   OBJECT [Perf.FastInst] xformMiss=250 of 15476 -- the object transform
+    //          moves on 1.6% of instances per frame.
+    // Fused, a camera move invalidates every entry every frame, which is why
+    // cross-frame draw redundancy measures bytes=19% while its cb3 half
+    // measures 88%. Split, a camera move invalidates ten entries.
+    //
+    // WHAT MAKES IT SOUND, AND IT IS NOT THIS COMMENT. Two gates, both already
+    // proven mechanisms in this tree rather than new ones:
+    //   1. safeToDefer(), the same three-axis purity certificate the memo
+    //      stores on, decided on the way OUT because it is a statement about
+    //      what the derivation DID.
+    //   2. the o2w path allowlist. Several objectToWorld sites derive from the
+    //      CAMERA (path 4 invView*cb3Mat, 5/6 rdef-with-live-cam, 8 cb2@4
+    //      fallback, 11 cached-VP, 13 camera-relative). Their object half is
+    //      not view-independent and must never cross a frame. The deleted
+    //      replay tier had already enumerated this set (~:15843); the mask is
+    //      rtx.splitTransformO2wPathMask so it is widened by measurement.
+    // and rtx.splitTransformVerify derives anyway on every serve and
+    // bit-compares, reporting FAIL and FAILcarrier.
+    //
+    // THE VIEW KEY DELIBERATELY OMITS SHADER IDENTITY. worldToView is the
+    // camera; it should not depend on which VS observed it. If two shaders in
+    // one view derive different view matrices, that is a real finding and FAIL
+    // will name it -- at which point vs/il goes into the view key and the ten
+    // entries become a few dozen, which still works. Starting with the
+    // principled key and letting verify arbitrate is the same order this tree
+    // used for every other narrowing.
+    // ==================================================================
+    struct XfObjectPart {
+      Matrix4  objectToWorld;
+      Matrix4  textureTransform;
+      Vector4  clipPlane;
+      uint64_t stablePropId;
+      // Pure identity rather than derived, but carried HERE because vs and ps
+      // are both in the object key -- so an object entry serves exactly the
+      // shader pair that produced it, and nothing has to re-read them.
+      uint64_t vertexShaderHash;
+      uint64_t pixelShaderHash;
+      uint32_t texgenMode;
+      uint32_t texcoordEncoding;
+      bool     enableClipPlane;
+      bool     isSubView;
+      bool     isSubViewSkybox;
+      // Frame this entry was last USED, for age eviction. See the cache block:
+      // a flat wipe at the cap throws away the stable working set together
+      // with the churn, which is a self-inflicted loss on top of the churn
+      // itself.
+      uint32_t lastFrame;
+
+      // ---- THE VALIDITY HASH. This is what makes identity keying safe. ------
+      // 2026-08-12: the map is keyed on OBJECT IDENTITY (IA buffer pointers +
+      // shader pair), not on the derivation's input bytes. Identity is stable
+      // across camera motion -- measured, [Perf.SplitXf] ident{}: 46-93 new
+      // keys/frame while moving against 933-959 for the byte key, and 0/frame
+      // on p1 -- but stability is not correctness. A stable key alone would
+      // serve a moving prop its first-ever matrix forever.
+      //
+      // So the key finds the entry and THIS decides whether it may be served:
+      // the hash of the derivation's input bytes, i.e. byte for byte the value
+      // the whole map used to be keyed on. Serve only when it matches.
+      //
+      // The property that follows is the point of the design: THE IDENTITY KEY
+      // CANNOT CAUSE A WRONG SERVE. Two distinct objects colliding on one
+      // identity, or an identity too coarse to separate them, costs a hit and
+      // nothing else -- the validity hash still has to match, and it is the
+      // same test that gated every serve before this change. Identity buys
+      // cache STABILITY (entries ~= objects instead of ~= byte patterns, which
+      // is what filled a 16384-entry cap in ~25 frames and made aged run to
+      // ~39,000 a window); the validity hash keeps CORRECTNESS.
+      //
+      // It is also what makes the per-path key mask checkable at last. A
+      // narrowed mask now narrows THIS, not the key, so a draw the mask
+      // wrongly forgives still lands on its own entry and verify still gets to
+      // compare -- where a narrowed KEY produced a hit on a different entry
+      // and the wrong serve was invisible (handoff 2.5's blind spot).
+      uint64_t valHash;
+
+      // ---- PROBE STATE. [Perf.SplitXf.Stale] / entry provenance. ------------
+      // Written on every store, read on every stale miss and every FAIL. Kept
+      // on the entry rather than in a side map so it cannot go out of sync with
+      // the payload it describes -- a side map keyed on the same identity would
+      // be updated by a different code path and this feature has already paid
+      // twice for two structures that were supposed to agree.
+      //
+      // ~15 uint64 on a ~16k-entry cache is ~2 MB. That is affordable and the
+      // alternative is another run spent guessing which component moved.
+      uint64_t comps[kXcCount];
+      // Which drop mask was in force when this entry was stored. THE MASK IS
+      // PER DRAW AND THE ENTRY IS SHARED: a p13 draw stores under one mask and
+      // a p1 draw on the same identity compares under another, against this one
+      // stored hash. Measured 18:44-18:45: p1 failed 10 times with DropTrue=1
+      // the moment DropFalse went non-zero, having been clean across 37 of 38
+      // windows with DropFalse=0. Storing it makes the mismatch countable, and
+      // is also the field the eventual fix compares.
+      uint8_t  dropMask;
+      // o2w path of the draw that stored this entry, and the frame it did so.
+      // storeFrame is NOT lastFrame: lastFrame is refreshed on use and drives
+      // eviction, this one never moves. Same-frame vs prior-frame replacement
+      // is the difference between "two live instances share one identity, so
+      // N-way associativity fixes it" and "the object changed over time, so it
+      // does not".
+      uint8_t  storePath;
+
+      // ---- [Perf.SplitXf.Bytes] SUB-COMPONENT STATE. -----------------------
+      // The component cross-tab settled that neither spans nor geo is
+      // droppable on p1 or p13: both appear in chgS AND chgR, so whatever the
+      // derivation reads is INSIDE one of them, not equal to one of them. That
+      // is as far as component granularity can go, and going further is the
+      // whole remaining prize -- 55% of draws are spurious misses.
+      //
+      // So record the pieces. Per-range hashes with their identity, and
+      // t31Entry element by element, both compared on a stale miss and both
+      // split by the spur/real verdict. A range or an element that moves on
+      // spurious misses and never on real ones is a byte the validity hash is
+      // covering and should not be; the reverse is one it must keep.
+      //
+      // Raw identity, not a bucket: rngId packs (stage, slot, byteOffset) so
+      // the report names the actual cbuffer location rather than an index into
+      // a table nobody can map back.
+      static constexpr uint32_t kXfRngMax = 12u;   // == DrawSnapshot::kMaxCbRanges
+      uint8_t  numRng;
+      uint32_t rngId  [kXfRngMax];
+      uint64_t rngHash[kXfRngMax];
+      float    t31[12];
+
+      // 16-BYTE SUB-BLOCKS OF THE OBJECT-SIDE RANGES. Range granularity was
+      // enough for t31Entry, where the element split named the translation
+      // column outright, and NOT enough for the cb3 spans: p1 reads s0c3+48
+      // with S=5433 R=1679 and p13 reads s0c3+0/48/64 with R in the thousands,
+      // so at range granularity both look load-bearing and neither can be
+      // narrowed. The question is which 16 bytes inside them the derivation
+      // reads, and one register is the natural unit -- cbuffers are laid out
+      // in float4 registers and a derivation reads whole registers.
+      //
+      // OBJECT-SIDE ONLY (slot not 0/1/2). Slots 0/1 are the per-frame globals
+      // and slot 2 is the view buffer; none are in the object validity hash,
+      // so recording them would spend the budget on ranges whose changes this
+      // cache does not care about. That is also why the c2 columns in the
+      // range report should be read as context and not as targets.
+      static constexpr uint32_t kXfBlkMax = 16u;
+      uint8_t  numBlk;
+      uint32_t blkId  [kXfBlkMax];   // (slot << 24) | byteOffset of the block
+      uint64_t blkHash[kXfBlkMax];
+      // How many times THIS IDENTITY has been overwritten, carried across the
+      // replacement. Feeds the thrash histogram: an identity restored once is a
+      // moving object, one restored eight times a window is several live
+      // instances fighting over a single slot, and only the second is fixed by
+      // making the entry N-way.
+      uint16_t restoreCount;
+      uint32_t storeFrame;
+
+      // ---- CARRIER REPLAY. rtx.splitTransformCarrierReplay. ----------------
+      // A serve skips the derivation, so any cross-draw state the derivation
+      // would have WRITTEN never moves, and a later draw reads state that was
+      // never updated. The store gate's answer has always been to refuse the
+      // draw outright, and that refusal is ~86% of all refusals and the single
+      // largest cost in the feature -- it is what holds the standing-still
+      // ceiling at ~71% and it starves the view cache too, because a refused
+      // draw stores NEITHER half.
+      //
+      // The alternative is to reproduce the write instead of skipping it.
+      // These fields are the recorded exit state of the groups named in
+      // rtx.splitTransformCarrierReplayMask, written back on every serve.
+      //
+      // ONLY kSdepCbLoc IS STORED HERE, and that is the whole safety argument:
+      // recording a value and replaying it later is correct only if the value
+      // is a pure function of THIS draw's inputs. The resolved proj/view
+      // location is a property of the shader and its cb layout, both of which
+      // are in the object key, so an entry replays into exactly the shader
+      // that produced it. kSdepCam's m_smoothedCamPos is an accumulator -- new
+      // value from old value -- and is deliberately NOT here; if that group
+      // ever needs replaying, the accumulator has to come out of the group
+      // first. Adding a field to a replayed group means adding it here too, or
+      // the replay silently writes a subset -- REPLAYFAIL is what tells you.
+      uint32_t carProjSlot;
+      size_t   carProjOffset;
+      int      carProjStage;
+      uint32_t carViewSlot;
+      size_t   carViewOffset;
+      bool     carColumnMajor;
+      // Which groups this entry's producing derivation actually moved. Zero
+      // for an entry stored under the all-clean rule, so an entry captured
+      // before the flag was turned on can never replay anything.
+      uint8_t  carGroups;
+    };
+    struct XfViewPart {
+      Matrix4  worldToView;
+      Matrix4  viewToProjection;
+      float    viewportWidth;
+      float    viewportHeight;
+      uint32_t worldToViewPathId;
+
+      // ---- kSdepCam CARRIER REPLAY, AND WHY IT LIVES ON THE VIEW HALF -----
+      // kSdepCam is ~86% of what is left of the store gate: refuse{carGrp}
+      // reads cam~7,500 per window against cbLoc~1,480 once cbLoc is replayed,
+      // and the gate as a whole is what holds the ceiling at 80%. Replaying it
+      // takes the ceiling to ~94%, which is the only route to a 90% serve.
+      //
+      // IT WAS PREVIOUSLY WRITTEN OFF AS UNREPLAYABLE, and that judgement was
+      // right about the OBJECT cache and wrong in general. The reasoning was:
+      // m_smoothedCamPos is an accumulator (new value from old) and the origin
+      // latches track the camera, so a value recorded N frames ago is stale.
+      // Both objections are objections to CROSSING A FRAME -- and the view
+      // cache does not. It is cleared at every frame boundary and it is keyed
+      // on comp[kMcCarCam], i.e. on the very state being recorded. A view entry
+      // is therefore always same-frame and always from a draw that entered with
+      // the same camera carrier, so replaying it is not a stale write, it is
+      // the write the skipped derivation would have made.
+      //
+      // That is the object/view split's own argument applied to the carrier
+      // rather than to the matrix, and it is the reason this belongs here and
+      // not in XfObjectPart. Putting these fields on the object half would
+      // reintroduce exactly the staleness the original objection described.
+      //
+      // FIELD LIST IS stageDepCarrierGroups' kSdepCam BLOCK, IN ORDER. It must
+      // stay that way: a field hashed there and missing here means the replay
+      // writes a subset, the group still reads clean to carrierMask, and
+      // REPLAYFAIL is the only thing that would catch it.
+      Vector3  camLastDrawOrigin;      bool camLastDrawOriginSet;
+      Vector3  camO2wOrigin;           bool camO2wValid;
+      bool     camO2wFromFanout;       uint32_t camO2wOff;
+      Vector3  camFanoutOrigin;        bool camHasFanoutOrigin;
+      Vector3  camViewmodelOrigin;     bool camHasViewmodelOrigin;
+      Vector3  camFanoutVpRow0;
+      Vector3  camFanoutVpRow1;
+      Vector3  camFanoutVpRow2;        bool camHasFanoutVpRows;
+      // NO SMOOTHER HERE. m_smoothedCamPos/m_hasPrevCamPos are kSdepCamSmooth
+      // now, which is deliberately not replayable -- recording an accumulator
+      // and writing it back reproduces a value that depends on the draw
+      // ORDER, not on this draw. Adding them back here is the bug that read
+      // REPLAYFAIL grp{cam=1..29}.
+      // Which groups this entry's producing derivation moved, same contract as
+      // XfObjectPart::carGroups. Zero for an entry stored under the all-clean
+      // rule, so a pre-flag entry replays nothing.
+      uint8_t  carGroups;
+
+      // ---- THE VIEW CACHE IS NO LONGER CLEARED EVERY FRAME. --------------
+      // It was, on the argument that "the camera changes every frame, and ten
+      // entries a frame is the measured population, so clearing is free".
+      // Clearing WAS free at ten entries. vsIl took store{view} from 390-590 to
+      // ~4,000 per window (~100/frame), and a per-frame cache costs one
+      // derivation per distinct key per frame -- so the clear became a hard
+      // ~9%-of-draws floor that no key tuning can remove. Measured: standing
+      // still at serve=83%, miss{obj=865 view=3520 both=2376}, i.e. view 14.8%
+      // against object 8.1%.
+      //
+      // The clear is also REDUNDANT with the key: the view key already carries
+      // the cb2 spans and carCam, so a camera move invalidates entries by key.
+      // Standing still those keys repeat and the entries simply hit.
+      //
+      // frameStored IS THE SAFETY VALVE, and it is what keeps the cam replay
+      // honest. That replay was justified by "the view cache is per-frame, so a
+      // recording cannot go stale" -- which stops being true here. So an entry
+      // whose producer MOVED kSdepCam is only usable in the frame that stored
+      // it; older ones are treated as a miss. Entries that moved no cam are
+      // free to cross frames, because there is nothing camera-shaped to go
+      // stale.
+      uint32_t frameStored;
+      // SEPARATE STAMP FOR EVICTION, and the two must not be merged.
+      // frameStored is IMMUTABLE -- it answers "was this recorded against the
+      // current camera", so refreshing it on use would make a cam-carrying
+      // entry look same-frame forever and reinstate exactly the stale write
+      // this design exists to prevent. lastUsed is refreshed on every serve and
+      // is what the age sweep reads, so a stationary camera's entries survive
+      // being hit for hundreds of frames.
+      uint32_t lastUsed;
+    };
+
+    // Splits the captured cbuffer spans by SLOT: slot 2 is the view/projection
+    // buffer ([DrawRedund] bytesSlot cb2=18% cross-frame, perFrameDistinct
+    // cb2=10 -- it is the camera), everything else is object/pass state.
+    // cb0 and cb1 go into BOTH keys: they take 4 and 2 distinct values a frame,
+    // so they cost neither key anything, and putting them in both means neither
+    // key can be blind to a dependency that turns out to live there.
+    // CHURN ABLATION. The object cache is measured CORRECT (whole windows of
+    // FAIL with o2w absent) and COLD -- newObj/frame runs in the hundreds
+    // against the ~4-13 objects per frame that [Perf.FastInst] says actually
+    // move. So the object VALUE is stable and the object KEY is not, and the
+    // question is which component moves. Three candidates and no way to pick
+    // between them by argument: accObj (cb3 is model x VIEW on the path-4
+    // sites, so its bytes follow the camera while the matrix does not),
+    // geoContent (the t31 per-instance entry), and instIdx (TF2 adds and drops
+    // ~6 props per fanout batch per frame, so instance indices shift under a
+    // stable object set -- rtx_types.h documents this).
+    //
+    // Same instrument as [Perf.MemoXf.Ablate], pointed at a cross-frame key
+    // instead of a within-frame one: build the key with one component held
+    // out, count how many NEW keys each variant takes on per frame, and the
+    // variant whose count collapses names the churner. Costs one run instead
+    // of one build per guess.
+    enum ObjVar : uint32_t {
+      kOvFull = 0,   // the shipping object key
+      kOvNoSpans,    // minus accObj (the cb3 / object cbuffer bytes)
+      kOvNoGeo,      // minus geoContent + geoSel
+      kOvNoInstIdx,  // minus m_currentInstanceIndex
+      kOvNoCbLoc,    // minus the cbLoc carrier fingerprint
+      kOvCount
+    };
+    // outObjKey is the object cache's IDENTITY key and outObjVal the validity
+    // hash that decides whether an entry found under it may be served. They are
+    // two different questions -- "which object is this" and "is what I recorded
+    // for it still current" -- and they were one value until 2026-08-12, which
+    // is why turning the camera invalidated a static prop. See XfObjectPart::
+    // valHash for why the split is safe by construction.
+    // outObjComps receives the kXcCount validity components UNMASKED, and
+    // outDropMask the mask that was applied to produce outObjVal. Both are
+    // probe outputs and both are optional; pass nullptr on the shipping path.
+    // Unmasked deliberately: the question a stale miss has to answer is which
+    // input MOVED, and a masked copy has already thrown that away.
+    void drawSplitKeys(const DrawSnapshot& s,
+                       uint64_t& outObjKey, uint64_t& outObjVal,
+                       uint64_t& outViewKey,
+                       uint64_t* outObjVariants = nullptr,
+                       uint64_t* outObjComps = nullptr,
+                       uint32_t* outDropMask = nullptr) const;
 
     // NV-DXVK [DrawSnapshot] viewport accessor -- the FIRST derivation input
     // moved off live state and onto the record.
