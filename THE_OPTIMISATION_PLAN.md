@@ -36,6 +36,107 @@ the other two in is Phase B (transforms) and Phase 2b (instance/scene work).
 
 ---
 
+## 0.2 STATUS — 2026-08-14. **THE CAPTURE FLOOR WAS NOT A FLOOR.** `[M]`
+
+The single largest correction this document has taken. Phase 1.1 concluded that `pfs_guard` is
+95.4% `captureDrawSnapshot`, that the capture floor is therefore ~13 ms, and that §6's
+`-14.92 pfs_guard` line had to be **revoked** because "removing it removes Phase 3".
+
+**Measured 2026-08-14, verify off:**
+
+```
+pfs_guard    14.92 ms  (24.5% of SubmitDraw, largest row in the report)
+          ->  0.66 ms  (1%)
+```
+
+The capture was not a floor. It was doing ~4x more work than any consumer read, and the excess
+came out without touching what Phase 3 runs on. §6's revocation is itself revoked — see §6.
+
+### What was built
+
+| # | Change | Result `[M]` |
+|---|---|---|
+| 1 | `[Perf.SplitXf.CbWaste]` — the capture/read cross-tab | 49% of captured **bytes** and 37% of write-combined **transactions** were for spans nothing read |
+| 2 | `ObjKeyMask` bit 23 — the **draw range** in the identity key | `keys/f 760->923`, `maxPerKey 48->21`, `FAIL=0` |
+| 3 | `splitTransformManifestPathFilter` — per-**path** capture | `wcMiss/draw 1.702 -> 0.433`, waste ~0, `satN 0`, `ovf 0` |
+| 4 | `kMaxCbManifest` 6 -> 10 | `satN 18,504 -> 0`, `manN 4.75` |
+| 5 | `splitTransformVerify = False` | the cache actually serves: `serve 65%`, `derive` 35% of draws |
+
+Both correctness gates held throughout: `FAIL=0`, `FAILcarrier=0 grp{}` empty.
+
+**AND THE §8 TRAP WAS CHECKED, BECAUSE THIS IS EXACTLY ITS SIGNATURE.** §8 warns that a leaf
+reading near zero means `RTX_D3D11_SUBMARK` was lost, not that anything got faster — and it cites
+`pfs_guard 0.28 ms` as the worked example of that false win. So, from `[Perf.SubmitDraw.acc]`,
+same window, ns:
+
+```
+pfs_guard   =  35,796,500   -> 0.80 ms/frame over 45 presentFrames  (report says 0.66)
+pfs_studio  =  19,697,700       alive
+pfs_drop    =  10,503,100       alive
+pf_setup    =  16,934,700       alive
+bt_extractXf= 570,567,900       alive
+tail_emit   = 329,890,900       alive
+```
+
+The whole named-leaf table is live and `pfs_guard`'s own accumulator independently agrees with the
+per-frame figure. The sub-markers were on; the drop is real.
+
+### The mechanism, in one line each
+
+- **The capture was keyed per VS; whether a span is read is decided by the o2w PATH**, and 55% of
+  draws sit on a VS that takes more than one. So p13's cb3 span was copied onto p1's draws every
+  draw, all frame. `p1 dead{3=8184/8063}` — cb3 captured on 100% of p1's draws, read on zero.
+- **The object identity key covered the IA binding but not the draw call's own
+  `Start`/`BaseVertexLocation`**, so different meshes sub-allocated out of one pooled buffer shared
+  a key and evicted each other. That is the collision N-way was built to absorb.
+
+### What this changed about the plan
+
+- **Phase 1.1's "capture floor ~13 ms" is refuted.** It is 0.66 ms.
+- **§6's frame-thread arithmetic reopens by ~14.3 ms.** See the corrected block there.
+- ~~**The frame thread is no longer where the big number is.** With `pfs_guard` at 1%, the dominant
+  CPU cost is `dxvk-cs` — `prepareSceneData 23.22` + `merge 17.89` ~= 41 ms — with **75% GPU idle**.
+  That is Phases 2 / 2b, still untouched.~~
+
+  > **WRONG, CORRECTED 2026-08-14 `[M]`. `merge` IS A CHILD OF `prepareSceneData`.** That sum adds
+  > a parent to its own child. The report nests them explicitly:
+  >
+  > ```
+  > the once-per-frame fat chunk   22.86
+  >   prepareSceneData             23.22   (nested)
+  >     merge                      17.89   (nested)
+  > ```
+  >
+  > and its own cross-validation row agrees: `PASS dxvk-cs PrepScene vs CsSplit fat chunk
+  > 23.22 vs 22.86 (1.5%)`. The chunk is **22.86 ms, not 41**.
+  >
+  > **The frame thread is still the pole**, and the report says so in as many words:
+  >
+  > ```
+  > BOTTLENECK: CPU, on the frame thread (95.66 ms). Second is 75.17 ms, so SLACK = 20.50 ms.
+  > ```
+  >
+  > That survives the `clkNs` caveat: against the §1 baseline, dxvk-cs inflated **more** than the
+  > frame thread (75.17/45.45 = 1.65x vs 95.66/74.76 = 1.28x), so a clean-clock window widens the
+  > gap rather than closing it. Per §7 there are **~20.5 ms of frame-thread savings that realise in
+  > full** before dxvk-cs binds.
+  >
+  > **So do not skip the frame thread for Phases 2 / 2b on this reasoning.** The ordering claim at
+  > the end of §6 ("Phases 2 / 2b are now the binding constraint, not Phase 3") rests on the same
+  > double-count and is void with it.
+
+### Open, and named honestly
+
+- **`bt_extractXf` did not move** — 11.41 ms against an 11.07 baseline, at 65% serve with verify
+  off. It should have dropped substantially. Either the serve is not saving what it should, or the
+  compose path costs what the derivation did. **Unexplained. `[U]`**
+- **Every absolute ms in the 2026-08-14 report was taken at `clkNs=101`** against a 41 ns baseline,
+  so per C.3b they are void; the *ratios* (`pfs_guard` at 1%) survive. One clean-clock capture is
+  owed before anyone sizes the next phase. A `clkNs=40` window did occur, so it is reachable.
+- **Phase 0 is still not done** (§5).
+
+---
+
 ## 1. BASELINE `[M]`
 
 ```
@@ -229,10 +330,60 @@ Writing a frame id across a contiguous 15k array is microseconds. The 97% never 
 
 ## 5. THE PLAN
 
-### Phase 0 — free, today. **-2.6 ms on the pole**
-Delete diagnostics sitting on the frame thread: `te_census` 1.01, `te_camDiag` 0.83,
-`te_propId` 0.37, fanout `dbgTrack` 0.39. The report flags them itself as "(diagnostics?)".
-No architecture, no risk.
+### Phase 0 — ~~free, today. -2.6 ms on the pole~~ **VOID. REFUTED 2026-08-14 `[M]`.**
+
+> The original text: *"Delete diagnostics sitting on the frame thread: `te_census` 1.01,
+> `te_camDiag` 0.83, `te_propId` 0.37, fanout `dbgTrack` 0.39. The report flags them itself as
+> '(diagnostics?)'. No architecture, no risk."*
+>
+> **None of the four is a diagnostic, and the -2.6 ms does not exist.** Checked in source before
+> gating anything off:
+>
+> | leaf | ms | what it actually is |
+> |---|---|---|
+> | `te_camDiag` | 1.07 | `transformData.sanitize()` (the NaN guard) + the live canonical `worldToView` override (`d3d11_rtx.cpp:47571-47597`). Its diagnostic half is **already gated** behind `RTX_D3D11_DIAG`. |
+> | `te_census` | 1.26 | **46% is `objAabb`** — `objAabb_ns=28,068,000` of `te_census=60,774,200` — the object-space bounding-box producer, already coupled to its consumer by `if (RtxOptions::needsMeshBoundingBox())` (`:48024`). The census map is already a gated pointer and the 64-sample world-AABB loop is already `if (tlasE != nullptr)` (`:47920`). |
+> | `te_propId` | 0.47 | the `stablePropId` producer — the fix for the black-square corruption. |
+> | `dbgTrack` | 0.46 | **the name is a fossil.** `markInst(instDbgTrackNs)` at `:12937` closes over `:12911-12937`, which is `acquirePooledTformVec()` x2 + `reserve(maxInstances)` x2. The diagnostic cluster its own comment describes was already removed. |
+>
+> **`RTX_D3D11_DIAG` is off** — `[PhantomProbe]`, `[TLASEntry]`, `[MainCamPose]` and `[StudioDump]`
+> each emitted **0 lines** across the whole log. The pure diagnostics were already dark, which is
+> why these buckets are the size they are: what is left in them is the functional work.
+>
+> **Where the -2.6 ms came from.** The `[Perf.Report]` verdict row is labelled
+> `te_census + te_camDiag (diagnostics?)` — **with a question mark**. The report generator is
+> guessing from the leaf's *name*; this plan hardened the guess into "free, today, no risk".
+> Acting on it would have deleted a NaN guard, a camera override, a bounding-box producer and a
+> corruption fix.
+>
+> **This is §0.2's lesson with the sign flipped.** There: *a leaf being large does not make it
+> irreducible.* Here: **a leaf being named "diag" does not make it removable.** Same fix in both
+> directions — cross-tab the leaf against what consumes it before believing the label.
+
+**What was actually free, and is now done `[M]`:** `rtx.perfDrawRedundancy` was left `True`
+through the 00:15 frame-time capture (378 `[DrawRedund]` lines in that log). §8 already said
+*"it is real time on the pole, so take the redundancy window and the frame-time window separately"*
+and the conf's own comment says *"set this back to False before quoting any fps number"* — it was
+not. Its question is already answered (§3.0). **Set `False` 2026-08-14.** Every absolute ms in the
+00:15 report carries its unbilled per-draw cost, on top of the `clkNs` problem below.
+
+**Two flags in the conf are inert and were mistaken for live `[M]`:** `rtx.memoExtractTransforms`
+and `rtx.memoExtractVerify` are both `True`, but `memoOn` requires `!splitHandled`
+(`d3d11_rtx.cpp:40370`) and `splitHandled` is set for every draw the split cache claims (`:37924`)
+— which `[Perf.SplitXf]` reports as 1309/frame, i.e. all of them. `[Perf.MemoXf]` has printed
+**zero lines** in the whole log, and it is not the log filter (`"[Perf.MemoXf"` is not in
+`kFilteredTags`). **Phase 3.2b is not running**, verify is not double-deriving, and neither flag
+explains anything in `bt_extractXf`. Testing the memo requires turning `splitTransformCache` off
+first.
+
+**One decision, not free, left open:** `needsMeshBoundingBox()` is
+`objectAntiCulling || lightAntiCulling || terrainBaking || alwaysCalculateAABB || NeeCachePass::enable()`
+(`rtx_options.cpp:653-658`). The conf turns off `antiCulling.object.enable` and
+`enableAlwaysCalculateAABB` — but **`rtx.neeCache.enable` defaults `true` and is not overridden**,
+and `pt_neeCache 0.42 ms` confirms the pass runs. So those two options buy nothing while NeeCache
+alone keeps `objAabb`'s ~0.58 ms/frame producer alive. Disabling NeeCache would recover it, but
+that is a **quality** change and the GPU is 75% idle — recommend leaving it on. Noted so the
+coupling is not rediscovered as a mystery.
 
 ### Phase 1 — MEASURE. **BLOCKING. Do not skip.**
 Three unknowns decide whether 30 fps is reachable at all:
@@ -255,6 +406,22 @@ Three unknowns decide whether 30 fps is reachable at all:
    item was written to detect. Phase 3 ("skip derivation for unchanged draws") cannot go below it,
    and §6's `-14.92 pfs_guard IF recoverable` line is now mostly **NOT** recoverable — capture is
    the mechanism Phase 3 runs on, not overhead sitting beside it. See §6 for the corrected sum.
+
+   > **REFUTED 2026-08-14 `[M]`. `pfs_guard` is now 0.66 ms — see §0.2.**
+   >
+   > The reasoning above is sound and the conclusion was still wrong, in a way worth recording
+   > because it is a shape this document has fallen into more than once: *"X is 95% of the cost,
+   > therefore X is a floor"* skips the question **"is X doing work anyone reads?"** It was not.
+   > The capture copied every span any path of a shader had ever read, onto every draw of that
+   > shader, because the manifest is keyed per VS while the read is decided by the o2w path.
+   > `[Perf.SplitXf.CbWaste]` measured 49% of captured bytes and 37% of write-combined
+   > transactions as dead. Keying the capture per path took `wcMiss/draw` 1.702 -> 0.433 and
+   > `pfs_guard` 14.92 ms -> 0.66 ms, and it did not remove anything Phase 3 runs on — the
+   > record still serves every consumer, it just stops copying what no consumer asks for.
+   >
+   > The general lesson: **a leaf being large does not make it irreducible. Cross-tab what it
+   > produces against what is consumed before calling it a floor.** The probe that settles that
+   > question is cheap; the assumption cost this plan a phase.
 
    Two cheap leads fall out, neither of which needs new instrumentation:
    - `drawSnapId_ns` ~2.1 ms/frame copies identity/stream/viewport fields that the source comment
@@ -826,6 +993,47 @@ can be removed; removing it removes Phase 3. At most ~2.1 ms (`drawSnapId_ns`, f
 reads) plus whatever manifest coalescing recovers from the 10.9 ms span copy is available here,
 not 14.92.
 
+> **THE CORRECTION IS ITSELF CORRECTED, 2026-08-14 `[M]`. PUT THE LINE BACK — IT WAS REALISED.**
+>
+> `pfs_guard` measured **0.66 ms**, from 14.92. The capture was not a floor; it was copying spans
+> no consumer read, because it was keyed per VS while the read is decided by the o2w path. Full
+> account in §0.2. Nothing Phase 3 runs on was removed.
+>
+> Note also that the ~2.1 ms `drawSnapId_ns` lead named above is **refuted separately** — those
+> fields have ~70 live consumers (`d3d11_rtx.cpp:9604` records the call-site census). The
+> recoverable part was never the identity copies; it was the span copy, and it is now recovered.
+>
+> ```
+> FRAME THREAD
+>   74.76  start
+>  -14.26  pfs_guard 14.92 -> 0.66            REALISED 2026-08-14
+>   ------
+>   60.50  realised today
+>   -2.60  Phase 0  diagnostics               still outstanding
+>   -4.90  Phase 4  fanout                    still outstanding
+>  -11.07  Phase 3  bt_extractXf              SEE BELOW - did NOT materialise at 65% serve
+>   ------
+>   41.93  if Phase 3 lands
+> ```
+>
+> **Phase 3 is the open risk, and it is now the specific one.** With verify off and `serve=65%`,
+> `bt_extractXf` read **11.41 ms** against its 11.07 baseline — it did not move. Two thirds of its
+> draws skip the derivation entirely and the bucket is unchanged. Either the serve is not saving
+> what it should, or the compose path costs what the derivation did. Until that is understood the
+> `-11.07` line above is `[U]`, not `[I]`.
+>
+> ~~**And the frame thread is no longer the binding constraint anyway.** With `pfs_guard` at 1% the
+> dominant CPU cost is `dxvk-cs` (`prepareSceneData 23.22` + `merge 17.89` ~= 41 ms) against **75%
+> GPU idle**. Phases 2 / 2b, untouched, are now the larger target.~~ Caveat per C.3b: that report ran
+> at `clkNs=101`, so its absolute values are void and only the ratios are load-bearing.
+>
+> > **VOID 2026-08-14 — `merge` is nested INSIDE `prepareSceneData`, so that sum double-counts a
+> > parent and its own child. See the corrected block in §0.2.** The fat chunk is 22.86 ms. The
+> > report's verdict reads `BOTTLENECK: frame thread (95.66 ms). Second is 75.17 ms, SLACK = 20.50`
+> > — the frame thread is still the pole, and dxvk-cs inflated *more* than it did versus baseline
+> > (1.65x vs 1.28x), so a clean clock widens the gap. **Frame-thread work still pays, up to
+> > ~20.5 ms.**
+
 So the frame thread bottoms out around **54 ms (~18.5 fps)** on everything currently identified,
 against a 33.3 ms target. **The gap is ~21 ms and there is no line item for it.** Either draw-level
 redundancy (Phase 1.2, still `[U]`) turns out to skip the capture itself — which means the skip test
@@ -843,6 +1051,19 @@ floor (`pfs_guard`) is small. The ~8.5 ms of unnamed residual inside the hook ha
 
 **Both of those unknowns are in Phase 1. That is why Phase 1 is blocking and every number on the
 frame-thread side is provisional.**
+
+> **UPDATE 2026-08-14 `[M]`: one of those two unknowns is closed, in the good direction.**
+> "*and if the capture floor (`pfs_guard`) is small*" — it is. 0.66 ms. The paragraph above treats
+> that as a condition on reaching 33.3 ms; the condition is met.
+>
+> The other one is not. Draw-level redundancy (Phase 1.2) is still `[U]`, and Phase 3's realised
+> saving is now *worse* than `[U]` — it is measured at approximately zero (`bt_extractXf` 11.41 vs
+> 11.07 at 65% serve). That is the next thing to settle on this side.
+>
+> **But the ordering rule in §7 now says not to settle it next.** `frame ~= max(frameThread,
+> dxvk-cs)`: with `pfs_guard` gone the frame thread has dropped by ~14 ms while `dxvk-cs` sits at
+> ~41 ms with 75% GPU idle, so further frame-thread savings buy nothing until `dxvk-cs` comes down.
+> **Phases 2 / 2b are now the binding constraint, not Phase 3.**
 
 **And note what the arithmetic assumes: a static scene.** These are steady-state numbers with
 `REDUNDANT=97%`, `created=0`, `matNew=0`. Under combat load the Phase 3 line shrinks toward zero
@@ -869,6 +1090,20 @@ against a heavy frame before believing 30 fps is held rather than merely reached
 ---
 
 ## 8. CONFIG STATE (set 2026-08-11, backup `rtx.conf.bak2-before-arch-off`)
+
+**AMENDED 2026-08-14.** Changes since this section was written, all in the live `rtx.conf` and all
+now matching their `rtx_options.h` defaults (checked — the two had drifted on `CamRelObjSpans`):
+
+| Option | Now | Why |
+|---|---|---|
+| `splitTransformVerify` | **False** | The gate it names is met: `FAIL=0`, `FAILcarrier=0 grp{}`. Until this flipped, the cache served **nothing** — the serve branch is `haveObj && haveView && !xVerify` — so every figure taken before it was a projection. |
+| `splitTransformObjKeyMask` | **14094335** | +bit 23 (8388608), the draw range in the identity key |
+| `splitTransformManifestPathFilter` | **True** (default) | per-path capture; see §0.2 |
+| `splitTransformCamRelObjSpans` | **True** | was already True in conf, default was still `false` — drift corrected 2026-08-14 |
+
+**With verify off, `FAIL` and `FAILcarrier` read 0 because nothing is compared, not because
+nothing is wrong.** Verify is what derives the second time. A zero there is no longer a
+measurement — the screen is the instrument. To re-measure, set it back to True.
 
 Target architecture, on:
 `useDrawSnapshot=True` · `batchSubmitDrawStages=True` · `geometryWorkerThreads=0` (auto,

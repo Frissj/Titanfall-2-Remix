@@ -303,6 +303,29 @@ namespace dxvk {
       return;
     }
 
+    // NV-DXVK [Perf] 2026-08-14: gate the WORK on the log denylist, same lever
+    // as D3D11Rtx::DumpSubViewSkyTextures.
+    //
+    // This had no off switch at all -- only s_done and the instance-count gate
+    // below -- so every run paid it. Measured 02:29: 277 .dds files, each a GPU
+    // readback plus a DDS encode and a disk write on rtx-asset-exporter, all
+    // landing ~10s after gameplay is detected. Being one-shot it does not touch
+    // steady state, but it does mean the first ~10-20s of EVERY capture is dirty,
+    // which is exactly the window a short measurement run lives in.
+    //
+    // Hoisted into a function-local static rather than called per invocation:
+    // tagDenied strlen()s the tag and memcmps its bucket (rtx_instance_manager.cpp
+    // :5177 records that cost being real at per-instance rates). The denylist is
+    // published once by Logger::setDenyTags during RtxOptions init and never
+    // changes, so a static is the correct lifetime. It resolves on the first call
+    // -- after the tag index exists -- and s_done is left alone so RTX_D3D11_DIAG=1
+    // or removing the entry from rtx.logDenyTags restores dump and log together.
+    static const bool kOnScreenAlbedoDenied =
+      Logger::tagDenied("[OnScreenAlbedoDump]");
+    if (kOnScreenAlbedoDenied) {
+      return;
+    }
+
     const auto& instances = getSceneManager().getAccelManager().getOrderedInstances();
     // Gameplay gate: menus/loading submit very few instances. 200 sits well
     // above menu/HUD draw counts and well below a real gameplay frame. Also

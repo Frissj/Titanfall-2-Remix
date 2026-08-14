@@ -117,6 +117,28 @@ namespace dxvk {
       AccRpKeyMs, AccRpSelMs, AccRpSelMissMs, AccRpProofMs,
       AccRpCommitMs, AccXtCapMs, AccRpO2wMs, RpTierTotalMs,
 
+      // ---- captureDrawSnapshot, the inside of pfs_guard (2026-08-14) ----
+      // THESE ARE LIVE WITH RTX_PERF_MARKS=0, and that is the whole point of
+      // them. Every other Acc* slot above comes from markStg, so with marks off
+      // they publish zero and the report's verdict prints "none published --
+      // the per-stage probes for this thread are gated off" while the largest
+      // item on the pole goes unnamed. These carry their own steady_clock pairs
+      // (see s_perfDrawSnapAccNs and friends in d3d11_rtx.cpp), so the report
+      // can name the guard's inside on a normal, cheap run.
+      //
+      // CONSEQUENCE TO EXPECT, NOT A BUG: with marks off, pfs_guard reads 0
+      // while its children read real values, so a child appears larger than its
+      // parent. The section header says so; do not "fix" it by nesting these
+      // under a slot that is only populated when marks are on.
+      //
+      // SpanMs is derived, not measured: drawSnap - (alloc + id), published
+      // pre-computed so the report never reconstructs it by hand -- the same
+      // mistake the SdLeaves comment above records paying for twice.
+      // WcMs/CaptureMs/ManifestMs/PreMfMs/SdepMs all sit inside SpanMs, and
+      // WcMs is nested inside CaptureMs, so they do NOT sum to it.
+      AccDrawSnapMs, AccDrawSnapAllocMs, AccDrawSnapIdMs, AccDrawSnapSpanMs,
+      AccCsSdepMs, AccCsPreMfMs, AccCsManifestMs, AccCsCaptureMs, AccCsWcMs,
+
       // ---- dxvk-cs: the per-draw chain (NESTED — see kNested) ----
       CommitRtMs, CommitSubmitMs, CommitFinalizeMs,
       ProcDcsMs, ProcDcsGeomMs, ProcDcsInstMs,

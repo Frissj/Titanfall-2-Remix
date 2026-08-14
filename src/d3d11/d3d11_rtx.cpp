@@ -8783,6 +8783,97 @@ namespace dxvk {
       return false;         // default OFF (leaf bisect landed 2026-08-08)
     return v[0] != '0';     // RTX_D3D11_SUBMARK=0 disables, no rebuild needed
   }();
+
+  // ================================================================
+  // NV-DXVK [Perf.MarksCompileOut] 2026-08-14 -- THE MEASUREMENT-FLOOR SWITCH.
+  //
+  // WHAT IT IS FOR. Every phase in THE_OPTIMISATION_PLAN is sized against
+  // frame times taken with this instrumentation live, and the instrument is not
+  // small: markStg's own comment prices a mark at ~41 ns and counts ~30 of them
+  // per draw, which is ~1.2 us in a ~17 us draw, and markXt / markFm / markInst
+  // add more on top. At ~1,350 draws/frame that is milliseconds of the very
+  // number being optimised. Appendix C.5 is the same lesson at 55x.
+  //
+  // Setting this to 0 makes all five mark lambdas compile to nothing -- the
+  // clock read included, because `if constexpr` DISCARDS the branch rather than
+  // predicting it. What you get is a build whose frame time is the frame time,
+  // for establishing a true baseline before sizing the next phase.
+  //
+  // NOTHING IS DELETED, and nothing functional depends on a mark. The lambdas
+  // only accumulate into diagnostic sinks and advance their own timestamp; the
+  // one caller that consumes a return value (the bt_extractXf eligibility and
+  // serve/derive splits) is itself a diagnostic and simply accumulates zero.
+  // Turn it back to 1 and every bucket returns, unchanged.
+  //
+  // TWO LEVELS, because they buy different things.
+  //
+  // 1. RTX_PERF_MARKS env var -- NO REBUILD. Read once into a static const,
+  //    exactly like s_submitDrawSubMarkers above. This is the one to use.
+  //      set RTX_PERF_MARKS=1   marks ON  -- opt in, for a measuring session
+  //      set RTX_PERF_MARKS=0   marks off
+  //      unset                  marks OFF -- THE DEFAULT, see below
+  //    It cannot ELIMINATE the clock read, only skip it -- but that is the whole
+  //    cost anyway. The read is ~41 ns x ~30 marks x ~1,350 draws ~= 1.6 ms of
+  //    every frame; what is left when it is skipped is one perfectly-predicted
+  //    branch on a static bool, ~1 ns a call, ~0.04 ms/frame. So the env var
+  //    recovers ~97% of what the compile-time switch does, at zero rebuild cost.
+  //
+  // 2. -DRTX_PERF_MARKS=0 (or editing the #define) -- compile-time, and the ONLY
+  //    way to get the last ~0.04 ms, because `if constexpr` DISCARDS the branch
+  //    rather than predicting it. Worth it only for a final headline number.
+  //    Setting it to 0 also makes the env var irrelevant: nothing is left to
+  //    switch on. Nothing in the build system defines this macro (checked
+  //    2026-08-14), so a normal build gets the default below.
+  //
+  // It lives in this .cpp rather than a header on purpose: rtx_options.h and
+  // d3d11_rtx.h are included nearly everywhere and a touch costs a ~20-minute
+  // full rebuild, whereas this is one TU. An RtxOption would also work but
+  // would be an option READ per mark rather than a static branch, which is the
+  // wrong side of the trade for something called ~40,000 times a frame.
+  //
+  // WHEN MARKS ARE OFF, BY EITHER ROUTE, the ENTIRE named-leaf table is dead by
+  // construction: pfs_guard, bt_extractXf, tail_emit, every te_*/bt_*/pff_*
+  // accumulator, the eligibility and serve/derive splits, and the
+  // [Perf.SubmitDraw.acc] line all read 0. That is the switch working, NOT a
+  // regression and NOT a lost RTX_D3D11_SUBMARK -- sec 8 of the plan describes
+  // the env-var version of exactly this false alarm, so do not go hunting.
+  //
+  // What stays valid with marks off: FRAME, the three timelines, HYGIENE, the
+  // D3D11 entry-point rows, and the dxvk-cs / GPU sections. Those come from
+  // separate instruments that do not use these lambdas -- which is the point,
+  // because they are the numbers a marks-off build exists to read.
+  #ifndef RTX_PERF_MARKS
+  #define RTX_PERF_MARKS 1
+  #endif
+  static constexpr bool kRtxPerfMarks = (RTX_PERF_MARKS != 0);
+  // Runtime half of the switch. DEFAULT OFF -- instrumentation is opt-in, the
+  // same convention RTX_D3D11_SUBMARK already uses above, so the two switches
+  // now agree instead of one defaulting each way.
+  //
+  // WHY OFF BY DEFAULT. These marks cost ~1.6 ms of every frame (~41 ns x ~30
+  // marks x ~1,350 draws) on the thread this project is trying to shorten, and
+  // they are read only when someone is deliberately measuring. A default that
+  // taxes every session to serve the occasional one is the wrong way round --
+  // and this file has already been burned twice by instruments that changed the
+  // answer (Appendix C.5's 55x, and the perfDrawRedundancy re-stamp that made
+  // pfs_guard read 0.66 instead of 7.61).
+  //
+  // CONSEQUENCE, AND IT IS NOT SUBTLE: with nothing set, every future log has a
+  // named-leaf table of ZEROS -- pfs_guard, bt_extractXf, tail_emit, every
+  // te_*/bt_*/pff_*, the eligibility and serve/derive splits, and the whole
+  // [Perf.SubmitDraw.acc] line. That is correct behaviour, not a regression and
+  // not a lost env var. Before reading any leaf, set RTX_PERF_MARKS=1.
+  //
+  // NOTE: the string literal is not macro-expanded, so sharing the name with the
+  // macro above is safe and deliberate -- one name, two levels.
+  static const bool s_perfMarksEnabled = []() {
+    const char* v = std::getenv("RTX_PERF_MARKS");
+    if (v == nullptr || v[0] == '\0')
+      return false;         // DEFAULT OFF -- opt in with RTX_PERF_MARKS=1
+    return v[0] != '0';     // =0 also disables, for an explicit off
+  }();
+  // ================================================================
+
   static thread_local int64_t s_perfPfsGuardAcc   = 0, s_perfPfsGuardMax   = 0;
   static thread_local int64_t s_perfPfsStudioAcc  = 0, s_perfPfsStudioMax  = 0;
   static thread_local int64_t s_perfPfsDropAcc    = 0, s_perfPfsDropMax    = 0;
@@ -9059,6 +9150,43 @@ namespace dxvk {
   // them.
   static thread_local bool s_xtEligLast  = false;  // safeToDefer() -- axes 1+2
   static thread_local bool s_xtElig3Last = false;  // ...&& geoBytesStatic() -- all 3
+  // NV-DXVK [Perf.ServeCost] 2026-08-14 -- WHAT DOES A SERVED DRAW ACTUALLY COST?
+  //
+  // THE QUESTION, and it is the one that decides whether the split cache is
+  // worth any further work. serve went 0% (verify on never serves) -> 65%
+  // (verify off) and bt_extractXf did not move: 11.07 -> 11.41 ms/frame. Two
+  // thirds of draws stopped deriving and the bucket is unchanged. THE_OPTIMISATION
+  // _PLAN sec 0.2 records this as Unexplained [U] and offers two candidates --
+  // "either the serve is not saving what it should, or the compose path costs
+  // what the derivation did" -- which a bucket TOTAL cannot tell apart, for
+  // exactly the reason the xfElig/xfInelig comment above gives.
+  //
+  // READ IT AS ns/draw: s_xfServeNs/s_xfServeN against s_xfDeriveNs/s_xfDeriveN.
+  //   serve ~= derive   -> the compose path (cand assembly + objectToView product
+  //                        + sanitize at :38586-38592) costs what it replaced.
+  //                        The cache is sound and pointless; fix the compose.
+  //   serve << derive   -> the serve IS cheap and the 11.41 ms is somewhere the
+  //                        cache never touched. Stop tuning serve% and go
+  //                        attribute the rest of the bucket.
+  // Either answer redirects the next phase, which is why this is one probe and
+  // not a rewrite.
+  //
+  // ZERO EXTRA CLOCK READS, same contract as the eligibility split: it re-bills
+  // the dNs markStg already computed and returns. bt_extractXf itself is
+  // untouched and stays comparable with every prior run.
+  //
+  // WRITTEN ON EVERY PATH THAT REACHES THE CONSUME SITE, and unlike
+  // s_xtEligLast there is no RAII guard to guarantee that, so the four writers
+  // are exhaustive by construction rather than by invariant:
+  //   split serve  (:38601)  true     split derive (:38614)  false
+  //   memo  hit    (:40401)  true     derive        (:40423) false
+  // The last of those is also the plain no-cache path (splitHandled false and
+  // memoOn false), so a draw with both features off bills as derive, correctly.
+  // Under verify the serve branch is skipped by !xVerify and everything bills
+  // as derive -- which is what verify does, so that is the honest reading.
+  static thread_local int64_t  s_xfServeNs = 0, s_xfDeriveNs = 0;
+  static thread_local uint32_t s_xfServeN  = 0, s_xfDeriveN  = 0;
+  static thread_local bool     s_xtServedLast = false;
   static thread_local int64_t s_perfBtSkyboxFilterAcc   = 0, s_perfBtSkyboxFilterMax   = 0;
   // [Perf.SubmitDraw] ExtractTransforms() internal subdivision. The function
   // is ~3,800 lines long and bt_extractXf (its total) is the dominant cost
@@ -9601,6 +9729,146 @@ namespace dxvk {
   static thread_local int64_t s_perfDrawSnapAccNs      = 0, s_perfDrawSnapMaxNs      = 0;
   static thread_local int64_t s_perfDrawSnapAllocAccNs = 0, s_perfDrawSnapAllocMaxNs = 0;
   static thread_local int64_t s_perfDrawSnapIdAccNs    = 0, s_perfDrawSnapIdMaxNs    = 0;
+  // NV-DXVK [perf] 2026-08-14: HOW MUCH OF THE SPAN COPY IS ACTUALLY WC LATENCY?
+  //
+  // WHY THIS EXISTS. The span copy -- drawSnap_ns - (Alloc + Id) -- measured
+  // 79.2% of the capture (514.8 of 650.3 ms/window, 5.72 ms/frame at 90 frames)
+  // and is the largest unnamed thing on the frame thread. THE_OPTIMISATION_PLAN
+  // sec 4 attributes it to write-combined reads that are not coalescing (16%
+  // hit), and the cb3 work queued behind that premise is worth 5.7 ms if it is
+  // right and ~0.2 ms if it is not. Nothing currently distinguishes the two:
+  //   - [DrawSnap] wcMiss counts TRANSACTIONS, never time.
+  //   - [Perf.WcCopy] counts BYTES and calls, never time -- and bytes are the
+  //     wrong unit anyway. Its top site by bytes is 287.58 MB at 6155 B/call
+  //     (the t31 read cache, d3d11_rtx.cpp:13498, NOT this path), which is a
+  //     large sequential movntdqa stream and amortises; this path's 198 B/call
+  //     window fills do not. Ranking WC work by bytes inverts the true cost.
+  //   - s_perfRpWcNs times the REPLAY tier's 64 B projection read, a different
+  //     read on a different path. It is the pattern to copy, not the answer.
+  //   - The natural experiment is closed: wcMiss/draw is pinned at 0.44-0.45 in
+  //     every mid-run window of both the 02:29 and 02:40 captures. The only
+  //     window that ever differs (0.68-0.82) is the LAST one of the run, in 4
+  //     runs out of 4 -- that is the teardown artifact previously logged as the
+  //     unattributed "cb2 swing", not a live variation to regress against.
+  //
+  // So measure it directly. Wraps ONLY the window-fill memcpyFromWC at ~:28480,
+  // which is the single WC transaction the capture issues (the hit path is a
+  // cached memcpy out of an already-filled window and costs nothing here).
+  //
+  // COST. ~603 fills/frame x 2 steady_clock reads at ~41 ns = ~50 us/frame,
+  // 0.7% of drawSnap_ns -- and each fill is 1192-2333 ns, well clear of the
+  // markFm jitter floor, so this resolves where a per-draw timer would not.
+  // Its own clock pair, NOT markStg: it must survive RTX_PERF_MARKS=0 like
+  // drawSnap_ns, so the number can be read without paying for 30 marks a draw.
+  //
+  // READ IT AS: drawSnapWcNs / (drawSnap_ns - Alloc - Id). Near 1.0 means sec 4
+  // is right and coalescing is worth up to 5.7 ms/frame. Near 0.05 means the
+  // span copy is something else -- the range walk, the manifest lookup, or the
+  // cached-memcpy volume -- and the cb3 coalescing work should NOT be started.
+  // drawSnapWcN is the divisor for a per-transaction ns, to cross-check against
+  // the tree's 1192-2333 ns/64 B figure and catch a mis-scaled window.
+  static thread_local int64_t  s_perfDrawSnapWcAccNs    = 0, s_perfDrawSnapWcMaxNs    = 0;
+  static thread_local uint32_t s_perfDrawSnapWcN        = 0;
+  // NV-DXVK [perf] 2026-08-14: SPLIT THE 4.55 ms THE WC TIMER LEFT BEHIND.
+  //
+  // The 03:00 capture killed sec 4: of the 5.01 ms/frame span copy, write-
+  // combined latency is 0.47 ms (9.3%, 616 transactions at 758 ns). The other
+  // 4.55 ms is 90.7% of the span copy, 71% of the guard, and has never been
+  // timed by anything. These two name it.
+  //
+  //   csCaptureNs/N  time inside the capture() lambda itself, i.e. the actual
+  //                  per-span work: the staging-ring probe, the kWcWays
+  //                  containment scan, GetMappedSlice on a miss, and the byte
+  //                  copies. The WC fill is nested inside this, so subtract
+  //                  drawSnapWcNs to get the non-WC part.
+  //   csManifestNs   the whole learned-span block (the `capLoc` loop). Its
+  //                  nested capture() calls are INCLUDED, so it is not disjoint
+  //                  from csCaptureNs -- see the read recipe below.
+  //
+  // WHY THE MANIFEST BLOCK IS THE SUSPECT. It runs mfSkip+mfCap = 427k span
+  // decisions per window (~3,715/frame against ~1,080 draws), and each one does
+  // mfWant(), a rebase multiply, and s.find() -- a LINEAR scan over the ranges
+  // already captured on this draw. find() is O(numCbRanges) inside a loop that
+  // is itself O(manifestN<=10), so the per-draw cost is quadratic in a record
+  // that meanRanges says holds ~2.6 ranges. Cheap per step, 3,715 steps.
+  //
+  // READ IT AS:
+  //   per span copy      = csCaptureNs / csCaptureN        (expect ~1 us)
+  //   non-WC per span    = (csCaptureNs - drawSnapWcNs) / csCaptureN
+  //   manifest walk only = csManifestNs - csCaptureNs * (mfCap / csCaptureN)
+  //     -- apportioning capture() cost by call count, which assumes the lambda
+  //        costs the same from the manifest as from the three named sites. It
+  //        does not exactly (named spans are likelier to be the FIRST touch of
+  //        a buffer and so likelier to take the WC fill), so treat the walk-only
+  //        figure as a floor, not a point estimate.
+  //
+  // COST. One clock pair per capture() call (~4,400/frame) plus one per draw
+  // for the manifest block: ~0.37 ms/frame, 8% of the 4.55 ms being split.
+  // That is real and it is the price of naming this; subtract it before
+  // comparing the total against the 03:00 baseline. Both are their own clock
+  // pairs, NOT markStg, so they survive RTX_PERF_MARKS=0 like drawSnap_ns.
+  static thread_local int64_t  s_perfCsCaptureAccNs     = 0;
+  static thread_local uint32_t s_perfCsCaptureN         = 0;
+  static thread_local int64_t  s_perfCsManifestAccNs    = 0;
+  // NV-DXVK [perf] 2026-08-14 ROUND 2: BISECT THE 4.58 ms NEITHER OF THEM FOUND.
+  //
+  // Round 1 came back: of a 5.81 ms/frame span copy, capture() is 1.23 (0.94 of
+  // it write-combined, and the non-WC per-span work is 82 ns -- nothing) and the
+  // manifest block is 1.03 INCLUDING its nested capture calls. So 4.58 ms/frame
+  // is inside captureDrawSnapshot, outside both, and unaccounted. Reading the
+  // region did not find it either: between the Id stamp and the capLoc lookup
+  // there are only declarations, and the [DrawSnap] census tail is one
+  // steady_clock::now() per draw (~0.04 ms/frame).
+  //
+  // csPreMfNs brackets end-of-Id -> start-of-manifest, i.e. the capLoc hash
+  // lookup plus the whole named proj/view/cameraOrigin location block. One
+  // clock pair per draw, ~0.04 ms/frame.
+  //
+  //   csPreMfNs ~= 4.7  -> the cost is the NAMED-span location logic, and the
+  //                       nested capture() calls are not it (csCapture already
+  //                       bounds those at 1.23 for ALL four sites). Split the
+  //                       proj / view / cameraOrigin blocks next.
+  //   csPreMfNs ~= 0.2  -> the cost is AFTER the manifest block, i.e. in the
+  //                       census tail, and something there is far more
+  //                       expensive per draw than the one clock read it looks
+  //                       like. Read the tail line by line at that point.
+  //
+  // Stated in advance so this round can be wrong on the record like the last
+  // two: I expect the first. Guessed the manifest walk, guessed the per-span
+  // copy, both refuted by their own timers -- so this is a bisect, not a third
+  // hypothesis, and it partitions the remainder either way.
+  static thread_local int64_t  s_perfCsPreMfAccNs       = 0;
+  // NV-DXVK [perf] 2026-08-14 ROUND 3: THE RESIDUAL WAS MISLABELLED, AND THIS
+  // IS THE ACTUAL CANDIDATE.
+  //
+  // Round 2 read csPreMf=0.64, csManifest=0.75, residual=4.47 -- and I called
+  // that residual "the census tail". It is not. The partition was
+  //   span = drawSnap - alloc - id
+  // and csPreMf only OPENS after the Id block closes, so the residual is
+  // everything outside [tPreMf0, manifest-close] -- which includes the UNTIMED
+  // 47-line gap between the alloc stamp (~:27992) and the Id region (~:28039),
+  // at the FRONT of the function, not the back. The census tail is six
+  // increments and one clock read and never could have been 4.47 ms.
+  //
+  // That gap is field assignments plus exactly one call: stageDepCarrierGroups.
+  // It builds kSdepGroupCount FNV-1a hashes with a byte-at-a-time loop --
+  //   for (i..n) { h ^= b[i]; h *= prime; }
+  // -- over a long list of Vector3/Matrix4/bool members. Every iteration
+  // depends on the previous multiply, so it is a serial ~3-cycle-per-BYTE
+  // chain, not a memcpy: a single Matrix4 is 64 dependent multiplies. At a few
+  // hundred bytes per call and ~1080 draws/frame that is microseconds per frame
+  // per hundred bytes, which is the right order for a 4.47 ms residual.
+  //
+  // csSdepN is here to catch the other thing this could be: stageDepCarrierGroups
+  // has four call sites (~:15709, :28010, :33088, :33130). If N/frame comes back
+  // at ~2x or ~3x the draw count, the fix is "stop calling it repeatedly" rather
+  // than "make the hash wider than a byte", and those are different fixes.
+  //
+  // Timed at the :28010 call site only -- that is the one inside the span copy,
+  // and attributing the residual is the question. The other three sites are
+  // outside drawSnap_ns and would muddy it.
+  static thread_local int64_t  s_perfCsSdepAccNs        = 0;
+  static thread_local uint32_t s_perfCsSdepN            = 0;
   // NV-DXVK [perf] 2026-08-11: SPLIT drawSnapId_ns INTO ITS THREE BLOCKS.
   //
   // WHY. The 22:35 capture resolved pfs_guard: drawSnap_ns is 95.4% of it
@@ -11620,10 +11888,17 @@ namespace dxvk {
     int64_t instAllocNs = 0, instPostLoopNs = 0, instLoopEchoNs = 0;
     auto tInstMark = tInst0;
     auto markInst = [&](int64_t& sink) {
+      // [Perf.MarksCompileOut] -- see the switch's declaration.
+      if constexpr (!kRtxPerfMarks) {
+        (void) sink;
+        return;
+      } else {
+      if (!s_perfMarksEnabled) return;   // RTX_PERF_MARKS=0, no rebuild
       if (!kInstTiming) return;
       const auto now = std::chrono::steady_clock::now();
       sink += std::chrono::duration_cast<std::chrono::nanoseconds>(now - tInstMark).count();
       tInstMark = now;
+      }
     };
     XXH64_hash_t instVsH = 0;
     if (kInstTiming) { XXH64_hash_t ptmp = 0; GetCurrentVsPsHashes(instVsH, ptmp); }
@@ -15214,11 +15489,19 @@ namespace dxvk {
     // microsecond truncation made these buckets unreadable. Same units so the
     // xt_* fields stay comparable with the rest of [Perf.SubmitDraw.acc].
     auto markXt = [&tXt](int64_t& acc, int64_t& max) {
+      // [Perf.MarksCompileOut] -- see the switch's declaration.
+      if constexpr (!kRtxPerfMarks) {
+        (void) acc; (void) max; (void) tXt;
+        return;
+      } else {
+      if (!s_perfMarksEnabled)      // RTX_PERF_MARKS=0, no rebuild
+        return;
       const auto now = std::chrono::steady_clock::now();
       const int64_t dNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now - tXt).count();
       acc += dNs;
       if (dNs > max) max = dNs;
       tXt = now;
+      }
     };
 
     // NV-DXVK [perf] 2026-08-06: markXtSub — markXt for OPTIONAL subdivisions,
@@ -27755,7 +28038,13 @@ namespace dxvk {
     // apart instead of folded.
     // Cheaper than the carrierFingerprint() it replaces, not dearer: that call
     // ran this same enumeration and then folded it: the fold is what is gone.
+    // NV-DXVK [perf] 2026-08-14: see s_perfCsSdepAccNs. Prime suspect for the
+    // 4.47 ms/frame that round 2's residual contained and round 2 mislabelled.
+    const auto tSdep0 = std::chrono::steady_clock::now();
     stageDepCarrierGroups(s.carrierGrp);
+    s_perfCsSdepAccNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - tSdep0).count();
+    ++s_perfCsSdepN;
     s.carrierMask = 0;
 
     const auto& st = m_context->m_state;
@@ -28171,6 +28460,11 @@ namespace dxvk {
       if (dIdNs > s_perfDrawSnapIdMaxNs) s_perfDrawSnapIdMaxNs = dIdNs;
     }
 
+    // NV-DXVK [perf] 2026-08-14: csPreMfNs opens here -- see its declaration.
+    // Bisects the 4.58 ms/frame that csCapture and csManifest between them did
+    // not account for. Closes immediately before the manifest block.
+    const auto tPreMf0 = std::chrono::steady_clock::now();
+
     // -- THE COPIED BYTES.
     //
     // NV-DXVK [DrawSnapshot] 2026-08-10: THE WC COALESCING WINDOW.
@@ -28222,7 +28516,14 @@ namespace dxvk {
     WcWindow wc[kWcWays];
     uint32_t wcNext = 0;
 
-    auto capture = [&s, &wc, &wcNext](const D3D11ConstantBufferBindings& cbs, uint32_t stage,
+    // NV-DXVK [perf] 2026-08-14: renamed to captureImpl and wrapped below, so
+    // csCaptureNs covers EVERY exit. The body has six early returns (bad slot,
+    // null buffer, range cap, byte cap, short staging, short window) and any
+    // scheme that stamped a second clock before a `return` would silently
+    // exclude exactly the cheap declines, which is the population that decides
+    // whether the manifest walk or the copy is the cost. A wrapper cannot miss
+    // one. Same reason drawSnap_ns brackets the call and not the body.
+    auto captureImpl = [&s, &wc, &wcNext](const D3D11ConstantBufferBindings& cbs, uint32_t stage,
                         uint32_t slot, uint32_t byteOffset, uint32_t byteCount) {
       if (slot >= cbs.size() || byteCount == 0)
         return;
@@ -28333,8 +28634,20 @@ namespace dxvk {
             // not evict the entry it is about to need again.
             WcWindow& w = wc[wcNext];
             wcNext = (wcNext + 1u) % kWcWays;
+            // NV-DXVK [perf] 2026-08-14: THE one WC transaction the capture
+            // issues -- see s_perfDrawSnapWcAccNs for why this number decides
+            // whether the sec 4 cb3 coalescing work is worth 5.7 ms or 0.2 ms.
+            // Brackets the fill ONLY: the hit path above is a cached memcpy out
+            // of a window this already paid for, and timing it would double-bill
+            // the saving coalescing is supposed to produce.
+            const auto tWc0 = std::chrono::steady_clock::now();
             memcpyFromWC(w.bytes,
                          static_cast<const uint8_t*>(mapped.mapPtr) + lo, want);
+            const int64_t dWcNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - tWc0).count();
+            s_perfDrawSnapWcAccNs += dWcNs;
+            ++s_perfDrawSnapWcN;
+            if (dWcNs > s_perfDrawSnapWcMaxNs) s_perfDrawSnapWcMaxNs = dWcNs;
             w.buf = b.buffer.ptr();
             w.lo  = lo;
             w.len = want;
@@ -28385,6 +28698,19 @@ namespace dxvk {
             s.pinDeferRefs[slot] = b.buffer->GetBuffer();
         }
       }
+    };
+
+    // NV-DXVK [perf] 2026-08-14: the timing wrapper. Every capture() call site
+    // below goes through this unchanged, so csCaptureN is the true per-span
+    // call count and csCaptureNs covers all six early exits of captureImpl.
+    // drawSnapWcNs is nested inside this figure; subtract it for the non-WC part.
+    auto capture = [&](const D3D11ConstantBufferBindings& cbs, uint32_t stage,
+                       uint32_t slot, uint32_t byteOffset, uint32_t byteCount) {
+      const auto tCs0 = std::chrono::steady_clock::now();
+      captureImpl(cbs, stage, slot, byteOffset, byteCount);
+      s_perfCsCaptureAccNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - tCs0).count();
+      ++s_perfCsCaptureN;
     };
 
     // Would one more span of this size fit? Same arithmetic capture() uses.
@@ -28712,6 +29038,18 @@ namespace dxvk {
     // FAIL and FAILcarrier must stay 0, as ever.
     // mfPredPath / mfFilter / mfWant are resolved once above the NAMED spans --
     // both kinds share the rule, so there is one lookup per draw, not two.
+    // NV-DXVK [perf] 2026-08-14: csManifestNs -- ONE clock pair per draw for the
+    // whole learned-span block, not one per entry. Per-entry would be ~3,715
+    // pairs a frame to resolve steps that are individually tens of nanoseconds,
+    // i.e. below the steady_clock floor, and would bill more than it measured --
+    // the markFm sub-bucket trap. The block total is micro-seconds and resolves
+    // cleanly. If it turns out to be the cost, split it by entry NEXT, once it
+    // is known to be worth the distortion. Nested capture() time is included.
+    const auto tMf0 = std::chrono::steady_clock::now();
+    // csPreMfNs closes on the SAME clock read that opens csManifestNs, so the
+    // two partition the region with no gap and no double-count between them.
+    s_perfCsPreMfAccNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
+        tMf0 - tPreMf0).count();
     if (capLoc != nullptr) {
       for (uint32_t i = 0; i < capLoc->manifestN; ++i) {
         const VsCbLocations::CbSpanReq& m = capLoc->manifest[i];
@@ -28753,6 +29091,11 @@ namespace dxvk {
           s.rangeToManifest[rIdxM] = static_cast<uint8_t>(i);
       }
     }
+    // Stamped OUTSIDE the null check so a draw with no manifest still counts as
+    // a (near-zero) sample. Excluding those would make the mean describe only
+    // the draws that had learned spans and overstate the per-draw walk cost.
+    s_perfCsManifestAccNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - tMf0).count();
 
     // -- [DrawSnap] coverage census. This is the number that says whether the
     // narrow capture actually covers the population it is meant to serve. If
@@ -29278,11 +29621,21 @@ namespace dxvk {
     // ns removes the floor-to-zero, but the ~41ns/mark instrument cost remains,
     // so keep confirming leaf wins by mechanism, not by a bucket moving.
     auto markFm = [&tFm](int64_t& acc, int64_t& max) {
+      // [Perf.MarksCompileOut] -- see the switch's declaration. This one matters
+      // most for honesty: the markFm leaves are sub-us, so at ~41 ns a mark the
+      // instrument is a large fraction of what it reports (see markFm-jitter).
+      if constexpr (!kRtxPerfMarks) {
+        (void) acc; (void) max; (void) tFm;
+        return;
+      } else {
+      if (!s_perfMarksEnabled)      // RTX_PERF_MARKS=0, no rebuild
+        return;
       const auto now = std::chrono::steady_clock::now();
       const int64_t dNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now - tFm).count();
       acc += dNs;
       if (dNs > max) max = dNs;
       tFm = now;
+      }
     };
     // NV-DXVK [Perf.FmSplit]: full-precision entry timestamp for the resolve-vs-rest
     // split. tFm is a real time_point; markFm mutates it as it walks, so capture a
@@ -32278,22 +32631,100 @@ namespace dxvk {
   // contract warns about: the survivor would have gone stale the first time a
   // group was added. Compare per group; do not reintroduce a fold.
 
+  // NV-DXVK [perf] 2026-08-14: WORD-WISE, FOUR-LANE. Was byte-at-a-time FNV-1a.
+  //
+  // WHY. Measured at 2,810 ns PER DRAW (csSdepNs/csSdepN, 154k calls/window
+  // against ~153k draws -- once per capture). That is ~70% of the whole
+  // cbuffer-span copy, ~54% of pfs_guard, and ~9% of the frame thread, spent
+  // entirely on change-detection hashes over ~458 bytes.
+  //
+  // The old loop did one xor+multiply PER BYTE, and every iteration depended on
+  // the previous multiply, so 458 bytes was a 458-long serial chain of ~3-cycle
+  // imuls -- the byte count was not the problem, the dependency chain was.
+  // kSdepStatic alone is 321 of those bytes (five Matrix4).
+  //
+  // This does 8 bytes per multiply AND splits the work across four independent
+  // accumulators, so a 32-byte block costs four multiplies that issue in
+  // parallel instead of 32 that serialise. ~8x fewer operations and ~4x more
+  // instruction-level parallelism on top.
+  //
+  // VALUE-NEUTRAL, VERIFIED BEFORE CHANGING IT. Every consumer of these hashes
+  // either compares two values this same function produced in this same process
+  // (~:15742 grpNow[g] != snap->carrierGrp[g]), copies one into a live key
+  // (~:25596), or re-hashes it with XXH64 into a memo key (~:26299). Nothing
+  // persists a group hash to disk, sends it anywhere, or compares one across
+  // runs -- so producers and consumers move together and the only requirement
+  // is that the function stay DETERMINISTIC for a given byte sequence.
+  //
+  // IT IS. The body is straight-line: every mix/seal below is unconditional, so
+  // the sequence of calls and their sizes is fixed by the code, never by data.
+  // Lane assignment is therefore identical on every draw, and seal() resets the
+  // lanes so groups stay independent of each other exactly as before.
+  //
+  // THIS DOES NOT CHANGE WHAT IS HASHED. Same fields, same order, same groups.
+  // Only the mixing function changed, so the change-DETECTION semantics -- which
+  // is all any consumer uses these for -- are untouched.
+  //
+  // VERIFY: FAIL=0 and FAILcarrier=0 on [Perf.SplitXf] across a camera-moving
+  // session, which is this tree's standing bar for anything touching carrier
+  // groups, plus replay{FAIL=0}. A hash that collided where the old one did not
+  // would show up as a serve of a stale transform, i.e. exactly those counters.
   void D3D11Rtx::stageDepCarrierGroups(uint64_t out[kSdepGroupCount]) const {
-    uint64_t h = 0xcbf29ce484222325ull;
-    const auto mix = [&h](const void* p, size_t n) {
+    constexpr uint64_t kSdepSeed  = 0xcbf29ce484222325ull;
+    constexpr uint64_t kSdepPrime = 0x100000001b3ull;
+    // Four lanes, seeded apart so a block of identical words does not collapse
+    // them onto the same value. Odd constants; any distinct set works.
+    uint64_t h0 = kSdepSeed;
+    uint64_t h1 = kSdepSeed ^ 0x9E3779B97F4A7C15ull;
+    uint64_t h2 = kSdepSeed ^ 0xC2B2AE3D27D4EB4Full;
+    uint64_t h3 = kSdepSeed ^ 0x165667B19E3779F9ull;
+    const auto mix = [&](const void* p, size_t n) {
       const uint8_t* b = static_cast<const uint8_t*>(p);
-      for (size_t i = 0; i < n; ++i) {
-        h ^= b[i];
-        h *= 0x100000001b3ull;
+      size_t i = 0;
+      // Four independent multiplies per 32-byte block. Matrix4 is exactly two
+      // of these, and it is 70% of the bytes hashed here.
+      for (; i + 32 <= n; i += 32) {
+        uint64_t w0, w1, w2, w3;
+        std::memcpy(&w0, b + i,      8);
+        std::memcpy(&w1, b + i +  8, 8);
+        std::memcpy(&w2, b + i + 16, 8);
+        std::memcpy(&w3, b + i + 24, 8);
+        h0 = (h0 ^ w0) * kSdepPrime;
+        h1 = (h1 ^ w1) * kSdepPrime;
+        h2 = (h2 ^ w2) * kSdepPrime;
+        h3 = (h3 ^ w3) * kSdepPrime;
+      }
+      for (; i + 8 <= n; i += 8) {
+        uint64_t w;
+        std::memcpy(&w, b + i, 8);
+        h0 = (h0 ^ w) * kSdepPrime;
+      }
+      // Tail (<8 B) folded into ONE word rather than byte-at-a-time, so a
+      // Vector3 costs two multiplies instead of twelve. Length is mixed in so
+      // {1 byte} and {that byte + zero padding} cannot alias.
+      if (i < n) {
+        uint64_t w = static_cast<uint64_t>(n - i);
+        for (size_t k = 0; i < n; ++i, ++k)
+          w ^= static_cast<uint64_t>(b[i]) << (8u * (k + 1u) % 64u);
+        h1 = (h1 ^ w) * kSdepPrime;
       }
     };
     // Each group closes with `seal`, which banks the running hash and restarts
     // it. Groups are hashed in sequence rather than independently so a field
     // cannot be silently dropped from all of them.
     uint32_t g = 0;
-    const auto seal = [&h, &g, out]() {
-      out[g++] = h;
-      h = 0xcbf29ce484222325ull;
+    const auto seal = [&]() {
+      // Fold the four lanes. Rotates before the final mixes so a difference
+      // confined to one lane cannot cancel against another.
+      uint64_t f = h0 ^ ((h1 << 29) | (h1 >> 35))
+                      ^ ((h2 << 17) | (h2 >> 47))
+                      ^ ((h3 << 47) | (h3 >> 17));
+      f ^= f >> 33; f *= kSdepPrime; f ^= f >> 29;
+      out[g++] = f;
+      h0 = kSdepSeed;
+      h1 = kSdepSeed ^ 0x9E3779B97F4A7C15ull;
+      h2 = kSdepSeed ^ 0xC2B2AE3D27D4EB4Full;
+      h3 = kSdepSeed ^ 0x165667B19E3779F9ull;
     };
     const auto mixV3 = [&mix](const Vector3& v) { mix(&v, sizeof(Vector3)); };
     const auto mixM4 = [&mix](const Matrix4& m) { mix(&m, sizeof(Matrix4)); };
@@ -32786,6 +33217,19 @@ namespace dxvk {
     // taking another clock read (~41 ns each, x ~30 marks x ~59k draws is not
     // free). Every existing call site discards it and is unaffected.
     auto markStg = [&tStg, this](int64_t& acc, int64_t& max) -> int64_t {
+      // [Perf.MarksCompileOut]: discards the whole body, clock read included.
+      // The (void) casts are not decoration: this TU builds with werror=true,
+      // and at 0 the taken branch touches neither the parameters nor the
+      // captures, which is exactly what unused-parameter / unused-capture
+      // diagnostics fire on. Cheaper than discovering it after a full rebuild.
+      if constexpr (!kRtxPerfMarks) {
+        (void) acc; (void) max; (void) tStg; (void) this;
+        return 0;
+      } else {
+      // Runtime half: RTX_PERF_MARKS=0. Before the clock read, so what remains
+      // when marks are off is this branch and nothing else.
+      if (!s_perfMarksEnabled)
+        return 0;
       const auto now = std::chrono::steady_clock::now();
       const int64_t dNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now - tStg).count();
       acc += dNs;
@@ -32806,6 +33250,7 @@ namespace dxvk {
         tStg = std::chrono::steady_clock::now();
       }
       return dNs;
+      }  // if constexpr (kRtxPerfMarks)
     };
 
     // NV-DXVK [perf]: markSub â€” a markStg for the OPTIONAL subdivisions of
@@ -32815,9 +33260,16 @@ namespace dxvk {
     // one predictable branch. Use markStg for permanent stages, markSub for
     // bisection scaffolding you want to leave in the tree.
     auto markSub = [&tStg, &markStg](int64_t& acc, int64_t& max) {
+      // [Perf.MarksCompileOut]: markStg is already a no-op, but return before
+      // even reading the env-var flag so nothing of markSub survives either.
+      if constexpr (!kRtxPerfMarks) {
+        (void) acc; (void) max; (void) tStg; (void) markStg;
+        return;
+      } else {
       if (!s_submitDrawSubMarkers)
         return;
       markStg(acc, max);
+      }
     };
 
     // NV-DXVK [BatchSubmitDraw]: decide once whether this draw is collected into the
@@ -38607,11 +39059,15 @@ namespace dxvk {
           // one happened to be. A serve implies both producers passed.
           s_xtEligLast  = true;
           s_xtElig3Last = true;
+          // [Perf.ServeCost]: this draw's bt_extractXf interval is a COMPOSE,
+          // not a derivation. See the accumulators' declaration.
+          s_xtServedLast = true;
         } else {
           const auto tXf0 = (haveObj && haveView)
               ? std::chrono::steady_clock::now()
               : std::chrono::steady_clock::time_point { };
           dcs.transformData = ExtractTransforms();
+          s_xtServedLast = false;  // [Perf.ServeCost]: full derivation
           // NV-DXVK [LateTag]: the path AS THE CACHE SEES IT. Stamped here
           // because everything below -- the serve decision, storePath, the
           // per-path buckets and the FAIL line -- runs at this point, while
@@ -40412,6 +40868,8 @@ namespace dxvk {
         // honest answer for both.
         s_xtEligLast  = true;
         s_xtElig3Last = true;
+        // [Perf.ServeCost]: a memo hit is a struct copy, not a derivation.
+        s_xtServedLast = true;
       } else {
         const auto tXf0 = (memoHitEnt != nullptr)
             ? std::chrono::steady_clock::now()
@@ -40422,6 +40880,12 @@ namespace dxvk {
         if (!splitHandled) {
           dcs.transformData = ExtractTransforms();
           s_xfPathAtCache = m_lastO2wPathId;  // NV-DXVK [LateTag], non-split path
+          // [Perf.ServeCost]: INSIDE the guard, deliberately. This else-branch
+          // is also taken when splitHandled is true (memoOn is false then), and
+          // writing the verdict out here would overwrite the split block's --
+          // billing every split serve as a derive and hiding the exact answer
+          // this probe exists to get.
+          s_xtServedLast = false;
         }
         if (memoHitEnt != nullptr) {
           // VERIFY MODE. Derived anyway; now prove the memo would have been
@@ -40843,6 +41307,22 @@ namespace dxvk {
       // Subset of the eligible bucket, not a third disjoint one -- elig3 implies
       // elig, so xfElig3 <= xfElig by construction.
       if (s_xtElig3Last) { s_xfElig3Ns += xfNs; ++s_xfElig3N; }
+      // [Perf.ServeCost]. THE SAME INTERVAL, cut by serve-vs-derive instead of
+      // by purity.
+      //
+      // HOW TO TELL IF THE VERDICT WENT STALE, because this if/else cannot.
+      // serveN + deriveN always equals xfEligN + xfIneligN -- both are a total
+      // if/else over the same site, so agreeing proves nothing about whether
+      // s_xtServedLast was actually WRITTEN for this draw. The check that does
+      // work is the independent counter: xfServeN must track [Perf.SplitXf]'s
+      // own serve= over the same window. Two routes to one event, which is the
+      // cross-validation discipline the [Perf.Report] block already uses. If
+      // they diverge, a path reaches here without publishing a verdict and the
+      // stale value is billing one draw's cost to the previous draw's outcome.
+      // (Note the windows differ -- SplitXf reports on its own 3 s timer -- so
+      // compare rates, not raw totals.)
+      if (s_xtServedLast) { s_xfServeNs  += xfNs; ++s_xfServeN;  }
+      else                { s_xfDeriveNs += xfNs; ++s_xfDeriveN; }
     }
 
     // NV-DXVK SESSION-Q: the instanced-hull objectToWorld override was removed from here.
@@ -52297,6 +52777,26 @@ namespace dxvk {
   // slot-0-is-albedo guarantee available here. The manifest records the PS
   // slot instead, which keeps albedo (usually 0) identifiable by eye.
   void D3D11Rtx::DumpSubViewSkyTextures(const DrawCallState& dcs) {
+    // NV-DXVK [Perf] 2026-08-14: bound the WORK, not just the output.
+    //
+    // Everything below is diagnostic, and none of it is cheap. The SRV loop
+    // scans all 128 PS slots ON THE FRAME THREAD for every sub-view sky draw
+    // (the dedup set spares the readback, not the scan), and a miss on
+    // sDropTexSeen costs a GPU readback plus a DDS encode and a disk write --
+    // 2048x2048 by the end of the 02:03 capture -- on rtx-asset-exporter,
+    // which [ThreadCensus] measured at 16-24% of a core while it ran.
+    //
+    // Gating on the log denylist instead of a new option is deliberate: it
+    // makes rtx.logDenyTags the SINGLE lever for this probe, so the tag can
+    // never be silenced while the cost stays behind (util_fmt_diag.h:27-36
+    // records this fork paying for exactly that mistake), and RTX_D3D11_DIAG=1
+    // still restores probe and log together. tagDenied returns false until the
+    // tag index is built, so the earliest frames behave as before; the 128 cap
+    // and the dedup set are untouched and still own the budget.
+    if (Logger::tagDenied("[SubViewSkyTexDump]")) {
+      return;
+    }
+
     // Gameplay gate â€” menu/loading frames issue sub-pass draws too and would
     // spend the dump budget before the level is even visible.
     if (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) <= 16u) {
@@ -61678,6 +62178,28 @@ namespace dxvk {
           pubNs(perfreport::Slot::AccVsAnalysisMs,  s_perfSubmitDrawStageVsAnalysisAcc);
           pubNs(perfreport::Slot::AccO2wT31Ms,      s_perfO2wT31Acc);
           pubNs(perfreport::Slot::AccCullVtxMs,     s_perfBtCullVtxCountAcc);
+          // 2026-08-14: the inside of pfs_guard. Unlike every pubNs above,
+          // these are NOT markStg-gated -- they publish on a normal run, which
+          // is why the guard could be decomposed without paying for 30 marks a
+          // draw. See the slot declarations for the parent>child inversion this
+          // produces when marks are off.
+          pubNs(perfreport::Slot::AccDrawSnapMs,      s_perfDrawSnapAccNs);
+          pubNs(perfreport::Slot::AccDrawSnapAllocMs, s_perfDrawSnapAllocAccNs);
+          pubNs(perfreport::Slot::AccDrawSnapIdMs,    s_perfDrawSnapIdAccNs);
+          // Derived here, once, rather than in the report or by hand in a log
+          // reader. Clamped at 0: the three timers are independent clock pairs,
+          // so a window boundary landing between them can make the subtraction
+          // go slightly negative, and a negative ms in the report reads as a
+          // broken probe rather than as rounding.
+          pubNs(perfreport::Slot::AccDrawSnapSpanMs,
+                std::max<int64_t>(0, s_perfDrawSnapAccNs
+                                     - s_perfDrawSnapAllocAccNs
+                                     - s_perfDrawSnapIdAccNs));
+          pubNs(perfreport::Slot::AccCsSdepMs,     s_perfCsSdepAccNs);
+          pubNs(perfreport::Slot::AccCsPreMfMs,    s_perfCsPreMfAccNs);
+          pubNs(perfreport::Slot::AccCsManifestMs, s_perfCsManifestAccNs);
+          pubNs(perfreport::Slot::AccCsCaptureMs,  s_perfCsCaptureAccNs);
+          pubNs(perfreport::Slot::AccCsWcMs,       s_perfDrawSnapWcAccNs);
           // v6.9f/g: the replay tier, so [Perf.Report] shows what it costs in
           // the same place it shows what the frame costs. Until now the only
           // way to see any of this was to divide fields out of the raw acc line
@@ -61793,6 +62315,19 @@ namespace dxvk {
                                  " xfIneligN=",      s_xfIneligN,
                                  " xfElig3=",        s_xfElig3Ns,
                                  " xfElig3N=",       s_xfElig3N,
+                                 // [Perf.ServeCost] 2026-08-14. DIVIDE BEFORE
+                                 // CONCLUDING, same as xfElig above: the answer
+                                 // is xfServe/xfServeN against
+                                 // xfDerive/xfDeriveN in ns per draw, never the
+                                 // totals. serve% is already known (65%); what
+                                 // is not known is whether a serve is CHEAPER,
+                                 // and 65% of a bucket that did not move is
+                                 // exactly the shape a compose-costs-what-the-
+                                 // derivation-did world produces.
+                                 " xfServe=",        s_xfServeNs,
+                                 " xfServeN=",       s_xfServeN,
+                                 " xfDerive=",       s_xfDeriveNs,
+                                 " xfDeriveN=",      s_xfDeriveN,
                                  // v6.9d REPLAY-PATH BUCKETS. Until these
                                  // existed every xt_* marker sat after the
                                  // replay early-return, so bt_extractXf's
@@ -61944,6 +62479,50 @@ namespace dxvk {
                                  " drawSnap_ns=",      s_perfDrawSnapAccNs,
                                  " drawSnapAlloc_ns=", s_perfDrawSnapAllocAccNs,
                                  " drawSnapId_ns=",    s_perfDrawSnapIdAccNs,
+                                 // NESTED IN THE SPAN COPY, i.e. in
+                                 // drawSnap_ns - (Alloc + Id). Its own clock
+                                 // pair, so unlike the te_*/dsi_* leaves it is
+                                 // LIVE with RTX_PERF_MARKS=0. Read as
+                                 // drawSnapWcNs / (drawSnap_ns - Alloc - Id):
+                                 // near 1.0 and the span copy IS write-combined
+                                 // latency and coalescing is worth up to
+                                 // 5.7 ms/frame; near 0.05 and it is not, and
+                                 // the cb3 coalescing work should not start.
+                                 // drawSnapWcNs/drawSnapWcN is ns per WC
+                                 // transaction -- cross-check it against the
+                                 // tree's 1192-2333 ns per 64 B before trusting
+                                 // the ratio, because a figure far off that
+                                 // means the window is mis-scaled, not that WC
+                                 // is cheap.
+                                 " drawSnapWcNs=",     s_perfDrawSnapWcAccNs,
+                                 " drawSnapWcN=",      s_perfDrawSnapWcN,
+                                 // THE 4.55 ms SPLIT. csCaptureNs is per-span
+                                 // work (WC fill nested inside it); csManifestNs
+                                 // is the learned-span block INCLUDING its
+                                 // nested capture() calls, so the two overlap --
+                                 // do not add them. Apportion with mfCap:
+                                 //   walkOnly = csManifestNs
+                                 //            - csCaptureNs * mfCap/csCaptureN
+                                 // and treat that as a floor (named spans skew
+                                 // costlier, being likelier to take the WC fill).
+                                 " csCaptureNs=",      s_perfCsCaptureAccNs,
+                                 " csCaptureN=",       s_perfCsCaptureN,
+                                 " csManifestNs=",     s_perfCsManifestAccNs,
+                                 // Partitions with csManifestNs on a shared
+                                 // clock read: end-of-Id -> manifest block.
+                                 // span - csPreMf - csManifest = the census
+                                 // tail. All three include their nested
+                                 // capture() time, which csCaptureNs bounds.
+                                 " csPreMfNs=",        s_perfCsPreMfAccNs,
+                                 // Sits in the untimed alloc->Id gap at the
+                                 // FRONT of captureDrawSnapshot, which round 2
+                                 // wrongly folded into a "census tail". If this
+                                 // is ~4.4 ms/f the residual is solved; check
+                                 // csSdepN against draws/frame first, because
+                                 // N>>draws means the fix is the call count,
+                                 // not the byte-at-a-time hash.
+                                 " csSdepNs=",         s_perfCsSdepAccNs,
+                                 " csSdepN=",          s_perfCsSdepN,
                                  // NESTED IN drawSnapId_ns, and they do NOT sum
                                  // to it: the remainder (cbuffer bindings +
                                  // viewports) is drawSnapId_ns - these three.
@@ -63283,6 +63862,12 @@ namespace dxvk {
                                  " drawSnap_ns=",      s_perfDrawSnapMaxNs,
                                  " drawSnapAlloc_ns=", s_perfDrawSnapAllocMaxNs,
                                  " drawSnapId_ns=",    s_perfDrawSnapIdMaxNs,
+                                 // Worst SINGLE WC transaction in the window.
+                                 // If this sits near the 1192-2333 ns figure the
+                                 // acc/N mean is trustworthy; if it is orders
+                                 // above, a few huge fills are carrying the mean
+                                 // and the per-transaction reading is not.
+                                 " drawSnapWcNs=",     s_perfDrawSnapWcMaxNs,
                                  " dsi_ident=",        s_perfDsiIdentMaxNs,
                                  " dsi_scan=",         s_perfDsiScanMaxNs,
                                  " dsi_t31=",          s_perfDsiT31MaxNs,
@@ -63348,6 +63933,10 @@ namespace dxvk {
         // bt_extractXf.
         s_xfEligNs = 0; s_xfIneligNs = 0; s_xfElig3Ns = 0;
         s_xfEligN  = 0; s_xfIneligN  = 0; s_xfElig3N  = 0;
+        // [Perf.ServeCost]: same rule, same reason -- it is only meaningful as
+        // a cut of the same window's bt_extractXf.
+        s_xfServeNs = 0; s_xfDeriveNs = 0;
+        s_xfServeN  = 0; s_xfDeriveN  = 0;
         s_perfXtVsLocCacheHits                = 0;
         s_perfXtVsLocCacheMisses              = 0;
         s_perfRpKeyAcc                        = 0; s_perfRpKeyMax                        = 0;
@@ -63434,6 +64023,11 @@ namespace dxvk {
         s_perfDrawSnapAccNs                   = 0; s_perfDrawSnapMaxNs                   = 0;
         s_perfDrawSnapAllocAccNs              = 0; s_perfDrawSnapAllocMaxNs              = 0;
         s_perfDrawSnapIdAccNs                 = 0; s_perfDrawSnapIdMaxNs                 = 0;
+        s_perfDrawSnapWcAccNs                 = 0; s_perfDrawSnapWcMaxNs                 = 0;
+        s_perfDrawSnapWcN                     = 0;
+        s_perfCsCaptureAccNs                  = 0; s_perfCsCaptureN                      = 0;
+        s_perfCsManifestAccNs                 = 0; s_perfCsPreMfAccNs                    = 0;
+        s_perfCsSdepAccNs                     = 0; s_perfCsSdepN                         = 0;
         s_perfDsiIdentAccNs                   = 0; s_perfDsiIdentMaxNs                   = 0;
         s_perfDsiScanAccNs                    = 0; s_perfDsiScanMaxNs                    = 0;
         s_perfDsiT31AccNs                     = 0; s_perfDsiT31MaxNs                     = 0;

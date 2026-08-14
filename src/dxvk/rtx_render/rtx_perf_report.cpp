@@ -445,6 +445,35 @@ namespace dxvk {
       };
       emitRows(kAccRows, sizeof(kAccRows) / sizeof(kAccRows[0]), now, wall);
 
+      // 2026-08-14: the inside of pfs_guard, which is the largest named item on
+      // the frame thread. Its own section because it is the ONLY block here that
+      // survives RTX_PERF_MARKS=0 -- every kAccRows entry above is markStg-gated
+      // and reads 0 on a normal run, including pfs_guard itself. So on a normal
+      // run these rows have real values and their parent above shows 0. That
+      // inversion is expected; the guard is measured by independent clock pairs
+      // precisely so it can be read without the 30-marks-per-draw tax.
+      Logger::warn("[Perf.Report]   -- captureDrawSnapshot = the inside of"
+                   " pfs_guard (LIVE WITH MARKS OFF; pfs_guard above reads 0"
+                   " when they are) --");
+      static const Row kSnapRows[] = {
+        { 1, "drawSnap TOTAL",       Slot::AccDrawSnapMs,      RowKind::kTotal  },
+        { 2, "alloc (arena slot)",   Slot::AccDrawSnapAllocMs, RowKind::kNested },
+        { 2, "identity block",       Slot::AccDrawSnapIdMs,    RowKind::kNested },
+        { 2, "cb span copy",         Slot::AccDrawSnapSpanMs,  RowKind::kNested },
+        // Children of the span copy. sdep was 70% of it until the byte-at-a-time
+        // FNV was replaced with a word-wise four-lane mix; if it climbs back the
+        // hash regressed or a new field was added to a carrier group.
+        { 3, "stageDepCarrierGroups", Slot::AccCsSdepMs,       RowKind::kNested },
+        { 3, "named-span locate",     Slot::AccCsPreMfMs,      RowKind::kNested },
+        { 3, "manifest block",        Slot::AccCsManifestMs,   RowKind::kNested },
+        // NOT disjoint from the two above -- capture() is called from both, and
+        // the WC fill is inside capture(). Alt views, so the depths above still
+        // read as a partition of the span copy.
+        { 3, "capture() all sites",   Slot::AccCsCaptureMs,    RowKind::kAltView },
+        { 4, "write-combined fill",   Slot::AccCsWcMs,         RowKind::kAltView },
+      };
+      emitRows(kSnapRows, sizeof(kSnapRows) / sizeof(kSnapRows[0]), now, wall);
+
       Logger::warn("[Perf.Report]   -- fanout, which lives OUTSIDE SubmitDraw --");
       static const Row kInstRows[] = {
         { 1, "SubmitInstancedDraw total", Slot::InstTotalMs,      RowKind::kTotal },
@@ -648,6 +677,24 @@ namespace dxvk {
           // the whole point of this section and is what nobody was computing.
           struct Target { const char* name; Slot slot; bool onFrameThread; };
           static const Target kTargets[] = {
+            // 2026-08-14: the guard's inside. These are the ONLY frame-thread
+            // targets here that are live with RTX_PERF_MARKS=0 -- everything
+            // else on this list is markStg-gated, which is why this section has
+            // been printing "(none published)" on every normal run while
+            // captureDrawSnapshot was ~15% of the frame thread. Ranked first in
+            // the array only for readability; the sort below is by size.
+            { "captureDrawSnapshot (IS pfs_guard)",       Slot::AccDrawSnapMs,    true  },
+            // NESTED INSIDE the row above -- do not add them to it. Listed
+            // because the split is where the decisions are: the span copy is the
+            // part §4 of THE_OPTIMISATION_PLAN is about, and the identity block
+            // is the part that has never been attacked at all.
+            { "  cb span copy (INSIDE drawSnap)",         Slot::AccDrawSnapSpanMs, true },
+            { "  identity block (INSIDE drawSnap)",       Slot::AccDrawSnapIdMs,  true  },
+            // NESTED INSIDE the span copy. Kept on the list after being fixed
+            // (byte-at-a-time FNV -> word-wise four-lane, ~9.7x) precisely so a
+            // regression re-ranks itself here instead of hiding: it was 70% of
+            // the span copy and nothing in this report could see it.
+            { "    stageDepCarrierGroups (INSIDE span)",  Slot::AccCsSdepMs,      true  },
             { "fanout co_cbRead (BSP camOrigin CB read)", Slot::InstCbReadMs,     true  },
             { "fanout setupPost residual (UNATTRIBUTED)", Slot::InstResidualMs,   true  },
             { "fanout dbgTrack (diagnostic?)",            Slot::InstDbgTrackMs,   true  },
