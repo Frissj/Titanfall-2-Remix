@@ -331,6 +331,20 @@ private:
   mutable uint32_t m_frameLastUpdated = kInvalidFrameIndex;
   mutable uint32_t m_frameCreated = kInvalidFrameIndex;
 
+  // NV-DXVK [Perf.PushInst] PHASE 2: which fanout batch record, if any, is
+  // currently holding a raw pointer to this instance. 0 means none.
+  //
+  // THIS FIELD IS THE LIFETIME CONTRACT, not a convenience. A batch record
+  // caches RtInstance* across frames, and GC deletes instances -- so without a
+  // back-pointer the record is a dangling-pointer generator, which is the exact
+  // failure class this file has already shipped twice (the file-static
+  // s_zigGunInstance deref and the GC-walk incRef race). Carrying the key here
+  // makes removeInstance's invalidation O(1) and, more importantly, TOTAL: an
+  // instance cannot be destroyed without the record that references it being
+  // invalidated in the same call, because the destroy path has to come through
+  // removeInstance to reach the event handlers at all.
+  mutable uint64_t m_batchRecordKey = 0ull;
+
   Flags<CameraType::Enum> m_seenCameraTypes;  // Camera types with which the instance has been originally rendered with
 
   MaterialDataType m_materialType = MaterialDataType::Invalid;
@@ -634,7 +648,105 @@ private:
   // Start at 1 to avoid using 0 - makes it easier to detect a 0 initialized RtInstance (which is invalid)
   uint64_t m_nextInstanceId = 1;
 
-  std::vector<RtInstance*> m_instances; 
+  // ================================================================
+  // NV-DXVK [Perf.PushInst] PHASE 2 -- PUSH, NOT POLL.
+  //
+  // THE MEASUREMENT THIS EXISTS FOR. [Perf.UpdInst] reads static=97%,
+  // REDUNDANT=97%, xfChg=1%, matChg=0%, and reachPct entry=100 fastRet=93. So
+  // ~15.5k instances a frame are each asked "did anything change" and 97% of
+  // them answer no. entry 2.73 ms + fastRet 4.15 ms = 6.88 ms/frame of dxvk-cs
+  // spent ASKING; the stages that do real work reach 6% and cost ~1.9 ms. We
+  // pay 3.6x more to ask the question than to do the work.
+  //
+  // WHY A BATCH RECORD AND NOT A PER-INSTANCE DIRTY FLAG. The visits are not
+  // per draw -- 1,349 draws produce ~15.5k instance visits, because fanout
+  // draws carry a placement array. The batch is therefore the natural unit:
+  // one fingerprint decides the fate of every placement in it, so the common
+  // case costs one hash and one bulk stamp instead of N finds and N updates.
+  //
+  // WHAT MAKES THE SKIP LEGAL. An unchanged instance cannot simply be omitted:
+  // garbageCollection reaps on
+  //     m_frameLastUpdated + instanceKeepN <= currentFrame
+  // and nothing else. So "skip" must mean KEEP ALIVE WITHOUT REPROCESSING, and
+  // that is exactly a frame-id stamp -- which is why this is expressible as a
+  // bulk write over a contiguous list rather than needing a redesign of GC.
+  //
+  // WHAT IS NOT SAFE TO ASSUME, AND IS THEREFORE HASHED OR REPLAYED:
+  //   - setFrameLastUpdated() CLEARS m_seenCameraTypes on the first stamp of a
+  //     frame, so the skip path must re-register the draw's camera or portal
+  //     and view-model logic silently loses its camera set.
+  //   - the record holds RAW RtInstance*. RtInstance::m_batchRecordKey is the
+  //     back-pointer that makes removeInstance invalidate this in O(1); see
+  //     that field for why a back-pointer rather than a scan.
+  //
+  // THE ORDER OF OPERATIONS IS THE SAME ONE THE SPLIT-TRANSFORM CACHE AND THE
+  // EXTRACT MEMO BOTH USED, AND IT IS NOT OPTIONAL: verify first, skip second.
+  // rtx.pushInstanceRecordsVerify defaults ON and runs both paths, scoring the
+  // prediction without acting on it. Nothing is skipped until FAIL reads 0.
+  struct FanoutBatchRecord {
+    uint64_t inputHash        = 0ull;   // fingerprint of everything resolution reads
+    uint32_t frameLastServed  = kInvalidFrameIndex;
+    uint32_t frameLastBuilt   = kInvalidFrameIndex;
+    bool     valid            = false;  // cleared by removeInstance / BLAS teardown
+    std::vector<RtInstance*> instances; // exactly what the placement loop produced
+  };
+  std::unordered_map<uint64_t, FanoutBatchRecord> m_fanoutRecords;
+  // NV-DXVK [Perf.PushInst] OCCURRENCE ORDINAL, added 2026-08-14 after the first
+  // verify run read FAIL=3367 with builtFrame == currentFrame on 100% of the
+  // failures.
+  //
+  // WHAT WENT WRONG. fanoutRecordKey names (vertex shader, geometry), and
+  // SEVERAL DRAWS PER FRAME SHARE THAT IDENTITY. Draw 1 stored the record; draw
+  // 2 found it valid with a matching fingerprint and predicted a hit -- but the
+  // two resolve to DIFFERENT instances, because resolution is stateful within a
+  // frame: draw 1's instances are already claimed, so findSimilarInstance hands
+  // draw 2 a fresh set. The record was describing the previous DRAW, not the
+  // previous FRAME. It also meant every same-key draw clobbered the record, so
+  // the next frame compared against whichever draw happened to be last -- which
+  // is where the 86% input-miss rate came from. One defect, both symptoms.
+  //
+  // THE FIX. The Nth occurrence of a batch identity within a frame gets its own
+  // record, so draw N is only ever compared against draw N of a previous frame.
+  // Counted here rather than taken from any draw index, for the reason
+  // [DrawRedund] records about its own ordinal: the draw counters only advance
+  // for draws surviving the filters, so several draws share one value.
+  std::unordered_map<uint64_t, uint32_t> m_fanoutOrdinals;
+  // Fingerprint of every input the placement resolution reads. Declared here so
+  // the contract above sits next to it; defined in the .cpp beside its caller.
+  uint64_t fanoutRecordFingerprint(const DrawCallState& drawCall,
+                                   const BlasEntry& blas,
+                                   const MaterialData& materialData,
+                                   const std::vector<Matrix4>* transforms,
+                                   const std::vector<Matrix4>* prevTransforms) const;
+  uint64_t fanoutRecordKey(const DrawCallState& drawCall, const BlasEntry& blas) const;
+  // Drop any record referencing this instance. Called from removeInstance.
+  void invalidateFanoutRecordFor(const RtInstance* instance);
+  // [Perf.PushInst] tallies, dxvk-cs only.
+  uint32_t m_piBatches = 0, m_piHit = 0, m_piMissKey = 0, m_piMissInput = 0;
+  uint32_t m_piMissInvalid = 0, m_piServedInst = 0, m_piFail = 0;
+  // Predictions vs SKIPS. m_piHit counts skips, which are zero by construction
+  // while verify is on -- so on the first run the ceiling was invisible and the
+  // line read hit=0 whether the record was working perfectly or not at all.
+  // m_piPredict counts records that WOULD have served, which is the number that
+  // says whether this is worth turning on. m_piMissSameFrame counts predictions
+  // refused because the record was built this same frame; see m_fanoutOrdinals.
+  uint32_t m_piPredict = 0, m_piMissSameFrame = 0, m_piPredictInst = 0;
+  // guard  = predictions REFUSED by the pre-stamp instance validation, i.e.
+  //          wrong answers downgraded to cache misses. Expected non-zero and
+  //          harmless; it is the mechanism working, not a fault.
+  // capped = stores refused because the map was at the ceiling after the sweep.
+  //          Should be 0; non-zero means raise pushInstanceRecordsMaxBatches.
+  // swept  = records retired by the per-frame age sweep.
+  uint32_t m_piGuard = 0, m_piCapped = 0, m_piSwept = 0;
+  // stale = predictions refused because the record was built more than one frame
+  //         ago, i.e. the batch skipped frames and the global resolution state
+  //         had time to drift. This was the entire residue of the second verify
+  //         run (FAIL=7, all four discriminator bits zero, gaps of 3-11 frames).
+  uint32_t m_piMissStale = 0;
+  uint32_t m_piFrame = kInvalidFrameIndex;
+  // ================================================================
+
+  std::vector<RtInstance*> m_instances;
   std::vector<RtInstance*> m_viewModelCandidates;
   uint32_t m_viewModelCandidatesFrameId = kInvalidFrameIndex;
   std::vector<RtInstance*> m_playerModelInstances;

@@ -1,9 +1,17 @@
 # THE OPTIMISATION PLAN
 
-**Written:** 2026-08-11
-**Branch:** `architecture-overhaul` @ `4681ecca` (the XfOverlap work is on `stable` @ `470eaf4b`, pushed, message "broken")
+**Written:** 2026-08-11 · **Last reconciled against the tree:** 2026-08-14
+**Branch:** `architecture-overhaul` @ `5ced56c2` (was `4681ecca` when this was written; six commits have landed since)
 **Goal:** 30 fps = 33.3 ms/frame
-**Source of every number below:** `[Perf.Report]` block at 02:47:54 in `remix-dxvk.log`, unless stated otherwise.
+**Source of numbers:** §1 carries TWO baselines. The 2026-08-11 one at `[Perf.Report]` 02:47:54
+is the historical anchor most of this document was sized against; the **2026-08-14 marks-off
+baseline is the current truth** and is the one to quote. Where a section still reads against the
+old anchor it says so.
+
+**READ §8 BEFORE ANY LEAF NUMBER.** Since 2026-08-14 there are TWO instrumentation switches, both
+defaulting OFF, and with them off the entire named-leaf table reads zeros *by design*. That is no
+longer the lost-env-var false alarm §8 was originally written about — it is now the normal state
+of a normal run.
 
 Confidence markers used throughout:
 `[M]` measured this session · `[I]` inferred from measured data, not itself measured · `[U]` unknown, needs a capture
@@ -129,15 +137,108 @@ per-frame figure. The sub-markers were on; the drop is real.
 
 - **`bt_extractXf` did not move** — 11.41 ms against an 11.07 baseline, at 65% serve with verify
   off. It should have dropped substantially. Either the serve is not saving what it should, or the
-  compose path costs what the derivation did. **Unexplained. `[U]`**
-- **Every absolute ms in the 2026-08-14 report was taken at `clkNs=101`** against a 41 ns baseline,
-  so per C.3b they are void; the *ratios* (`pfs_guard` at 1%) survive. One clean-clock capture is
-  owed before anyone sizes the next phase. A `clkNs=40` window did occur, so it is reachable.
-- **Phase 0 is still not done** (§5).
+  compose path costs what the derivation did. **Still unexplained `[U]`, and now UNMEASURABLE by
+  default:** with `RTX_PERF_MARKS` off (§8) `bt_extractXf` reads 0. Settling it needs a marks-on
+  window plus an A/B of `rtx.splitTransformCache`. Serve is 64% on 2026-08-14
+  (`serve=52958 derive=29005`, `FAIL=0`), so the question is unchanged, only the instrument moved.
+- ~~**Every absolute ms in the 2026-08-14 report was taken at `clkNs=101`**~~ — **CLOSED. The clean
+  window arrived.** Both 2026-08-14 captures (03:48 and 04:47) read `clkNs=32-49`, `xMin=1.00`,
+  `cpuSlowX=1`. The absolute milliseconds in §1's current baseline are therefore load-bearing, not
+  void. This is the capture that block said was owed.
+- **Phase 0 is VOID, not outstanding** — see §5. All four of its targets were checked in source and
+  none is a diagnostic. Nothing to do.
+- **THE SLACK HAS COLLAPSED, and it changes the ordering of everything below.** 29.31 ms on
+  2026-08-11; **2.91 ms** on 2026-08-14. The two CPU threads have converged. Per §7's realisation
+  rule, frame-thread work now buys ~2.9 ms before dxvk-cs binds, so the paragraph above
+  ("there are ~20.5 ms of frame-thread savings that realise in full") **is spent**. Both columns
+  now have to come down roughly together; neither alone moves the frame.
 
 ---
 
 ## 1. BASELINE `[M]`
+
+### 1a. CURRENT — 2026-08-14, marks OFF, clean clock. **QUOTE THIS ONE.**
+
+```
+FRAME 40.56 ms (24.7 fps)   inst=15445  uniqueBlas=462  drawsIn=1349  drawsCommit=1078
+                            matNew=0    matTotal=1471   texTotal=2461
+
+frame thread (PRESENT)   38.57 ms   busy 93.6%   blocked 2.63 ms    <- STILL THE POLE
+dxvk-cs                  35.66 ms   busy 89.9%   idle    4.02 ms
+GPU                      13.96 ms                idle   20.69 ms (35% busy)
+
+SLACK = 38.57 - 35.66 = 2.91 ms
+clkNs = 32-49   xMin = 1.00   cpuSlowX = 1        <- machine state SANE, per C.3b
+```
+
+**77.44 -> 40.56 ms is real, and it is two effects that must not be conflated.** The
+`pfs_guard` work (§0.2) took ~14 ms off the frame thread; the new `RTX_PERF_MARKS` switch
+(§8) removes ~1.6 ms of instrument that every earlier number in this document was paying.
+Same scene either way: `inst` 15431 -> 15445, `uniqueBlas` 457 -> 462, `drawsIn` 1338 -> 1349.
+
+**THE STRUCTURAL CHANGE IS THE SLACK, NOT THE FRAME TIME.** 29.31 ms -> 2.91 ms. The two CPU
+threads have converged, so §7's realisation rule now bites on every line in §6: a frame-thread
+saving larger than ~2.9 ms does not appear in the frame time until dxvk-cs comes down with it.
+The GPU is still not the limit — 20.69 ms idle, ~26 ms of headroom.
+
+#### Budget to 30 fps, current
+
+| thread | now | target | must cut |
+|---|---|---|---|
+| frame thread | 38.57 | 33.3 | **5.3 ms** |
+| dxvk-cs | 35.66 | 33.3 | **2.4 ms** |
+| GPU | 13.96 | — | none |
+
+**30 fps is now a small number away on both threads** — 5.3 and 2.4 ms, against the 41.5 and
+12.2 it needed on 2026-08-11. That is the single most important change to this plan's outlook
+and it is why the phases below are re-ordered by *realisable* size rather than gross size.
+
+#### Frame-thread composition, current `[M]`
+
+```
+D3D11 entry points               24.82 ms  61%
+  DrawIndexedInstanced           10.89 ms  27%   (nested)  <- 100% UNATTRIBUTED, see below
+  DrawIndexed                    10.48 ms  26%   (nested)
+  Draw                            0.52 ms   1%   (nested)
+  state-setting calls             2.92 ms   7%   (nested)
+between entry points             16.15 ms  40%
+  afterQueryEnd                  10.84 ms  27%   (nested)
+```
+
+Two things in that block are new and neither is in the older analysis:
+
+- **`between entry points` is 40% of the pole, and it is NOT all Source engine.** The batch
+  parallel-for runs from `EndFrame`, on this thread, and `[BatchSubmitDraw]` measures it at
+  **`parallelForMsPerFrame=6` with `itemsPerFrame=1068 workers=30`**. That 6-7 ms lands here and
+  has been read as engine time. See §5 Phase 6e.
+- **`DrawIndexedInstanced` 10.89 ms is the fanout path and it is entirely dark** with marks off —
+  `SubmitInstancedDraw` reads 0.00 and the report FAILs its own fanout cross-validation row
+  because of it. 28% of the pole cannot currently be seen.
+
+`SubmitDraw` wall is **14.01 ms/frame** (`[Perf.SdThreads] wallUs=1723539 / 123 frames`,
+1374 draws/frame => 10.2 us/draw). Of that, `captureDrawSnapshot` is 3.80 and the remaining
+~10.2 ms is unattributed while marks are off.
+
+#### `captureDrawSnapshot` is now BOOKKEEPING, not copying `[M]`
+
+Per frame, from the unconditional timers that survive marks-off:
+
+| item | ms | what it is |
+|---|---|---|
+| `drawSnap` TOTAL | **3.80** | |
+| identity block | 1.52 | `dsi_scan 0.76` + `dsi_ident 0.40` + `dsi_t31 0.25` |
+| cb span copy | 2.20 | of which **the actual write-combined memcpy is 0.60** |
+| — carrier-group hashing | 0.39 | `stageDepCarrierGroups` |
+| — named-span locate | 0.68 | |
+| — manifest block | 0.75 | |
+
+**The path-filter fix worked and left a different problem behind.** `[Perf.SplitXf.CbWaste]` now
+reads `capB/f=0 wasteB/f=0` — nothing dead is copied. But only 27% of the "span copy" bucket is
+copying; the rest is *deciding what to copy*. `dsi_scan` 0.76 ms is the 128-SRV + 32-VB walk,
+i.e. exactly Phase 8's target, and `[DrawPure] dynSrvSlots{t4=684 t31=103028}` says two slots of
+128 ever matter.
+
+### 1b. HISTORICAL — 2026-08-11 `[M]`. The anchor most of this document was sized against.
 
 ```
 FRAME 77.44 ms (12.9 fps)   inst=15431  uniqueBlas=457  drawsIn=1338  drawsCommit=1042
@@ -151,19 +252,19 @@ SLACK = 74.76 - 45.45 = 29.31 ms
 ```
 
 `csSyncMs=0 gpuSyncMs=0` — nobody blocks on anybody. This is pure CPU work on two threads.
-The GPU is idle because it is **starved**, not because it is fast. It has ~61.7 ms of headroom,
-so nothing in this plan is GPU-limited.
+The GPU is idle because it is **starved**, not because it is fast.
 
-### Budget to 30 fps
+Budget as it stood then — kept because §6's arithmetic is still written against it:
 
-| thread | now | target | must cut |
+| thread | then | target | must cut |
 |---|---|---|---|
 | frame thread | 74.76 | 33.3 | **41.5 ms** |
 | dxvk-cs | 45.45 | 33.3 | **12.2 ms** |
 | GPU | 15.71 | — | none |
 
 **Both threads must be fixed.** `frame = max(frameThread, dxvk-cs)`, so cutting only one
-stops paying the moment it crosses the other.
+stops paying the moment it crosses the other. That was true at 29.31 ms of slack and it is
+far more binding at 2.91.
 
 ### Frame thread composition `[M]`
 
@@ -176,11 +277,14 @@ between entry points             19.21 ms  25%   <- Source engine, untouchable
 Our injection is **71% of the pole**. Floor with injection at zero is ~22 ms (~45 fps).
 30 fps therefore requires cutting 53.01 -> ~11.5 ms, i.e. keeping 22% of current per-draw cost.
 
-Named leaves inside SubmitDraw:
+Named leaves inside SubmitDraw — **2026-08-11 values. `pfs_guard` is the only one since
+re-measured (14.92 -> 0.66, §0.2); the rest have NOT been re-measured because
+`RTX_PERF_MARKS` (§8) now defaults off and reads them all as zero.** Treat every row below
+as an 08-11 figure carrying ~1.6 ms of marks overhead spread across it, not as current:
 
 | stage | ms | note |
 |---|---|---|
-| `pfs_guard` | **14.92** | **largest item on the pole, completely unattributed** `[U]` |
+| `pfs_guard` | ~~**14.92**~~ **0.66** | **REALISED, see §0.2.** Now `captureDrawSnapshot` at 3.80 ms measured by its own unconditional timers (§1a) |
 | `bt_extractXf` | 11.07 | the transform derivation |
 | `tail_emit` | 4.93 | incl. `te_census` 1.01, `te_camDiag` 0.83, `te_propId` 0.37 (diagnostics) |
 | `tail_capture` | 1.34 | |
@@ -199,22 +303,39 @@ and `dbgTrack` 0.39 diagnostic; `loop` 3.40 → `inst_loop` 2.84, `t31_copy` 0.6
 
 Replay tier tax is now **0.09 ms** — it is off (`rp_key=0`), confirmed.
 
-### dxvk-cs composition `[M]`
+### dxvk-cs composition — CURRENT, 2026-08-14 `[M]`
 
 ```
-commitGeometryToRT              26.39
-  submitDrawState               23.83
-    processDrawCallState        21.46
-      processSceneObject        12.78
+commitGeometryToRT              20.16
+  submitDrawState               18.32
+    processDrawCallState        16.72
+      processSceneObject        10.58
+        updateInstance / find / mid / addInstance   ALL n/a -- perfSceneObjSplit=False  [U]
+      geom                       4.82
+  finalize (worker join)         0.87
+the once-per-frame fat chunk    12.29
+  prepareSceneData              10.23   (nested -- do NOT add to the line above, see below)
+    merge                        7.57   (loop 3.65, buildBlases 2.32, dynBlas 1.30, setup 0.25)
+    surfMat 1.08  gc 1.06  setup1+instSetup 0.40  tlas+accel+light 0.12
+```
+
+`merge` is nested inside `prepareSceneData`, which is nested inside the fat chunk. Adding them
+double-counts a parent and its own child — a mistake this document made once and had to retract
+(§0.2). The chunk is **12.29 ms**, and the report's own cross-validation agrees:
+`PASS dxvk-cs PrepScene vs CsSplit fat chunk 10.19 vs 12.35`.
+
+**`processSceneObject` 10.58 ms is now the largest single item on either thread that has no
+attribution at all.** `rtx.perfSceneObjSplit=False`, so `updateInstance`, `findSimilarInstance`,
+`mid` and `addInstance` all read `n/a`. Phase 1.3 is what makes Phase 2's remaining half sizable.
+
+Historical, 2026-08-11, kept because §6's dxvk-cs arithmetic is written against it:
+
+```
+commitGeometryToRT              26.39   (processSceneObject 12.78, geom 5.98)
         ui_fastRet   3.30   ui_entry  2.20   ui_tail 0.65   ui_xform 0.57
         ui_flags     0.28   ui_surf   0.24   ui_rest 0.35
         find / mid / addInstance    ~5.2 residual, NOT MEASURED  [U]
-      geom                       5.98
-  finalize (worker join)         1.16
-the once-per-frame fat chunk    15.36
-  prepareSceneData              14.75
-    merge                       11.25   (loop 5.10, buildBlases 3.84, dynBlas 1.82, setup 0.37)
-    surfMat 1.59  gc 1.24  setup1+instSetup 0.53  tlas+accel+light 0.13
+the once-per-frame fat chunk    15.36  (prepareSceneData 14.75, merge 11.25)
 ```
 
 ---
@@ -588,7 +709,7 @@ Three unknowns decide whether 30 fps is reachable at all:
    names `rtx.perfUpdateInstSplit` for this; that is the **wrong switch** — it splits the `update`
    quarter, which is already attributed. `perfSceneObjSplit` is declared at `rtx_options.h:675`.
 
-### Phase 2 — push-not-poll on dxvk-cs. **-7 to -10 ms on dxvk-cs**
+### Phase 2 — push-not-poll on dxvk-cs. **-7 to -10 ms on dxvk-cs. PARTIALLY BUILT 2026-08-14.**
 Persistent per-instance records; the draw side marks dirty when `xfChg`/`matChg` fire (1% / 0%).
 Per-frame loop iterates the dirty set only. Unchanged instances get a **bulk frame-id stamp**
 instead of a call. Kills most of `entry` 2.73 + `fastRet` 4.15, and should reach into
@@ -598,6 +719,82 @@ Feasibility note: identity is already exact-keyed with `created=0`, so this is a
 plus a dirty list — comparable to Phase 3 in difficulty, **not** the "structurally hostile"
 problem earlier drafts of this plan claimed. Steady state has `created=0`; the creation path
 during streaming and level transitions still needs handling.
+
+#### 2.1 WHAT WAS BUILT `[M]` — `rtx.pushInstanceRecords`, `[Perf.PushInst]`
+
+**The keep-alive rule was read out of the source rather than assumed, and it is the whole design
+constraint.** `InstanceManager::garbageCollection` reaps on
+
+```
+clauseLifetime = (force||enable) && (m_frameLastUpdated + instanceKeepN <= currentFrame)
+```
+
+and **nothing else**. So §4's "skip must mean keep alive without reprocessing" is expressible
+exactly as a frame-id stamp, with no change to GC at all.
+
+Built on the **fanout path**, because that is where the visits are: 1,349 draws produce ~15.5k
+instance visits, since a fanout draw carries a placement array. The batch is therefore the unit —
+one fingerprint decides every placement in it.
+
+| piece | where |
+|---|---|
+| `FanoutBatchRecord` (input fingerprint + resolved instance list + frame stamps) | `rtx_instance_manager.h` |
+| `fanoutRecordKey` / `fanoutRecordFingerprint` | `rtx_instance_manager.cpp` |
+| skip = bulk `setFrameLastUpdated` + `registerCamera` per recorded instance | `processSceneObjectFanout` |
+| O(1) total invalidation via `RtInstance::m_batchRecordKey` | `removeInstance` |
+| `rtx.pushInstanceRecords`, `…Verify` (default **true**), `…MaxBatches` | `rtx_options.h` |
+
+Two traps handled rather than assumed away: `setFrameLastUpdated` **clears `m_seenCameraTypes`**
+on the first stamp of a frame, so the skip path must re-register the draw's camera; and a batch
+whose loop rejected any placement is never recorded, because those rejections are decided by
+per-placement state the fingerprint does not claim to cover.
+
+#### 2.2 FIRST VERIFY RUN 2026-08-14 — `FAIL=3367`. The gate did its job. `[M]`
+
+```
+[Perf.PushInst] verify=1 batches=460 hit=0 servedInst=0
+                miss{key=4 input=398 invalid=0} records=768 evict=0 FAIL=3367
+```
+
+**`builtFrame == currentFrame` on 100% of the FAIL lines**, with the same key repeating
+consecutively and `recorded == actual` size diverging at index 0.
+
+**The defect: several draws per frame share one (vertex shader, geometry) identity, and they are
+not interchangeable.** Draw 1 stored the record; draw 2 found it valid with a matching
+fingerprint and predicted a hit — but the two resolve to *different* instances, because
+resolution is stateful within a frame (draw 1's instances are already claimed, so
+`findSimilarInstance` hands draw 2 a fresh set). The record was describing the previous **draw**,
+not the previous **frame**. The same defect produced the 86% `input` miss rate: every same-key
+draw clobbered the record, so the next frame compared against whichever draw happened to be last.
+One cause, both symptoms.
+
+**FIXED 2026-08-14, UNVERIFIED:** an **occurrence ordinal** folded into the key, so the Nth
+occurrence of a batch identity within a frame gets its own record — the same device
+`[DrawRedund]`'s keyed probe needed, and counted the same way (in its own map, never from a draw
+index, because those only advance for draws surviving the filters). Plus an independent
+`frameLastBuilt == currentFrame` backstop reported as `miss{sameFrame=}`, which must read 0.
+
+Also fixed: `hit=` counts *skips*, which are zero by construction under verify — so a working
+record and a broken one printed the same thing. The line now carries `predict=`/`predictInst=`,
+which is the ceiling and the per-INSTANCE number that maps onto `entry` 2.73 + `fastRet` 4.15.
+
+**Frame time was unchanged across that run** (40.87 -> 40.56, both threads slightly *up*), which
+is exactly what verify predicts: it hashes and compares while skipping nothing. `servedInst=0`.
+
+#### 2.3 WHAT PHASE 2 STILL OWES `[U]`
+
+1. **The fingerprint is O(placements), so this is PULL, not PUSH.** It hashes every placement
+   matrix of every batch every frame — ~15.5k x 64 bytes ~= 1 MB/frame of XXH64. Far cheaper than
+   a find + update per instance, but it does **not** achieve this plan's stated "the 97% are never
+   enumerated". The push form needs the change signal plumbed from the draw side, which is where
+   `xfChg`/`matChg` already come from. Size it after 2.2 verifies, not before.
+2. **The single-placement path has no record.** `processSceneObject` — ~1,349 draws/frame still
+   poll. Small beside fanout's ~15.5k instance visits, which is why fanout went first.
+3. **find/mid/add is still unattributed** (§1's dxvk-cs block, `perfSceneObjSplit=False`). The
+   claim that Phase 2 "should reach into find/mid/add" has no number behind it until Phase 1.3
+   runs.
+4. **The creation path** during streaming and level transitions is correct but unaccelerated — a
+   changed fingerprint simply falls through to the loop.
 
 ### Phase 2b — split `commitGeometryToRT`: relocate what survives. **up to -21 ms on dxvk-cs**
 A **different lever from Phase 2, and they compose.** Phase 2 deletes redundant work; this moves
@@ -892,19 +1089,61 @@ The batch is **built, running, and half-populated**: 1055 items in 6 ms on 30 wo
 **four of the six** per-draw stages. Full anatomy in **Appendix A**. The two missing stages are
 transforms (here) and instance/scene work (Phase 2b). Concrete steps:
 
-- **6a. Cherry-pick Phase B batch 1 from `stable`. THIS IS THE FIRST CODE ACTION ON THIS BRANCH.**
-  45 sites already converted, independent of the crashing worker, behaviour-neutral. At
-  `4681ecca` `drawIndexBuffer` and `drawPixelShaderCom` have **zero** uses — the work exists only
-  on `stable`/`470eaf4b`. Do not rewrite what is already written.
-- **6b. Batch 2 — identity reads.** Need new snapshot fields/accessors: `rs.viewports` x9 +
-  `rs.numViewports` x4, `om.cbState` x3, `om.dsState` x2, `rs.state` x1, `ps.shaderResources` x2,
-  `ps.constantBuffers` x2, and `GetCurrentVsPsHashes` x12 (one snapshot-hash accessor covers all 12).
-- **6c. Batch 3 — content reads, the careful class.** 14 `GetMappedSlice` sites + 4
+- **6a. ~~Cherry-pick Phase B batch 1 from `stable`~~ — DONE, AND DO NOT DO IT. `[M]` 2026-08-14.**
+  The conversions were **redone independently on this branch** and HEAD is now *ahead* of `stable`.
+  Cherry-picking would drag in the XfOverlap worker that Phase 7 deletes, to gain nothing.
+
+  | accessor | `4681ecca` | `stable` `470eaf4b` | **HEAD `5ced56c2`** |
+  |---|---|---|---|
+  | `drawVertexShaderCom` | 36 | 53 | **54** |
+  | `drawPixelShaderCom` | 0 | 5 | **6** |
+  | `drawIndexBuffer` | 0 | 13 | **13** |
+  | `drawVsSrv` | 12 | 15 | **15** |
+  | `drawCbSpan` | 18 | 18 | **19** |
+  | `drawViewport*` | 12 | 12 | **27** |
+  | `drawVertexBuffer` | 3 | 14 | 4 -> **13** (6f) |
+  | `drawInputLayout` | 11 | 13 | 11 -> **13** (6f) |
+
+  The two counts where HEAD looked "behind" were **deliberate, not a regression**:
+  `d3d11_rtx.h:1841` records that 10 of the 22 `inputLayout` reads in the file are *outside*
+  SubmitDraw, where the record would serve the PREVIOUS draw's bindings. `stable`'s broader pass
+  is the reason to read a conversion before lifting it.
+- **6b. ~~Batch 2 — identity reads~~ — DONE ON THIS BRANCH, and it never existed on `stable`.**
+  `drawBlendState`, `drawDepthState`, `drawRasterState`, `drawPsSrv0to7`, `drawRtv0`, `drawVsCb`,
+  `drawT31Entry` and `noteGeoLiveRead` are all live at `d3d11_rtx.h:1860-1869`.
+- **6c. Batch 3 — content reads, the careful class.** Still outstanding. `GetMappedSlice` sites +
   `vs.constantBuffers` binding+content sites, routed through `drawCbSpan` / the manifest.
   **Never convert a binding without its bytes** (A.7).
-- **6d. Add `ExtractTransforms` to the batch.** One more stage in `DrawWorkItem`, one
-  `rtx.batchExtractTransforms` sub-flag beside `batchHashes`/`batchBoundingBox`/`batchSkinning`.
-  Dispatch/join/emit unchanged. `[DrawPure]`'s `cbLive`/`geoLive` reaching 0 is the progress meter.
+- **6d. Add `ExtractTransforms` to the batch. ~~One more stage~~ — THE SIZING IS WRONG. `[M]`**
+  This was written as "one more stage in `DrawWorkItem`, dispatch/join/emit unchanged". The code
+  does not allow it. **`dcs.transformData` has ~170 read sites INSIDE SubmitDraw, after the
+  derivation** (`d3d11_rtx.cpp:41599` through `:51760`; SubmitDraw runs to `:52039`), and three of
+  them *write back into it* — `objectToWorld` at `:41599`, `worldToView`/`viewToProjection` at
+  `:42329`, `instancesToObject` at `:43040`. Sampled: sub-view classification, sky-probe gating,
+  capture keys, viewmodel. Functional, not diagnostics.
+
+  **The criterion the four batched stages actually meet is not purity — it is having NO
+  in-SubmitDraw consumer.** `materialData`, `geometryData.hashes`, `geometryData.boundingBox` and
+  `skinningData.pBoneMatrices` are read only on the CS thread. That is why they were easy.
+  Deferring transforms means deferring the ~11,000 lines of SubmitDraw that follow it.
+- **6e. THE BATCH JOIN IS 6-7 ms OF THE POLE AND NOBODY HAS LOOKED AT IT. `[M]` NEW 2026-08-14.**
+  `flushGeometryBatch` (`d3d11_rtx.cpp:29319`) times `tBatch0 -> tBatch1` = dispatch + join **wall
+  time on the frame thread**, called from `EndFrame`, so it lands in `between entry points` (§1a)
+  and has been read as engine time. `[BatchSubmitDraw] itemsPerFrame=1068 parallelForMsPerFrame=6
+  workers=30` — 36 items per worker taking 6 ms is ~170 us/item, roughly 30x what the per-draw
+  material path measured. Either the work is far larger than believed or the pool is not
+  delivering it (29 `Schedule`+notify calls into a deliberately `LowLatency=false` pool, so every
+  idle worker must be woken). **Split the timer into dispatch-only vs join-only vs per-chunk
+  before adding a fifth stage to a mechanism whose efficiency is unmeasured.**
+- **6f. SubmitDraw-tail conversion — PARTIALLY DONE 2026-08-14. `[M]`**
+  Live `m_context->m_state` reads between the derivation (`:39069`) and the batch commit point
+  (`:50533`) went **24 -> 12**. Converted: the identity/immutable vertex-buffer and input-layout
+  cluster, plus five *aggregate* binds (`const auto& xxIa = m_context->m_state.ia;`) that the
+  original census missed because they alias the whole `ia` struct instead of indexing it.
+  The remaining 12 are all documented in-tree with their reason, and split two ways: batch-3
+  content readers (binding + `GetMappedSlice` must convert together), and two SRV scans whose slot
+  comes from RDEF reflection and can be any of 128 while the record's PS window stops at slot 7 —
+  widening that is the same 128-slot walk Phase 8 exists to remove.
 
 **Relationship to Phase 3 — do not double-count.** Both target `bt_extractXf` (11.07 ms), by
 different means: Phase 3 stops deriving the static 97%; Phase 6 parallelises whatever is left.
@@ -1072,11 +1311,53 @@ against a heavy frame before believing 30 fps is held rather than merely reached
 
 ---
 
+### 6.1 THE ARITHMETIC, REDONE ON THE 2026-08-14 BASELINE `[M]`
+
+Everything above this line is written against the 74.76 / 45.45 baseline. It is kept because the
+reasoning and the retractions are worth having, but **this is the sum that is current**:
+
+```
+FRAME THREAD                                  DXVK-CS
+  38.57  now                                    35.66  now
+  33.30  target                                 33.30  target
+  ------                                        ------
+  -5.27  must cut                               -2.36  must cut
+```
+
+**SLACK IS 2.91 ms, and that is the number that governs.** Per §7, a realised saving is
+`min(size, poleMs - secondMs)`. So:
+
+- Any single frame-thread win larger than ~2.9 ms is **truncated** — it moves the pole down to
+  dxvk-cs and stops paying there.
+- Neither thread can be finished alone. The old advice on both sides ("do not skip the frame
+  thread", and its opposite "Phases 2 / 2b are the binding constraint") were both written when one
+  thread led the other by ~20 ms. **At 2.91 ms apart, they must be worked in alternation**, in
+  chunks of roughly the current slack, re-measuring between.
+
+What is actually sized and available on each side today:
+
+| side | item | size | status |
+|---|---|---|---|
+| frame | batch join (Phase 6e) | **6-7 ms** | unexamined, largest single item anywhere |
+| frame | `captureDrawSnapshot` bookkeeping (§1a) | 2.20 + 1.52 | `dsi_scan` 0.76 is Phase 8 |
+| frame | fanout (`DrawIndexedInstanced`) | 10.89 | 100% dark until marks on |
+| cs | `processSceneObject` | 10.58 | unattributed until Phase 1.3 |
+| cs | Phase 2 skip | `[U]` | built, `FAIL` not yet 0 (§2.2) |
+| cs | BLAS (Phase 5) | 3.62 | `buildBlases` 2.32 + `dynBlas` 1.30 |
+
+**30 fps is 5.3 and 2.4 ms away.** That is the first time this document has been able to write a
+single-digit number in that sentence, and it is why the honest-target paragraph above (~20 fps)
+is superseded — not by an argument, but by the 2026-08-14 measurement.
+
+---
+
 ## 7. RULES THAT MUST NOT BE BROKEN
 
 - **`frame ~= max(frameThread, dxvk-cs)`**; realised saving = `min(size, poleMs - secondMs)`.
-  Slack is 29.31 ms today: frame-thread savings past that buy nothing until dxvk-cs comes down.
-  (`rtx_options.h:380-381`)
+  ~~Slack is 29.31 ms today~~ — **slack is 2.91 ms (2026-08-14).** This rule was a footnote when
+  the threads were 29 ms apart and it is now the governing constraint on every phase: no single
+  win larger than ~2.9 ms realises in full, and the two threads must be worked in alternation.
+  See §6.1. (`rtx_options.h:380-381`)
 - **Do not reorder the commit.** `commitGeometryToRT` replays in-order on the CS stream and its
   `copyBuffer` depends on that position (`rtx_context.cpp:4948-4959`). This is correctness, not
   performance.
@@ -1114,14 +1395,55 @@ Dead ends, off:
 `replayExtractTransforms=False` · `replayExtractVerify=False` · `perfStageDepCensus=False` ·
 `extractOverlap` / `extractOverlapVerify` keys removed (do not exist at `4681ecca`)
 
-**`RTX_D3D11_SUBMARK=1` MUST BE IN THE ENVIRONMENT or the named leaf table is a lie. `[M]`**
-The 2026-08-12 00:06 run reports `pfs_guard 0.28 ms` against 12.73 the run before. Nothing got
-faster: `pfs_guard` is marked with `markSub`, which early-returns when the sub-markers are off,
-so the span silently falls into the next `markStg` bucket. The whole named-leaf table
-(`pfs_guard`, `bt_extractXf`, `tail_emit`, …) goes dark with it, and the frame time drops ~10 ms
-because ~30 clock reads per draw stop happening. **A leaf reading near zero is the signature of
-a lost env var, not of a win** — check this before believing any leaf number, including a
-regression.
+**AMENDED AGAIN 2026-08-14** (live conf; backup `rtx.conf.bak-2026-08-14-before-pushinst`):
+
+| Option | Now | Why |
+|---|---|---|
+| `pushInstanceRecords` | **True** | Phase 2.1 |
+| `pushInstanceRecordsVerify` | **True** | pinned explicitly rather than left to the default. Nothing is skipped until `FAIL=0` — see §2.2 for what happened when it was first run |
+| `memoExtractTransforms` | True -> **False** | inert all session (zero `[Perf.MemoXf]` lines, because `splitHandled` is true for every draw). Turning the feature off rather than leaving it True-but-dead means it cannot wake up when `splitTransformCache` is next toggled for an unrelated reason |
+| `memoExtractVerify` | **True** (unchanged) | deliberately left armed. If the memo is ever re-enabled it must come back with verify already on — the same order `pushInstanceRecords` and `splitTransformCache` both use |
+| `perfSceneObjSplit` | **False** (unchanged) | Phase 1.3, wanted, but in its OWN window — §8's one-question-per-capture rule |
+
+### THE MEASUREMENT REGIME CHANGED 2026-08-14 — TWO SWITCHES, BOTH DEFAULT OFF `[M]`
+
+**A named-leaf table of zeros is now the NORMAL state of a normal run, not an alarm.**
+
+| switch | where | default | what it costs when on |
+|---|---|---|---|
+| `RTX_PERF_MARKS` | env var, `d3d11_rtx.cpp:8869` | **OFF** | ~1.6 ms/frame (~41 ns x ~30 marks x ~1,350 draws) |
+| `RTX_D3D11_SUBMARK` | env var, `d3d11_rtx.cpp:8781` | **OFF** | the leaf splits inside those marks |
+
+`RTX_PERF_MARKS` is new (`[Perf.MarksCompileOut]`, 2026-08-14) and is the outer gate: with it off,
+all five mark lambdas skip the clock read, and `pfs_guard`, `bt_extractXf`, `tail_emit`, every
+`te_*`/`bt_*`/`pff_*` accumulator, the eligibility and serve/derive splits and the whole
+`[Perf.SubmitDraw.acc]` line read **0**. There is also a compile-time form (`-DRTX_PERF_MARKS=0`)
+that recovers the last ~0.04 ms by discarding the branch entirely; nothing in the build system
+defines it, so a normal build gets the runtime switch.
+
+**To read leaves you need BOTH:**
+
+```
+set RTX_PERF_MARKS=1
+set RTX_D3D11_SUBMARK=1
+```
+
+**And do not quote a frame time from that window** — the marks are ~1.6 ms of the very number
+being optimised. Ratios from the marks-on window, absolutes from the marks-off window. This is
+C.5's lesson (diagnostics distort by more than the thing measured) applied to the instrument that
+had been exempt from it.
+
+**What stays valid with marks off:** `FRAME`, the three timelines, `HYGIENE`, the D3D11
+entry-point rows, the dxvk-cs and GPU sections, and `captureDrawSnapshot`'s own breakdown — those
+come from separate unconditional timers, which is the point.
+
+> **THE ORIGINAL WARNING, still true and still worth reading, because the shape recurs.** The
+> 2026-08-12 00:06 run reported `pfs_guard 0.28 ms` against 12.73 the run before. Nothing got
+> faster: `markSub` early-returns when the sub-markers are off, so the span silently fell into the
+> next `markStg` bucket, and the frame time dropped ~10 ms because ~30 clock reads per draw
+> stopped happening. **A leaf reading near zero is the signature of a lost switch, not of a win.**
+> The only thing that changed in 2026-08-14 is that the switch is now off *on purpose*, so the
+> check is "did I set both env vars" rather than "did I lose one".
 
 Still to change when taking measurements:
 `perfDrawRedundancy=True` for the Phase 1.2 capture (built 2026-08-11, never yet run) — needs
@@ -1233,11 +1555,27 @@ Current reading: **`itemsPerFrame=1055 parallelForMsPerFrame=6 workers=30`**.
 | geometry hashing | **yes** | `rtx.batchHashes` (`:357`) |
 | object-space bbox scan | **yes** | `rtx.batchBoundingBox` (`:358`) |
 | bone-palette build | **yes** | `rtx.batchSkinning` (`:359`) |
-| **`ExtractTransforms`** | **NO** | blocked on Phase B purity — see A.7 |
-| **instance find/mid/add** | **NO** | on dxvk-cs; Phase 2 target |
+| **`ExtractTransforms`** | **NO** | ~~blocked on Phase B purity~~ — blocked on its ~170 IN-SUBMITDRAW CONSUMERS. See Phase 6d |
+| **instance find/mid/add** | **NO** | on dxvk-cs; blocked on SHARED MUTABLE STATE, not purity. See below |
 
 Parent flag `rtx.batchSubmitDrawStages` (`:353`). Sub-flags default `true` so enabling the parent
 gives the fully coherent batch; disable one to bisect a stage back to its per-draw path.
+
+**THE CRITERION FOR JOINING THIS TABLE IS NOT PURITY. `[M]` 2026-08-14.** Every one of the four
+stages above writes a `dcs` field read **only on the CS thread** — `materialData`,
+`geometryData.hashes`, `geometryData.boundingBox`, `skinningData.pBoneMatrices`. Nothing inside
+SubmitDraw consumes them. That is what made them easy, and it is the test to apply before calling
+any future stage "one more entry in `DrawWorkItem`".
+
+Measured against it, the two remaining rows fail for **unrelated** reasons, and neither is the
+"finish Phase B purity" story this document told for three days:
+
+- `ExtractTransforms` is pure *enough* now (95% of touched draws, `[DrawPure]`), but
+  `dcs.transformData` has ~170 readers inside SubmitDraw and three writers among them (Phase 6d).
+- instance find/mid/add is not a purity problem at all. **Appendix B.6 already says so in its own
+  words** — the scene work races on the instance manager, BLAS cache and geometry cache. Thirty
+  workers cannot touch it until Phase 2 gives instances persistent records. B.6 and the old Phase
+  6d text contradicted each other; B.6 was right.
 
 ## A.6 DrawSnapshot — why any of this is legal
 
@@ -1272,19 +1610,25 @@ trying to avoid.
 The consumer half (join -> `SetSkyCategoryFromCb2`, ~9,240 lines) was censused at
 **77 direct `m_state` reads + ~27 indirect**. Batch 1 converted 45 sites.
 
-> **Branch warning:** Batch 1 lives on `stable` (`470eaf4b`), **not** on `parallel-clean`.
-> At `4681ecca`, `drawIndexBuffer` and `drawPixelShaderCom` have **zero** uses. Cherry-pick those
-> 45 sites out of `xfoverlap-wip`/`stable` before continuing — they are independent of the
-> XfOverlap worker and behaviour-neutral.
+> **~~Branch warning~~ — OBSOLETE, and following it would now be a regression. `[M]` 2026-08-14.**
+> Batch 1 was redone independently on `architecture-overhaul` and HEAD is ahead of `stable` on
+> every accessor except two that were left alone deliberately. Full per-accessor table in Phase
+> 6a. Cherry-picking from `stable` would import the XfOverlap worker Phase 7 deletes, for nothing.
 
-**32 residual live reads remain**, in three classes:
+**~~32 residual live reads remain~~ — recount 2026-08-14: 12 remain in the window that matters**,
+i.e. between the derivation (`:39069`) and the batch commit point (`:50533`). Batch 2 is done;
+what is left is batch 3 plus two deliberate exclusions.
 
-*Batch 2 — identity reads, need new snapshot fields/accessors:*
-`rs.viewports` x9, `rs.numViewports` x4 (check how many sites actually want viewport 0),
-`om.cbState` x3, `om.dsState` x2, `rs.state` x1 (blend/depth/raster object pointers — note the
-existing BlendCache/DepthCache decode caches already key on these pointers),
-`ps.shaderResources` x2, `ps.constantBuffers` x2, plus `GetCurrentVsPsHashes` x12 (add one
-snapshot-hash accessor).
+*~~Batch 2 — identity reads, need new snapshot fields/accessors~~ — **DONE.*** The accessors exist
+at `d3d11_rtx.h:1860-1869`: `drawBlendState`, `drawDepthState`, `drawRasterState`,
+`drawPsSrv0to7`, `drawRtv0`, `drawVsCb`, plus `drawT31Entry` and `noteGeoLiveRead`. Viewport reads
+went 12 -> 27 uses. None of this existed on `stable`.
+
+*A class the original census missed entirely — **aggregate binds:*** five sites of the form
+`const auto& xxIa = m_context->m_state.ia;` that then index `.vertexBuffers[0]` and `.indexBuffer`.
+They never matched a `m_state.<stage>.<field>` grep because they alias the whole struct. All five
+were identity-only and are converted. **Grep for `m_context->m_state\.[a-z]+;` as well as the
+two-dot form when re-censusing.**
 
 *Batch 3 — CONTENT reads, the careful class:*
 the 14 `GetMappedSlice` sites, plus 4 `vs.constantBuffers` binding+content sites. Route through
@@ -1539,11 +1883,16 @@ the missing piece; purity was.
 
 ## D.3 Branches
 
-- **`architecture-overhaul` @ `4681ecca`** — current. Clean tree, no XfOverlap. Work here.
-  (Created 2026-08-11; the short-lived `parallel-clean` at the same commit has been deleted.)
-- **`stable` @ `470eaf4b`** — the XfOverlap commit, message "broken". **Already pushed to
-  `origin/stable`**, so do not rewind it without a force-push decision. **Contains Phase B batch 1
-  (the 45 accessor conversions), which is wanted — cherry-pick, do not discard. See Phase 6a.**
+- **`architecture-overhaul` @ `5ced56c2`** — current, clean tree, no XfOverlap. Work here.
+  Six commits past the `4681ecca` this document was written at:
+  `683d49dd` Plan, `6b0e2e7b` backup, `42d116bf` fixes, `0655e48a` fixed options,
+  `8bf0d7f7` + `5ced56c2` optimisations.
+- **`stable` @ `470eaf4b`** — the XfOverlap commit, message "broken". A single commit off
+  `4681ecca`; `git merge-base --is-ancestor stable HEAD` is **false**, so it holds exactly one
+  thing this branch does not: XfOverlap, which Phase 7 deletes. **~~Cherry-pick, do not discard~~
+  — NOTHING LEFT TO TAKE. `[M]` 2026-08-14.** Its Phase B batch 1 was redone here and surpassed
+  (Phase 6a). Already pushed to `origin/stable`, so do not rewind it without a force-push
+  decision, but there is no longer a reason to merge from it.
 - `main` @ `62378bcf` — "broken", stale.
 
 ## D.4 Per-commit subsystem attribution `[M]`

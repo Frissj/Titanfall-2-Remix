@@ -42087,7 +42087,10 @@ namespace dxvk {
         SceneDump::writeCameraMarker();
       }
       if (SceneDump::g_obj.is_open()) {
-        const auto& pvb = m_context->m_state.ia.vertexBuffers[posSem->inputSlot];
+        // NV-DXVK [PhaseB tail]: record-served binding. Sound here because the
+        // only thing read off it is GetImmutableData(), which never renames --
+        // unlike GetMappedSlice(), which is why the sibling dumps below stay live.
+        const auto& pvb = drawVertexBuffer(posSem->inputSlot);
         const uint8_t* posData = nullptr; size_t posLen = 0;
         if (pvb.buffer != nullptr) {
           const auto& imm = pvb.buffer->GetImmutableData();
@@ -43495,9 +43498,14 @@ namespace dxvk {
       // not by slot index, because TF2 ships VGUI shader variants with
       // different t-slot orderings (verified empirically on the gauntlet
       // weapon descriptor vs. training drone stats panel).
-      const auto& ps2 = m_context->m_state.ps;
-      const auto* cs2 = ps2.shader != nullptr
-        ? ps2.shader->GetCommonShader() : nullptr;
+      // NV-DXVK [PhaseB tail]: PS identity from the record. The SRV read below
+      // deliberately stays live -- its slot comes from RDEF reflection and can
+      // be any of 128, while the record's PS SRV window is slots 0-7
+      // (DrawSnapshot::psSrv0to7). Widening that to serve this is the same
+      // 128-slot walk the sibling note at the TF2 sky-probe scan rejects on
+      // cost. Not a half-conversion: SRV IDENTITY, not buffer contents.
+      const auto* cs2 = drawPixelShaderCom() != nullptr
+        ? drawPixelShaderCom()->GetCommonShader() : nullptr;
       if (cs2 != nullptr) {
         struct VguiSbRole {
           const char* names[3];
@@ -43517,7 +43525,8 @@ namespace dxvk {
           }
           if (slot == UINT32_MAX) continue;
           if (slot >= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) continue;
-          D3D11ShaderResourceView* srv = ps2.shaderResources.views[slot].ptr();
+          D3D11ShaderResourceView* srv =
+            m_context->m_state.ps.shaderResources.views[slot].ptr();
           if (!srv) continue;
           if (srv->GetResourceType() != D3D11_RESOURCE_DIMENSION_BUFFER) continue;
           Rc<DxvkBufferView> view = srv->GetBufferView();
@@ -43978,14 +43987,16 @@ namespace dxvk {
               // expects, plus the bound vertex buffer for each input slot.
               // If we see 2+ TEXCOORDs from different slots, Remix's
               // texcoordBuffer might be reading the wrong UV stream.
-              if (auto* il = m_context->m_state.ia.inputLayout.ptr()) {
+              // NV-DXVK [PhaseB tail]: identity-only reads (pointer, ByteWidth,
+              // stride) -- no buffer contents touched, so the record serves them.
+              if (auto* il = drawInputLayout()) {
                 const auto& sems = il->GetRtxSemantics();
                 for (const auto& s : sems) {
                   uint64_t vbHandle = 0;
                   uint64_t vbLen = 0;
                   uint32_t vbStride = 0;
                   if (s.inputSlot < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) {
-                    const auto& vb = m_context->m_state.ia.vertexBuffers[s.inputSlot];
+                    const auto& vb = drawVertexBuffer(s.inputSlot);
                     if (vb.buffer != nullptr) {
                       vbHandle = reinterpret_cast<uint64_t>(vb.buffer.ptr());
                       vbLen = vb.buffer->Desc()->ByteWidth;
@@ -44042,6 +44053,12 @@ namespace dxvk {
                 for (const auto& s : sems) {
                   if (std::strncmp(s.name, "TEXCOORD", 8) != 0) continue;
                   if (s.inputSlot >= D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) continue;
+                  // NV-DXVK [PhaseB tail] DELIBERATELY LIVE, both halves. The
+                  // read below is GetMappedSlice() -- buffer CONTENT, which
+                  // renames on Map(DISCARD). Serving the BINDING from the record
+                  // while the BYTES come from the live slice would pair two
+                  // instants, which is the exact half-conversion A.7 forbids.
+                  // Convert this only together with a routed byte read.
                   const auto& vb = m_context->m_state.ia.vertexBuffers[s.inputSlot];
                   if (vb.buffer == nullptr || vb.stride == 0) continue;
                   auto* d3dBuf = vb.buffer.ptr();
@@ -44159,7 +44176,8 @@ namespace dxvk {
             || vsH_decode == 0xe7abcf4ea24b0fa7ull
             || vsH_decode == 0x448e372f6d5e78e1ull;
           if (isBspVsDecode) {
-            if (auto* il = m_context->m_state.ia.inputLayout.ptr()) {
+            // NV-DXVK [PhaseB tail]: layout identity only.
+            if (auto* il = drawInputLayout()) {
               const auto& sems = il->GetRtxSemantics();
               // NV-DXVK: dump POSITION0 too. The interleaver decodes
               // R32G32_UINT positions via a hardcoded 21|21|22-bit layout
@@ -44174,6 +44192,10 @@ namespace dxvk {
                 const uint32_t fmt = uint32_t(s.format);
                 if (fmt != 101u) continue;  // R32G32_UINT only â€” float positions are fine
 
+                // NV-DXVK [PhaseB tail] DELIBERATELY LIVE: the read below falls
+                // back to GetMappedSlice() when the immutable shadow is empty,
+                // so binding and bytes must come from the same instant. See the
+                // TEXCOORD dump above for the full reason.
                 const auto& vb = m_context->m_state.ia.vertexBuffers[s.inputSlot];
                 if (vb.buffer == nullptr || vb.stride == 0) continue;
                 auto* d3dBuf = vb.buffer.ptr();
@@ -44292,6 +44314,8 @@ namespace dxvk {
                 const bool isFloatTexcoord = (fmt == 103u);
                 if (!isUintTexcoord && !isFloatTexcoord) continue;
 
+                // NV-DXVK [PhaseB tail] DELIBERATELY LIVE -- same immutable-or-
+                // GetMappedSlice fallback as the POSITION dump above.
                 const auto& vb = m_context->m_state.ia.vertexBuffers[s.inputSlot];
                 if (vb.buffer == nullptr || vb.stride == 0) continue;
                 auto* d3dBuf = vb.buffer.ptr();
@@ -45164,8 +45188,10 @@ namespace dxvk {
                 && !biSem->perInstance
                 && geo.boneIndexBase == 0u
                 && !geo.boneBaseBuffer.defined()
-                && biSem->inputSlot < m_context->m_state.ia.vertexBuffers.size()) {
-              const auto& biVb = m_context->m_state.ia.vertexBuffers[biSem->inputSlot];
+                && biSem->inputSlot < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) {
+              // NV-DXVK [PhaseB tail]: record-served binding; the only read is
+              // GetImmutableData() below, which cannot rename.
+              const auto& biVb = drawVertexBuffer(biSem->inputSlot);
               D3D11Buffer* biBuf = biVb.buffer.ptr();
               if (biBuf != nullptr && biVb.stride >= 4u) {
                 // Immutable CPU shadow only â€” see the dynamic-VB rule above.
@@ -46769,11 +46795,13 @@ namespace dxvk {
               " sameIB=", ((drawIndexBuffer().buffer != nullptr
                 && geo.indexBuffer.buffer().ptr() == drawIndexBuffer().buffer->GetBuffer().ptr()) ? 1 : 0),
               " posAbsOff=", geo.positionBuffer.offset(),
+              // NV-DXVK [PhaseB tail]: pointer identity only, and the sibling
+              // sameIB= above already reads the record via drawIndexBuffer().
               " samePosVB=", ((posSem != nullptr
-                && posSem->inputSlot < m_context->m_state.ia.vertexBuffers.size()
-                && m_context->m_state.ia.vertexBuffers[posSem->inputSlot].buffer != nullptr
+                && posSem->inputSlot < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT
+                && drawVertexBuffer(posSem->inputSlot).buffer != nullptr
                 && geo.positionBuffer.buffer().ptr()
-                   == m_context->m_state.ia.vertexBuffers[posSem->inputSlot].buffer->GetBuffer().ptr()) ? 1 : 0)));
+                   == drawVertexBuffer(posSem->inputSlot).buffer->GetBuffer().ptr()) ? 1 : 0)));
           }
         }
       }
@@ -46876,6 +46904,16 @@ namespace dxvk {
         const uint8_t* ibaseSk = (ibSk.buffer != nullptr) ? cpuBaseSk(ibSk.buffer.ptr(), ibLenSk) : nullptr;
         const uint8_t* pbase = nullptr; size_t pLen = 0; uint32_t pStride = 0; size_t pOff0 = 0;
         const uint8_t* bibase = nullptr; size_t biLen = 0; uint32_t biStride = 0; size_t biOff0 = 0;
+        // NV-DXVK [PhaseB tail] DELIBERATELY LIVE: cpuBaseSk above falls back to
+        // GetMappedSlice(), so every binding it consumes is a CONTENT read and
+        // must share one instant with the bytes.
+        //
+        // NOTE THE ASYMMETRY, it is not an oversight to copy: ibSk above is
+        // already record-served (drawIndexBuffer()) and then handed to the same
+        // live-byte lambda. That pairing is harmless while this runs in-draw --
+        // record and context agree until the game rebinds -- but it is exactly
+        // the half-conversion that becomes wrong the day this block runs
+        // deferred. Close BOTH halves together (route the bytes), or neither.
         const auto& vbs = m_context->m_state.ia.vertexBuffers;
         if (posSem != nullptr && posSem->inputSlot < vbs.size() && vbs[posSem->inputSlot].buffer != nullptr) {
           const auto& vb = vbs[posSem->inputSlot];
@@ -47431,11 +47469,14 @@ namespace dxvk {
           && dxvk::tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
         static std::mutex sDnMu;
         static std::unordered_set<std::string> sDnSeen;
-        const auto& dnIa = m_context->m_state.ia;
-        const uint64_t dnVbPtr = (!dnIa.vertexBuffers.empty() && dnIa.vertexBuffers[0].buffer != nullptr)
-          ? reinterpret_cast<uint64_t>(dnIa.vertexBuffers[0].buffer.ptr()) : 0ull;
-        const uint64_t dnIbPtr = (dnIa.indexBuffer.buffer != nullptr)
-          ? reinterpret_cast<uint64_t>(dnIa.indexBuffer.buffer.ptr()) : 0ull;
+        // NV-DXVK [PhaseB tail]: geometry-stream IDENTITY only (pointer/offset/
+        // stride), never contents -- so the record answers it.
+        const auto& dnVb0 = drawVertexBuffer(0);
+        const auto& dnIb  = drawIndexBuffer();
+        const uint64_t dnVbPtr = (dnVb0.buffer != nullptr)
+          ? reinterpret_cast<uint64_t>(dnVb0.buffer.ptr()) : 0ull;
+        const uint64_t dnIbPtr = (dnIb.buffer != nullptr)
+          ? reinterpret_cast<uint64_t>(dnIb.buffer.ptr()) : 0ull;
 
         // Cheap integer identity for the triple, mixed with the same constant
         // the other memos in this file use. Collisions only lose a log line
@@ -47797,6 +47838,9 @@ namespace dxvk {
         auto camLocDiag = commonDiag->FindCBField("CBufCommonPerCamera", "c_cameraOrigin");
         if (camLocDiag && camLocDiag->size >= 12
             && camLocDiag->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+          // NV-DXVK [PhaseB] BATCH 3: reads cbuffer CONTENTS (GetMappedSlice)
+          // below, so binding and bytes must come from one instant. Route
+          // through drawCbSpan together, or leave both live.
           const auto& vsCbsDiag = m_context->m_state.vs.constantBuffers;
           const auto& camCbDiag = vsCbsDiag[camLocDiag->slot];
           if (camCbDiag.buffer != nullptr) {
@@ -47843,6 +47887,8 @@ namespace dxvk {
               " usedFallback=", m_lastExtractUsedFallback ? 1 : 0,
               " o2wRow0=(", float(o2w[0][0]), ",", float(o2w[0][1]), ",", float(o2w[0][2]), ",", float(o2w[0][3]), ")",
               " cbuffer dump ==="));
+            // NV-DXVK [PhaseB] BATCH 3: cbuffer CONTENT dump -- binding + bytes
+            // convert together or not at all.
             const auto& vsCbsC = m_context->m_state.vs.constantBuffers;
             for (uint32_t s = 0; s < 8; ++s) {
               const auto& cb = vsCbsC[s];
@@ -48286,8 +48332,11 @@ namespace dxvk {
             baseBytes = static_cast<const uint8_t*>(mapPtrBase);
             baseLen   = posBuf.length();
           } else if (posSem != nullptr
-                  && posSem->inputSlot < m_context->m_state.ia.vertexBuffers.size()) {
-            const auto& vb = m_context->m_state.ia.vertexBuffers[posSem->inputSlot];
+                  && posSem->inputSlot < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) {
+            // NV-DXVK [PhaseB tail]: this is the IMMUTABLE arm specifically --
+            // reached only when the mapped slice was unavailable, and it reads
+            // GetImmutableData(), which never renames. Record-served.
+            const auto& vb = drawVertexBuffer(posSem->inputSlot);
             if (vb.buffer != nullptr) {
               const auto& imm = vb.buffer->GetImmutableData();
               if (!imm.empty()) {
@@ -48323,8 +48372,9 @@ namespace dxvk {
                 bool hasD3DBuf = false;
                 size_t immSize = 0;
                 if (hasPosSem
-                    && posSem->inputSlot < m_context->m_state.ia.vertexBuffers.size()) {
-                  const auto& vb = m_context->m_state.ia.vertexBuffers[posSem->inputSlot];
+                    && posSem->inputSlot < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) {
+                  // NV-DXVK [PhaseB tail]: presence bit + immutable size only.
+                  const auto& vb = drawVertexBuffer(posSem->inputSlot);
                   hasD3DBuf = (vb.buffer != nullptr);
                   if (hasD3DBuf) immSize = vb.buffer->GetImmutableData().size();
                 }
@@ -49307,19 +49357,19 @@ namespace dxvk {
       }
 
       if (tspDepthWriteOff && tspPsHasCubeSrv && !tspVsHasModelInst) {
-        const auto& tspIa = m_context->m_state.ia;
+        // NV-DXVK [PhaseB tail]: geometry-stream IDENTITY only -- record-served.
         uint64_t tspVbPtr    = 0ull;
         uint32_t tspVbOffset = 0u;
         uint32_t tspVbStride = 0u;
-        if (!tspIa.vertexBuffers.empty()) {
-          const auto& tspVb0 = tspIa.vertexBuffers[0];
+        {
+          const auto& tspVb0 = drawVertexBuffer(0);
           if (tspVb0.buffer != nullptr) {
             tspVbPtr    = reinterpret_cast<uint64_t>(tspVb0.buffer.ptr());
             tspVbOffset = tspVb0.offset;
             tspVbStride = tspVb0.stride;
           }
         }
-        const auto& tspIb = tspIa.indexBuffer;
+        const auto& tspIb = drawIndexBuffer();
         const uint64_t tspIbPtr =
           (tspIb.buffer != nullptr)
             ? reinterpret_cast<uint64_t>(tspIb.buffer.ptr())
@@ -49588,16 +49638,18 @@ namespace dxvk {
     // the object-local recon, needs this frame's view transform reapplied. Pure
     // measurement, zero behaviour change. Gated on rtx.logMemoCeiling (default off).
     if (RtxOptions::logMemoCeiling()) {
-      const auto& iaMc = m_context->m_state.ia;
+      // NV-DXVK [PhaseB tail]: geometry-stream IDENTITY only -- record-served.
+      const auto& vb0Mc = drawVertexBuffer(0);
+      const auto& ibMc  = drawIndexBuffer();
       uint64_t vbPtrMc = 0; uint32_t vbOffMc = 0, vbStrMc = 0;
-      if (!iaMc.vertexBuffers.empty() && iaMc.vertexBuffers[0].buffer != nullptr) {
-        vbPtrMc = reinterpret_cast<uint64_t>(iaMc.vertexBuffers[0].buffer.ptr());
-        vbOffMc = iaMc.vertexBuffers[0].offset;
-        vbStrMc = iaMc.vertexBuffers[0].stride;
+      if (vb0Mc.buffer != nullptr) {
+        vbPtrMc = reinterpret_cast<uint64_t>(vb0Mc.buffer.ptr());
+        vbOffMc = vb0Mc.offset;
+        vbStrMc = vb0Mc.stride;
       }
-      const uint64_t ibPtrMc = (iaMc.indexBuffer.buffer != nullptr)
-        ? reinterpret_cast<uint64_t>(iaMc.indexBuffer.buffer.ptr()) : 0ull;
-      const uint32_t ibOffMc = (iaMc.indexBuffer.buffer != nullptr) ? iaMc.indexBuffer.offset : 0u;
+      const uint64_t ibPtrMc = (ibMc.buffer != nullptr)
+        ? reinterpret_cast<uint64_t>(ibMc.buffer.ptr()) : 0ull;
+      const uint32_t ibOffMc = (ibMc.buffer != nullptr) ? ibMc.offset : 0u;
 
       struct GeomId {
         uint64_t vs, vbPtr, ibPtr;
@@ -49625,6 +49677,8 @@ namespace dxvk {
       uint64_t slotHashMc[4] = { 0, 0, 0, 0 };
       const uint8_t* slotPtrMc[4] = { nullptr, nullptr, nullptr, nullptr };
       size_t slotLenMc[4] = { 0, 0, 0, 0 };
+      // NV-DXVK [PhaseB] BATCH 3: hashes cbuffer CONTENT below -- binding and
+      // bytes convert together.
       const auto& vsCbsMc = m_context->m_state.vs.constantBuffers;
       for (uint32_t sl = 0; sl < 4u; ++sl) {
         const auto& cb = vsCbsMc[sl];
@@ -49756,16 +49810,18 @@ namespace dxvk {
     //   dupSame       â€” duplicate with identical cam + PS (truly redundant).
     // Pure measurement, gated on rtx.logDupPass (default off).
     if (RtxOptions::logDupPass()) {
-      const auto& iaDp = m_context->m_state.ia;
+      // NV-DXVK [PhaseB tail]: geometry-stream IDENTITY only -- record-served.
+      const auto& vb0Dp = drawVertexBuffer(0);
+      const auto& ibDp  = drawIndexBuffer();
       uint64_t vbPtrDp = 0; uint32_t vbOffDp = 0, vbStrDp = 0;
-      if (!iaDp.vertexBuffers.empty() && iaDp.vertexBuffers[0].buffer != nullptr) {
-        vbPtrDp = reinterpret_cast<uint64_t>(iaDp.vertexBuffers[0].buffer.ptr());
-        vbOffDp = iaDp.vertexBuffers[0].offset;
-        vbStrDp = iaDp.vertexBuffers[0].stride;
+      if (vb0Dp.buffer != nullptr) {
+        vbPtrDp = reinterpret_cast<uint64_t>(vb0Dp.buffer.ptr());
+        vbOffDp = vb0Dp.offset;
+        vbStrDp = vb0Dp.stride;
       }
-      const uint64_t ibPtrDp = (iaDp.indexBuffer.buffer != nullptr)
-        ? reinterpret_cast<uint64_t>(iaDp.indexBuffer.buffer.ptr()) : 0ull;
-      const uint32_t ibOffDp = (iaDp.indexBuffer.buffer != nullptr) ? iaDp.indexBuffer.offset : 0u;
+      const uint64_t ibPtrDp = (ibDp.buffer != nullptr)
+        ? reinterpret_cast<uint64_t>(ibDp.buffer.ptr()) : 0ull;
+      const uint32_t ibOffDp = (ibDp.buffer != nullptr) ? ibDp.offset : 0u;
 
       struct GeomIdDp {
         uint64_t vs, vbPtr, ibPtr;
@@ -49882,16 +49938,18 @@ namespace dxvk {
           dfBlendOn = itB->second.enable != 0;
         }
         if (!dfBlendOn) {
-          const auto& iaDf = m_context->m_state.ia;
+          // NV-DXVK [PhaseB tail]: geometry-stream IDENTITY only -- record-served.
+          const auto& vb0Df = drawVertexBuffer(0);
+          const auto& ibDf  = drawIndexBuffer();
           uint64_t dfVbPtr = 0; uint32_t dfVbOff = 0, dfVbStr = 0;
-          if (!iaDf.vertexBuffers.empty() && iaDf.vertexBuffers[0].buffer != nullptr) {
-            dfVbPtr = reinterpret_cast<uint64_t>(iaDf.vertexBuffers[0].buffer.ptr());
-            dfVbOff = iaDf.vertexBuffers[0].offset;
-            dfVbStr = iaDf.vertexBuffers[0].stride;
+          if (vb0Df.buffer != nullptr) {
+            dfVbPtr = reinterpret_cast<uint64_t>(vb0Df.buffer.ptr());
+            dfVbOff = vb0Df.offset;
+            dfVbStr = vb0Df.stride;
           }
-          const uint64_t dfIbPtr = (iaDf.indexBuffer.buffer != nullptr)
-            ? reinterpret_cast<uint64_t>(iaDf.indexBuffer.buffer.ptr()) : 0ull;
-          const uint32_t dfIbOff = (iaDf.indexBuffer.buffer != nullptr) ? iaDf.indexBuffer.offset : 0u;
+          const uint64_t dfIbPtr = (ibDf.buffer != nullptr)
+            ? reinterpret_cast<uint64_t>(ibDf.buffer.ptr()) : 0ull;
+          const uint32_t dfIbOff = (ibDf.buffer != nullptr) ? ibDf.offset : 0u;
 
           struct DfId {
             uint64_t vs, ps, vbPtr, ibPtr, bsPtr;
@@ -50050,6 +50108,9 @@ namespace dxvk {
         const VsLayoutDescriptor& d = m_vsLayoutTable.entries[m_currentLayoutId].desc;
         auto snapCb = [&](uint32_t slot, uint32_t off, float out[16]) -> bool {
           if (slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) return false;
+          // NV-DXVK [PhaseB] BATCH 3: stagedCbBytes falls back to
+          // GetMappedSlice(), so this is a CONTENT read -- binding and bytes
+          // convert together, via drawCbSpan, or neither.
           const auto& cb = m_context->m_state.vs.constantBuffers[slot];
           if (cb.buffer == nullptr) return false;
           size_t len = 0;

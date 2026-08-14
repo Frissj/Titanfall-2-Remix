@@ -648,7 +648,21 @@ namespace dxvk {
       // first cull, which is the same "first use runs the full path" policy
       // as m_instStateKey/m_fastDrawBits above and costs 8 corner transforms
       // once per clone.
-      static_assert(RtInstanceSize == 936, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+      // 936 -> 944 on 2026-08-14: added uint64_t m_batchRecordKey
+      // ([Perf.PushInst] PHASE 2 — which fanout batch record currently holds a
+      // raw pointer to this instance, 0 for none; the back-pointer that makes
+      // InstanceManager::invalidateFanoutRecordFor O(1) and TOTAL).
+      // COPY CTOR: DELIBERATELY NOT COPIED, and here that is a correctness
+      // requirement rather than the "first use runs the full path" convention
+      // the three members above follow. A record's instance list is the exact,
+      // ordered output of one placement loop, and createInstanceCopy does not
+      // add the clone to it — so the clone is NOT a member of that batch. If it
+      // inherited the key, removeInstance(clone) would invalidate a record the
+      // clone was never in (silently costing the real batch its skip), and the
+      // record's own back-pointer cleanup would skip the clone because it never
+      // walks it. Left at 0, a clone simply owns no record until some placement
+      // loop genuinely resolves to it, which is the truth.
+      static_assert(RtInstanceSize == 944, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }
@@ -1477,6 +1491,12 @@ namespace dxvk {
     }
 
     m_instances.clear();
+    // NV-DXVK [Perf.PushInst] PHASE 2: every instance the records referenced has
+    // just been deleted. removeInstance above already invalidated each record it
+    // reached, but drop the map wholesale rather than leaving invalidated husks
+    // behind -- clear() is a level transition, so nothing here is worth keeping,
+    // and an empty map cannot serve a pointer into freed memory by any route.
+    m_fanoutRecords.clear();
     m_viewModelCandidates.clear();
     m_playerModelInstances.clear();
   }
@@ -3156,6 +3176,102 @@ namespace dxvk {
   }
 
   void InstanceManager::onFrameEnd() {
+    // NV-DXVK [Perf.PushInst] PHASE 2 heartbeat. Throttled to 3 s like every
+    // other counter in this file.
+    //
+    // READ IT IN THIS ORDER, and stop at the first one that disappoints:
+    //   FAIL      the only number that can veto the feature. Printed even when
+    //             zero so its absence is never mistaken for the probe being off.
+    //             Non-zero => fanoutRecordFingerprint is missing an input; the
+    //             .FAIL line names the shader and the diverging index.
+    //   predict/batches  the CEILING, and the number to read under verify.
+    //             hit= counts skips actually taken, which is zero by
+    //             construction while verify is on -- on the first run that made
+    //             a working record and a broken one look identical. Against the
+    //             measured static=97% predict/batches should be high; if it is
+    //             not, the fingerprint is moving for a reason worth naming
+    //             BEFORE optimising, and miss{} says which of the five causes.
+    //   predictInst the instances that ceiling covers -- this is the number that
+    //             maps onto [Perf.UpdInst]'s entry 2.73 + fastRet 4.15 ms,
+    //             because those are per INSTANCE, not per batch.
+    //   miss{sameFrame} must be 0. Non-zero means the occurrence ordinal has
+    //             stopped separating sibling draws of one batch identity, which
+    //             is the defect the first verify run found.
+    //   evict     non-zero means the map is thrashing; raise
+    //             rtx.pushInstanceRecordsMaxBatches rather than living with it.
+    // NV-DXVK [Perf.PushInst] AGE SWEEP -- retirement, replacing the eviction
+    // scan that used to run on insert.
+    //
+    // THE BOUND IS NOT ARBITRARY. A record cannot usefully outlive the instances
+    // it points at, and the longest an instance can survive untouched is the
+    // larger of the two keep windows -- numFramesToKeepInstances for ordinary
+    // props, numFramesToKeepSubViewInstances for the IgnoreAntiCulling and
+    // stable-propId classes (the conf's shadow-pass terrain note). Past that
+    // point garbageCollection has certainly reaped them, every such record has
+    // already been invalidated through m_batchRecordKey, and it is dead weight.
+    //
+    // O(records) ONCE PER FRAME, in the same frame-end pass that already walks
+    // this data -- against O(records) PER INSERT for the eviction scan, paid
+    // hardest during streaming when inserts are most frequent. Same asymptotic
+    // work, a different multiplier, and it is the mechanism the split-transform
+    // cache already uses (`[Perf.SplitXf] evict{sweeps= aged= wipes= rung=}`).
+    if (RtxOptions::pushInstanceRecords() && !m_fanoutRecords.empty()) {
+      const uint32_t curFrame = m_device->getCurrentFrameId();
+      const uint32_t keepN = std::max(RtxOptions::numFramesToKeepInstances(),
+                                      RtxOptions::numFramesToKeepSubViewInstances());
+      for (auto it = m_fanoutRecords.begin(); it != m_fanoutRecords.end(); ) {
+        // Guard the unsigned subtraction: frameLastServed is kInvalidFrameIndex
+        // on a record that has never served, and curFrame - UINT32_MAX wraps to
+        // a huge age that would retire it on its first frame alive.
+        const bool aged = (it->second.frameLastServed != kInvalidFrameIndex)
+                       && (curFrame > it->second.frameLastServed)
+                       && (curFrame - it->second.frameLastServed > keepN);
+        if (aged) {
+          // Clear back-pointers before erasing: an instance whose key still
+          // names an erased record would never be invalidated again, and the
+          // key would collide with whatever later hashes to the same slot.
+          for (RtInstance* inst : it->second.instances) {
+            if (inst->m_batchRecordKey == it->first)
+              inst->m_batchRecordKey = 0ull;
+          }
+          it = m_fanoutRecords.erase(it);
+          m_piSwept += 1;
+        } else {
+          ++it;
+        }
+      }
+    }
+
+    if (RtxOptions::pushInstanceRecords()) {
+      static std::chrono::steady_clock::time_point sLast {};
+      const auto now = std::chrono::steady_clock::now();
+      if (sLast.time_since_epoch().count() == 0) sLast = now;
+      if (now - sLast >= std::chrono::seconds(3)) {
+        sLast = now;
+        Logger::info(str::format(
+          "[Perf.PushInst] verify=", (RtxOptions::pushInstanceRecordsVerify() ? 1 : 0),
+          " batches=", m_piBatches,
+          " predict=", m_piPredict,
+          " predictInst=", m_piPredictInst,
+          " hit=", m_piHit,
+          " servedInst=", m_piServedInst,
+          " miss{key=", m_piMissKey,
+          " input=", m_piMissInput,
+          " invalid=", m_piMissInvalid,
+          " sameFrame=", m_piMissSameFrame,
+          " stale=", m_piMissStale,
+          " guard=", m_piGuard, "}",
+          " records=", m_fanoutRecords.size(),
+          " swept=", m_piSwept,
+          " capped=", m_piCapped,
+          " FAIL=", m_piFail,
+          "  | per-frame counts (batches/hit/miss/served reset each frame);"
+          " records/FAIL are cumulative. FAIL must be 0 over a session including"
+          " a level transition and a combat frame before"
+          " rtx.pushInstanceRecordsVerify goes off."));
+      }
+    }
+
     m_viewModelCandidates.clear();
     m_playerModelInstances.clear();
     resetSurfaceIndices();
@@ -3350,6 +3466,87 @@ namespace dxvk {
                                   existingInstance, drawCallCache, nullptr, drawState);
   }
 
+  // NV-DXVK [Perf.PushInst] PHASE 2. Contract and rationale on the member
+  // declarations in rtx_instance_manager.h; this is the mechanics.
+  //
+  // THE KEY names the BATCH -- which shader, which geometry. It deliberately
+  // does NOT include anything that varies frame to frame, because a key that
+  // moves means the record is never found and the feature silently does
+  // nothing while reporting a healthy-looking miss rate. Everything that DOES
+  // vary belongs in the fingerprint instead, where a change is a miss with a
+  // reason rather than a lost record.
+  uint64_t InstanceManager::fanoutRecordKey(const DrawCallState& drawCall,
+                                            const BlasEntry& blas) const {
+    uint64_t k = static_cast<uint64_t>(drawCall.getTransformData().vertexShaderHash);
+    k = k * 0x9E3779B97F4A7C15ull
+      + static_cast<uint64_t>(blas.input.getHash(RtxOptions::geometryAssetHashRule()));
+    // Never 0: 0 is the "no record" sentinel on RtInstance::m_batchRecordKey.
+    return k ? k : 1ull;
+  }
+
+  // THE FINGERPRINT answers one question: would the placement loop, run now,
+  // resolve to the same instances in the same order as when this record was
+  // built? Everything the resolution reads has to be in here.
+  //
+  // WHAT IS IN, AND WHY EACH ONE:
+  //   - the placement transform BYTES. This is the whole point; a prop that
+  //     moved must miss. Hashed as raw bytes rather than compared per element
+  //     because the SpatialMap key contract is already bit-for-bit ("reproduces
+  //     last frame's composed matrix bit-for-bit"), so byte equality is exactly
+  //     the right granularity -- no epsilon, deliberately.
+  //   - the ENGINE HISTORY (prevInstancesToObject) bytes and its presence. The
+  //     loop resolves through the history when the current transform misses, so
+  //     two frames with identical current transforms but different history can
+  //     land on different instances.
+  //   - the base objectToWorld, which composes with every placement.
+  //   - the material hash and camera type, which select the instance as surely
+  //     as the transform does -- matChg reads 0% today, and hashing it is what
+  //     keeps that a measurement rather than an assumption.
+  //   - the placement COUNT, so a batch that grew or shrank can never match a
+  //     shorter recorded list.
+  uint64_t InstanceManager::fanoutRecordFingerprint(
+      const DrawCallState& drawCall, const BlasEntry& blas,
+      const MaterialData& materialData,
+      const std::vector<Matrix4>* transforms,
+      const std::vector<Matrix4>* prevTransforms) const {
+    XXH64_hash_t h = 0;
+    const auto& xf = drawCall.getTransformData();
+    h = XXH64(&xf.objectToWorld, sizeof(xf.objectToWorld), h);
+    const uint32_t n = transforms ? static_cast<uint32_t>(transforms->size()) : 0u;
+    h = XXH64(&n, sizeof(n), h);
+    if (n != 0u)
+      h = XXH64(transforms->data(), sizeof(Matrix4) * size_t(n), h);
+    const uint32_t pn = prevTransforms ? static_cast<uint32_t>(prevTransforms->size()) : 0u;
+    h = XXH64(&pn, sizeof(pn), h);
+    if (pn != 0u)
+      h = XXH64(prevTransforms->data(), sizeof(Matrix4) * size_t(pn), h);
+    const uint32_t cam = static_cast<uint32_t>(drawCall.cameraType);
+    h = XXH64(&cam, sizeof(cam), h);
+    const XXH64_hash_t mat = materialData.getHash();
+    h = XXH64(&mat, sizeof(mat), h);
+    // Category flags select instance behaviour (sub-view, anti-culling) and are
+    // written onto the instance by updateInstance, so a change here is a change
+    // in the output even when every matrix matches.
+    const uint32_t cat = drawCall.getCategoryFlags().raw();
+    h = XXH64(&cat, sizeof(cat), h);
+    return static_cast<uint64_t>(h);
+  }
+
+  // O(1) and TOTAL -- see RtInstance::m_batchRecordKey. Invalidating the whole
+  // record rather than erasing one element is deliberate: the recorded list is
+  // only meaningful as the complete, ordered output of one placement loop, and
+  // a list with a hole in it would resolve later placements onto the wrong
+  // instance with full confidence. Cheap to rebuild, impossible to half-trust.
+  void InstanceManager::invalidateFanoutRecordFor(const RtInstance* instance) {
+    const uint64_t key = instance->m_batchRecordKey;
+    if (key == 0ull)
+      return;
+    const auto it = m_fanoutRecords.find(key);
+    if (it != m_fanoutRecords.end())
+      it->second.valid = false;
+    instance->m_batchRecordKey = 0ull;
+  }
+
   void InstanceManager::processSceneObjectFanout(
     const CameraManager& cameraManager, const RayPortalManager& rayPortalManager,
     BlasEntry& blas, const DrawCallState& drawCall, MaterialData& materialData,
@@ -3489,6 +3686,243 @@ namespace dxvk {
       st.frame = currentFrameIdx;
     }
 
+    // ================================================================
+    // NV-DXVK [Perf.PushInst] PHASE 2 -- the record lookup and the skip.
+    // Contract and rationale on the member declarations in the header.
+    //
+    // PLACED HERE, BELOW THE ROLLOVER, ON PURPOSE. The rollover must run for
+    // every batch including a skipped one: it moves the per-VS propId
+    // membership sets from `cur` to `prev`, and a frame that skipped the loop
+    // still has to leave the next frame comparing against the right baseline.
+    // Above it, this block would also reference prevTransforms and `st` before
+    // either is declared.
+    const bool piOn     = RtxOptions::pushInstanceRecords();
+    // NV-DXVK [perf] 2026-08-14: HOISTED above the Phase 2 block. It used to be
+    // declared just above the placement loop, which was fine while the skip only
+    // stamped instances. The skip now composes placement matrices too (it calls
+    // updateInstance), so both paths need it. Same value, still once per draw.
+    const bool fanoutBaseIsIdentity = isIdentityExact(drawObjectToWorld);
+
+    const bool piVerify = RtxOptions::pushInstanceRecordsVerify();
+    uint64_t piKey = 0ull, piPrint = 0ull;
+    FanoutBatchRecord* piRec = nullptr;
+    bool piPredictHit = false;
+    if (piOn) {
+      if (m_piFrame != currentFrameIdx) {
+        m_piFrame = currentFrameIdx;
+        m_piBatches = m_piHit = m_piMissKey = m_piMissInput = 0;
+        m_piMissInvalid = m_piServedInst = 0;
+        m_piPredict = m_piMissSameFrame = m_piPredictInst = 0;
+        m_piGuard = m_piCapped = m_piMissStale = 0;  // m_piSwept cumulative, like FAIL
+        // The ordinal is per FRAME: draw N of this frame must line up with draw
+        // N of the last one, so the count restarts here and nowhere else.
+        m_fanoutOrdinals.clear();
+      }
+      m_piBatches += 1;
+      // Batch identity, then WHICH occurrence of it this is. See m_fanoutOrdinals.
+      const uint64_t piBaseKey = fanoutRecordKey(drawCall, blas);
+      const uint32_t piOrd = m_fanoutOrdinals[piBaseKey]++;
+      piKey = piBaseKey * 0x9E3779B97F4A7C15ull + (static_cast<uint64_t>(piOrd) + 1ull);
+      if (piKey == 0ull)
+        piKey = 1ull;   // 0 is the "no record" sentinel on m_batchRecordKey
+      piPrint = fanoutRecordFingerprint(drawCall, blas, materialData, transforms, prevTransforms);
+      const auto it = m_fanoutRecords.find(piKey);
+      if (it == m_fanoutRecords.end()) {
+        m_piMissKey += 1;
+      } else if (!it->second.valid) {
+        m_piMissInvalid += 1;
+        piRec = &it->second;
+      } else if (it->second.frameLastBuilt == currentFrameIdx) {
+        // INDEPENDENT BACKSTOP, and it stays even though the ordinal should make
+        // it unreachable. A record is a statement about a PREVIOUS frame; one
+        // built during this frame describes a sibling draw, and serving it is
+        // precisely the bug the first verify run caught (FAIL=3367, every line
+        // builtFrame == f). If this counter ever reads non-zero the ordinal has
+        // stopped separating siblings and the reason wants finding before
+        // anything is skipped -- so it is counted, not silently swallowed.
+        m_piMissSameFrame += 1;
+        piRec = &it->second;
+      } else if (it->second.frameLastServed + 1u != currentFrameIdx) {
+        // A PREDICTION HAS A SHELF LIFE OF EXACTLY ONE FRAME.
+        //
+        // NV-DXVK 2026-08-14: this tests frameLastSERVED, not frameLastBuilt.
+        // It was frameLastBuilt, and that was a defect that only existed while
+        // verify was on. frameLastBuilt is written by the REFRESH block at the
+        // bottom of the FULL path; the skip returns long before it. So once
+        // verify went off:
+        //   f    full path, built=f, served=f
+        //   f+1  built+1 == f+1  -> SKIP, built STAYS f
+        //   f+2  built+1 != f+2  -> stale miss, full path, built=f+2
+        // i.e. a batch submitted every single frame could be served at most
+        // every OTHER frame, forever. Under verify the full path runs every
+        // frame and refreshes built every frame, so the bound was always
+        // satisfied and predict read 89% -- the measurement that made this look
+        // healthy was the thing preventing the bug from appearing.
+        //
+        // frameLastServed is written by BOTH paths (here and in REFRESH), so it
+        // means "the frame this record last produced the answer", which is
+        // exactly what a one-frame adjacency bound wants to test. frameLastBuilt
+        // keeps its original meaning -- the last frame we actually RESOLVED --
+        // which is what makes it worth printing in [Perf.PushInst.FAIL].
+        //
+        // The 2b protection is unchanged: a batch that stops being submitted
+        // stops being served, served falls behind, and the record goes stale on
+        // exactly the frame it used to.
+        //
+        // THE MEASUREMENT THAT FORCED THIS. The second verify run left FAIL=7,
+        // flat, with ALL FOUR discriminator bits zero on every one -- so the
+        // inputs genuinely were identical and no instance had been reaped,
+        // relinked or claimed within the frame. What every failure DID share was
+        // a gap: builtFrame lagged the current frame by 3 to 11, while
+        // recLastUpd sat at f-1. The batch had skipped frames, and during the
+        // gap OTHER draws went on claiming and updating its instances, so the
+        // resolution mapping drifted underneath a record that still looked
+        // perfectly valid.
+        //
+        // The fingerprint cannot cover this and no amount of hashing will: what
+        // moved was not an input to this batch, it was the global resolution
+        // state between two of its appearances. Bounding the staleness to a
+        // single frame is what makes the record's claim true again -- "these
+        // inputs resolved to these instances ONE frame ago" is verifiable;
+        // "...eleven frames ago" is not.
+        //
+        // Costs almost nothing: a batch submitted every frame always has a gap
+        // of 1. Only intermittently-submitted batches lose acceleration, and
+        // those are exactly the ones this refuses to trust. VS_2947c6 -- the
+        // shadow-pass terrain the conf documents as submitted only when TF2's
+        // spot-shadow pass runs -- is three of the seven.
+        m_piMissStale += 1;
+        piRec = &it->second;
+      } else if (it->second.inputHash != piPrint) {
+        m_piMissInput += 1;
+        piRec = &it->second;
+      } else if (it->second.instances.size() != transforms->size()) {
+        // Belt and braces: the count is already in the fingerprint, so this can
+        // only fire on a hash collision. Counted as an input miss rather than
+        // trusted, because the alternative is indexing past a shorter list.
+        m_piMissInput += 1;
+        piRec = &it->second;
+      } else {
+        piRec = &it->second;
+        piPredictHit = true;
+        // Counted whether or not the skip is taken, so verify runs report the
+        // ceiling instead of the constant zero that hit= reads under verify.
+        m_piPredict += 1;
+        m_piPredictInst += static_cast<uint32_t>(piRec->instances.size());
+      }
+
+      // VALIDATE THE RECORDED INSTANCES BEFORE TRUSTING THEM.
+      //
+      // The fingerprint answers "are the INPUTS the same". It cannot answer "are
+      // the instances those inputs resolved to last frame still the ones this
+      // draw would resolve to", because resolution reads state this batch does
+      // not own -- the spatial map and draw-call cache are global, and an
+      // earlier draw in THIS frame can legitimately claim an instance that this
+      // batch used to get. No per-batch hash can see that.
+      //
+      // So do not try to hash it. CHECK IT. Three loads per instance against a
+      // full find + update, and every failure downgrades a wrong answer into an
+      // ordinary cache miss, which is always safe:
+      //   - still linked to THIS geometry (an instance can be relinked)
+      //   - not already stamped this frame => nobody else has claimed it
+      //   - not marked for collection
+      // This is the same shape as the split cache validating vkPath{agree} and
+      // the memo requiring safeToDefer: prove the served answer, do not assume
+      // the key was sufficient.
+      if (piPredictHit) {
+        for (const RtInstance* inst : piRec->instances) {
+          if (inst->m_linkedBlas != &blas
+              || inst->m_frameLastUpdated == currentFrameIdx
+              || inst->m_isMarkedForGC) {
+            piPredictHit = false;
+            m_piGuard += 1;
+            break;
+          }
+        }
+      }
+    }
+
+    // THE SKIP. Only when the record predicted a hit AND verify is off.
+    //
+    // WHAT IT SKIPS -- AND WHAT IT DELIBERATELY DOES NOT.
+    //
+    // It skips processSceneObjectImpl, and the only thing in there worth
+    // skipping is findSimilarInstance: the RESOLVE. That is what this phase
+    // owns, it is what `entry` measures, and it is ~2.73 ms.
+    //
+    // It does NOT skip updateInstance. The first version of this block did --
+    // a bulk setFrameLastUpdated + registerCamera + push, on the argument that
+    // garbageCollection reaps on m_frameLastUpdated and nothing else, so a
+    // stamp is sufficient. That argument is true and it is not the whole
+    // claim. The stamp keeps the instance ALIVE. It does not keep it
+    // DESCRIBED. That version shipped visible flicker.
+    //
+    // updateInstance's own fast path (drawState.fastPathAllowed) enumerates
+    // what still has to happen every frame even when every input is
+    // unchanged, and the list is not optional: the dynamic buffer rebind
+    // (slice renaming -- a d3d11 dynamic VB is a DIFFERENT allocation each
+    // frame, so an instance that is not rebound reads last frame's renamed
+    // slice), isInsideFrustum, the prev-transform advance, the picking value,
+    // textureTransform/clipPlane, the m_isHidden re-promotion, and the
+    // non-skippable OMM event handlers.
+    //
+    // So the division of labour is:
+    //     THIS record  skips the FIND.
+    //     fastPathAllowed  skips the UPDATE.
+    // The second one is already tuned and already validated by m_instStateKey
+    // + m_fastDrawBits + an objectToWorld byte-compare + the SpatialMap sync
+    // proof, and it is what `fastRet` measures. fastRet is NOT waste waiting to
+    // be deleted -- it is the per-frame work that cannot be deleted. Phase 2's
+    // honest ceiling is `entry`, not `entry + fastRet`, and the 6.88 ms figure
+    // in the plan double-counts work that must happen.
+    if (piPredictHit && !piVerify) {
+      for (size_t placement = 0; placement < piRec->instances.size(); ++placement) {
+        RtInstance* inst = piRec->instances[placement];
+
+        // The SAME composition the full loop performs, and it has to be the
+        // same one bit-for-bit: updateInstance byte-compares this against
+        // surface.objectToWorld to decide its own fast path, so a differently
+        // rounded product here would silently demote every instance to the
+        // slow path and cost more than the find ever saved.
+        // Safe to index transforms by the instance index: the record is only
+        // stored when out_instances.size() == transforms->size() (see REFRESH),
+        // and a size mismatch is rejected as an input miss above.
+        FanoutSplit split;
+        if (fanoutBaseIsIdentity) {
+          split.objectToWorld = (*transforms)[placement];
+        } else {
+          split.objectToWorld = drawObjectToWorld * (*transforms)[placement];
+        }
+        if (prevTransforms != nullptr) {
+          if (fanoutBaseIsIdentity) {
+            split.prevObjectToWorld = (*prevTransforms)[placement];
+          } else {
+            split.prevObjectToWorld = drawObjectToWorld * (*prevTransforms)[placement];
+          }
+          split.hasPrevObjectToWorld = true;
+        }
+
+        // Empty hint ON PURPOSE. SpatialKeyHint::isUsable() is false when
+        // hash == 0, which its own definition documents as "what an instance
+        // that never went through findSimilarInstance gets" -- and that is
+        // precisely our situation. We did not run the find, so we have no
+        // queryMatrixHash, and inventing one would file the instance in the
+        // SpatialMap under a key nothing else agrees with.
+        updateInstance(*inst, cameraManager, blas, drawCall, materialData,
+                       drawState, &split, SpatialKeyHint{});
+
+        out_instances.push_back(inst);
+      }
+      piRec->frameLastServed = currentFrameIdx;
+      m_piHit += 1;
+      m_piServedInst += static_cast<uint32_t>(piRec->instances.size());
+      st.draws += 1;
+      st.nInst += static_cast<uint32_t>(transforms->size());
+      st.live  += static_cast<uint32_t>(out_instances.size());
+      return;
+    }
+    // ================================================================
+
     // Parallel to out_instances: the composed transform and identity each accepted
     // placement was resolved with. Kept because updateInstance has already
     // overwritten surface.objectToWorld by the time a later placement is found to
@@ -3512,7 +3946,8 @@ namespace dxvk {
     // SpatialMap key contract ("reproduces last frame's composed matrix
     // bit-for-bit") is preserved exactly. A non-identity base (if that path
     // ever appears) takes the original multiply unchanged.
-    const bool fanoutBaseIsIdentity = isIdentityExact(drawObjectToWorld);
+    // (fanoutBaseIsIdentity is now declared above the Phase 2 block -- the skip
+    // path composes the same matrices and must use the same rule.)
 
     for (size_t placement = 0; placement < transforms->size(); ++placement) {
       FanoutSplit split;
@@ -3779,6 +4214,121 @@ namespace dxvk {
       out_instances.push_back(instance);
       sPlacedO2w.push_back(split.objectToWorld);
     }
+
+    // ================================================================
+    // NV-DXVK [Perf.PushInst] PHASE 2 -- VERIFY, then refresh the record.
+    //
+    // VERIFY IS THE POINT OF THE FIRST RUN. When the record predicted a hit we
+    // ran the loop anyway; compare what it produced against what the record
+    // would have served. A divergence means the fingerprint is INCOMPLETE --
+    // the resolution read some input that is not hashed -- and the consequence
+    // of acting on it would be an instance in the wrong place or a stale
+    // instance held alive by a stamp it never earned. Same failure class, and
+    // the same remedy, as memoExtractVerify's FAIL.
+    if (piOn && piPredictHit && piVerify && piRec != nullptr) {
+      bool diverged = (piRec->instances.size() != out_instances.size());
+      size_t badIdx = SIZE_MAX;
+      if (!diverged) {
+        for (size_t i = 0; i < out_instances.size(); ++i) {
+          if (piRec->instances[i] != out_instances[i]) {
+            diverged = true;
+            badIdx = i;
+            break;
+          }
+        }
+      }
+      if (diverged) {
+        m_piFail += 1;
+        // Throttled: a systematic fingerprint hole would otherwise emit one
+        // line per batch per frame and bury the first (most diagnosable) case.
+        thread_local uint32_t sPiFailLog = 0;
+        if (sPiFailLog < 32u || (sPiFailLog & 0x3FFu) == 0u) {
+          // WHY IT DIVERGED, not just that it did. These four bits separate the
+          // candidate causes, which a percentage cannot:
+          //   actNew=1   the resolution CREATED an instance this frame => the
+          //              streaming / creation path, or a dedup miss. Expected
+          //              non-zero while HYGIENE reports matNew>0.
+          //   recStamp=1 the recorded instance was ALREADY stamped this frame,
+          //              i.e. an earlier draw claimed it => cross-batch order
+          //              dependence, which no per-batch fingerprint can cover.
+          //   recRelink=1 the recorded instance is now linked to a DIFFERENT
+          //              geometry (the engine-class relink garbageCollection
+          //              documents).
+          //   recGC=1    it is marked for collection.
+          // All four zero => a genuine fingerprint hole, and only then is
+          // fanoutRecordFingerprint the thing to change.
+          const RtInstance* recI = (badIdx != SIZE_MAX && badIdx < piRec->instances.size())
+                                 ? piRec->instances[badIdx] : nullptr;
+          const RtInstance* actI = (badIdx != SIZE_MAX && badIdx < out_instances.size())
+                                 ? out_instances[badIdx] : nullptr;
+          Logger::warn(str::format(
+            "[Perf.PushInst.FAIL] #", sPiFailLog,
+            " f=", currentFrameIdx,
+            " vs=0x", std::hex, vsHash, std::dec,
+            " key=0x", std::hex, piKey, std::dec,
+            " recorded=", piRec->instances.size(),
+            " actual=", out_instances.size(),
+            " firstDiffIdx=", (badIdx == SIZE_MAX ? -1 : int64_t(badIdx)),
+            " builtFrame=", piRec->frameLastBuilt,
+            " actNew=", (actI != nullptr && actI->m_frameCreated == currentFrameIdx) ? 1 : 0,
+            " recStamp=", (recI != nullptr && recI->m_frameLastUpdated == currentFrameIdx) ? 1 : 0,
+            " recRelink=", (recI != nullptr && recI->m_linkedBlas != &blas) ? 1 : 0,
+            " recGC=", (recI != nullptr && recI->m_isMarkedForGC) ? 1 : 0,
+            " recLastUpd=", (recI != nullptr ? int64_t(recI->m_frameLastUpdated) : -1),
+            "  | READ actNew/recStamp/recRelink/recGC FIRST -- all four zero is"
+            " the only case that means fanoutRecordFingerprint is incomplete."
+            " Do NOT turn rtx.pushInstanceRecordsVerify off until this reads 0."));
+        }
+        sPiFailLog += 1;
+      }
+    }
+
+    // REFRESH. Store on the way out, with the fingerprint computed on the way
+    // in -- the inputs cannot change mid-call (this is all one dxvk-cs call),
+    // so the pair is coherent, and storing the entry the loop actually produced
+    // is what makes the next frame's hit a replay rather than a guess.
+    //
+    // A record is only stored for a batch that resolved every placement to a
+    // live instance. A short out_instances means some placement was rejected
+    // (collision, non-finite transform), and those rejections are decided by
+    // per-placement state this fingerprint does not claim to cover -- so such a
+    // batch stays on the loop rather than being recorded and mispredicted.
+    if (piOn && out_instances.size() == transforms->size() && !out_instances.empty()) {
+      if (piRec == nullptr) {
+        // THE CAP IS A BACKSTOP, NOT THE MECHANISM. Retirement is the per-frame
+        // age sweep in onFrameEnd; if the map is still at the ceiling after that
+        // has run, refusing the store is O(1) and merely costs this batch its
+        // acceleration. The first version scanned the whole map on every insert
+        // to evict the least-recently-served entry -- O(N) per insert, on
+        // dxvk-cs, in the streaming phase where inserts are most frequent, i.e.
+        // paid hardest exactly when the frame is already worst.
+        if (m_fanoutRecords.size() >= RtxOptions::pushInstanceRecordsMaxBatches()) {
+          m_piCapped += 1;
+          piRec = nullptr;   // NOT `return` -- the FsState accumulation below is
+                             // [FanoutSplit]'s per-frame data and must run for
+                             // every batch, recorded or not.
+        } else {
+          piRec = &m_fanoutRecords[piKey];
+        }
+      }
+      if (piRec != nullptr) {
+        // Drop back-pointers from the previous contents before overwriting, or
+        // an instance that left this batch keeps naming it and would be
+        // invalidated against a record it is no longer part of.
+        for (RtInstance* inst : piRec->instances) {
+          if (inst->m_batchRecordKey == piKey)
+            inst->m_batchRecordKey = 0ull;
+        }
+        piRec->instances.assign(out_instances.begin(), out_instances.end());
+        piRec->inputHash       = piPrint;
+        piRec->frameLastBuilt  = currentFrameIdx;
+        piRec->frameLastServed = currentFrameIdx;
+        piRec->valid           = true;
+        for (RtInstance* inst : piRec->instances)
+          inst->m_batchRecordKey = piKey;
+      }
+    }
+    // ================================================================
 
     // Accumulate only — the [FanoutSplit] line for this frame is emitted by the
     // rollover at the TOP of the next frame's first call for this VS, because the
@@ -8216,6 +8766,15 @@ namespace dxvk {
         }
       }
     }
+
+    // NV-DXVK [Perf.PushInst] PHASE 2: drop any batch record holding this
+    // pointer. FIRST, and above the m_isCreatedByRenderer early-return below,
+    // because this is a lifetime invariant and not a feature: every path that
+    // destroys an instance passes through here, and an instance that leaves
+    // without invalidating its record leaves a dangling RtInstance* behind for
+    // the next frame's bulk stamp to write through. No-op when the feature is
+    // off (m_batchRecordKey stays 0), so it costs one predictable load.
+    invalidateFanoutRecordFor(instance);
 
     // Always clean up replacement instance references, even for renderer-created instances
     // to avoid use-after-free bugs in ReplacementInstance.prims
