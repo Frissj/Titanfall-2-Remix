@@ -4421,6 +4421,121 @@ namespace dxvk {
   }
 
   // ============================================================
+  // [SrInst] PER-INSTANCE POINTER STABILITY -- the one measurement that decides
+  // whether a REDengine-style stable per-model id is reachable at all.
+  //
+  // WHAT WE KNOW (IDA, studiorender.dll @ 0x180000000):
+  //   sub_180015A60(a1, count, perInstanceArray, a4, a5)   <- .rdata vtable +0x65A88
+  //     immediate:  sub_1800120B0(off_18007A148, a1+8, count, array, a4, a5)
+  //     queued:     copies 104B from a1+8 into a command record and enqueues;
+  //                 dispatcher sub_180013B30 replays it on a MATSYS WORKER
+  //                 THREAD (confirmed by the captured stacks: no engine.dll or
+  //                 client.dll frame is present at the draw).
+  //   sub_180010E10 then walks `perInstanceArray` with a 32-byte stride:
+  //       +0x00 model header (read at +236/+240)
+  //       +0x08 mesh/material table, indexed 16 * *v14
+  //       +0x10 PER-INSTANCE DATA  <- becomes r14 in sub_180011CB0
+  //       +0x18 count
+  //
+  // WHY THIS IS THE DECIDING NUMBER. The entity identity is NOT recoverable
+  // downstream: it is discarded across two thread-hopping command queues
+  // (client.dll enqueues one, studiorender enqueues another) and neither
+  // fixed-size payload carries an entity reference. studiorender is a geometry
+  // service -- it never receives one. So the only candidate identity is
+  // whatever SURVIVES both hops, and that is this per-instance pointer.
+  //
+  // Sampling it under a debugger established two things: it is per-instance
+  // (two instances of one model shared model-data/counts/buffers but had
+  // distinct per-instance pointers) and the ALLOCATION persists (byte-identical
+  // after 12s / hundreds of frames). It did NOT establish the thing that
+  // matters: that the SAME entity maps to the SAME pointer on the NEXT frame.
+  // If the engine cycles these buffers per frame the pointer churns and the
+  // whole direction is dead -- fall back to canonicalising the transform
+  // (stableObjectToWorld) instead.
+  //
+  // So: RAW POINTERS, no hashing, no classification. Log the array and its
+  // per-instance entries for a bounded number of frames and read whether the
+  // same (modelHdr -> perInstance) pairing repeats frame to frame. Grouping key
+  // is the model header at +0x00, which is shared across instances of a model.
+  using SrInst_t = uint64_t(*)(uint64_t, uint32_t, uint64_t, uint32_t, uint32_t);
+  static SrInst_t g_srInstOrig = nullptr;
+  static void**   g_srInstSlot = nullptr;
+  static std::atomic<uint32_t> g_srInstFramesSeen{ 0 };
+  static uint64_t srInstWrapper(uint64_t a1, uint32_t count, uint64_t arr,
+                                uint32_t a4, uint32_t a5) {
+    // Bounded, gameplay-gated, and it NEVER touches the pass-through path: the
+    // original is called on every route out of this function, including every
+    // early return below. A diagnostic that can skip the engine's own draw is
+    // not a diagnostic, it is a renderer bug.
+    do {
+      if (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) <= 16u)
+        break;                                   // menu / loading
+      const uint32_t fid = g_remixFrameId.load(std::memory_order_relaxed);
+      static uint32_t s_lastFid = 0xFFFFFFFFu;
+      static uint32_t s_callsThisFrame = 0;
+      static uint32_t s_framesLogged = 0;
+      if (fid != s_lastFid) {
+        s_lastFid = fid;
+        s_callsThisFrame = 0;
+        if (s_framesLogged < 0xFFFFu) ++s_framesLogged;
+      }
+      if (s_framesLogged > 120u) break;          // 120 frames is plenty to see churn
+      if (s_callsThisFrame >= 8u) break;         // 8 calls/frame keeps the log readable
+      ++s_callsThisFrame;
+      if (arr == 0 || count == 0 || count > 4096u) break;
+      if (!studioMemReadable(reinterpret_cast<const void*>(arr), 32ull * (count < 4u ? count : 4u)))
+        break;
+      std::string ents;
+      ents.reserve(256);
+      const uint32_t n = (count < 4u) ? count : 4u;
+      for (uint32_t i = 0; i < n; ++i) {
+        const uint8_t* rec = reinterpret_cast<const uint8_t*>(arr) + 32ull * i;
+        const uint64_t hdr  = *reinterpret_cast<const uint64_t*>(rec + 0x00);
+        const uint64_t inst = *reinterpret_cast<const uint64_t*>(rec + 0x10);
+        char bb[80];
+        std::snprintf(bb, sizeof(bb), "%s{hdr=0x%llx inst=0x%llx}", (i ? " " : ""),
+                      static_cast<unsigned long long>(hdr),
+                      static_cast<unsigned long long>(inst));
+        ents += bb;
+      }
+      Logger::warn(str::format(
+        "[SrInst] f=", fid, " call=", s_callsThisFrame,
+        " arr=0x", std::hex, arr, std::dec, " count=", count,
+        " ", ents,
+        "  | READ: does the SAME hdr keep the SAME inst across frames? yes =>"
+        " per-instance pointer is a usable stable id. no => it churns, use"
+        " stableObjectToWorld canonicalisation instead."));
+    } while (false);
+
+    return g_srInstOrig ? g_srInstOrig(a1, count, arr, a4, a5) : 0;
+  }
+  static bool srInstInstallHook() {
+    HMODULE sr = GetModuleHandleA("studiorender.dll");
+    if (sr == nullptr) return false;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(sr);
+    // .rdata vtable entry verified statically against the on-disk PE: the qword
+    // at RVA 0x65A88 is 0x180015A60 with imageBase 0x180000000.
+    void** slot = reinterpret_cast<void**>(base + 0x65A88);
+    if (!studioMemReadable(slot, 8)) return false;
+    void* cur = *slot;
+    if (cur == reinterpret_cast<void*>(&srInstWrapper)) return true;   // already hooked
+    if (cur != reinterpret_cast<void*>(base + 0x15A60)) {
+      Logger::warn(str::format("[SrInst] slot holds 0x", std::hex, reinterpret_cast<uintptr_t>(cur),
+        " != sub_180015A60; abort", std::dec));
+      return true;
+    }
+    g_srInstOrig = reinterpret_cast<SrInst_t>(cur);
+    g_srInstSlot = slot;
+    DWORD op = 0;
+    if (!VirtualProtect(slot, 8, PAGE_READWRITE, &op)) { Logger::warn("[SrInst] VirtualProtect failed; abort"); return true; }
+    *slot = reinterpret_cast<void*>(&srInstWrapper);
+    DWORD tmp = 0; VirtualProtect(slot, 8, op, &tmp);
+    Logger::warn(str::format("[SrInst] installed: slot=0x", std::hex,
+      reinterpret_cast<uintptr_t>(slot), " orig=0x", base + 0x15A60, std::dec));
+    return true;
+  }
+
+  // ============================================================
   // [MatBatch] The studio-model BATCH renderer is matsys sub_18001D780
   // (materialsystem_dx11+0x1D780), reached through the SAME vtable [MatBind]
   // hooks (head 0x1D5448):
@@ -8185,9 +8300,131 @@ namespace dxvk {
   // entry â€” the stack at this point includes the TF2 caller frames above
   // DXVK's D3D11 layer.
   static inline void captureVanishStackIfTarget(uint64_t vsHash, float vpWf, float vpHf, float vpMaxDepthf = 1.0f) {
-    bool isTarget = false;
-    for (int i = 0; i < 3; ++i) { if (vsHash == k_VanishStackTargets[i]) { isTarget = true; break; } }
-    if (!isTarget) return;
+    // NV-DXVK [VanishDiag-Stack-Auto] WIDENED 2026-08-14, for the stable-id work.
+    //
+    // WAS: a 3-entry hardcoded VS allowlist (k_VanishStackTargets), because the
+    // question then was "which engine function culls the floor". The question
+    // now is different and needs the opposite filter: "which engine functions
+    // submit the BULK of the scene", so that the x64dbg / hook work aimed at
+    // recovering a per-entity handle points at the paths that actually carry
+    // the geometry instead of at whichever call site a past bug hunt happened
+    // to reach. (studiorender+0x11E91 was found chasing the vanishing floor --
+    // it draws studio models only, and nothing established that studio models
+    // are the bulk of anything.)
+    //
+    // So the gate is POPULARITY, not identity: a VS earns a capture once it has
+    // been seen kStackMinDraws times. That separates the handful of shaders
+    // that carry the scene from the long tail of one-off UI/effect draws, and
+    // -- the reason a plain "capture everything" does not work -- it stops menu
+    // and loading-screen draws from claiming every slot before gameplay starts.
+    // Threshold, not exact-match: the slot table below keys on
+    // (vs, viewport, depthBucket) so ONE VS still gets a separate capture per
+    // render pass, which is the property the original comment calls out as
+    // load-bearing. An == test would capture only whichever pass happened to be
+    // active on the threshold-crossing draw.
+    // NV-DXVK: GAMEPLAY GATE FIRST, AND IT IS THE FIRST THING IN THE FUNCTION.
+    //
+    // This is called from OnDraw/OnDrawIndexed unconditionally -- ~1,350 times
+    // a frame -- in the menu and through the whole level load, not just in
+    // gameplay. Two consequences, and the first version of this widening had
+    // both:
+    //   1. COST. The counter below was a std::mutex + unordered_map lookup per
+    //      draw. That is ~1,350 lock/unlock pairs per frame on the GAME thread,
+    //      paid during loading when the frame is already worst. It made getting
+    //      into a level take minutes.
+    //   2. WRONG DATA. Menu and loading shaders accumulate draws too, so they
+    //      cross the threshold first and claim capture slots before gameplay
+    //      geometry is ever submitted.
+    // Same rule as every other per-frame probe in this file.
+    if (tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) <= 16u) {
+      return;
+    }
+
+    // Shared ranking map. Written on a coarse schedule (see below) and read by
+    // the [VanishDiag-VsRank] dump; never touched on the per-draw path.
+    static std::mutex s_vsSeenMu;
+    static std::unordered_map<uint64_t, uint32_t> s_vsSeen;
+
+    // THE RANKING, and it is a separate line ON PURPOSE.
+    //
+    // `draws=` on the capture line is the count AT CAPTURE TIME, and captures
+    // fire at fixed sample points -- so that column ranks how fast a shader
+    // reached the sample, not how much geometry it carries. The first widened
+    // run made it obvious: 65 captures spanning draws=401..814, no ordering at
+    // all. s_vsSeen holds the true running totals; dump it sorted every ~10s
+    // and cross-reference to the stacks by VS hash.
+    //
+    // A lambda because it must be reachable from the COARSE path as well as the
+    // sample points -- every shader eventually passes the last sample point,
+    // and if the dump only lived there the ranking would go silent exactly when
+    // the totals became most meaningful.
+    const auto maybeDumpRank = []() {
+      static std::chrono::steady_clock::time_point s_lastRank{};
+      const auto nowRank = std::chrono::steady_clock::now();
+      std::vector<std::pair<uint64_t, uint32_t>> ranked;
+      {
+        std::lock_guard<std::mutex> g(s_vsSeenMu);
+        if (s_lastRank.time_since_epoch().count() == 0) {
+          s_lastRank = nowRank;
+          return;
+        }
+        if (nowRank - s_lastRank < std::chrono::seconds(10)) {
+          return;
+        }
+        s_lastRank = nowRank;
+        ranked.assign(s_vsSeen.begin(), s_vsSeen.end());
+      }
+      std::sort(ranked.begin(), ranked.end(),
+                [](const auto& a, const auto& b) { return a.second > b.second; });
+      std::string top;
+      top.reserve(512);
+      for (size_t r = 0; r < ranked.size() && r < 20u; ++r) {
+        char b[48];
+        std::snprintf(b, sizeof(b), "%s0x%08llx=%u", (r ? " " : ""),
+                      static_cast<unsigned long long>(ranked[r].first >> 32),
+                      ranked[r].second);
+        top += b;
+      }
+      Logger::warn(str::format(
+        "[VanishDiag-VsRank] distinctVS=", ranked.size(),
+        " top20(vsHashHi32=cumulativeDraws): ", top));
+    };
+
+    // Counting is THREAD_LOCAL, so the per-draw cost is one hash increment and
+    // three integer compares -- no lock on the hot path at any point. Per-thread
+    // totals are fine for a ranking; draws arrive on the game thread.
+    static thread_local std::unordered_map<uint64_t, uint32_t> t_vsSeenLocal;
+    const uint32_t vsDrawCount = ++t_vsSeenLocal[vsHash];
+
+    // CAPTURE AT FIXED SAMPLE POINTS, not "every draw past a threshold".
+    //
+    // A plain `>= 400` looks like a filter but is not one: once a shader passes
+    // it, EVERY subsequent draw falls through into the slot-table lock below.
+    // For the top shader that is ~29,000 lock acquisitions on the game thread,
+    // which is worse than the mutex this was meant to remove.
+    //
+    // Three fixed counts instead. Spread apart so the samples land in different
+    // render passes -- the reason the slot table keys on viewport at all -- and
+    // it makes the kMaxSlotsPerVs cap below redundant-but-harmless rather than
+    // load-bearing. Everything else returns on an integer compare.
+    if (vsDrawCount != 400u && vsDrawCount != 2000u && vsDrawCount != 10000u) {
+      // Refresh the shared ranking map on a coarse schedule. 1-in-256 draws, so
+      // the lock is ~5 acquisitions/frame across all shaders instead of ~1,350.
+      if ((vsDrawCount & 0xFFu) == 0u) {
+        {
+          std::lock_guard<std::mutex> g(s_vsSeenMu);
+          s_vsSeen[vsHash] = vsDrawCount;
+        }
+        maybeDumpRank();
+      }
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> g(s_vsSeenMu);
+      s_vsSeen[vsHash] = vsDrawCount;
+    }
+    maybeDumpRank();
+
     const uint32_t vpW = static_cast<uint32_t>(vpWf);
     const uint32_t vpH = static_cast<uint32_t>(vpHf);
     // NV-DXVK [FP-pass discovery]: bucket by the engine's first-person depth marker. A
@@ -8207,13 +8444,43 @@ namespace dxvk {
     // P-edge is unreliable at low fps). Module attribution is nearest-base-
     // below across engine/client/materialsystem_dx11/d3d11 so frames resolve
     // to the right DLL instead of the old fixed-window mislabeling.
+    // 16 -> 64 slots with the widening: the allowlist admitted 3 VSes across a
+    // few passes each, this admits every VS over the draw threshold across every
+    // pass it appears in. 16 would fill on the first few shaders and silently
+    // drop the rest -- and a silently truncated caller map is worse than none,
+    // because it reads as "these are the paths" when it means "these were first".
+    // If `slots full` ever appears in the log, raise this rather than trusting
+    // the map.
     struct VpSlot { uint64_t vs; uint32_t w, h, depthBucket; bool used; };
-    static VpSlot s_slots[16] = {};
+    static VpSlot s_slots[64] = {};
     static std::mutex s_vpMu;
     {
       std::lock_guard<std::mutex> g(s_vpMu);
+      // NV-DXVK: CAP THE SLOTS ONE VS MAY OCCUPY.
+      //
+      // The viewport keying is what makes this probe capture EVERY pass a
+      // shader appears in, and that is worth keeping. But once the filter
+      // admits every VS instead of three, it becomes the thing that exhausts
+      // the table: on the first widened run VS 0x289d6d4a alone claimed 8+
+      // slots across vp=1x1, 2x2, 16x16, 128x128, 60x270, 120x270, 480x270 and
+      // 1920x1080 -- shadow / cubemap / downsample passes, each a distinct key
+      // and none of them the submission path we are looking for. SLOT TABLE
+      // FULL fired and the map came back truncated.
+      //
+      // Three passes per VS is enough to see whether a shader is submitted
+      // through more than one route, which is the actual question.
+      constexpr int kMaxSlotsPerVs = 3;
+      int usedByThisVs = 0;
+      for (int s = 0; s < 64; ++s) {
+        if (s_slots[s].used && s_slots[s].vs == vsHash) {
+          ++usedByThisVs;
+        }
+      }
+      if (usedByThisVs >= kMaxSlotsPerVs) {
+        return;
+      }
       int freeSlot = -1;
-      for (int s = 0; s < 16; ++s) {
+      for (int s = 0; s < 64; ++s) {
         if (s_slots[s].used) {
           if (s_slots[s].vs == vsHash && s_slots[s].w == vpW && s_slots[s].h == vpH && s_slots[s].depthBucket == depthBucket)
             return;  // already captured this (vs, viewport, depthBucket)
@@ -8221,7 +8488,20 @@ namespace dxvk {
           freeSlot = s;
         }
       }
-      if (freeSlot < 0) return;  // table full
+      if (freeSlot < 0) {
+        // NOT a silent drop. A truncated caller map reads as a complete one,
+        // and acting on "these are the submission paths" when it means "these
+        // were the first 64" is how the studiorender-only picture happened in
+        // the first place. Say so, once.
+        static bool s_warnedFull = false;
+        if (!s_warnedFull) {
+          s_warnedFull = true;
+          Logger::warn("[VanishDiag-Stack-Auto] SLOT TABLE FULL (64) -- the caller"
+                       " map below is TRUNCATED and must not be read as complete."
+                       " Raise s_slots[] and re-capture.");
+        }
+        return;
+      }
       s_slots[freeSlot] = { vsHash, vpW, vpH, depthBucket, true };
     }
 
@@ -8229,40 +8509,63 @@ namespace dxvk {
     const USHORT n = RtlCaptureStackBackTrace(0, 16, frames, nullptr);
     ++g_vanishStackTotalHits;
 
-    struct Mod { const char* name; uint64_t base; };
-    Mod mods[6] = {
-      { "eng",   reinterpret_cast<uint64_t>(GetModuleHandleA("engine.dll")) },
-      { "cli",   reinterpret_cast<uint64_t>(GetModuleHandleA("client.dll")) },
-      { "mat",   reinterpret_cast<uint64_t>(GetModuleHandleA("materialsystem_dx11.dll")) },
-      { "d3d11", reinterpret_cast<uint64_t>(GetModuleHandleA("d3d11.dll")) },
-      { "studio",reinterpret_cast<uint64_t>(GetModuleHandleA("studiorender.dll")) },
-      { "server",reinterpret_cast<uint64_t>(GetModuleHandleA("server.dll")) },
-    };
-    constexpr uint64_t kWindow = 0x40000000ull;
+    // NV-DXVK 2026-08-14: module attribution is now RESOLVED, not guessed.
+    //
+    // It used to be a hardcoded 6-name list (engine/client/mat/d3d11/studio/
+    // server) plus a 0x40000000 nearest-base-below window. Anything outside
+    // those six printed as "?+<absolute address>", and on the first widened
+    // capture that swallowed an ENTIRE call chain -- VS 0x28674497 resolved to
+    // "?+0x7ff81082dd52 | ?+0x7ff81082dea1 | ?+0x7ff81082fad1", i.e. the one
+    // submission path that is neither studiorender nor materialsystem was the
+    // one the list could not name. Guessing more names would just move the
+    // blind spot.
+    //
+    // GetModuleHandleExA(FROM_ADDRESS) asks the loader which module owns the
+    // address, so every frame resolves regardless of what is loaded. The
+    // UNCHANGED_REFCOUNT flag matters: without it each call takes a reference
+    // on the module and never releases it.
     std::string framesStrA;
-    framesStrA.reserve(640);
+    framesStrA.reserve(768);
     for (USHORT k = 0; k < n && k < 16; ++k) {
       const uint64_t addr = reinterpret_cast<uint64_t>(frames[k]);
-      const char* mod = "?";
-      uint64_t rva = addr, bestBase = 0;
-      for (int m = 0; m < 6; ++m) {
-        if (mods[m].base && addr >= mods[m].base && mods[m].base > bestBase
-            && addr < mods[m].base + kWindow) {
-          bestBase = mods[m].base; mod = mods[m].name; rva = addr - mods[m].base;
+      char bufA[80];
+      HMODULE hMod = nullptr;
+      if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                             | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             reinterpret_cast<LPCSTR>(frames[k]), &hMod)
+          && hMod != nullptr) {
+        char path[MAX_PATH] = {};
+        const DWORD got = GetModuleFileNameA(hMod, path, MAX_PATH);
+        const char* leaf = path;
+        if (got > 0) {
+          if (const char* slash = std::strrchr(path, '\\')) {
+            leaf = slash + 1;
+          }
+        } else {
+          leaf = "?";
         }
+        std::snprintf(bufA, sizeof(bufA), "%s+0x%llx", leaf,
+                      static_cast<unsigned long long>(addr - reinterpret_cast<uint64_t>(hMod)));
+      } else {
+        // Genuinely unowned (JIT / dynamically generated / freed). Absolute.
+        std::snprintf(bufA, sizeof(bufA), "?@0x%llx",
+                      static_cast<unsigned long long>(addr));
       }
       if (!framesStrA.empty()) framesStrA += " | ";
-      char bufA[64];
-      std::snprintf(bufA, sizeof(bufA), "%s+0x%llx", mod,
-                    static_cast<unsigned long long>(rva));
       framesStrA += bufA;
     }
     Logger::warn(str::format(
       "[VanishDiag-Stack-Auto] VS=0x", std::hex, vsHash, std::dec,
+      // draws= is what makes this a MAP rather than a list: it ranks the call
+      // sites by how much geometry each actually carries, which is the whole
+      // point of the widening. Read the stacks in descending draws= order and
+      // hook the top one; a path with draws=401 is noise next to draws=50000.
+      " draws=", vsDrawCount,
       " vp=", vpW, "x", vpH, " depthFP=", depthBucket, " frames=", n,
-      " (eng@0x", std::hex, mods[0].base, " cli@0x", mods[1].base,
-      " mat@0x", mods[2].base, " d3d11@0x", mods[3].base, std::dec,
-      ") stack: ", framesStrA));
+      // Module bases used to be printed here so absolute "?" frames could be
+      // resolved by hand. Frames now carry their own module name, so there is
+      // nothing left to resolve and the bases were only ever noise.
+      " stack: ", framesStrA));
   }
 
   // NV-DXVK [DropStack]: capture the engine submission call-stack for the
@@ -8475,6 +8778,67 @@ namespace dxvk {
         && lookupHash(RtxOptions::suppressStablePropIdVsHashes(), sh->getHash());
   }
 
+  // ============================================================
+  // NV-DXVK [PropIdSrc] 2026-08-15: WHICH PRODUCER MINTED stablePropId.
+  //
+  // WHY THIS EXISTS. [FindStage] reports withPropId=60-63 and propIdMiss=58 --
+  // i.e. essentially every propId minted is missing. It reported EXACTLY 58
+  // before and after the sub-view producer was changed to hash the pre-reproject
+  // matrix, and an unchanged number admits two readings that demand opposite
+  // fixes:
+  //   (a) the change failed  -> the pre-reproject transform is not frame-stable
+  //       (its own comment says "stable per static prop at SUB-1u JITTER", and
+  //       the rounding that was removed existed to absorb exactly that), so the
+  //       key wants quantized translation PLUS exact basis bytes -- rounding to
+  //       absorb jitter, basis included so co-located props at different angles
+  //       cannot collide the way the pure-rounded key did.
+  //   (b) the change was never exercised -> those 63 come from a DIFFERENT
+  //       producer and the sub-view path contributes ~0, leaving the fix
+  //       untested and the bone producer as the real source of the misses.
+  // Guessing between them is how the last two attempts were spent. This counts.
+  //
+  // There are four store sites across three families; each gets its own slot so
+  // the answer is a breakdown rather than a total.
+  enum PropIdSrc : uint32_t {
+    kPropIdSrcBoneA = 0,   // bone-animated, ~:42036 / :42076
+    kPropIdSrcBoneB = 1,   // bone-animated, ~:43396 / :43487
+    kPropIdSrcTsp   = 2,   // tspPropId,      ~:49696
+    kPropIdSrcSubView = 3, // sub-view reproject, ~:51805 -- the one that changed
+    kPropIdSrcCount = 4
+  };
+  static std::atomic<uint32_t> g_propIdSrcCounts[kPropIdSrcCount] = {};
+  static void notePropIdSrc(uint32_t which) {
+    if (which >= kPropIdSrcCount) return;
+    g_propIdSrcCounts[which].fetch_add(1, std::memory_order_relaxed);
+    // Per-frame rollover, so the numbers are directly comparable to
+    // [FindStage]'s per-frame withPropId. Emitted at most once every ~3s to
+    // stay off the per-draw path in cost and out of the log in volume.
+    static std::atomic<uint32_t> s_lastFid{ 0xFFFFFFFFu };
+    const uint32_t fid = g_remixFrameId.load(std::memory_order_relaxed);
+    uint32_t prev = s_lastFid.load(std::memory_order_relaxed);
+    if (fid == prev) return;
+    // CAS so only ONE thread rolls a given frame; these stores happen on the
+    // game thread today but the producers are not documented as single-threaded.
+    if (!s_lastFid.compare_exchange_strong(prev, fid, std::memory_order_relaxed)) {
+      return;
+    }
+    static std::chrono::steady_clock::time_point s_last{};
+    const auto now = std::chrono::steady_clock::now();
+    if (s_last.time_since_epoch().count() == 0) { s_last = now; }
+    else if (now - s_last >= std::chrono::seconds(3)) {
+      s_last = now;
+      Logger::warn(str::format(
+        "[PropIdSrc] f=", fid,
+        " boneA=", g_propIdSrcCounts[kPropIdSrcBoneA].load(std::memory_order_relaxed),
+        " boneB=", g_propIdSrcCounts[kPropIdSrcBoneB].load(std::memory_order_relaxed),
+        " tsp=",   g_propIdSrcCounts[kPropIdSrcTsp].load(std::memory_order_relaxed),
+        " subView=", g_propIdSrcCounts[kPropIdSrcSubView].load(std::memory_order_relaxed),
+        "  | CUMULATIVE. Compare the SHAPE against [FindStage] withPropId~63:"
+        " subView~0 => the pre-reproject fix was never exercised (reading b),"
+        " subView~63 => it was exercised and still misses (reading a)."));
+    }
+  }
+
   uint64_t D3D11Rtx::MakeBoneStablePropId(const Matrix4* firstInstanceObjectToWorld) const {
     // NV-DXVK [BoneStablePropId]: per-DCS prop identity for bone-animated
     // draws. The four sites that set objectToWorld for bone-animated
@@ -8603,6 +8967,44 @@ namespace dxvk {
         && firstInstanceObjectToWorld != nullptr
         && (fanoutTx != 0 || fanoutTy != 0 || fanoutTz != 0);
 
+    // ============================================================
+    // NV-DXVK [BoneId non-fanout] 2026-08-15. THE MEASURED PROBLEM:
+    //
+    //   [PropIdSrc]  boneA ~58/frame   boneB ~458/frame  subView ~5/frame
+    //   [FindStage]  withPropId=63  propIdMiss=58  (hits = 5)
+    //
+    // withPropId(63) == boneA(58) + subView(5), and propIdMiss == boneA exactly.
+    // So the NON-FANOUT bone producer misses 100% of the time, the sub-view
+    // producer hits 100% of the time, and boneB's 458/frame never reach the
+    // exact-stage lookup at all (fanout placements resolve via `split`, not
+    // transformData.stablePropId -- 458 buffer reads + XXH64 per frame computed
+    // and discarded, which is its own free perf win, separately).
+    //
+    // fanoutPosOnly cannot help boneA: it requires firstInstanceObjectToWorld
+    // != nullptr and boneA is precisely the path that passes nullptr. That
+    // population has never had a workaround.
+    //
+    // WHAT ROTATES. The block above states it outright -- "vbPtr rotates
+    // per-frame -> same mountain gets a new propId each frame", period measured
+    // at exactly 3. One rotating field poisons the whole hash, so the ID is
+    // fresh every frame and a stationary prop can never match the instance it
+    // filed last frame. That IS propIdMiss=58.
+    //
+    // THE CHANGE, scoped to non-fanout only so the fanout population (which is
+    // not even consumed) is left untouched: drop the DYNAMIC-BUFFER fields --
+    // vbPtr, vbOffset, ibOffset -- and keep ibPtr + bonePalettePtr + vbStride.
+    // An index buffer for skinned geometry is static per model, and t30 is
+    // already gated on the VS actually declaring slot 30 (see [BonePaletteGate]
+    // above), so the surviving inputs are the ones with a claim to stability.
+    //
+    // KNOWN RISK, stated rather than discovered later: ibPtr identifies a MODEL,
+    // not an entity. Two characters sharing one model would now share a propId,
+    // and the symptom of that is a prop VANISHING (dedup collapsing two objects
+    // into one instance), not flicker. If that appears, this is the change to
+    // revert. The [BoneIdRaw] probe below exists so the alternative -- ibPtr
+    // rotating too -- is distinguishable from a collision without another run.
+    const bool boneNonFanout = (firstInstanceObjectToWorld == nullptr);
+
     struct BoneId {
       uint64_t vbPtr;
       uint64_t ibPtr;
@@ -8614,17 +9016,75 @@ namespace dxvk {
       int32_t  fanoutTy;
       int32_t  fanoutTz;
       uint32_t _pad;
+    // MEASURED 2026-08-15 by [BoneIdRaw], and it inverts the claim above.
+    // Same draw slot, three consecutive frames, VS 0x28f7ff684a0de327:
+    //   f=2414 vb=0x4f87b32aa0 ib=0x4f87b333a0 t30=0x10a29c370
+    //   f=2415 vb=0x4f87b32aa0 ib=0x4f87b333a0 t30=0x10a29db70
+    //   f=2416 vb=0x4f87b32aa0 ib=0x4f87b333a0 t30=0x10a29c470
+    // vb and ib are STABLE. t30 -- the bone palette -- is what rotates, every
+    // frame. The in-tree note blaming vbPtr is wrong for this population, and
+    // acting on it cost a run: dropping vb/vbOff/ibOff left propIdMiss at 58
+    // because the rotating input was still in the hash.
+    //
+    // It is also the physically sensible answer. A bone palette is per-frame
+    // dynamic data streamed into a ring buffer, so its pointer MUST cycle;
+    // vertex/index buffers for a skinned model are static allocations.
+    //
+    // So for non-fanout draws: keep vb/ib/offsets/stride, drop ONLY
+    // bonePalettePtr. vb+ib also look like true per-entity identity in that
+    // capture -- two draws of one entity in different passes shared them
+    // (correctly collapsing to one propId) while different entities differed,
+    // which is exactly the behaviour the SpatialMap wants.
     } id { fanoutPosOnly ? 0ull : vbPtr,
            fanoutPosOnly ? 0ull : ibPtr,
-           fanoutPosOnly ? 0ull : bonePalettePtr,
-           fanoutPosOnly ? 0u   : vbOffset,
+           (fanoutPosOnly || boneNonFanout) ? 0ull : bonePalettePtr,
+           fanoutPosOnly ? 0u : vbOffset,
            vbStride,
-           fanoutPosOnly ? 0u   : ibOffset,
+           fanoutPosOnly ? 0u : ibOffset,
            fanoutTx, fanoutTy, fanoutTz, 0u };
     static_assert(sizeof(BoneId) % 8 == 0, "BoneId must have no trailing padding");
 
     uint64_t hash = static_cast<uint64_t>(XXH64(&id, sizeof(id), 0xA11CEBABEull));
     if (hash == 0) hash = 1;  // 0 reserved as "use matrix hash"; force non-zero
+
+    // NV-DXVK [BoneIdRaw] 2026-08-15: RAW INPUTS for the non-fanout population,
+    // so ONE run is decisive whichever way the change above goes.
+    //   propIdMiss -> ~0   the fix worked; this log is just corroboration.
+    //   propIdMiss stays   read the columns across frames: whichever field
+    //                      CHANGES for an otherwise-identical draw is the
+    //                      rotating one, and it is then named rather than
+    //                      guessed. If ibPtr is what moves, buffer identity is
+    //                      dead for skinned draws and the remaining candidate is
+    //                      the studiorender model header (stable per [SrInst]),
+    //                      which needs the queue bridge.
+    // Raw values, no hashing or bucketing -- a single wrong line has to be
+    // visible rather than averaged away. Gameplay-gated, 4/frame, 60 frames.
+    if (boneNonFanout
+        && tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+      static thread_local uint32_t s_lastFid = 0xFFFFFFFFu;
+      static thread_local uint32_t s_perFrame = 0;
+      static thread_local uint32_t s_frames = 0;
+      const uint32_t fid = g_remixFrameId.load(std::memory_order_relaxed);
+      if (fid != s_lastFid) { s_lastFid = fid; s_perFrame = 0; ++s_frames; }
+      if (s_frames <= 60u && s_perFrame < 4u) {
+        ++s_perFrame;
+        uint64_t vsRaw = 0;
+        const auto vsPRaw = m_context->m_state.vs.shader;
+        if (vsPRaw != nullptr && vsPRaw->GetCommonShader() != nullptr) {
+          const auto& shRaw = vsPRaw->GetCommonShader()->GetShader();
+          if (shRaw != nullptr) vsRaw = static_cast<uint64_t>(shRaw->getHash());
+        }
+        Logger::warn(str::format(
+          "[BoneIdRaw] f=", fid, " n=", s_perFrame,
+          " vs=0x", std::hex, vsRaw,
+          " vb=0x", vbPtr, " ib=0x", ibPtr, " t30=0x", bonePalettePtr,
+          std::dec,
+          " vbOff=", vbOffset, " vbStr=", vbStride, " ibOff=", ibOffset,
+          " hash=0x", std::hex, hash, std::dec,
+          "  | same vs across frames: whichever column MOVES is the rotating"
+          " input. hash must hold steady for a stationary entity."));
+      }
+    }
 
     // [BoneIdProbe.Bulker] log every NEW (fanoutT, hash) tuple seen for
     // VS_2947c6 (TF2 PI prop-fanout bulk source; ~7787 slots/frame).
@@ -24822,8 +25282,18 @@ namespace dxvk {
     out.hashVertexCount = hashVertexCount;
   }
 
-  static GeometryHashes runBatchHashJob(const BatchHashJob& j) {
+  // NV-DXVK [BatchJoinPeak]: what this job ACTUALLY read, reported by the code that
+  // does the clamping rather than recomputed by the caller (a second copy of the
+  // clamp logic would be free to drift from this one and then quietly lie).
+  struct BatchHashBytes {
+    size_t posBytes = 0, tcBytes = 0, idxBytes = 0;
+    size_t posLength = 0;   // whole-buffer size, to see how much of it was skipped
+    bool   cheapBranch = false;   // GPU-only source: pointer hash, no byte reads
+  };
+
+  static GeometryHashes runBatchHashJob(const BatchHashJob& j, BatchHashBytes* outBytes = nullptr) {
     GeometryHashes hashes;
+    if (outBytes) { *outBytes = BatchHashBytes {}; outBytes->posLength = j.posLength; }
     hashes[HashComponents::GeometryDescriptor] = j.descHash;
     hashes[HashComponents::VertexLayout]       = j.layoutHash;
     if (j.posData && j.posStride > 0) {
@@ -24833,6 +25303,7 @@ namespace dxvk {
       else if (startByte + posBytes > j.posLength) posBytes = j.posLength - startByte;
       if (posBytes > 0) {
         const auto* posBase = static_cast<const uint8_t*>(j.posData) + startByte;
+        if (outBytes) outBytes->posBytes = posBytes;
         hashes[HashComponents::VertexPosition] = XXH3_64bits_withSeed(posBase, posBytes, static_cast<XXH64_hash_t>(j.hashStartVertex));
       } else {
         hashes[HashComponents::VertexPosition] = XXH3_64bits(&j.posOffset, sizeof(j.posOffset));
@@ -24844,14 +25315,17 @@ namespace dxvk {
         else if (tcStartByte + tcBytes > j.tcLength) tcBytes = j.tcLength - tcStartByte;
         if (tcBytes > 0) {
           const auto* tcBase = static_cast<const uint8_t*>(j.tcData) + tcStartByte;
+          if (outBytes) outBytes->tcBytes = tcBytes;
           hashes[HashComponents::VertexTexcoord] = XXH3_64bits_withSeed(tcBase, tcBytes, static_cast<XXH64_hash_t>(j.hashStartVertex));
         }
       }
       if (j.idxData && j.idxStride > 0) {
         const size_t idxBytes = static_cast<size_t>(j.indexCount) * j.idxStride;
+        if (outBytes) outBytes->idxBytes = std::min(idxBytes, j.idxLength);
         hashes[HashComponents::Indices] = hashContiguousMemory(j.idxData, std::min(idxBytes, j.idxLength));
       }
     } else {
+      if (outBytes) outBytes->cheapBranch = true;
       // GPU-only buffer: stable identity hash from buffer address and offset (matches
       // ComputeGeometryHashes exactly â€” it hashed the &posBuf pointer value + offset).
       XXH64_hash_t posHash = XXH3_64bits(&j.posBuf, sizeof(j.posBuf));
@@ -25048,6 +25522,125 @@ namespace dxvk {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count());
   }
+
+  // ============================================================
+  // NV-DXVK [BatchJoinSplit] -- HANDOFF Â§6e. The single number
+  // `parallelForMsPerFrame=6` is four unrelated things added together, and the
+  // decision it gates (Phase 2b: add TWO more parallel passes over the same pool)
+  // depends entirely on which of the four it is:
+  //
+  //   disp   scheduling the futures        FIXED cost, paid again by every pass
+  //   self   the tail range this thread    REAL work; parallelism does not remove it
+  //   wake   sched -> worker first line    FIXED cost, paid again by every pass
+  //   work   worker range duration         REAL work
+  //
+  // 6 ms of `work`+`self` means the pool is fine and 2b's ~15 ms parallelises.
+  // 6 ms of `disp`+`wake`+idle means every extra pass costs ~6 ms BEFORE doing
+  // anything useful, and 2b's win is already spent. Nothing in the current
+  // counter can tell those apart, which is why Â§6e is a prerequisite and not a
+  // sibling task.
+  //
+  // Timestamps are published per chunk rather than accumulated, because the
+  // question is about the MAXIMUM (the straggler that the join actually waits
+  // on), and an average over 30 chunks hides exactly that. ~2 steady_clock reads
+  // per chunk, ~30 chunks/frame => ~2.5 us/frame; the ranges themselves are
+  // hundreds of us, so this is far above the measurement floor that made
+  // per-DRAW timers unusable elsewhere in this file.
+  //
+  // Index kBjMaxChunks is a scratch sink for pools wider than the array, so an
+  // over-wide pool degrades to "not measured" instead of writing out of bounds.
+  static constexpr uint32_t kBjMaxChunks = 256;
+  static std::atomic<uint64_t> g_bjChunkSchedNs[kBjMaxChunks + 1] {};  // game thread, pre-Schedule
+  static std::atomic<uint64_t> g_bjChunkStartNs[kBjMaxChunks + 1] {};  // worker, first line
+  static std::atomic<uint64_t> g_bjChunkEndNs  [kBjMaxChunks + 1] {};  // worker, last line
+
+  // The FIRST split measurement said the 6 ms was not the pool at all: disp ~120 us,
+  // JOINIDLE ~1 us, wait ~0 -- the 29 workers were always finished before the game
+  // thread got through its own 19-item remainder at ~320 us/item against the workers'
+  // ~24 us/item. 13x per item is not scheduling noise, and it admits two readings that
+  // demand opposite fixes:
+  //
+  //   (a) those particular draws are heavy   -> finer chunks + stealing
+  //   (b) the game thread is being preempted -> stop giving it a range
+  //
+  // Both changes are live below: the tail range is now SCHEDULED like every other
+  // chunk (b's fix, and free -- if (a) holds the cost simply reappears as `tail`),
+  // and the tail range carries per-ITEM timing that follows the RANGE rather than the
+  // thread, so moving it to a worker does not silence the probe that explains it.
+  // One monster item => (a), and maxItemIdx names it. 19 uniform items => (b).
+  // Result: (b) REFUTED. Scheduling the tail did not remove the cost, it moved it --
+  // `self` 6000us became `tail` 6500us with JOINIDLE still ~1us. So the range really
+  // is expensive. But maxItemAvg=1250us against a 6500us chunk says it is not ONE
+  // monster draw either: it is several expensive draws sitting CONTIGUOUSLY, which
+  // equal-count chunking cannot help but group together.
+  //
+  // The tail-only probe could only ever find monsters in the tail -- a selection
+  // artifact that would keep "re-confirming" the tail no matter where the expensive
+  // draws actually are. Per-item timing is therefore per CHUNK now, so the whole
+  // arena is visible. Cost is 2 clock reads per item, ~2200/frame at ~41 ns = ~90 us
+  // on a ~6500 us stage (~1.4%), which inflates `work` slightly and is worth it to
+  // stop guessing at the distribution. Per-chunk slots, so no cross-thread contention.
+  // itemPeak reached 2.6-6.5 ms on SINGLE draws. runOne does four things and only a
+  // timer can say which: FillMaterialData, the geometry hash, the object-space bbox,
+  // and the bone-palette build. Two of them are O(mesh bytes) and the bbox additionally
+  // memcpys the whole position buffer before scanning it, so either is a candidate --
+  // but "either is a candidate" is not a reason to start caching geometry hashes,
+  // where being wrong means a prop silently vanishes. So: attribute first.
+  //
+  // Also carries the vertex/index counts and whether the source buffers were mappable,
+  // because the fix under consideration (compute once per IMMUTABLE buffer instead of
+  // once per frame) is only legal when the source provably cannot be rewritten.
+  //
+  // 5 clock reads/item, ~5300/frame at ~41 ns = ~220 us on a ~6500 us stage (~3.4%).
+  // That is a real distortion and this breakdown comes back out once it has answered.
+  // Written by the one thread owning the chunk, read after the join.
+  // OFF. This is the per-ITEM probe (5 clock reads/item, ~5300/frame). It cost ~220 us
+  // on a 29 ms stage while it was answering; the stage is now 8.5 ms, so the same 220 us
+  // is ~2.6% and the probe distorts what it measures. A logDenyTags entry would only
+  // hide the OUTPUT -- the reads are the cost, so this has to be a compile-time constant
+  // the optimiser can fold away. Flip to true to bring [BatchJoinPeak]/[BatchJoinCensus]
+  // back; the per-CHUNK timing behind [BatchJoinSplit] stays on unconditionally because
+  // it is ~60 reads/frame and is what shows tail/wait/disp.
+  static constexpr bool kBjItemProbe = false;
+
+  struct BjItemBreak {
+    uint64_t totalNs = 0, matNs = 0, hashNs = 0, bboxNs = 0, skinNs = 0;
+    uint32_t idx = 0, verts = 0, indices = 0;
+    bool     posMappable = false, idxMappable = false;
+    // Bytes the hash job actually read, straight from the code that clamps them.
+    // v=132/idx=78 with hash=2257us means ~2 KB took 2.3 ms, which XXH3 cannot
+    // explain by three orders of magnitude -- so the question is whether the byte
+    // COUNT is secretly huge (a clamp not doing its job) or whether a small count
+    // is pathologically slow to READ (write-combined upload memory, see the source
+    // split at the (4c) comment in SubmitDraw). These two numbers separate that.
+    size_t   posBytes = 0, tcBytes = 0, idxBytes = 0, posLength = 0;
+    // 23 KB in 2.68 ms is ~8.7 MB/s against XXH3's 10-30 GB/s on cached RAM, so the
+    // bytes are not being computed on, they are being WAITED for. These flags say
+    // whether that is fixable at allocation (HOST_VISIBLE without HOST_CACHED means
+    // every CPU read is uncached) or whether the memory type is already right and
+    // the source has to change instead. DEVICE_LOCAL|HOST_VISIBLE is the BAR case,
+    // where reads cross the bus and no memory-type change can rescue them.
+    uint32_t posMemFlags = 0;
+  };
+  static BjItemBreak g_bjChunkPeak[kBjMaxChunks + 1] {};
+
+  // The peak alone would size the CRITICAL PATH and nothing else, which is the wrong
+  // question for a cache: sum(work) is ~30 ms/frame against a ~6.5 ms critical path,
+  // so what the cache is worth is set by the POPULATION, not by the worst draw. It
+  // also decides whether the peak matters at all -- an itemPeak that is itself
+  // cacheable does not floor anything.
+  //
+  // Free to collect: runOne already times all four components on every item, so this
+  // is adds, not clock reads. mapPos is the cacheability precondition (a GPU-only
+  // source already takes the cheap pointer-hash branch and has nothing to cache), so
+  // mapPosHashBboxNs is the actual prize -- the per-frame time that computing once
+  // per immutable buffer would delete.
+  struct BjChunkSum {
+    uint64_t matNs = 0, hashNs = 0, bboxNs = 0, skinNs = 0;
+    uint64_t mapPosHashBboxNs = 0;
+    uint32_t items = 0, mapPosItems = 0;
+  };
+  static BjChunkSum g_bjChunkSum[kBjMaxChunks + 1] {};
 
   static void bjStartWatchdog() {
     static std::once_flag once;
@@ -29334,53 +29927,158 @@ namespace dxvk {
     // per-draw deferred path (d3d11_rtx.cpp ~22013), so the result is identical.
     const uint32_t workers = (m_pGeometryWorkers != nullptr)
         ? std::max<uint32_t>(1u, m_pGeometryWorkers->numThreads()) : 1u;
-    const uint32_t chunks  = std::min(workers, n);
+    // OVERSUBSCRIPTION WAS TRIED AT 4x AND REVERTED -- it made everything worse, and
+    // the reason is the point. Measured, 30 chunks -> 119 chunks:
+    //
+    //   tail       6500us -> 7300us      disp    120us -> 370us
+    //   wake avg    155us ->  800us      sum(work) 30ms -> 47ms
+    //   frames/3s      54 ->     17
+    //
+    // Finer chunks did not rebalance anything; they multiplied the pool's per-task
+    // cost. 119 Schedule() calls each take a mutex round trip and a notify_one into
+    // 30 condvar-sleeping workers, and the aggregate worker time rose 58% -- that
+    // extra CPU competes with the game and CS threads, which is why the frame rate
+    // fell rather than just this stage. Raising the count made this pool slower, the
+    // exact failure the header comment on GeometryProcessor already records from
+    // 2026-07-28. Chunk count is not the lever here.
+    //
+    // The measurement that matters came from the same run: slowChunk was 26-28% one
+    // item, and itemPeak was 2.6-6.5 ms landing at idx 4, 23, 48, 117, 132, 150, 155,
+    // 205, 568, 1058 -- i.e. SINGLE DRAWS costing milliseconds, scattered across the
+    // whole arena, not the tail cluster the tail-only probe implied. A parallel-for
+    // can never finish sooner than its most expensive indivisible item, so with an
+    // itemPeak of ~5 ms the ~6.5 ms critical path at 1x is already near its floor.
+    // Balancing is finished as an avenue; the individual draws have to get cheaper.
+    static constexpr uint32_t kChunksPerWorker = 1;
+    const uint32_t chunks  = std::min(workers * kChunksPerWorker, n);
     const uint32_t chunkSz = (n + chunks - 1u) / chunks;
 
-    auto runRange = [this](uint32_t begin, uint32_t end) {
-      for (uint32_t i = begin; i < end; ++i) {
+    auto runOne = [this](uint32_t i, BjItemBreak& br) {
         // [BatchJoin] progress heartbeat — bumped by whichever thread runs this
         // range, so the watchdog can tell a slow worker from an absent one.
         g_bjItemsDone.fetch_add(1u, std::memory_order_relaxed);
         DrawWorkItem& it = m_geoBatch->items[i];
+        // Mappability is read BEFORE releasePins() nulls the buffer pointers. It is
+        // the precondition for computing a hash/bbox once per buffer rather than once
+        // per frame, so it has to travel with the timing that justifies doing so.
+        // Folds to nothing when the probe is off -- see kBjItemProbe.
+        const auto bjTick = []() -> uint64_t { return kBjItemProbe ? bjNowNs() : 0ull; };
+        if constexpr (kBjItemProbe) {
+          br.posMappable = (it.hasHashJob && it.hashJob.posData != nullptr);
+          br.idxMappable = (it.hasHashJob && it.hashJob.idxData != nullptr);
+          // Read while the pin still holds posBuf -- releasePins() nulls it below.
+          br.posMemFlags = (it.hasHashJob && it.hashJob.posBuf)
+              ? static_cast<uint32_t>(it.hashJob.posBuf->memFlags()) : 0u;
+        }
+        const uint64_t t0 = bjTick();
         // Material (always batched when the parent flag is on).
         FillMaterialData(it.matSnap.resultMat, it.matSnap);
         it.dcs.materialData = std::move(it.matSnap.resultMat);
         it.matSnap.releasePins();
+        const uint64_t t1 = bjTick();
         // Geometry hashing (rtx.batchHashes) â€” writes geometryData.hashes so the
         // CS-thread finalizeGeometryHashes takes the "pre-computed" branch.
+        BatchHashBytes hb;
         if (it.hasHashJob) {
-          it.dcs.geometryData.hashes = runBatchHashJob(it.hashJob);
+          it.dcs.geometryData.hashes =
+              runBatchHashJob(it.hashJob, kBjItemProbe ? &hb : nullptr);
           it.hashJob.releasePins();
         }
+        const uint64_t t2 = bjTick();
         // Object-space bounding box (rtx.batchBoundingBox).
         if (it.hasBboxJob) {
           it.dcs.geometryData.boundingBox = runBatchBboxJob(it.bboxJob);
           it.bboxJob.releasePins();
         }
+        const uint64_t t3 = bjTick();
         // Skinned bone-palette build (rtx.batchSkinning) â€” boneHash stays synchronous
         // (computed at collect); only the float3x4->Matrix4 materialisation defers.
         if (it.hasSkinJob) {
           it.dcs.skinningData.pBoneMatrices.adopt(runBatchSkinJob(it.skinJob));
         }
+        const uint64_t t4 = bjTick();
+        if constexpr (kBjItemProbe) {
+          br.matNs = t1 - t0; br.hashNs = t2 - t1; br.bboxNs = t3 - t2; br.skinNs = t4 - t3;
+          br.totalNs = t4 - t0;
+          br.idx     = i;
+          br.verts   = it.dcs.getGeometryData().vertexCount;
+          br.indices = it.dcs.getGeometryData().indexCount;
+          br.posBytes = hb.posBytes; br.tcBytes = hb.tcBytes;
+          br.idxBytes = hb.idxBytes; br.posLength = hb.posLength;
+        }
+    };
+
+    // Per-ITEM timing on every chunk; the max lands in this chunk's own slot, so the
+    // reduction after the join can point at the single most expensive draw in the
+    // whole arena rather than only the tail's.
+    auto runRange = [runOne](uint32_t begin, uint32_t end, uint32_t slot) {
+      BjItemBreak peak, cur;
+      BjChunkSum  sum;
+      for (uint32_t i = begin; i < end; ++i) {
+        runOne(i, cur);
+        ++sum.items;
+        sum.matNs += cur.matNs; sum.hashNs  += cur.hashNs;
+        sum.bboxNs += cur.bboxNs; sum.skinNs += cur.skinNs;
+        if (cur.posMappable) {
+          ++sum.mapPosItems;
+          sum.mapPosHashBboxNs += cur.hashNs + cur.bboxNs;
+        }
+        if (cur.totalNs > peak.totalNs)
+          peak = cur;
       }
+      g_bjChunkPeak[slot] = peak;
+      g_bjChunkSum[slot]  = sum;
     };
 
     std::vector<Future<void>> futs;
     futs.reserve(chunks);
+
+    // [BatchJoinSplit] clear this flush's slots before any are written: a flush with
+    // fewer chunks than the last one would otherwise fold the previous flush's
+    // timestamps into max()/avg() below and report a straggler that did not happen.
+    const uint32_t statChunks = std::min<uint32_t>(chunks, kBjMaxChunks);
+    for (uint32_t c = 0; c < statChunks; ++c) {
+      g_bjChunkSchedNs[c].store(0, std::memory_order_relaxed);
+      g_bjChunkStartNs[c].store(0, std::memory_order_relaxed);
+      g_bjChunkEndNs[c].store(0, std::memory_order_relaxed);
+      g_bjChunkPeak[c] = BjItemBreak {};
+      g_bjChunkSum[c]  = BjChunkSum {};
+    }
+
     uint32_t begin = 0;
     for (uint32_t c = 0; c < chunks; ++c) {
       const uint32_t end = std::min(begin + chunkSz, n);
+      // The tail chunk is SCHEDULED like every other one rather than kept for this
+      // thread. The original rationale -- "the last range runs on this (game) thread
+      // so it is not idle during the join" -- was measured and came back backwards:
+      // keeping it made the GAME THREAD the straggler for ~6 ms while 29 workers sat
+      // finished, to fill a join that costs ~1 us.
       const bool lastChunk = (c + 1u == chunks) || (end >= n);
-      if (lastChunk) {
-        runRange(begin, n);   // game thread processes the tail range
-        break;
+      const uint32_t hi = lastChunk ? n : end;
+      const uint32_t slot = (c < kBjMaxChunks) ? c : kBjMaxChunks;
+      g_bjChunkSchedNs[slot].store(bjNowNs(), std::memory_order_relaxed);
+      Future<void> f = m_pGeometryWorkers->Schedule([runRange, begin, hi, slot]() {
+        g_bjChunkStartNs[slot].store(bjNowNs(), std::memory_order_relaxed);
+        runRange(begin, hi, slot);
+        g_bjChunkEndNs[slot].store(bjNowNs(), std::memory_order_relaxed);
+      });
+      if (f.valid()) {
+        futs.push_back(f);
+      } else {
+        // Worker queue full: run inline. Stamped the same way so the chunk reads as
+        // "zero wake, ran on the game thread" rather than as a chunk that vanished.
+        g_bjChunkStartNs[slot].store(bjNowNs(), std::memory_order_relaxed);
+        runRange(begin, hi, slot);
+        g_bjChunkEndNs[slot].store(bjNowNs(), std::memory_order_relaxed);
       }
-      Future<void> f = m_pGeometryWorkers->Schedule([runRange, begin, end]() { runRange(begin, end); });
-      if (f.valid()) futs.push_back(f);
-      else           runRange(begin, end);   // worker queue full: run inline
+      if (lastChunk)
+        break;
       begin = end;
     }
+
+    // Everything is dispatched; this thread now only joins. `self` is gone from the
+    // split -- an inline-fallback range lands in `disp` instead.
+    const auto tDispatch = std::chrono::steady_clock::now();
 
     // [BatchJoin] publish the join state for the watchdog thread. The join below
     // is a busy spin inside Result::get() with no timeout, so if it never returns
@@ -29403,6 +30101,65 @@ namespace dxvk {
     g_bjFlushes.fetch_add(1u, std::memory_order_relaxed);
 
     const auto tBatch1 = std::chrono::steady_clock::now();
+
+    // ---- [BatchJoinSplit] reduce this flush's per-chunk timestamps ----------
+    // Read AFTER the join, so relaxed loads are safe: every worker's stores happen
+    // before its Result::set(), and the joiner's Result::get() observed that store,
+    // so the whole range is ordered before this point. Inline-fallback chunks ran on
+    // this thread and are trivially ordered.
+    uint64_t lastEndNs = 0, wakeSumNs = 0, wakeMaxNs = 0, workSumNs = 0, workMaxNs = 0;
+    uint32_t measured = 0;
+    // The slowest chunk, and the worst single ITEM inside it. Read together these
+    // answer the only question left: a slow chunk whose maxItem is most of it is one
+    // indivisible monster draw (chunking cannot help, the draw itself must get
+    // cheaper); a slow chunk whose maxItem is a small fraction is imbalance (finer
+    // chunks + stealing fix it). Also the global worst item, wherever it landed.
+    uint64_t slowChunkWorkNs = 0, slowChunkMaxItemNs = 0;
+    uint32_t slowChunkMaxItemIdx = 0;
+    BjItemBreak peak;    // worst single item in the arena, with its 4-way breakdown
+    BjChunkSum  census;  // every item, summed -- what a cache would actually be worth
+    for (uint32_t c = 0; c < statChunks; ++c) {
+      const uint64_t sc = g_bjChunkSchedNs[c].load(std::memory_order_relaxed);
+      const uint64_t st = g_bjChunkStartNs[c].load(std::memory_order_relaxed);
+      const uint64_t en = g_bjChunkEndNs[c].load(std::memory_order_relaxed);
+      if (sc == 0 || st == 0 || en == 0)
+        continue;   // chunk was never scheduled this flush (n < chunks)
+      ++measured;
+      const uint64_t wake = (st > sc) ? (st - sc) : 0;
+      const uint64_t work = (en > st) ? (en - st) : 0;
+      wakeSumNs += wake; wakeMaxNs = std::max(wakeMaxNs, wake);
+      workSumNs += work; workMaxNs = std::max(workMaxNs, work);
+      lastEndNs = std::max(lastEndNs, en);
+      const BjItemBreak& cp = g_bjChunkPeak[c];
+      if (cp.totalNs > peak.totalNs)
+        peak = cp;
+      const BjChunkSum& cs = g_bjChunkSum[c];
+      census.matNs  += cs.matNs;  census.hashNs += cs.hashNs;
+      census.bboxNs += cs.bboxNs; census.skinNs += cs.skinNs;
+      census.mapPosHashBboxNs += cs.mapPosHashBboxNs;
+      census.items += cs.items;   census.mapPosItems += cs.mapPosItems;
+      if (work > slowChunkWorkNs) {
+        slowChunkWorkNs = work; slowChunkMaxItemNs = cp.totalNs; slowChunkMaxItemIdx = cp.idx;
+      }
+    }
+
+    const auto asNs = [](auto d) {
+      return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(d).count());
+    };
+    const uint64_t dispNs = asNs(tDispatch - tBatch0);
+    const uint64_t waitNs = asNs(tBatch1 - tDispatch);
+    // `tail` is how far the slowest worker ran past the end of dispatch -- the part
+    // of `wait` that is genuine straggler work. Same clock as bjNowNs(), so the two
+    // are directly comparable.
+    const uint64_t tDispNs = asNs(tDispatch.time_since_epoch());
+    const uint64_t tailNs  = (lastEndNs > tDispNs) ? (lastEndNs - tDispNs) : 0;
+    // Whatever `wait` has left over after the straggler is the join itself: the
+    // spin-yield in Result::get() not noticing a completion it already had.
+    const uint64_t idleNs  = (waitNs > tailNs) ? (waitNs - tailNs) : 0;
+    // What fraction of the critical path is the slowest chunk's worst single item.
+    // 100 means the chunk IS one draw and no chunking can help; low means imbalance.
+    const uint64_t slowChunkItemPct = slowChunkWorkNs
+        ? (100u * slowChunkMaxItemNs / slowChunkWorkNs) : 0u;
 
     // Phase C â€” hand the now-complete DrawCallStates to the CS thread in the original
     // draw order (the arena is naturally ordered). finalizePendingFutures on the CS
@@ -29435,10 +30192,33 @@ namespace dxvk {
       static thread_local int64_t  sDispatchAccNs = 0;
       static thread_local uint32_t sFrames       = 0;
       static thread_local bool     sInit         = false;
+      // [BatchJoinSplit] accumulators, same 3 s window as the line above.
+      static thread_local uint64_t sDispAcc = 0, sWaitAcc = 0;
+      static thread_local uint64_t sTailAcc = 0, sIdleAcc = 0;
+      static thread_local uint64_t sWakeSum = 0, sWakeMax = 0;
+      static thread_local uint64_t sWorkSum = 0, sWorkMax = 0;
+      static thread_local uint64_t sChunkCnt = 0;
+      // Worst single item in the arena (window peak + index), and the slowest chunk's
+      // internal makeup averaged over the window.
+      static thread_local BjItemBreak sPeak;     // window peak, with its breakdown
+      static thread_local BjChunkSum  sCensus;   // window census, summed over frames
+      static thread_local uint64_t sSlowChunkAcc = 0, sSlowItemAcc = 0, sSlowPctAcc = 0;
       if (!sInit) { sLast = tBatch0; sInit = true; }
       sItemAcc      += n;
       sDispatchAccNs += std::chrono::duration_cast<std::chrono::nanoseconds>(tBatch1 - tBatch0).count();
       ++sFrames;
+      sDispAcc += dispNs; sWaitAcc += waitNs;
+      sTailAcc += tailNs; sIdleAcc += idleNs;
+      sWakeSum += wakeSumNs; sWakeMax = std::max(sWakeMax, wakeMaxNs);
+      sWorkSum += workSumNs; sWorkMax = std::max(sWorkMax, workMaxNs);
+      sChunkCnt += measured;
+      sSlowChunkAcc += slowChunkWorkNs; sSlowItemAcc += slowChunkMaxItemNs;
+      sSlowPctAcc   += slowChunkItemPct;
+      if (peak.totalNs > sPeak.totalNs) sPeak = peak;
+      sCensus.matNs  += census.matNs;  sCensus.hashNs += census.hashNs;
+      sCensus.bboxNs += census.bboxNs; sCensus.skinNs += census.skinNs;
+      sCensus.mapPosHashBboxNs += census.mapPosHashBboxNs;
+      sCensus.items += census.items;   sCensus.mapPosItems += census.mapPosItems;
       if (std::chrono::duration_cast<std::chrono::milliseconds>(tBatch1 - sLast).count() >= 3000) {
         const int64_t fr = sFrames ? int64_t(sFrames) : 1;
         Logger::info(str::format(
@@ -29446,7 +30226,86 @@ namespace dxvk {
           " itemsPerFrame=", sItemAcc / uint64_t(fr),
           " parallelForMsPerFrame=", sDispatchAccNs / 1000000 / fr,
           " workers=", workers));
+        // Per-frame us for the four components, plus the two per-CHUNK distributions.
+        // `tax` is the read that Â§6e exists to produce: what one extra parallel pass
+        // over this pool costs before it does any useful work. Phase 2b adds two.
+        const uint64_t ch  = sChunkCnt ? sChunkCnt : 1;
+        const uint64_t taxUs = (sDispAcc / uint64_t(fr) + sIdleAcc / uint64_t(fr)) / 1000
+                             + (sWakeSum / ch) / 1000;
+        Logger::info(str::format(
+          "[BatchJoinSplit] chunksPerFrame=", sChunkCnt / uint64_t(fr),
+          " | disp=",   sDispAcc / uint64_t(fr) / 1000, "us"
+          " wait=",     sWaitAcc / uint64_t(fr) / 1000, "us"
+          " (tail=",    sTailAcc / uint64_t(fr) / 1000, "us"
+          " JOINIDLE=", sIdleAcc / uint64_t(fr) / 1000, "us)"
+          " wake{avg=", (sWakeSum / ch) / 1000, "us max=", sWakeMax / 1000, "us}"
+          " work{avg=", (sWorkSum / ch) / 1000, "us max=", sWorkMax / 1000, "us}"
+          " taxPerPass=", taxUs, "us"
+          // slowChunk vs its own worst item is the remaining fork: pct near 100 means
+          // the critical path IS a single indivisible draw and no amount of chunking
+          // moves it; a low pct means the chunk is many mediums, i.e. imbalance that
+          // stealing can still take out. itemPeak names the worst draw in the ARENA,
+          // which the tail-only probe structurally could not see.
+          " | slowChunk{work=", (sSlowChunkAcc / uint64_t(fr)) / 1000, "us"
+          " maxItem=",          (sSlowItemAcc  / uint64_t(fr)) / 1000, "us"
+          " =", sSlowPctAcc / uint64_t(fr), "%}"));
+        // The worst single draw in the arena, split four ways. Whichever component
+        // owns it is the one to make cheaper; v/idx say how big it is, and mapPos/
+        // mapIdx say whether the source is even readable on the CPU -- a GPU-only
+        // buffer already takes the cheap pointer-hash branch in runBatchHashJob and
+        // therefore cannot be the cost.
+        if constexpr (kBjItemProbe)
+        Logger::info(str::format(
+          "[BatchJoinPeak] item=", sPeak.totalNs / 1000, "us@idx", sPeak.idx,
+          " mat=",  sPeak.matNs  / 1000, "us"
+          " hash=", sPeak.hashNs / 1000, "us"
+          " bbox=", sPeak.bboxNs / 1000, "us"
+          " skin=", sPeak.skinNs / 1000, "us"
+          " | v=", sPeak.verts, " idx=", sPeak.indices,
+          " mapPos=", (sPeak.posMappable ? 1 : 0),
+          " mapIdx=", (sPeak.idxMappable ? 1 : 0),
+          // Volume or latency. posB+tcB+idxB in the megabytes means a clamp is not
+          // clamping and the fix is to hash the draw's range. A few KB against a
+          // millisecond means the bytes are fine and the READ is the cost, which
+          // points at write-combined upload memory and a completely different fix.
+          " | posB=", sPeak.posBytes, " tcB=", sPeak.tcBytes, " idxB=", sPeak.idxBytes,
+          " posBufLen=", sPeak.posLength,
+          // Decoded rather than raw-only: the whole decision is one bit, and a hex
+          // dump invites re-deriving it wrong later.
+          " | posMem=0x", std::hex, sPeak.posMemFlags, std::dec,
+          " devLocal=", ((sPeak.posMemFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)  ? 1 : 0),
+          " hostVis=",  ((sPeak.posMemFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)  ? 1 : 0),
+          " hostCoh=",  ((sPeak.posMemFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ? 1 : 0),
+          " HOSTCACHED=", ((sPeak.posMemFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? 1 : 0)));
+        // EVERY item, not just the worst one. sumWork here is the four components
+        // added up, so it should track work{avg}*chunks -- if it does not, something
+        // outside these four is eating the stage and the cache is aimed at the wrong
+        // thing. CACHEABLE is the prize: hash+bbox time spent on CPU-readable sources,
+        // i.e. what computing once per immutable buffer would delete outright. Read it
+        // against sumWork, not against the 6.5 ms critical path -- cutting total CPU is
+        // what moved frame rate when the 4x chunk experiment raised it.
+        if constexpr (kBjItemProbe) {
+          const uint64_t sumWorkNs = sCensus.matNs + sCensus.hashNs
+                                   + sCensus.bboxNs + sCensus.skinNs;
+          const uint64_t pct = sumWorkNs
+              ? (100u * sCensus.mapPosHashBboxNs / sumWorkNs) : 0u;
+          Logger::info(str::format(
+            "[BatchJoinCensus] items=", sCensus.items / uint64_t(fr),
+            " sumWork=", (sumWorkNs / uint64_t(fr)) / 1000, "us"
+            " | mat=",  (sCensus.matNs  / uint64_t(fr)) / 1000, "us"
+            " hash=",   (sCensus.hashNs / uint64_t(fr)) / 1000, "us"
+            " bbox=",   (sCensus.bboxNs / uint64_t(fr)) / 1000, "us"
+            " skin=",   (sCensus.skinNs / uint64_t(fr)) / 1000, "us"
+            " | mapPos=", sCensus.mapPosItems / uint64_t(fr), "/", sCensus.items / uint64_t(fr),
+            " CACHEABLE=", (sCensus.mapPosHashBboxNs / uint64_t(fr)) / 1000, "us"
+            " (", pct, "% of sumWork)"));
+        }
         sLast = tBatch1; sItemAcc = 0; sDispatchAccNs = 0; sFrames = 0;
+        sDispAcc = sWaitAcc = sTailAcc = sIdleAcc = 0;
+        sWakeSum = sWakeMax = sWorkSum = sWorkMax = sChunkCnt = 0;
+        sPeak = BjItemBreak {};
+        sCensus = BjChunkSum {};
+        sSlowChunkAcc = sSlowItemAcc = sSlowPctAcc = 0;
       }
     }
   }
@@ -41731,6 +42590,7 @@ namespace dxvk {
           const uint64_t propId = MakeBoneStablePropId(nullptr);
           if (propId != 0) {
             dcs.transformData.stablePropId = propId;
+            notePropIdSrc(kPropIdSrcBoneA);   // [PropIdSrc] non-fanout bone draw
             static std::mutex sLogMu;
             static std::unordered_set<uint64_t> sLogged;
             bool first = false;
@@ -41771,6 +42631,7 @@ namespace dxvk {
           const uint64_t propId = MakeBoneStablePropId(nullptr);
           if (propId != 0) {
             dcs.transformData.stablePropId = propId;
+            notePropIdSrc(kPropIdSrcBoneA);   // [PropIdSrc] non-fanout bone draw
             static std::mutex sLogMu;
             static std::unordered_set<uint64_t> sLogged;
             bool first = false;
@@ -43091,6 +43952,7 @@ namespace dxvk {
         const uint64_t propId = MakeBoneStablePropId(&firstInst);
         if (propId != 0) {
           dcs.transformData.stablePropId = propId;
+          notePropIdSrc(kPropIdSrcBoneB);   // [PropIdSrc] path-10 fanout
           // NV-DXVK [perf] 2026-08-08: the [BonePropId path10-fanout] diagnostic
           // that lived here is DELETED, answer recorded 2026-08-05: this propId
           // names whichever prop is element [0] of the batch and ROTATES every
@@ -43182,6 +44044,7 @@ namespace dxvk {
         const uint64_t propId = MakeBoneStablePropId(nullptr);
         if (propId != 0) {
           dcs.transformData.stablePropId = propId;
+          notePropIdSrc(kPropIdSrcBoneB);   // [PropIdSrc] path-10 N-draw
           static std::mutex sLogMu;
           static std::unordered_set<uint64_t> sLogged;
           bool first = false;
@@ -49391,6 +50254,10 @@ namespace dxvk {
             XXH64(&tspBufId, sizeof(tspBufId), 0xA11CEBABEull));
           if (tspPropId == 0ull) tspPropId = 1ull;
           dcs.transformData.stablePropId = tspPropId;
+          // [PropIdSrc] third producer, and note it is ALSO a buffer-id hash
+          // (tspBufId) -- the same shape as the bone producer whose in-tree
+          // comment admits its pointers rotate per frame.
+          notePropIdSrc(kPropIdSrcTsp);
 
           // One-shot per VS log so we can see in [Coverage] / log that
           // the propId is being written. After this lands, the stale-
@@ -51435,6 +52302,58 @@ namespace dxvk {
             const float idData[3] = { subTx, subTy, subTz };
             propId = static_cast<uint64_t>(XXH64(idData, sizeof(idData), 0xA11CEBABEull));
           }
+          // ============================================================
+          // NV-DXVK [canonical propId] 2026-08-15 -- REPLACES both producers
+          // above. They are left computing their values because the
+          // [PropIdHashInputs] probe below reports them, but neither decides
+          // identity any more.
+          //
+          // WHY. [FindStage] measured the consumer working and the PRODUCERS
+          // broken: withPropId=61-63 of 8,600-12,200 calls (0.5% coverage) and
+          // propIdMiss=58 of those 63. findSimilarInstance's own comment says
+          // what a propId miss means -- "the key is position-independent, so a
+          // stationary prop can only miss if the ID ITSELF changed since the
+          // instance was filed". So 92% of the IDs being minted were unstable.
+          //
+          // Both producers explain that number, and both were already known to:
+          //   - the buffer-pointer hash: the comment block above ADMITS "vbPtr
+          //     rotates per-frame -> same mountain gets a new propId each frame
+          //     -> stale-surface churn. Accepted as the less-bad option", with
+          //     the rotation period measured at exactly 3.
+          //   - the rounded-translation fallback: rounding is what produced the
+          //     documented collisions, 13 of the first 46 sightings with maxRot
+          //     1.2-2.0 on a unit basis -- two props at one spot 90-180 degrees
+          //     apart, one silently dropped.
+          //
+          // THE FIX IS THE TRANSFORM ITSELF, PRE-CAMERA. objectToWorld has not
+          // been reprojected yet at this point (the apply is further down:
+          // `objectToWorld = T_reproject * objectToWorld`), so what is in it
+          // right now is the sub-view-LOCAL matrix. That value is:
+          //   - camera-INDEPENDENT, so it does not change when the player moves
+          //     -- which is the entire failure this is fixing. [FindStage] put
+          //     the fall-through at 2-4% standing still against 21-37% moving.
+          //   - BYTE-EXACT, so co-located props at different angles cannot
+          //     collide the way the rounded key let them.
+          //   - unique per placement, and constant per frame for a static prop.
+          //
+          // COST IS ZERO. getDataAtTransform hashes the matrix itself whenever
+          // overrideHash == 0; supplying an override makes it skip that. One
+          // XXH64 per lookup either way -- this changes WHICH matrix is hashed,
+          // not how much work happens. Fewer misses then means fewer
+          // addInstance calls, so it should be net negative.
+          //
+          // WHAT THIS DOES NOT FIX, deliberately: a genuinely MOVING object.
+          // Its local transform changes every frame, so any transform-derived
+          // key changes with it. No key of this kind can identify a moving
+          // object -- that needs an engine entity id, and the engine does not
+          // carry one this far (it is discarded across two thread-hopping
+          // command queues; studiorender receives geometry, never identity).
+          // Those instances are ~1% ([Perf.UpdInst] xfChg=1%) and they already
+          // resolve through the NEAREST stage rather than the exact one, so
+          // this leaves them exactly where they were.
+          propId = static_cast<uint64_t>(
+            XXH64(&dcs.transformData.objectToWorld, sizeof(Matrix4), 0xA11CEBABEull));
+
           // Force non-zero (0 means "use matrix hash" per the spatial map
           // convention). If XXH64 ever returns 0, bump to 1 â€” collision
           // probability with another non-zero hash is negligible.
@@ -51448,6 +52367,11 @@ namespace dxvk {
           // rather than accepted. See IsStablePropIdSuppressed().
           if (!IsStablePropIdSuppressed()) {
             dcs.transformData.stablePropId = propId;
+            // [PropIdSrc] the sub-view producer -- the one whose key changed to
+            // the pre-reproject matrix hash. If this counter stays near zero
+            // while [FindStage] withPropId sits at ~63, that change was never
+            // exercised and the misses belong to the bone producer instead.
+            notePropIdSrc(kPropIdSrcSubView);
           }
 
           // NV-DXVK [PropIdHashInputs.Mtn2904]: expanded per-draw probe for
@@ -57270,6 +58194,41 @@ namespace dxvk {
           if (kEnableMatBindProbe && !s_matBindHookInstalled) {
             if (matBindInstallHook())
               s_matBindHookInstalled = true;
+          }
+
+          // [SrInst] studiorender .rdata vtable +0x65A88 (sub_180015A60), the
+          // entry point ABOVE the immediate/queued branch -- so it sees every
+          // studio draw regardless of threading mode, unlike the dispatcher.
+          // Answers one question and then should be switched off: is the
+          // per-instance pointer stable across frames for the same model? See
+          // srInstInstallHook. Self-limits to 120 frames x 8 calls.
+          // ANSWERED 2026-08-15, and switched OFF. 120 captures over 120
+          // frames, and the result killed the direction it was testing:
+          //   f=1782 arr=0x4f1a28f0 {hdr=0x41b8520010 inst=0x4f178580} ...
+          //   f=1783 arr=0x4f2f8910 {hdr=0x41b8520010 inst=0x4f2ce5a0} ...
+          // 120 rows, 120 DISTINCT array bases. The model header (hdr) is
+          // perfectly stable frame to frame -- same pointers, same order -- but
+          // the per-instance pointer churns every frame, with bases marching
+          // monotonically upward while the offsets BETWEEN entries stay
+          // identical. That is a bump/arena allocator refilled per frame, so
+          // the per-instance pointer cannot be an identity.
+          //
+          // It also corrected an earlier wrong conclusion of mine: sampling one
+          // allocation under a debugger and finding it byte-identical 12s later
+          // was NOT evidence of stability. It only showed the arena had not
+          // wrapped around to overwrite that address -- a different property
+          // from "the same entity maps here each frame", which is what this
+          // probe actually measured, and answered as no.
+          //
+          // KEPT KNOWLEDGE: hdr IS a stable per-MODEL id available at the draw.
+          // It cannot separate two instances of one model, so it does not solve
+          // the SpatialMap's problem, but it is real if a per-model key is ever
+          // wanted. Set true only to re-measure that.
+          static const bool kEnableSrInstProbe = false;
+          static bool s_srInstHookInstalled = false;
+          if (kEngineHooksEnabled && kEnableSrInstProbe && !s_srInstHookInstalled) {
+            if (srInstInstallHook())
+              s_srInstHookInstalled = true;
           }
 
           // [MatBatch] vtable-swap matsys slots 0x550 / 0x558 (the studio-model

@@ -106,6 +106,57 @@
 #define RTX_D3D11_CACHED_DYNAMIC_SRV_BUFFERS true
 #endif
 
+#ifndef RTX_D3D11_CACHED_DYNAMIC_VERTEX_BUFFERS
+// NV-DXVK [perf/CachedDynamicVB] 2026-08-15: the same substitution a third time,
+// for DYNAMIC VERTEX buffers, because the GEOMETRY HASH reads them back on the CPU
+// every frame. On by default. Set to false to A/B against stock behaviour.
+//
+// THIS REVERSES A CLAIM MADE AT THE DYNAMIC CASE BELOW. That comment said "VERTEX
+// and CONSTANT buffers still keep write-combining: they are genuinely write-only
+// streaming data from our side", and listed the one vertex-buffer reader it knew
+// about (the charIdx instance buffer, safe behind m_instBufCache at a 100% hit
+// rate). It missed runBatchHashJob, which reads position AND texcoord bytes out of
+// these buffers to compute the mesh identity hash, once per draw, forever.
+//
+// MEASURED, not inferred ([BatchJoinCensus] / [BatchJoinPeak] in d3d11_rtx.cpp):
+//   sumWork 29 ms/frame in the frame-end parallel-for, of which hash = 17.6 ms
+//   mapPos  72 of 1070 draws are CPU-readable -- 6.7% of draws, 74% of the stage
+//   peak    posB=11648 tcB=11648 hashed in 2680 us  =>  ~8.7 MB/s
+//   posMem  0x7 = DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT, HOST_CACHED clear
+// XXH3 runs at 10-30 GB/s on cached RAM, so ~8.7 MB/s is three orders of magnitude
+// off and is not computation -- it is the BAR read. The byte counts also prove the
+// range clamps are correct (an 11 KB window of a 917504-byte buffer), so there is
+// nothing left to tune on the read side. Same conclusion the t31 work reached:
+// the bytes are all wanted, the layout is already right, the memory type is the cost.
+//
+// Corroborated by a second, independent reader of the same buffers: runBatchBboxJob
+// memcpys before scanning (the standard WC-read workaround) and still shows 4480
+// bytes taking 1464 us = ~3 MB/s. Two different consumers, same ceiling.
+//
+// THE TRADE, and it is BIGGER HERE THAN IN EITHER PRIOR CASE. Index data is copied
+// into RT geometry buffers rather than fetched per-draw, and even the t31 SRV case
+// only exposed the game's own vertex shaders. Vertex buffers are fetched per-draw by
+// the rasterizer AND copied for BLAS builds, so moving them to system RAM puts real
+// per-draw GPU traffic on PCIe. Two things bound that exposure: only 72 of ~1070
+// draws use DYNAMIC vertex buffers at all (the other ~998 are device-local immutable
+// and untouched by this), and the t31 A/B -- which had the same shape of risk -- came
+// back with the GPU never noticing. Precedent is favourable; it is not proof.
+//
+// VERIFY, and do not skip the GPU half:
+//   [BatchJoinCensus] hash=17600us   should collapse toward ~100 us
+//   [BatchJoinCensus] bbox=4700us    should fall too (same buffers, same ceiling)
+//   [BatchJoinSplit]  tail=6500us    should fall; sumWork should drop by ~20 ms
+//   [Perf.GpuPass]                   WATCH THIS. Any rise is the PCIe cost landing,
+//                                    and if it exceeds the CPU win this is a LOSS
+//                                    even though the hash numbers improved.
+// Compare DISTRIBUTIONS across a run, never first window against last -- this game's
+// per-draw cost swings ~2x in a fixed scene (see the A/B note above).
+//
+// Same dependency as the SRV case: the HostVisibleSmallPool fix in dxvk_memory.cpp,
+// and the same known VRAM-sawtooth interaction with the geometry-cache trim.
+#define RTX_D3D11_CACHED_DYNAMIC_VERTEX_BUFFERS true
+#endif
+
 namespace dxvk {
 
   D3D11Buffer::D3D11Buffer(
@@ -376,11 +427,18 @@ namespace dxvk {
         // write-combined ceiling this carve-out exists to escape. See
         // RTX_D3D11_CACHED_DYNAMIC_SRV_BUFFERS at the top of this file.
         //
-        // VERTEX and CONSTANT buffers still keep write-combining: they are
-        // genuinely write-only streaming data from our side. The instance buffer
-        // carrying charIdx is a vertex buffer and IS read per draw, but through
-        // m_instBufCache at a 100% hit rate ([Perf.InstBufCache]), so it costs
-        // one copy per buffer rather than one per draw and is not a target.
+        // Scope note, revised again 2026-08-15: this used to end "VERTEX and
+        // CONSTANT buffers still keep write-combining: they are genuinely
+        // write-only streaming data from our side", qualified only by the charIdx
+        // instance buffer being safe behind m_instBufCache. The VERTEX half of that
+        // is now REFUTED -- runBatchHashJob reads position and texcoord bytes out of
+        // DYNAMIC vertex buffers to build the mesh identity hash, 72 draws/frame at
+        // ~8.7 MB/s for 17.6 ms/frame. See RTX_D3D11_CACHED_DYNAMIC_VERTEX_BUFFERS
+        // at the top of this file for the measurement and the (larger) trade.
+        //
+        // CONSTANT buffers keep write-combining and that half still stands: the
+        // cbuffer readers copy on the frame thread at capture time rather than
+        // reading back per draw.
         if (RTX_D3D11_CACHED_DYNAMIC_INDEX_BUFFERS
          && (m_desc.BindFlags & D3D11_BIND_INDEX_BUFFER)) {
           memoryFlags |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
@@ -389,6 +447,12 @@ namespace dxvk {
 
         if (RTX_D3D11_CACHED_DYNAMIC_SRV_BUFFERS
          && (m_desc.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
+          memoryFlags |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+          memoryFlags &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        }
+
+        if (RTX_D3D11_CACHED_DYNAMIC_VERTEX_BUFFERS
+         && (m_desc.BindFlags & D3D11_BIND_VERTEX_BUFFER)) {
           memoryFlags |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
           memoryFlags &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
         }
