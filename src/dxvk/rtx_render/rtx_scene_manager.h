@@ -664,7 +664,35 @@ private:
     bool         isRaytracedRenderTarget = false;
     bool         valid                   = false;
   };
-  SurfaceMaterialMemo m_lastSurfaceMaterial;
+  // NV-DXVK [Phase2b prerequisite] 2026-08-15: ONE SLOT PER WORKER, not one slot.
+  //
+  // This was a single memo written on every instance update. Under N workers that is
+  // two separate failures at once, and the call site advertises neither:
+  //   1. a data race -- concurrent writers tearing a multi-field struct, and a reader
+  //      matching some fields against one entry and the rest against another, which
+  //      can serve the WRONG material rather than merely missing;
+  //   2. a hit-rate collapse -- one slot shared by N workers thrashes, and the memo
+  //      is currently a 67-68% hit ([Perf.MatCache]) precisely because consecutive
+  //      draws on ONE thread repeat their material. Split that stream across N
+  //      workers and the locality it depends on is gone.
+  //
+  // Per-slot rather than plain thread_local because the memo holds an INDEX INTO
+  // m_surfaceMaterialCache: both invalidation sites exist because a cache clear
+  // renumbers every material, so invalidation MUST reach every slot. A thread_local
+  // would leave each worker's entry alive across a reset, still pointing at an index
+  // that now names a different material -- silent corruption, not a stale miss.
+  //
+  // Behaviourally identical while everything still runs on the CS thread: one thread
+  // claims slot 0 and nothing else is ever touched.
+  static constexpr uint32_t kSurfaceMaterialMemoSlots = 64;
+  SurfaceMaterialMemo m_lastSurfaceMaterial[kSurfaceMaterialMemoSlots];
+  std::atomic<uint32_t> m_surfaceMaterialMemoNextSlot = { 0 };
+  // Stable per-thread slot id, handed out on first use. Overflow parks every extra
+  // thread on the last slot: degraded hit rate, never a wrong answer, never OOB.
+  uint32_t surfaceMaterialMemoSlot();
+  // Clears ALL slots. Every existing `m_lastSurfaceMaterial.valid = false` site must
+  // call this instead -- see the index-renumbering argument above.
+  void invalidateSurfaceMaterialMemo();
 
   void logMaterialChurn();
 };

@@ -300,8 +300,9 @@ namespace dxvk {
     m_surfaceMaterialCache.clear();
     m_preCreationSurfaceMaterialMap.clear();
     // NV-DXVK [perf]: the memo holds an index INTO m_surfaceMaterialCache, so it
-    // must die with it -- a scene reset renumbers every material.
-    m_lastSurfaceMaterial.valid = false;
+    // must die with it -- a scene reset renumbers every material. ALL slots, not
+    // this thread's: a surviving worker entry would name a renumbered material.
+    invalidateSurfaceMaterialMemo();
     m_legacyOpaqueConversionCache.clear();
     m_surfaceMaterialExtensionCache.clear();
     m_volumeMaterialCache.clear();
@@ -1669,7 +1670,7 @@ namespace dxvk {
     // NV-DXVK [perf]: the createSurfaceMaterial memo answers the same question
     // over the same inputs, so it carries the same lifetime. Cleared here rather
     // than relying on its frameId alone so the two can never disagree.
-    m_lastSurfaceMaterial.valid = false;
+    invalidateSurfaceMaterialMemo();
     // NV-DXVK [perf]: same constraint, same lifetime. as<OpaqueMaterialData>() reads
     // rtx.legacyMaterial.* and rtx.ignoreAlphaOnTextures, so an entry must not
     // outlive the frame it was built in.
@@ -3808,6 +3809,21 @@ namespace dxvk {
     return instance;
   }
 
+  // NV-DXVK [Phase2b prerequisite]: see the SurfaceMaterialMemo block in the header.
+  uint32_t SceneManager::surfaceMaterialMemoSlot() {
+    thread_local uint32_t sSlot = UINT32_MAX;
+    if (sSlot == UINT32_MAX) {
+      const uint32_t claimed = m_surfaceMaterialMemoNextSlot.fetch_add(1u, std::memory_order_relaxed);
+      sSlot = std::min(claimed, kSurfaceMaterialMemoSlots - 1u);
+    }
+    return sSlot;
+  }
+
+  void SceneManager::invalidateSurfaceMaterialMemo() {
+    for (uint32_t i = 0; i < kSurfaceMaterialMemoSlots; ++i)
+      m_lastSurfaceMaterial[i].valid = false;
+  }
+
   const RtSurfaceMaterial& SceneManager::createSurfaceMaterial(const MaterialData& renderMaterialData,
                                                                const DrawCallState& drawCallState,
                                                                uint32_t* out_indexInCache) {
@@ -3829,16 +3845,20 @@ namespace dxvk {
     const bool         memoIsEye           = drawCallState.isEye();
     const bool         memoIsRtRenderTarget = drawCallState.isUsingRaytracedRenderTarget;
 
-    if (m_lastSurfaceMaterial.valid
-        && m_lastSurfaceMaterial.frameId                 == memoFrameId
-        && m_lastSurfaceMaterial.materialHash            == memoMaterialHash
-        && m_lastSurfaceMaterial.materialType            == static_cast<uint32_t>(renderMaterialDataType)
-        && m_lastSurfaceMaterial.samplerOverride         == memoSamplerOverride
-        && m_lastSurfaceMaterial.drawSampler             == memoDrawSampler
-        && m_lastSurfaceMaterial.drawSampler2            == memoDrawSampler2
-        && m_lastSurfaceMaterial.hasTexcoords            == hasTexcoords
-        && m_lastSurfaceMaterial.isEye                   == memoIsEye
-        && m_lastSurfaceMaterial.isRaytracedRenderTarget == memoIsRtRenderTarget) {
+    // This thread's own slot -- no other thread reads or writes it, so the fields
+    // below cannot be a torn mix of two different materials' state.
+    SurfaceMaterialMemo& memo = m_lastSurfaceMaterial[surfaceMaterialMemoSlot()];
+
+    if (memo.valid
+        && memo.frameId                 == memoFrameId
+        && memo.materialHash            == memoMaterialHash
+        && memo.materialType            == static_cast<uint32_t>(renderMaterialDataType)
+        && memo.samplerOverride         == memoSamplerOverride
+        && memo.drawSampler             == memoDrawSampler
+        && memo.drawSampler2            == memoDrawSampler2
+        && memo.hasTexcoords            == hasTexcoords
+        && memo.isEye                   == memoIsEye
+        && memo.isRaytracedRenderTarget == memoIsRtRenderTarget) {
       // Counted as a lookup so matLookup keeps meaning "calls into this
       // function" and stays comparable across the change; matMemo is the new
       // split-out. matBuild is untouched by construction -- a memo hit can only
@@ -3846,23 +3866,23 @@ namespace dxvk {
       ++m_matLookupCount;
       ++m_matMemoHitCount;
       if (out_indexInCache) {
-        *out_indexInCache = m_lastSurfaceMaterial.indexInCache;
+        *out_indexInCache = memo.indexInCache;
       }
-      return m_surfaceMaterialCache.at(m_lastSurfaceMaterial.indexInCache);
+      return m_surfaceMaterialCache.at(memo.indexInCache);
     }
 
     auto rememberSurfaceMaterial = [&](const uint32_t indexInCache) {
-      m_lastSurfaceMaterial.frameId                 = memoFrameId;
-      m_lastSurfaceMaterial.materialHash            = memoMaterialHash;
-      m_lastSurfaceMaterial.materialType            = static_cast<uint32_t>(renderMaterialDataType);
-      m_lastSurfaceMaterial.samplerOverride         = memoSamplerOverride;
-      m_lastSurfaceMaterial.drawSampler             = memoDrawSampler;
-      m_lastSurfaceMaterial.drawSampler2            = memoDrawSampler2;
-      m_lastSurfaceMaterial.hasTexcoords            = hasTexcoords;
-      m_lastSurfaceMaterial.isEye                   = memoIsEye;
-      m_lastSurfaceMaterial.isRaytracedRenderTarget = memoIsRtRenderTarget;
-      m_lastSurfaceMaterial.indexInCache            = indexInCache;
-      m_lastSurfaceMaterial.valid                   = true;
+      memo.frameId                 = memoFrameId;
+      memo.materialHash            = memoMaterialHash;
+      memo.materialType            = static_cast<uint32_t>(renderMaterialDataType);
+      memo.samplerOverride         = memoSamplerOverride;
+      memo.drawSampler             = memoDrawSampler;
+      memo.drawSampler2            = memoDrawSampler2;
+      memo.hasTexcoords            = hasTexcoords;
+      memo.isEye                   = memoIsEye;
+      memo.isRaytracedRenderTarget = memoIsRtRenderTarget;
+      memo.indexInCache            = indexInCache;
+      memo.valid                   = true;
     };
 
     // We're going to use this to create a modified sampler for replacement textures.
