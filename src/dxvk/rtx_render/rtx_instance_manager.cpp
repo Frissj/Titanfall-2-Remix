@@ -395,7 +395,35 @@ namespace dxvk {
         (uint64_t(objectToWorldMirrored ? 1 : 0) << 2) ^
         (uint64_t(worldToProjectionMirrored ? 1 : 0) << 3) ^
         (uint64_t(cullMode) << 8);
-      static std::unordered_set<uint64_t> s_loggedFlagDecide;
+      // NV-DXVK [Phase2b] 2026-08-18: thread_local, and THIS ONE FROZE THE GAME.
+      //
+      // It was a plain function-local `static std::unordered_set`. determineInstanceFlags
+      // runs per draw inside updateInstance, which Phase 2b moved onto ~29 shard
+      // workers, so ~1050 concurrent insert() calls per frame hit one unsynchronized
+      // MSVC hash table. A concurrent insert corrupts the bucket vector's iterator
+      // pairs; a later probe then walks a broken chain and NEVER TERMINATES. Symptom:
+      // one worker pinned at 98% of a core ([ThreadCensus] d3d11-geometry(16)), its
+      // bundle never returns, and the game thread spins forever in the shard join —
+      // caught exactly by [BatchJoin] STUCK phase=shard2b joiningFuture=0/29
+      // itemsDoneDelta=0. Symbolized to `s_loggedFlagDecide` in x64dbg.
+      //
+      // WHY thread_local AND NOT A MUTEX: the insert runs on EVERY draw, not just on
+      // the first sighting of a key, so a mutex here would be ~1050 acquisitions per
+      // frame across 29 workers on the hot path — the plan's Sec 6 rule is that the
+      // escape lock never touches a path taken by every draw. thread_local costs
+      // nothing, cannot be corrupted by construction, and the only thing it changes
+      // is fidelity: "log once per process" becomes "log once per worker thread", so
+      // a given key can now produce up to N lines instead of one. For a
+      // first-sighting diagnostic that is the right trade. Note the insert happens
+      // BEFORE Logger::warn, so the rtx.logDenyTags filter does NOT protect you from
+      // this — a silenced tag still ran the racing insert every frame.
+      //
+      // Nine sibling diagnostics on this same worker path got the identical
+      // treatment (sCollideSeen, sFnLog, sFhSeen, sTf2CcSeen, sUiSeenWarn, sMvSeen,
+      // sLastSeen, `seen`, s_cloudRouteSeen). acquireVsDebugId's sVsIds is NOT one of
+      // them: it hands out a stable id consumed by the GPU surface, so per-thread
+      // tables would hand the same shader different ids — it keeps its real mutex.
+      static thread_local std::unordered_set<uint64_t> s_loggedFlagDecide;
       if (s_loggedFlagDecide.insert(key).second && s_loggedFlagDecide.size() <= 256) {
         Logger::warn(str::format("[SpawnGeomDiag.FlagDecide] vsHash=0x", std::hex, vsHash,
           " matHash=0x", matHash,
@@ -4252,7 +4280,7 @@ namespace dxvk {
           const CollideKey ck { vsHash, mtxHash };
           const uint64_t ckHash = XXH64(&ck, sizeof(ck), 0xC0111DEull);
           static std::mutex sCollideMu;
-          static std::unordered_set<uint64_t> sCollideSeen;
+          static thread_local std::unordered_set<uint64_t> sCollideSeen;
           bool firstSighting = false;
           {
             std::lock_guard<std::mutex> g(sCollideMu);
@@ -7348,7 +7376,7 @@ namespace dxvk {
         static thread_local std::unordered_set<XXH64_hash_t> tFnSeen;
         if (tFnSeen.insert(vsFn).second) {
           static std::mutex sFnMu;
-          static std::unordered_set<XXH64_hash_t> sFnLog;
+          static thread_local std::unordered_set<XXH64_hash_t> sFnLog;
           std::lock_guard<std::mutex> g(sFnMu);
           firstFn = sFnLog.insert(vsFn).second;
         }
@@ -8011,7 +8039,7 @@ namespace dxvk {
               if ((tFhSeen & fhBit) == 0) {
                 tFhSeen |= fhBit;
                 static std::mutex sFhMu;
-                static std::unordered_set<uint32_t> sFhSeen;
+                static thread_local std::unordered_set<uint32_t> sFhSeen;
                 std::lock_guard<std::mutex> g(sFhMu);
                 if (sFhSeen.insert(key).second) firstFh = true;
               }
@@ -8062,7 +8090,7 @@ namespace dxvk {
               bool firstCc = false;
               if (tTf2CcSeen.insert(vsHashCc).second) {
                 static std::mutex sTf2CcMu;
-                static std::unordered_set<uint64_t> sTf2CcSeen;
+                static thread_local std::unordered_set<uint64_t> sTf2CcSeen;
                 std::lock_guard<std::mutex> g(sTf2CcMu);
                 if (sTf2CcSeen.size() < 32u
                     && sTf2CcSeen.insert(vsHashCc).second) {
@@ -8102,7 +8130,7 @@ namespace dxvk {
           // ever fires so we notice.
           if (currentInstance.m_isWorldSpaceUI) {
             const XXH64_hash_t matHash = drawCall.getMaterialData().getHash();
-            static std::unordered_set<XXH64_hash_t> sUiSeenWarn;
+            static thread_local std::unordered_set<XXH64_hash_t> sUiSeenWarn;
             if (sUiSeenWarn.insert(matHash).second) {
               Logger::warn(str::format(
                 "[EmissivePromote.WorldUI.Unhandled] matHash=0x",
@@ -8293,7 +8321,7 @@ namespace dxvk {
           // whichever probe ran first define "last frame" for the other.
           struct MvSeen { uint32_t frame; float x, y, z; };
           static std::mutex sMvMtx;
-          static std::unordered_map<uint64_t, MvSeen> sMvSeen;
+          static thread_local std::unordered_map<uint64_t, MvSeen> sMvSeen;
           int   fslMv = -1;
           float repMv = -1.0f, pmlMv = -1.0f;
           {
@@ -8376,7 +8404,7 @@ namespace dxvk {
             const uint64_t instId = currentInstance.getId();
             struct LastSeen { uint32_t frame; float x, y, z; };
             static std::mutex sMtnMtx;
-            static std::unordered_map<uint64_t, LastSeen> sLastSeen;
+            static thread_local std::unordered_map<uint64_t, LastSeen> sLastSeen;
             int      fsl = -1;
             float    rep = -1.0f, pml = -1.0f;
             {
@@ -8449,7 +8477,7 @@ namespace dxvk {
           // for which mesh's UVs we're seeing (same mesh = same hash).
           const uint64_t txcHash = uint64_t(currentInstance.m_texcoordHash);
           const uint64_t comboKey = key ^ (txcHash * 0x9E3779B97F4A7C15ull);
-          static std::unordered_set<uint64_t> seen;
+          static thread_local std::unordered_set<uint64_t> seen;
           if (seen.insert(comboKey).second) {
             Logger::info(str::format(
               "[RTX-InstMgr.UVx] txcHash=0x", std::hex, txcHash, std::dec,
@@ -8996,7 +9024,7 @@ namespace dxvk {
         && tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
       const uint32_t vsHashCR = uint32_t(uint64_t(drawCall.getTransformData().vertexShaderHash) & 0xffffffffu);
       static std::mutex s_cloudRouteMu;
-      static std::unordered_set<uint32_t> s_cloudRouteSeen;
+      static thread_local std::unordered_set<uint32_t> s_cloudRouteSeen;
       bool firstCR = false;
       {
         std::lock_guard<std::mutex> g(s_cloudRouteMu);
