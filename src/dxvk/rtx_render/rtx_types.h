@@ -1132,6 +1132,100 @@ using CategoryFlags = Flags<InstanceCategories>;
 
 #define DECAL_CATEGORY_FLAGS InstanceCategories::DecalStatic, InstanceCategories::DecalDynamic, InstanceCategories::DecalSingleOffset, InstanceCategories::DecalNoOffset
 
+// NV-DXVK [Phase2b sharded instance processing]: per-draw sidecar produced by
+// SceneManager::processDeferredDrawBatch on the game thread at EndFrame and
+// consumed by RtxContext::commitGeometryToRT on dxvk-cs. It travels through the
+// Phase C EmitCs lambda ALONGSIDE the DrawCallState (not inside it, so the
+// pBlas->input copy in onSceneObjectUpdated never drags it along). See
+// PHASE2B_IMPLEMENTATION_SPEC.md for the full architecture.
+class RtInstance;
+struct BlasEntry;
+
+// A spatial-map write recorded by a worker during the sharded instance phase and
+// applied by the ordered tail. targetBlas is captured EXPLICITLY at record time:
+// the migration path erases from the instance's OLD entry, so resolving through
+// m_linkedBlas at apply time would target the wrong map (the relink has already
+// happened by then). The op reads/writes instance->m_spatialCacheHash at APPLY
+// time, so multi-op chains on one instance resolve exactly like the inline code.
+struct DeferredSpatialOp {
+  // kDecalOrder rides the same per-item op list: it is not a map write, but it
+  // is the same shape of problem — an order-sensitive assignment that must
+  // happen in arena order in the tail (decal sort order approximates draw order
+  // on the GPU). Only `instance` is meaningful for it.
+  enum class Kind : uint8_t { kMove, kInsert, kDecalOrder };
+  Kind kind = Kind::kMove;
+  RtInstance* instance = nullptr;
+  BlasEntry* targetBlas = nullptr;
+  Vector3 centroid = Vector3(0.f, 0.f, 0.f);
+  Matrix4 transform;
+  uint64_t stablePropId = 0;
+  XXH64_hash_t precomputedMatrixHash = 0;
+};
+
+struct ShardedDrawInfo {
+  // TWO live routes, not the four the spec's first draft listed. A `kDropped`
+  // value existed for ignored materials and was removed as dead: an ignored draw
+  // is routed kSharded with NO shard membership (no cache touch, no stamps, no
+  // instance work), which lets the CS slim path reach processDrawCallState's own
+  // pre-cache ignored return instead of re-running the whole legacy prologue —
+  // the pre-pass has already mutated the fog/replacement/material caches for it.
+  // The buffer-cache overflow case is likewise not a per-draw route: it is a
+  // whole-frame admission gate that sends EVERY draw legacy (see
+  // shardingAdmissible in processDeferredDrawBatch).
+  enum class Route : uint8_t {
+    kNone = 0,     // not preprocessed: CS runs the full legacy path (option off)
+    kLegacyCS,     // camera classified at flush only; scene+instance work stays on CS
+                   // (replacements, terrain, sky, and anything else the pre-pass
+                   // routes away from the shard path)
+    kSharded,      // geom decision + instance work precomputed at flush; CS consumes
+                   // the results and records the GPU work
+  };
+  Route route = Route::kNone;
+  bool cameraDone = false;           // dcs.cameraType classified in the pre-pass; CS must not re-run
+  bool blasFirstDrawOfFrame = false; // frameLastTouched != fid BEFORE the pre-pass stamped it
+  bool needsTailContinuation = false;// set on a dedup miss by a worker; consumed by the ordered tail
+  int8_t geomResult = -1;            // SceneManager::ObjectCacheState decided at flush; <0 = none
+  BlasEntry* pBlas = nullptr;        // stable node pointer (see rtx_draw_call_cache.h:39) until GC
+
+  // NV-DXVK [Phase2b]: per-INSTANCE deferred work recorded by updateInstance on
+  // a worker and replayed by the CS record step. One entry per updateInstance
+  // call (fanout: one per placement), so the event args keep per-placement
+  // fidelity — a per-draw flag would smear one placement's hasTransformChanged
+  // over the whole batch and feed OMM wrong rebuild signals.
+  struct PendingInstanceOps {
+    RtInstance* instance = nullptr;
+    bool bindBuffers = false;   // surface buffer rebind (post-updateBufferCache)
+    bool billboard = false;     // createBillboards/createBeams eligibility passed
+    bool omm = false;           // the non-skippable OMM callback was due
+    bool rayPortal = false;     // processRayPortalData was due (RayPortal material)
+    bool evHasTransformChanged = false;
+    bool evHasPreviousPositions = false;
+    bool evIsFirstUpdateThisFrame = false;
+  };
+  std::vector<PendingInstanceOps> pendingOps;
+  // Instances produced/updated for this draw (fanout: all placements; single: one entry).
+  std::vector<RtInstance*> instances;
+  // Fanout placements whose find missed on the worker (deferred, cold at
+  // addedPct=0). The ordered tail re-runs exactly these placement indices
+  // sequentially. Non-empty also suppresses the pushInstanceRecords verify for
+  // this draw (the produced list is deliberately incomplete until the tail runs)
+  // — the record REFRESH already self-suppresses on a short out_instances.
+  std::vector<uint32_t> deferredPlacements;
+  // Spatial-map writes recorded on workers, applied by the ordered tail in arena
+  // order. Never carried to CS (drained before Phase C).
+  std::vector<DeferredSpatialOp> spatialOps;
+  // Render material after replacement/override resolution AND after the instance
+  // manager's mutations — CS-side consumers (particles, OMM callback, effect
+  // lights) read this instead of re-deriving it.
+  std::shared_ptr<MaterialData> renderMaterial;
+
+  ShardedDrawInfo() = default;
+  ShardedDrawInfo(ShardedDrawInfo&&) = default;
+  ShardedDrawInfo& operator=(ShardedDrawInfo&&) = default;
+  ShardedDrawInfo(const ShardedDrawInfo&) = delete;
+  ShardedDrawInfo& operator=(const ShardedDrawInfo&) = delete;
+};
+
 struct DrawCallState {
   DrawCallState() = default;
   DrawCallState(const DrawCallState& _input) = default;

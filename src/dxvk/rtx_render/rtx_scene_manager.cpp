@@ -68,6 +68,13 @@
 
 namespace dxvk {
 
+  // NV-DXVK [Phase2b]: the CS-side consume pointer. Set by
+  // RtxContext::commitGeometryToRT around its submitDrawState call for a
+  // batched draw; null everywhere else (external draws, replacements'
+  // recursion, the option-off path), which makes every consumer below fall
+  // through to the unchanged legacy behavior. CS-thread-local by construction.
+  thread_local ShardedDrawInfo* t_shardedConsume = nullptr;
+
   // NV-DXVK [MatChurn]: defined in rtx_texture_manager.cpp, incremented in the
   // D3D11 layer whenever a game image enters the material path without a hash.
   // See SceneManager::logMaterialChurn.
@@ -847,13 +854,83 @@ namespace dxvk {
   static dxvk::mutex s_geoChurnMu;
   static GeoChurnStats s_geoChurn;
 
-  template<bool isNew>
-  SceneManager::ObjectCacheState SceneManager::processGeometryInfo(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, RaytraceGeometry& inOutGeometry) {
-    ScopedCpuProfileZone();
-    ObjectCacheState result = ObjectCacheState::KBuildBVH;
-    const RasterGeometry& input = drawCallState.getGeometryData();
+  // NV-DXVK [Perf.GeoSplit] — THE_OPTIMISATION_PLAN_2 post-2b Step 0. `[ProcDCS]
+  // geomMs` is one number covering four unrelated mechanisms, and which of them
+  // dominates decides whether any of processGeometryInfo can follow the decision
+  // onto the workers. Plan rule R9: split a timer by MECHANISM before acting on
+  // it. The four:
+  //
+  //   alloc  m_device->createBuffer inside the bake switch. Takes the device
+  //          allocator lock, which is already thread-safe — MOVABLE to the
+  //          shard workers if this is where the time is.
+  //   rec    the barrier + cacheIndexDataOnGPU/cacheVertexDataOnGPU copies and
+  //          the interleave dispatch. Records through ctx and consumes the
+  //          gpuCapture rebind's outputs — CANNOT move (plan Sec 0.1).
+  //          Derived: bake - alloc.
+  //   tape   updateBufferCache -> nine m_bufferCache.track() calls handing out
+  //          bindless indices. MOVABLE to the ordered tail (single-threaded
+  //          there, so no lock needed and indices stay deterministic) — but
+  //          gated on auditing SparseUniqueCache::track first.
+  //   rest   geom - bake - tape: the decision, the probes, the flag bookkeeping.
+  //
+  // MEASUREMENT FLOOR: geom is ~4 us/draw (5-6 ms over ~1350 draws), so these
+  // buckets land near ~1 us each against a 41 ns steady_clock read — ~25x the
+  // read, resolvable. That is the opposite of the [markFm] case, where the real
+  // per-draw work was sub-us and NO per-draw timer could ever resolve it. The
+  // ~8 extra reads/draw are still ~0.45 ms/frame, so this is gated OFF by
+  // default: it rides rtx.logPrepSceneSplit, the same switch that turns on
+  // [Perf.GeoChurn]'s COUNTS — the two are meant to be read together (times
+  // tell you what to move, counts tell you how often the path is even taken).
+  //
+  // TO READ THEM TOGETHER YOU NEED BOTH OF THESE IN rtx.conf:
+  //   rtx.logPrepSceneSplit = True
+  //   rtx.logDenyTags = -[Perf.GeoChurn]
+  // because [Perf.GeoChurn] is on the logger's DEFAULT denylist (log.cpp:626,
+  // "counter, not a timing source") and would otherwise emit nothing while
+  // looking like the code never ran — the exact failure that denylist comment
+  // warns about. [Perf.GeoSplit] itself is not denied.
+  static thread_local int64_t  s_geoAllocNs = 0, s_geoBakeNs = 0, s_geoTapeNs = 0;
+  static thread_local uint64_t s_geoAllocN  = 0, s_geoBakeN  = 0, s_geoTapeN  = 0;
 
-    // Determine the optimal object state for this geometry
+  // Scoped accumulator. Constructed with the gate already evaluated, so a
+  // gated-off zone is one predictable branch and no clock read at all.
+  struct GeoSplitZone {
+    std::chrono::steady_clock::time_point t0;
+    int64_t* acc;
+    uint64_t* cnt;
+    GeoSplitZone(bool on, int64_t* a, uint64_t* c)
+      : acc(on ? a : nullptr), cnt(c) {
+      if (acc != nullptr) {
+        t0 = std::chrono::steady_clock::now();
+      }
+    }
+    ~GeoSplitZone() {
+      if (acc == nullptr) {
+        return;
+      }
+      *acc += std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - t0).count();
+      ++*cnt;
+    }
+  };
+
+  // NV-DXVK [Phase2b]: the cache-state DECISION, extracted so the flush-side
+  // shard task (which cannot record GPU work) and processGeometryInfo (the CS
+  // record step) share ONE implementation and cannot disagree — both inputs are
+  // stable between the two call sites by the drain contract. Includes every
+  // override that feeds the final result: the hash compares, the unobservable
+  // GPU-bone-base rule, the pendingSrcBake recovery, and the smooth-normals
+  // promotion. Does NOT include the invalid-input checks (those keep their
+  // ONCE-logged sites in processGeometryInfo; the flush side tests the same two
+  // conditions itself and routes such draws to the legacy path).
+  template<bool isNew>
+  SceneManager::ObjectCacheState SceneManager::computeGeometryCacheState(const DrawCallState& drawCallState, const RaytraceGeometry& inOutGeometry, bool* outForcedByPendingSrcBake) {
+    const RasterGeometry& input = drawCallState.getGeometryData();
+    ObjectCacheState result = ObjectCacheState::KBuildBVH;
+    if (outForcedByPendingSrcBake != nullptr) {
+      *outForcedByPendingSrcBake = false;
+    }
+
     if (!isNew) {
       // This is a geometry we've seen before, that requires updating
       //  'inOutGeometry' has valid historical data
@@ -869,36 +946,59 @@ namespace dxvk {
       }
     }
 
-    // NV-DXVK [BoneWindow fix, part 2]: never claim "unchanged" for a draw whose
-    // bone base we cannot observe.
-    //
-    // boneHash is computed CPU-side over a window of the game's bone buffer. Two
-    // offsets decide where a draw's bones actually live: the SRV FirstElement
-    // (handled — d3d11_rtx.cpp hashes from srvByteOffset), and a per-instance
-    // base packed in COLOR1.y. When that second base is GPU-resident
-    // (boneBaseBuffer defined) the CPU CANNOT read it: the per-instance VB is
-    // dynamic and the game renames it under us, so a CPU read returns another
-    // draw's bytes. That race is why the base was moved GPU-side in the first
-    // place ([C1Probe] *OOR* *FLIPS* *RENAME*), and re-introducing a CPU read to
-    // feed the hash would re-introduce the corruption.
-    //
-    // So for these draws the hash is structurally blind: it covers [base1,
-    // base1+span) while the bones are at [base1+base2, ...). Measured by
-    // [BoneWindow]: vs 0x289fcf236f97bbb8 (gpuBase=1 on 410/410 windows) froze in
-    // 287 of them with only 5.3% of its draws re-skinning, while every
-    // observable-window shader came out either correctly re-skinning or
-    // correctly static.
-    //
-    // An unobservable input must be treated as dirty, not as clean. This costs
-    // those draws a re-skin per frame, which is the honest price of not being
-    // able to see them; the alternative is rendering a stale skin, which is what
-    // it was doing. Scoped to the GPU-base draws alone, so nothing whose window
-    // we CAN read is affected.
+    // [BoneWindow fix, part 2]: an unobservable GPU-resident bone base must be
+    // treated as dirty — see the full rationale at the (former) inline site.
     if (!isNew
         && result == ObjectCacheState::kUpdateInstance
         && input.boneBaseBuffer.defined()) {
       result = ObjectCacheState::kUpdateBVH;
     }
+
+    // [s2s mangle/black FIX B]: a prior bake caught the source mid-upload —
+    // force a re-cache until a bake lands with the source ready. The out-flag
+    // marks exactly this override for the recovery-termination logic in
+    // processGeometryInfo (single-retry gate at the pendingSrcBake clear).
+    if (!isNew && inOutGeometry.pendingSrcBake && result == ObjectCacheState::kUpdateInstance) {
+      result = ObjectCacheState::kUpdateBVH;
+      if (outForcedByPendingSrcBake != nullptr) {
+        *outForcedByPendingSrcBake = true;
+      }
+    }
+
+    // Smooth-normals state flip (added or removed) promotes to kUpdateBVH so the
+    // vertex data is re-interleaved and the dispatch runs (or originals return).
+    if (drawCallState.shouldGenerateSmoothNormals() != inOutGeometry.smoothNormalsApplied
+        && result == ObjectCacheState::kUpdateInstance) {
+      result = ObjectCacheState::kUpdateBVH;
+    }
+
+    return result;
+  }
+
+  // NV-DXVK [Phase2b]: explicit instantiations so the flush-side driver (defined
+  // later in this file) and any future caller link against both variants.
+  template SceneManager::ObjectCacheState SceneManager::computeGeometryCacheState<true>(const DrawCallState&, const RaytraceGeometry&, bool*);
+  template SceneManager::ObjectCacheState SceneManager::computeGeometryCacheState<false>(const DrawCallState&, const RaytraceGeometry&, bool*);
+
+  template<bool isNew>
+  SceneManager::ObjectCacheState SceneManager::processGeometryInfo(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, RaytraceGeometry& inOutGeometry) {
+    ScopedCpuProfileZone();
+    const RasterGeometry& input = drawCallState.getGeometryData();
+
+    // NV-DXVK [Perf.GeoSplit]: read the gate ONCE per call — see the block above
+    // the GeoSplitZone declaration for what the buckets mean and why the floor
+    // arithmetic works out here but did not for [markFm].
+    const bool geoSplitOn = RtxOptions::logPrepSceneSplit();
+
+    // NV-DXVK [Phase2b]: the decision now lives in computeGeometryCacheState —
+    // ONE implementation for this (CS record) site and the flush-side shard.
+    // The overrides that used to be inline below (bone-base, pendingSrcBake,
+    // smooth-normals promotion) are all inside it; the blocks that follow keep
+    // only their probes and side effects.
+    bool forcedByPendingSrcBake = false;
+    ObjectCacheState result = computeGeometryCacheState<isNew>(drawCallState, inOutGeometry, &forcedByPendingSrcBake);
+    // (The [BoneWindow fix, part 2] unobservable-bone-base override — full
+    // rationale preserved in git history — now lives in computeGeometryCacheState.)
 
     // NV-DXVK [flicker V8]: a source rebound onto a SubmitDraw-ordered capture
     // (commitGeometryToRT rebind) is stable by construction — the capture copy
@@ -933,11 +1033,9 @@ namespace dxvk {
     //
     // `forcedByPendingSrcBake` marks the bakes that exist ONLY to recover from a
     // prior racy bake, so the clear below can be made to actually terminate.
-    const bool forcedByPendingSrcBake =
-      (!isNew && inOutGeometry.pendingSrcBake && result == ObjectCacheState::kUpdateInstance);
-    if (forcedByPendingSrcBake) {
-      result = ObjectCacheState::kUpdateBVH;
-    }
+    // NV-DXVK [Phase2b]: the override itself (and the flag derivation) moved
+    // into computeGeometryCacheState — `forcedByPendingSrcBake` above carries
+    // its out-param, so the recovery-termination logic below is unchanged.
 
     // NV-DXVK [ReskinProbe]: boneHash is what decides whether a skinned mesh
     // RE-SKINS this frame (kUpdateBVH) or is left as-is (kUpdateInstance). Its
@@ -1070,11 +1168,10 @@ namespace dxvk {
     const bool needsSmoothNormals = drawCallState.shouldGenerateSmoothNormals();
     const bool forceNormals = needsSmoothNormals && !input.normalBuffer.defined();
 
-    // When smooth normals state changes (added or removed), promote to kUpdateBVH so the vertex
-    // data is re-interleaved and the smooth normals dispatch runs (or original normals are restored).
-    if (needsSmoothNormals != output.smoothNormalsApplied && result == ObjectCacheState::kUpdateInstance) {
-      result = ObjectCacheState::kUpdateBVH;
-    }
+    // NV-DXVK [Phase2b]: the smooth-normals-flip promotion moved into
+    // computeGeometryCacheState (it reads the PRE-copy flag there, which is the
+    // same value `output` holds at this point). Only the flag clear stays here —
+    // it is an output mutation, not a decision.
     if (!needsSmoothNormals) {
       output.smoothNormalsApplied = false;
     }
@@ -1189,6 +1286,13 @@ namespace dxvk {
     // capture's transfer write was recorded at the draw's position, i.e. in an
     // earlier command buffer than this bake, so copyBuffer/dispatch hazard
     // tracking (scoped to the current barrier set) cannot see it either.
+    // NV-DXVK [Perf.GeoSplit]: `bake` opens HERE, at the ordering barrier, and
+    // closes after the switch — barrier + copies + interleave dispatch + the
+    // allocations, i.e. everything this function records or allocates. `rec`
+    // (the part that cannot leave dxvk-cs) is bake minus alloc.
+    const auto tGsBake0 = geoSplitOn
+      ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+
     if ((result == ObjectCacheState::KBuildBVH || result == ObjectCacheState::kUpdateBVH)
         && (srcPending || srcCaptured)) {
       ctx->emitMemoryBarrier(0,
@@ -1238,7 +1342,10 @@ namespace dxvk {
         info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
 
         info.size = align(output.indexCount * indexStride, CACHE_LINE_SIZE);
-        output.indexCacheBuffer = m_device->createBuffer(info, memoryProperty, DxvkMemoryStats::Category::RTXAccelerationStructure, "Index Cache Buffer");
+        {
+          GeoSplitZone gsz(geoSplitOn, &s_geoAllocNs, &s_geoAllocN);   // NV-DXVK [Perf.GeoSplit]
+          output.indexCacheBuffer = m_device->createBuffer(info, memoryProperty, DxvkMemoryStats::Category::RTXAccelerationStructure, "Index Cache Buffer");
+        }
 
         if (!RtxGeometryUtils::cacheIndexDataOnGPU(ctx, input, output)) {
           ONCE(Logger::err("processGeometryInfo: failed to cache index data on GPU"));
@@ -1248,7 +1355,10 @@ namespace dxvk {
         output.indexBuffer = RaytraceBuffer(DxvkBufferSlice(output.indexCacheBuffer), 0, indexStride, indexBufferType);
 
         info.size = align(vertexBufferSize, CACHE_LINE_SIZE);
-        output.historyBuffer[0] = m_device->createBuffer(info, memoryProperty, DxvkMemoryStats::Category::RTXAccelerationStructure, "Geometry Buffer");
+        {
+          GeoSplitZone gsz(geoSplitOn, &s_geoAllocNs, &s_geoAllocN);   // NV-DXVK [Perf.GeoSplit]
+          output.historyBuffer[0] = m_device->createBuffer(info, memoryProperty, DxvkMemoryStats::Category::RTXAccelerationStructure, "Geometry Buffer");
+        }
 
         RtxGeometryUtils::cacheVertexDataOnGPU(ctx, input, output, forceNormals);
 
@@ -1269,7 +1379,10 @@ namespace dxvk {
         if (output.historyBuffer[0]->info().size != align(vertexStride * input.vertexCount, CACHE_LINE_SIZE)) {
           auto desc = output.historyBuffer[0]->info();
           desc.size = align(vertexStride * input.vertexCount, CACHE_LINE_SIZE);
-          output.historyBuffer[0] = m_device->createBuffer(desc, memoryProperty, DxvkMemoryStats::Category::RTXAccelerationStructure, "Geometry Buffer");
+          {
+            GeoSplitZone gsz(geoSplitOn, &s_geoAllocNs, &s_geoAllocN);   // NV-DXVK [Perf.GeoSplit]
+            output.historyBuffer[0] = m_device->createBuffer(desc, memoryProperty, DxvkMemoryStats::Category::RTXAccelerationStructure, "Geometry Buffer");
+          }
 
           // Invalidate the current buffer
           output.historyBuffer[1] = nullptr;
@@ -1283,8 +1396,9 @@ namespace dxvk {
 
         if (output.historyBuffer[0].ptr() == nullptr) {
           // First frame this object has been dynamic need to allocate a 2nd frame of data to preserve history.
+          GeoSplitZone gsz(geoSplitOn, &s_geoAllocNs, &s_geoAllocN);   // NV-DXVK [Perf.GeoSplit]
           output.historyBuffer[0] = m_device->createBuffer(output.historyBuffer[1]->info(), memoryProperty, DxvkMemoryStats::Category::RTXAccelerationStructure, "Geometry Buffer");
-        } 
+        }
 
         RtxGeometryUtils::cacheVertexDataOnGPU(ctx, input, output, forceNormals);
 
@@ -1375,6 +1489,16 @@ namespace dxvk {
       }
       default:
         break;
+    }
+
+    // NV-DXVK [Perf.GeoSplit]: close `bake`. Counted on EVERY call, including
+    // kUpdateInstance (where the switch is a no-op) — that is deliberate: the
+    // per-call floor of an empty bake is exactly the baseline the other two
+    // buckets have to be read against.
+    if (geoSplitOn) {
+      s_geoBakeNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - tGsBake0).count();
+      ++s_geoBakeN;
     }
 
     // NV-DXVK [s2s mangle/black FIX B]: record whether THIS bake read a source
@@ -1534,7 +1658,14 @@ namespace dxvk {
     output.vguiStylesBuffer     = cloneVguiSb(input.vguiStylesBuffer);
 
     // Update buffers in the cache
-    updateBufferCache(output);
+    {
+      // NV-DXVK [Perf.GeoSplit]: `tape` — the nine m_bufferCache.track() calls.
+      // Runs on EVERY call including kUpdateInstance (this site is outside the
+      // switch), so it is per-DRAW cost, not per-bake, which is exactly why it
+      // is a candidate for the ordered tail.
+      GeoSplitZone gsz(geoSplitOn, &s_geoTapeNs, &s_geoTapeN);
+      updateBufferCache(output);
+    }
 
     // NV-DXVK [TrimCache]: s2s mangle/black race probe — the CACHE-WRITE side.
     // The trim BLAS build input (modifiedGeometryData index buffer + vertexCount)
@@ -1610,6 +1741,10 @@ namespace dxvk {
     m_instanceManager.onFrameEnd();
     m_previousFrameSceneAvailable = raytracedThisFrame && RtxOptions::enablePreviousTLAS();
 
+    // NV-DXVK [Phase2b]: capture the tape's final size before the clear — the
+    // flush-side pre-pass reads it (drain-ordered, no race) as the overflow
+    // predictor, since at flush time the live tape is always freshly empty.
+    m_bufferCacheLastFrameCount = m_bufferCache.getTotalCount();
     m_bufferCache.clear();
     m_externalGpuInstancingTransforms.clear();
     if (raytracedThisFrame){
@@ -1979,6 +2114,21 @@ namespace dxvk {
       input.getGeometryData().vertexCount,
       meshtrace::Stage::Submitted,
       static_cast<uint64_t>(input.getMaterialData().getHash()));
+
+    // NV-DXVK [Phase2b]: slim path for a sharded draw — the flush-side pre-pass
+    // already ran everything between here and processDrawCallState (entry
+    // diagnostics, the buffer-cache overflow check, the fog block, the hash +
+    // replacement lookup, determineMaterialData), so re-running it would
+    // double-mutate the caches it touches. The render material travels in the
+    // sidecar, post-instance-manager mutations included. Legacy routes
+    // (kLegacyCS / kNone / external draws with no sidecar) fall through to the
+    // unchanged full path below.
+    if (t_shardedConsume != nullptr
+        && t_shardedConsume->route == ShardedDrawInfo::Route::kSharded) {
+      assert(t_shardedConsume->renderMaterial != nullptr);
+      processDrawCallState(ctx, input, *t_shardedConsume->renderMaterial, nullptr, nullptr);
+      return;
+    }
 
     // NV-DXVK [perf]: gate the per-draw diagnostic blocks below behind the same
     // RTX_D3D11_DIAG env the rest of the codebase uses. These blocks (strstr
@@ -2952,6 +3102,14 @@ namespace dxvk {
     // when neither flag is set, the old code acquired the pointer and used it for
     // nothing.
     if (hasTransformChanged || hasVerticesChanged) {
+      // NV-DXVK [Phase2b]: setInstanceUpdateFlag writes an unlocked global map
+      // (GameCapturer::instanceFlags) — inert unless capturing, but a capture
+      // during the sharded phase would race it. Cold (xfChg~1%), so the escape
+      // lock covers it.
+      std::unique_lock<std::mutex> capLock;
+      if (inShardedInstancePhase()) {
+        capLock = std::unique_lock<std::mutex>(m_instanceManager.shardEscapeMutex());
+      }
       auto capturer = m_device->getCommon()->capturer();
       if (hasTransformChanged) {
         capturer->setInstanceUpdateFlag(instance, GameCapturer::InstFlag::XformUpdate);
@@ -3154,7 +3312,16 @@ namespace dxvk {
 
     // Update portal
     if (surfaceMaterial.getType() == RtSurfaceMaterialType::RayPortal) {
-      m_rayPortalManager.processRayPortalData(instance, surfaceMaterial);
+      // NV-DXVK [Phase2b]: RayPortalManager state is global and pair-order
+      // sensitive; findSimilarInstance's portal virtual-matching also READS it
+      // lock-free during the parallel phase, which is only sound because no one
+      // writes it then. Defer to the CS record step (ordered, pre-injectRTX),
+      // which re-derives the surface material via the per-thread memo.
+      if (inShardedInstancePhase()) {
+        t_shardPhase.currentOps->rayPortal = true;
+      } else {
+        m_rayPortalManager.processRayPortalData(instance, surfaceMaterial);
+      }
     }
   }
 
@@ -3471,6 +3638,28 @@ namespace dxvk {
         " otherMs=", (s_pdcsTotalNs - s_pdcsGeomNs - s_pdcsInstNs) / 1000000 / fr,
         " geomUsPerDraw=", (s_pdcsCount ? s_pdcsGeomNs / 1000 / int64_t(s_pdcsCount) : 0),
         " instUsPerDraw=", (s_pdcsCount ? s_pdcsInstNs / 1000 / int64_t(s_pdcsCount) : 0)));
+
+      // NV-DXVK [Perf.GeoSplit]: the mechanism split of geomMs. Silent unless
+      // rtx.logPrepSceneSplit is on (same switch as [Perf.GeoChurn]'s counts —
+      // read them together). recUs is DERIVED (bake - alloc) and is the part
+      // that cannot leave dxvk-cs; allocUs and tapeUs are the movable halves,
+      // and restUs is what the decision extraction already left behind.
+      if (s_geoBakeN != 0) {
+        const int64_t recNs = (s_geoBakeNs > s_geoAllocNs) ? (s_geoBakeNs - s_geoAllocNs) : 0;
+        const int64_t restNs = s_pdcsGeomNs - s_geoBakeNs - s_geoTapeNs;
+        Logger::info(str::format(
+          "[Perf.GeoSplit] calls=", s_geoBakeN, " frames=", s_pdcsFrames,
+          " | allocUs=", s_geoAllocNs / 1000 / fr, " (n=", s_geoAllocN / uint64_t(fr), ")",
+          " recUs=", recNs / 1000 / fr,
+          " tapeUs=", s_geoTapeNs / 1000 / fr, " (n=", s_geoTapeN / uint64_t(fr), ")",
+          " restUs=", restNs / 1000 / fr,
+          " | geomUs=", s_pdcsGeomNs / 1000 / fr,
+          "   MOVABLE=alloc+tape=", (s_geoAllocNs + s_geoTapeNs) / 1000 / fr, "us"
+          " PINNED=rec=", recNs / 1000 / fr, "us"));
+      }
+      s_geoAllocNs = s_geoBakeNs = s_geoTapeNs = 0;
+      s_geoAllocN = s_geoBakeN = s_geoTapeN = 0;
+
       s_pdcsLastLog = tPdcs0;
       s_pdcsTotalNs = 0; s_pdcsGeomNs = 0; s_pdcsInstNs = 0; s_pdcsCount = 0; s_pdcsFrames = 0;
     }
@@ -3513,20 +3702,70 @@ namespace dxvk {
     // NV-DXVK: auto-dump material textures on first sighting.
     autoDumpMaterialTextures(ctx, renderMaterialData);
 
+    // NV-DXVK [Phase2b]: CS-side consume. For a sharded draw the pre-pass
+    // already resolved the BlasEntry, stamped frameLastTouched/noteDraw, and ran
+    // the CPU bookkeeping halves of onSceneObject{Added,Updated} (material
+    // cache ops + input copy) on the flush side; the shard decided the cache
+    // state. What remains HERE is the GPU-record half: processGeometryInfo
+    // recomputes the identical decision (computeGeometryCacheState — same
+    // inputs, unchanged since the flush by the drain contract) and records the
+    // bake's copies/dispatches + updateBufferCache at this draw's CS position,
+    // exactly like the legacy path.
+    ShardedDrawInfo* const p2b =
+      (t_shardedConsume != nullptr && t_shardedConsume->route == ShardedDrawInfo::Route::kSharded)
+        ? t_shardedConsume : nullptr;
+
     ObjectCacheState result = ObjectCacheState::kInvalid;
     BlasEntry* pBlas = nullptr;
     const auto tPdcsGeom0 = std::chrono::steady_clock::now();
-    if (m_drawCallCache.get(drawCallState, &pBlas) == DrawCallCache::CacheState::kExisted) {
+    if (p2b != nullptr) {
+      pBlas = p2b->pBlas;
+      if (!p2b->blasFirstDrawOfFrame) {
+        // Same-frame duplicate of this entry: the legacy path's touched-fast
+        // branch (cacheMaterial + kUpdateInstance); cacheMaterial ran at flush.
+        result = ObjectCacheState::kUpdateInstance;
+      } else if (static_cast<ObjectCacheState>(p2b->geomResult) == ObjectCacheState::KBuildBVH) {
+        // onSceneObjectAdded minus the flush-side halves.
+        result = processGeometryInfo<true>(ctx, drawCallState, pBlas->modifiedGeometryData);
+        pBlas->frameLastUpdated = m_device->getCurrentFrameId();
+      } else {
+        // onSceneObjectUpdated minus the flush-side halves (clearMaterialCache +
+        // input copy ran at flush; the buffer-field fixup happens below).
+        result = processGeometryInfo<false>(ctx, drawCallState, pBlas->modifiedGeometryData);
+        if (result == ObjectCacheState::kUpdateBVH) {
+          pBlas->frameLastUpdated = m_device->getCurrentFrameId();
+        }
+      }
+      // NV-DXVK [Phase2b]: input-copy buffer fixup. The flush-side copy
+      // (pBlas->input = drawCallState) ran BEFORE the gpuCapture rebind, so its
+      // geometry buffers still name the renameable dynamic slices. Re-point them
+      // at the capture-rebound buffers this lambda's dcs now holds — the exact
+      // bindings the legacy (post-rebind) copy stored.
+      if (p2b->blasFirstDrawOfFrame) {
+        RasterGeometry& cachedGeo = pBlas->input.geometryData;
+        const RasterGeometry& liveGeo = drawCallState.geometryData;
+        cachedGeo.positionBuffer     = liveGeo.positionBuffer;
+        cachedGeo.normalBuffer       = liveGeo.normalBuffer;
+        cachedGeo.texcoordBuffer     = liveGeo.texcoordBuffer;
+        cachedGeo.texcoord1Buffer    = liveGeo.texcoord1Buffer;
+        cachedGeo.color0Buffer       = liveGeo.color0Buffer;
+        cachedGeo.indexBuffer        = liveGeo.indexBuffer;
+        cachedGeo.sourceIsGpuCapture = liveGeo.sourceIsGpuCapture;
+        cachedGeo.indexDataGpuStash  = liveGeo.indexDataGpuStash;
+        cachedGeo.indexNeedsGpuStash = liveGeo.indexNeedsGpuStash;
+      }
+    } else if (m_drawCallCache.get(drawCallState, &pBlas) == DrawCallCache::CacheState::kExisted) {
       result = onSceneObjectUpdated(ctx, drawCallState, pBlas);
     } else {
       result = onSceneObjectAdded(ctx, drawCallState, pBlas);
     }
     s_pdcsGeomNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - tPdcsGeom0).count();
-    
+
     assert(pBlas != nullptr);
     assert(result != ObjectCacheState::kInvalid);
 
+    if (p2b == nullptr) {
     // Update the input state, so we always have a reference to the original draw call state
     pBlas->frameLastTouched = m_device->getCurrentFrameId();
     // NV-DXVK [ReapJoin]: same site, but a COUNT rather than a flag — see the
@@ -3534,6 +3773,7 @@ namespace dxvk {
     // a multi-copy mesh. This is the only place a draw is bound to an entry, so
     // it is the only place the count can be correct.
     pBlas->noteDraw(m_device->getCurrentFrameId());
+    }  // NV-DXVK [Phase2b]: sharded draws were stamped in the ordered pre-pass.
 
     // NV-DXVK [ShipBake]: transforms feeding the hull (0x292b) geometry bake.
     // RESULT (don't redo): objectToWorld is IDENTITY in both visible AND vanish
@@ -3706,7 +3946,41 @@ namespace dxvk {
     // Note: The material data can be modified in instance manager
     const auto tPdcsInst0 = std::chrono::steady_clock::now();
     RtInstance* instance = nullptr;
-    if (splitFanout) {
+    if (p2b != nullptr) {
+      // NV-DXVK [Phase2b]: the find/update work ran in the flush-side shard (or
+      // its ordered-tail continuation). Consume the produced instances, then
+      // replay the CS-domain residue the workers recorded: the surface buffer
+      // rebind (only valid after processGeometryInfo's updateBufferCache above),
+      // the billboard stage (positional buffer reads + m_billboards appends),
+      // the deferred OMM callbacks (with the REAL billboard outcome), and
+      // ray-portal registration.
+      sFanoutInstances.assign(p2b->instances.begin(), p2b->instances.end());
+      instance = sFanoutInstances.empty() ? nullptr : sFanoutInstances[0];
+      for (ShardedDrawInfo::PendingInstanceOps& ops : p2b->pendingOps) {
+        if (ops.instance == nullptr) {
+          continue;
+        }
+        if (ops.bindBuffers) {
+          m_instanceManager.bindInstanceBuffersFromBlas(*pBlas, *ops.instance);
+        }
+        bool billboardsGotGenerated = false;
+        if (ops.billboard) {
+          billboardsGotGenerated = m_instanceManager.runBillboardStage(
+            *ops.instance, m_cameraManager.getMainCamera().getDirection(false));
+        }
+        if (ops.omm || (billboardsGotGenerated && RtxOptions::getEnableOpacityMicromap())) {
+          m_instanceManager.fireDeferredOmmCallbacks(
+            *ops.instance, drawCallState, renderMaterialData,
+            ops.evHasTransformChanged, ops.evHasPreviousPositions, ops.evIsFirstUpdateThisFrame);
+        }
+        if (ops.rayPortal) {
+          uint32_t portalMatIndex = UINT32_MAX;
+          const RtSurfaceMaterial& portalMat =
+            createSurfaceMaterial(renderMaterialData, drawCallState, &portalMatIndex);
+          m_rayPortalManager.processRayPortalData(*ops.instance, portalMat);
+        }
+      }
+    } else if (splitFanout) {
       m_instanceManager.processSceneObjectFanout(m_cameraManager, m_rayPortalManager, *pBlas, drawCallState, renderMaterialData, &m_drawCallCache, sFanoutInstances);
       // The first prop stands in for the draw where a single instance is all the
       // interface allows (the ReplacementInstance identity check, which a fanout
@@ -3809,6 +4083,515 @@ namespace dxvk {
     return instance;
   }
 
+  // ======================================================================
+  // NV-DXVK [Phase2b]: THE FLUSH-SIDE DRIVER — THE_OPTIMISATION_PLAN_2.md
+  // Steps 1-6. Runs on the game thread inside flushGeometryBatch, after the
+  // caller drained the CS thread and joined Phase B. See the .h declaration
+  // and PHASE2B_IMPLEMENTATION_SPEC.md for the architecture.
+  // ======================================================================
+  void SceneManager::processDeferredDrawBatch(std::vector<ShardedDrawBatchItem>& batch, const ShardScheduleFn& schedule, uint32_t maxTasks) {
+    ScopedCpuProfileZone();
+    const uint32_t fid = m_device->getCurrentFrameId();
+    const auto t2b0 = std::chrono::steady_clock::now();
+
+    // Per-BLAS shards: item indices in arena order. thread_local so capacity is
+    // reused frame-to-frame — this runs only on the game thread.
+    static thread_local std::vector<std::vector<uint32_t>> sShards;
+    static thread_local std::unordered_map<BlasEntry*, uint32_t> sShardOf;
+    for (auto& s : sShards) { s.clear(); }
+    sShardOf.clear();
+    uint32_t liveShards = 0;
+
+    uint32_t nSharded = 0, nLegacy = 0, nIgnored = 0;
+
+    // NV-DXVK [Shard2b]: legacy BY REASON. `legacy=` alone says the win is
+    // capped without saying by what, and the reasons have completely different
+    // remedies: terrain must stay on CS (it records GPU work), sky is routed on
+    // a four-way over-approximation that may be shrinkable, replacements are a
+    // separate sharding job, and unready/unknown-camera/invalid are draws the
+    // legacy path itself treats specially. First-match attribution, because
+    // that is what actually chose the route; `repl` is tested later, after the
+    // material work, so it is its own bucket.
+    uint32_t nLgAdmit = 0, nLgFut = 0, nLgFinal = 0, nLgSky = 0;
+    uint32_t nLgTerrain = 0, nLgCam = 0, nLgGeom = 0, nLgRepl = 0;
+
+    // NV-DXVK [Shard2b]: pre-pass STAGE split. preUs is the new serial cost on
+    // the game thread and the post-2b plan's Step 1 is "move four of these six
+    // into Phase B" — which four is not answerable from one aggregate (plan
+    // rule R9). Same gate as [Perf.GeoSplit] / [Perf.GeoChurn]: ~7 extra clock
+    // reads per draw is ~0.4 ms/frame, which is a large fraction of the very
+    // thing being measured, so it stays OFF unless you are bisecting.
+    const bool preSplitOn = RtxOptions::logPrepSceneSplit();
+    int64_t preFinNs = 0, preCamNs = 0, preFogNs = 0, preHashNs = 0, preMatNs = 0, preGetNs = 0;
+    const auto preNow = [preSplitOn]() {
+      return preSplitOn ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+    };
+    const auto preAdd = [preSplitOn](int64_t& acc, const std::chrono::steady_clock::time_point& t0) {
+      if (preSplitOn) {
+        acc += std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+      }
+    };
+
+    // ---- ORDERED PRE-PASS (Step 1), arena order --------------------------
+    const bool shardingAdmissible =
+      !RtxOptions::enableInstanceDebuggingTools()
+      // Conservative overflow admission: the tape is rebuilt on the CS record
+      // step, so at flush time only last frame's final size predicts the cliff.
+      // Within 1/8th of the limit, route everything legacy — the legacy path
+      // keeps its exact per-draw overflow check.
+      && (m_bufferCacheLastFrameCount + (m_bufferCacheLastFrameCount >> 3)) < kBufferCacheLimit;
+
+    for (ShardedDrawBatchItem& item : batch) {
+      DrawCallState& dcs = *item.dcs;
+      ShardedDrawInfo& info = *item.info;
+
+      // Camera classification runs for EVERY item in arena order — the exact
+      // CameraManager op order the CS path produced — and exactly once
+      // (commitGeometryToRT skips it when cameraDone is set).
+      // The finalize below must precede it only in that both precede any
+      // consumer; finalize first matches the CS order (finalize -> classify).
+      const bool futuresPending =
+        dcs.geometryData.futureGeometryHashes.valid() || dcs.futureMaterialData.valid()
+        || dcs.geometryData.futureBoundingBox.valid() || dcs.futureSkinningData.valid();
+
+      bool finalized = false;
+      if (!futuresPending) {
+        // Idempotent under the CS-side re-run at commitGeometryToRT:5270 — all
+        // futures are invalid (batched stages filled the fields directly), so
+        // the re-run recombines the same hashes and re-ORs the same categories.
+        const auto tPre = preNow();
+        finalized = dcs.finalizePendingFutures(nullptr);
+        preAdd(preFinNs, tPre);
+      }
+
+      // Classify ONLY finalize-ready draws — the CS path classifies inside its
+      // own futuresReady gate, so an unready draw never classifies today and
+      // must not start doing so here. Unready draws go legacy with
+      // cameraDone=false; the CS side then does exactly what it always did.
+      if (finalized) {
+        const auto tPre = preNow();
+        dcs.cameraType = m_cameraManager.processCameraData(dcs);
+        preAdd(preCamNs, tPre);
+        info.cameraDone = true;
+      }
+
+      // ---- ROUTE. Everything the shard path cannot prove safe takes the
+      // UNCHANGED legacy CS path, in original draw order. Over-approximations
+      // are deliberate: a legacy-routed draw is always exactly correct.
+      const bool skyLike =
+        dcs.cameraType == CameraType::Sky
+        || dcs.getTransformData().isSubViewSkybox
+        || dcs.testCategoryFlags(InstanceCategories::Sky)
+        || dcs.skyAutoDetected;
+      const bool terrainLike = dcs.testCategoryFlags(InstanceCategories::Terrain);
+      const bool unknownCamera = dcs.cameraType == CameraType::Unknown;
+      const RasterGeometry& geo = dcs.getGeometryData();
+      const bool invalidGeom = !geo.positionBuffer.defined() || geo.vertexCount == 0;
+
+      if (!shardingAdmissible || futuresPending || !finalized || skyLike || terrainLike
+          || unknownCamera || invalidGeom) {
+        info.route = ShardedDrawInfo::Route::kLegacyCS;
+        ++nLegacy;
+        // First-match attribution, in the same order the test above short-
+        // circuits, so the bucket names the condition that actually decided it.
+        if (!shardingAdmissible)  { ++nLgAdmit; }
+        else if (futuresPending)  { ++nLgFut; }
+        else if (!finalized)      { ++nLgFinal; }
+        else if (skyLike)         { ++nLgSky; }
+        else if (terrainLike)     { ++nLgTerrain; }
+        else if (unknownCamera)   { ++nLgCam; }
+        else                      { ++nLgGeom; }
+        continue;
+      }
+
+      // ---- submitDrawState's entry/hash/material stages, hoisted (the CS slim
+      // path skips them — see the [Phase2b] block in submitDrawState).
+      // Fog block first, exactly like submitDrawState:2452.
+      const auto tPreFog = preNow();
+      if (dcs.getFogState().mode != FogMode::None) {
+        const XXH64_hash_t fogHash = dcs.getFogState().getHash();
+        if (m_fogStates.find(fogHash) == m_fogStates.end()) {
+          m_fogStates[fogHash] = dcs.getFogState();
+          MaterialData* pFogReplacement = m_pReplacer->getReplacementMaterial(fogHash);
+          if (pFogReplacement) {
+            trackReplacementMaterialHash(fogHash);
+            if (pFogReplacement->getType() != MaterialDataType::Translucent) {
+              Logger::warn(str::format("Fog replacement materials must be translucent.  Ignoring material for ", std::hex, m_fog.getHash()));
+            } else {
+              uint32_t id = UINT32_MAX;
+              createSurfaceMaterial(*pFogReplacement, dcs, &id);
+              m_startInMediumMaterialIndex_inCache = id;
+            }
+          } else if (m_fog.mode == FogMode::None) {
+            m_fog = dcs.getFogState();
+          }
+        }
+      }
+
+      preAdd(preFogNs, tPreFog);
+
+      // Replacement lookup — the same three probes submitDrawState makes. Any
+      // hit routes legacy (drawReplacements builds multi-prim instances and
+      // honours existingInstance; out of shard scope by design).
+      const auto tPreHash = preNow();
+      const XXH64_hash_t activeReplacementHash = dcs.getHash(RtxOptions::geometryAssetHashRule());
+      trackMeshHash(activeReplacementHash);
+      std::vector<AssetReplacement>* pReplacements = m_pReplacer->getReplacementsForMesh(activeReplacementHash);
+      if ((RtxOptions::geometryHashGenerationRule() & rules::LegacyAssetHash0) == rules::LegacyAssetHash0 && !pReplacements) {
+        const XXH64_hash_t legacyHash = dcs.getHashLegacy(rules::LegacyAssetHash0);
+        trackMeshHash(legacyHash);
+        pReplacements = m_pReplacer->getReplacementsForMesh(legacyHash);
+      }
+      if ((RtxOptions::geometryHashGenerationRule() & rules::LegacyAssetHash1) == rules::LegacyAssetHash1 && !pReplacements) {
+        const XXH64_hash_t legacyHash = dcs.getHashLegacy(rules::LegacyAssetHash1);
+        trackMeshHash(legacyHash);
+        pReplacements = m_pReplacer->getReplacementsForMesh(legacyHash);
+      }
+      preAdd(preHashNs, tPreHash);
+
+      if (pReplacements != nullptr) {
+        info.route = ShardedDrawInfo::Route::kLegacyCS;
+        ++nLegacy;
+        ++nLgRepl;
+        continue;
+      }
+
+      // Material — computed ONCE, here; the sidecar copy is what both the
+      // flush-side instance work and every CS-side consumer read.
+      const auto tPreMat = preNow();
+      info.renderMaterial = std::make_shared<MaterialData>(determineMaterialData(nullptr, dcs));
+      preAdd(preMatNs, tPreMat);
+
+      info.route = ShardedDrawInfo::Route::kSharded;
+
+      if (info.renderMaterial->getIgnored()) {
+        // Matches processDrawCallState's pre-cache early return: no cache
+        // touch, no stamps, no instance work. The CS slim path re-checks the
+        // sidecar material and returns the same way.
+        ++nIgnored;
+        continue;
+      }
+
+      // ---- Step 1 proper: resolve the BlasEntry, capture first-of-frame
+      // BEFORE stamping (onSceneObjectUpdated's same-frame-dup test reads
+      // pre-stamp state), stamp, and assign the shard.
+      const auto tPreGet = preNow();
+      BlasEntry* pBlas = nullptr;
+      m_drawCallCache.get(dcs, &pBlas);
+      info.pBlas = pBlas;
+      info.blasFirstDrawOfFrame = (pBlas->frameLastTouched != fid);
+      pBlas->frameLastTouched = fid;
+      pBlas->noteDraw(fid);
+      preAdd(preGetNs, tPreGet);
+
+      const uint32_t itemIdx = static_cast<uint32_t>(&item - batch.data());
+      auto shardIt = sShardOf.find(pBlas);
+      if (shardIt == sShardOf.end()) {
+        if (liveShards == sShards.size()) {
+          sShards.emplace_back();
+        }
+        shardIt = sShardOf.emplace(pBlas, liveShards++).first;
+      }
+      sShards[shardIt->second].push_back(itemIdx);
+      ++nSharded;
+    }
+
+    const auto t2bPre = std::chrono::steady_clock::now();
+
+    // ---- PARALLEL BY SHARD (Steps 2-5) -----------------------------------
+    // The shard is the OWNERSHIP unit (one BLAS, its items in arena order); the
+    // BUNDLE is the scheduling unit. Scheduling one task per shard would issue
+    // ~460 Schedule() calls per frame, and plan Sec 13 measured this pool
+    // collapsing at 119 (frames/3s 54 -> 17) — each call is a mutex round trip
+    // plus a notify_one into 30 condvar-sleeping workers, and that cost is per
+    // TASK, not per unit of work. Packing whole shards into maxTasks bundles
+    // keeps exclusive BLAS ownership exactly (a BLAS never spans two bundles)
+    // at Phase B's proven one-task-per-worker scale.
+    //
+    // Bundles are contiguous runs of shards balanced by ITEM COUNT, which also
+    // keeps each bundle's arena accesses roughly contiguous. Item count is the
+    // only cost proxy available here — plan Sec 13 records single draws costing
+    // milliseconds, so a bundle can still straggle; that is what the pool's
+    // work stealing and the tail timer are for, and it is strictly better than
+    // paying 460 task setups to find out.
+    static thread_local std::vector<Future<void>> sShardFuts;
+    static thread_local std::vector<uint32_t> sBundleStart;  // shard indices, + end sentinel
+    sShardFuts.clear();
+    sBundleStart.clear();
+
+    if (liveShards > 0) {
+      const uint32_t bundles = std::max(1u, std::min(liveShards, maxTasks));
+      const uint32_t targetItems = (nSharded + bundles - 1u) / bundles;
+      uint32_t acc = 0;
+      sBundleStart.push_back(0u);
+      for (uint32_t s = 0; s < liveShards; ++s) {
+        acc += static_cast<uint32_t>(sShards[s].size());
+        // Cut only AFTER consuming a shard and never at the very end, so no
+        // bundle is ever empty; stop cutting once the budget is spent.
+        if (acc >= targetItems && (s + 1u) < liveShards
+            && static_cast<uint32_t>(sBundleStart.size()) < bundles) {
+          sBundleStart.push_back(s + 1u);
+          acc = 0;
+        }
+      }
+      sBundleStart.push_back(liveShards);
+    }
+
+    const uint32_t nBundles = sBundleStart.empty()
+      ? 0u : static_cast<uint32_t>(sBundleStart.size() - 1u);
+    for (uint32_t b = 0; b < nBundles; ++b) {
+      const uint32_t s0 = sBundleStart[b];
+      const uint32_t s1 = sBundleStart[b + 1u];
+      // sShards is a game-thread thread_local of static duration and is not
+      // touched again until the join, so a pointer into it is safe on a worker.
+      std::vector<std::vector<uint32_t>>* pShards = &sShards;
+      std::vector<ShardedDrawBatchItem>* pBatch = &batch;
+      SceneManager* self = this;
+      Future<void> f = schedule([self, pShards, pBatch, s0, s1]() {
+        for (uint32_t s = s0; s < s1; ++s) {
+          for (const uint32_t idx : (*pShards)[s]) {
+            self->runShardedDrawItem((*pBatch)[idx]);
+          }
+        }
+      });
+      if (f.valid()) {
+        sShardFuts.push_back(f);
+      } else {
+        for (uint32_t s = s0; s < s1; ++s) {
+          for (const uint32_t idx : sShards[s]) {
+            runShardedDrawItem(batch[idx]);
+          }
+        }
+      }
+    }
+    for (auto& f : sShardFuts) {
+      f.get();
+    }
+    sShardFuts.clear();
+
+    const auto t2bPar = std::chrono::steady_clock::now();
+
+    // ---- ORDERED TAIL (Step 6), arena order ------------------------------
+    uint32_t nDeferred = 0;
+    for (ShardedDrawBatchItem& item : batch) {
+      if (item.info->route == ShardedDrawInfo::Route::kSharded && item.info->pBlas != nullptr) {
+        if (item.info->needsTailContinuation || !item.info->deferredPlacements.empty()
+            || !item.info->spatialOps.empty()) {
+          if (item.info->needsTailContinuation || !item.info->deferredPlacements.empty()) {
+            ++nDeferred;
+          }
+          runShardedDrawTail(item);
+        }
+      }
+    }
+
+    // ---- [Shard2b] heartbeat (3s window) ---------------------------------
+    {
+      const auto t2b1 = std::chrono::steady_clock::now();
+      static thread_local std::chrono::steady_clock::time_point sLast {};
+      static thread_local bool sInit = false;
+      static thread_local uint64_t sFrames = 0, sSharded = 0, sLegacy = 0, sIgnored = 0;
+      static thread_local uint64_t sDeferred = 0, sShardCnt = 0, sBundleCnt = 0;
+      static thread_local int64_t sPreNs = 0, sParNs = 0, sTailNs = 0;
+      // NV-DXVK [Shard2b]: legacy-by-reason and pre-pass-stage accumulators.
+      static thread_local uint64_t sLgAdmit = 0, sLgFut = 0, sLgFinal = 0, sLgSky = 0;
+      static thread_local uint64_t sLgTerrain = 0, sLgCam = 0, sLgGeom = 0, sLgRepl = 0;
+      static thread_local int64_t sPreFinNs = 0, sPreCamNs = 0, sPreFogNs = 0;
+      static thread_local int64_t sPreHashNs = 0, sPreMatNs = 0, sPreGetNs = 0;
+      if (!sInit) { sLast = t2b0; sInit = true; }
+      ++sFrames;
+      sSharded += nSharded; sLegacy += nLegacy; sIgnored += nIgnored;
+      sDeferred += nDeferred; sShardCnt += liveShards; sBundleCnt += nBundles;
+      sLgAdmit += nLgAdmit; sLgFut += nLgFut; sLgFinal += nLgFinal; sLgSky += nLgSky;
+      sLgTerrain += nLgTerrain; sLgCam += nLgCam; sLgGeom += nLgGeom; sLgRepl += nLgRepl;
+      sPreFinNs += preFinNs; sPreCamNs += preCamNs; sPreFogNs += preFogNs;
+      sPreHashNs += preHashNs; sPreMatNs += preMatNs; sPreGetNs += preGetNs;
+      sPreNs  += std::chrono::duration_cast<std::chrono::nanoseconds>(t2bPre - t2b0).count();
+      sParNs  += std::chrono::duration_cast<std::chrono::nanoseconds>(t2bPar - t2bPre).count();
+      sTailNs += std::chrono::duration_cast<std::chrono::nanoseconds>(t2b1 - t2bPar).count();
+      if (std::chrono::duration_cast<std::chrono::milliseconds>(t2b1 - sLast).count() >= 3000) {
+        const int64_t fr = sFrames ? static_cast<int64_t>(sFrames) : 1;
+        // Sec-15 reads: shards ~= uniqueBlas on [Perf.Report]; deferred ~0 in
+        // steady state (addedPct=0); legacy = sky/terrain/replacement volume.
+        // sharded+legacy+ignored == itemsPerFrame on [BatchSubmitDraw] (the
+        // plan's "sum of shard sizes == drawsCommit" does NOT hold: legacy and
+        // ignored draws are deliberately outside every shard).
+        // bundles = tasks actually scheduled; it must track the worker count,
+        // NOT shards — if it ever approaches shards, the Sec-13 tombstone is
+        // back and the pool is paying ~460 task setups a frame.
+        Logger::info(str::format(
+          "[Shard2b] frames=", sFrames,
+          " sharded=", sSharded / fr,
+          " legacy=", sLegacy / fr,
+          " ignored=", sIgnored / fr,
+          " shards=", sShardCnt / fr,
+          " bundles=", sBundleCnt / fr,
+          " deferred=", sDeferred / fr,
+          " | preUs=", sPreNs / 1000 / fr,
+          " parUs=", sParNs / 1000 / fr,
+          " tailUs=", sTailNs / 1000 / fr));
+
+        // WHY the legacy draws are legacy. terrain is permanent (it records GPU
+        // work); sky is the four-way over-approximation and the one worth
+        // attacking; repl is a separate sharding job; admit>0 means the
+        // whole-frame buffer-cache gate fired and NOTHING was sharded that
+        // frame, which would make every other number here meaningless.
+        if (sLegacy != 0) {
+          Logger::info(str::format(
+            "[Shard2b.legacy] perFrame admit=", sLgAdmit / uint64_t(fr),
+            " unreadyFutures=", sLgFut / uint64_t(fr),
+            " notFinalized=", sLgFinal / uint64_t(fr),
+            " sky=", sLgSky / uint64_t(fr),
+            " terrain=", sLgTerrain / uint64_t(fr),
+            " unknownCam=", sLgCam / uint64_t(fr),
+            " invalidGeom=", sLgGeom / uint64_t(fr),
+            " replacement=", sLgRepl / uint64_t(fr),
+            "  (total=", sLegacy / uint64_t(fr), ")"));
+        }
+
+        // Which of the six ordered stages preUs actually is. Silent unless
+        // rtx.logPrepSceneSplit is on. cam+get are structurally ordered (camera
+        // op order / cache mutation); fin+fog+hash+mat are the candidates for
+        // Phase B, and this line says whether moving them is worth the churn.
+        const int64_t preSum = sPreFinNs + sPreCamNs + sPreFogNs + sPreHashNs + sPreMatNs + sPreGetNs;
+        if (preSum != 0) {
+          Logger::info(str::format(
+            "[Shard2b.pre] perFrameUs finalize=", sPreFinNs / 1000 / fr,
+            " camera=", sPreCamNs / 1000 / fr,
+            " fog=", sPreFogNs / 1000 / fr,
+            " hash+repl=", sPreHashNs / 1000 / fr,
+            " material=", sPreMatNs / 1000 / fr,
+            " cacheGet=", sPreGetNs / 1000 / fr,
+            " | sum=", preSum / 1000 / fr, " of preUs=", sPreNs / 1000 / fr,
+            "  MOVABLE(fin+fog+hash+mat)=",
+            (sPreFinNs + sPreFogNs + sPreHashNs + sPreMatNs) / 1000 / fr, "us"));
+        }
+
+        sLast = t2b1;
+        sFrames = sSharded = sLegacy = sIgnored = sDeferred = sShardCnt = sBundleCnt = 0;
+        sPreNs = sParNs = sTailNs = 0;
+        sLgAdmit = sLgFut = sLgFinal = sLgSky = sLgTerrain = sLgCam = sLgGeom = sLgRepl = 0;
+        sPreFinNs = sPreCamNs = sPreFogNs = sPreHashNs = sPreMatNs = sPreGetNs = 0;
+      }
+    }
+  }
+
+  // NV-DXVK [Phase2b]: one arena item's shard-task body — geom decide + CPU
+  // bookkeeping (the flush-side halves of onSceneObject{Added,Updated}) and the
+  // instance work, under exclusive BLAS ownership. Runs on a worker (or the
+  // game thread via the inline fallback).
+  void SceneManager::runShardedDrawItem(ShardedDrawBatchItem& item) {
+    DrawCallState& dcs = *item.dcs;
+    ShardedDrawInfo& info = *item.info;
+    BlasEntry* pBlas = info.pBlas;
+    const uint32_t fid = m_device->getCurrentFrameId();
+
+    // ---- geom decide + apply (Step 5) ------------------------------------
+    if (info.blasFirstDrawOfFrame) {
+      // A blas created by this frame's pre-pass has frameCreated == fid; the
+      // second-and-later draws of it are not blasFirstDrawOfFrame, so this
+      // conjunction is exactly DrawCallCache::get's kNew for this draw.
+      const bool wasNew = (pBlas->frameCreated == fid);
+      const ObjectCacheState r = wasNew
+        ? computeGeometryCacheState<true>(dcs, pBlas->modifiedGeometryData)
+        : computeGeometryCacheState<false>(dcs, pBlas->modifiedGeometryData);
+      info.geomResult = static_cast<int8_t>(r);
+      if (!wasNew) {
+        // onSceneObjectUpdated's flush-side halves. The input copy is
+        // pre-rebind; the CS record step re-points its buffer fields at the
+        // capture (see processDrawCallState's fixup).
+        pBlas->clearMaterialCache();
+        pBlas->input = dcs;
+      }
+    } else {
+      // Same-frame duplicate: onSceneObjectUpdated's touched-fast path.
+      info.geomResult = static_cast<int8_t>(ObjectCacheState::kUpdateInstance);
+      pBlas->cacheMaterial(dcs.getMaterialData());
+    }
+
+    // ---- instance work (Steps 3-4) ---------------------------------------
+    t_shardPhase.info = &info;
+    t_shardPhase.deferredThisDraw = false;
+    t_shardPhase.allowMiss = false;
+    t_shardPhase.currentOps = nullptr;
+
+    static thread_local std::vector<RtInstance*> sShardInstances;
+    sShardInstances.clear();
+
+    const DrawCallTransforms& tf = dcs.getTransformData();
+    const bool splitFanout =
+      RtxOptions::splitFanoutInstances()
+      && tf.isFanoutBatch
+      && tf.instancesToObject != nullptr
+      && tf.instancesToObject->size() > 1;
+
+    if (splitFanout) {
+      m_instanceManager.processSceneObjectFanout(m_cameraManager, m_rayPortalManager,
+        *pBlas, dcs, *info.renderMaterial, &m_drawCallCache, sShardInstances);
+    } else {
+      RtInstance* inst = m_instanceManager.processSceneObject(m_cameraManager, m_rayPortalManager,
+        *pBlas, dcs, *info.renderMaterial, nullptr, &m_drawCallCache);
+      if (inst != nullptr) {
+        sShardInstances.push_back(inst);
+      } else if (t_shardPhase.deferredThisDraw) {
+        info.needsTailContinuation = true;
+      }
+    }
+    info.instances.assign(sShardInstances.begin(), sShardInstances.end());
+
+    t_shardPhase = ShardedInstancePhase {};
+  }
+
+  // NV-DXVK [Phase2b]: the ordered-tail body for one item — apply the
+  // parallel-phase deferred ops, then run any miss continuation in allowMiss
+  // mode (creation/migration/map writes inline; CS-domain work still recorded
+  // into pendingOps for the record step), then apply what the continuation
+  // recorded. Single-threaded, arena order.
+  void SceneManager::runShardedDrawTail(ShardedDrawBatchItem& item) {
+    DrawCallState& dcs = *item.dcs;
+    ShardedDrawInfo& info = *item.info;
+
+    for (const DeferredSpatialOp& op : info.spatialOps) {
+      m_instanceManager.applyDeferredSpatialOp(op);
+    }
+    info.spatialOps.clear();
+
+    if (!info.needsTailContinuation && info.deferredPlacements.empty()) {
+      return;
+    }
+
+    t_shardPhase.info = &info;
+    t_shardPhase.deferredThisDraw = false;
+    t_shardPhase.allowMiss = true;
+    t_shardPhase.currentOps = nullptr;
+
+    if (info.needsTailContinuation) {
+      info.needsTailContinuation = false;
+      RtInstance* inst = m_instanceManager.processSceneObject(m_cameraManager, m_rayPortalManager,
+        *info.pBlas, dcs, *info.renderMaterial, nullptr, &m_drawCallCache);
+      if (inst != nullptr) {
+        info.instances.insert(info.instances.begin(), inst);
+      }
+    }
+    if (!info.deferredPlacements.empty()) {
+      m_instanceManager.processDeferredFanoutPlacements(m_cameraManager, m_rayPortalManager,
+        *info.pBlas, dcs, *info.renderMaterial, &m_drawCallCache,
+        info.deferredPlacements, info.instances);
+      info.deferredPlacements.clear();
+    }
+
+    t_shardPhase = ShardedInstancePhase {};
+
+    // Ops the continuation recorded in allowMiss mode are CS-domain only
+    // (buffer binds / billboards / OMM live in pendingOps, replayed on CS);
+    // map writes ran inline. Anything that still landed here applies now.
+    for (const DeferredSpatialOp& op : info.spatialOps) {
+      m_instanceManager.applyDeferredSpatialOp(op);
+    }
+    info.spatialOps.clear();
+  }
+
   // NV-DXVK [Phase2b prerequisite]: see the SurfaceMaterialMemo block in the header.
   uint32_t SceneManager::surfaceMaterialMemoSlot() {
     thread_local uint32_t sSlot = UINT32_MAX;
@@ -3863,12 +4646,27 @@ namespace dxvk {
       // function" and stays comparable across the change; matMemo is the new
       // split-out. matBuild is untouched by construction -- a memo hit can only
       // occur where the preCreation map would also have hit.
-      ++m_matLookupCount;
-      ++m_matMemoHitCount;
+      m_matLookupCount.fetch_add(1, std::memory_order_relaxed);
+      m_matMemoHitCount.fetch_add(1, std::memory_order_relaxed);
       if (out_indexInCache) {
         *out_indexInCache = memo.indexInCache;
       }
-      return m_surfaceMaterialCache.at(memo.indexInCache);
+      // NV-DXVK [Phase2b]: return the memo slot's COPY, never a reference into
+      // m_surfaceMaterialCache.m_objects — a concurrent (locked) miss-path
+      // insert can push_back-reallocate that vector under a lock-free reader.
+      // Contract: the reference is valid until this THREAD's next
+      // createSurfaceMaterial call; both callers consume it before then.
+      return *memo.material;
+    }
+
+    // NV-DXVK [Phase2b]: everything past the memo is the Sec-6 escape — sampler
+    // tracking, the preCreation map, texture tracking, and the cache insert all
+    // mutate shared unlocked containers ([MatChurn]: matNew=2-4 EVERY frame, so
+    // the miss path is warm, not load-time-only). One lock, taken only here,
+    // never on the memo-hit path above.
+    std::unique_lock<std::mutex> matEscapeLock;
+    if (inShardedInstancePhase()) {
+      matEscapeLock = std::unique_lock<std::mutex>(m_instanceManager.shardEscapeMutex());
     }
 
     auto rememberSurfaceMaterial = [&](const uint32_t indexInCache) {
@@ -3882,6 +4680,9 @@ namespace dxvk {
       memo.isEye                   = memoIsEye;
       memo.isRaytracedRenderTarget = memoIsRtRenderTarget;
       memo.indexInCache            = indexInCache;
+      // Copied while the escape lock (or CS single-threading) protects the
+      // cache — the memo-hit path serves this copy lock-free forever after.
+      memo.material                = m_surfaceMaterialCache.at(indexInCache);
       memo.valid                   = true;
     };
 
@@ -4059,7 +4860,7 @@ namespace dxvk {
     // per frame - what is NOT normal is the m_surfaceMaterialCache INSERT further
     // down, which only happens when the resulting material hashes to something the
     // cache has never held. See MaterialChurnSample in the header.
-    ++m_matLookupCount;
+    m_matLookupCount.fetch_add(1, std::memory_order_relaxed);
 
     auto iter = m_preCreationSurfaceMaterialMap.find(preCreationHash);
     if (iter != m_preCreationSurfaceMaterialMap.end()) {
@@ -4067,10 +4868,12 @@ namespace dxvk {
       if (out_indexInCache) {
         *out_indexInCache = iter->second;
       }
-      return m_surfaceMaterialCache.at(iter->second);
+      // NV-DXVK [Phase2b]: memo copy, not a cache reference — see the memo-hit
+      // return above. rememberSurfaceMaterial just filled it under the lock.
+      return *memo.material;
     }
 
-    ++m_matPreMissCount;
+    m_matPreMissCount.fetch_add(1, std::memory_order_relaxed);
 
     std::optional<RtSurfaceMaterial> surfaceMaterial;
 
@@ -4693,7 +5496,9 @@ namespace dxvk {
     if (out_indexInCache) {
       *out_indexInCache = index;
     }
-    return m_surfaceMaterialCache.at(index);
+    // NV-DXVK [Phase2b]: memo copy, not a cache reference — see the memo-hit
+    // return above.
+    return *memo.material;
   }
 
   std::optional<XXH64_hash_t> SceneManager::findLegacyTextureHashByObjectPickingValue(uint32_t objectPickingValue) {
@@ -4887,9 +5692,9 @@ namespace dxvk {
     auto& textureManager = m_device->getCommon()->getTextureManager();
 
     MaterialChurnSample cur;
-    cur.matLookups      = m_matLookupCount;
-    cur.matMemoHits     = m_matMemoHitCount;
-    cur.matPreMiss      = m_matPreMissCount;
+    cur.matLookups      = m_matLookupCount.load(std::memory_order_relaxed);
+    cur.matMemoHits     = m_matMemoHitCount.load(std::memory_order_relaxed);
+    cur.matPreMiss      = m_matPreMissCount.load(std::memory_order_relaxed);
     cur.matInserts      = m_surfaceMaterialCache.getInsertCount();
     cur.matExtInserts   = m_surfaceMaterialExtensionCache.getInsertCount();
     cur.matClears       = m_surfaceMaterialCache.getClearCount();

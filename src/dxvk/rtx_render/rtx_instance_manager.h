@@ -414,6 +414,14 @@ private:
 
   XXH64_hash_t m_spatialCacheHash = kEmptyHash;
 
+  // NV-DXVK [Phase2b]: frame id of the last DEFERRED spatial-map op recorded for
+  // this instance (sharded instance phase only). Lets onTransformChanged detect
+  // that an earlier op of the same frame is still pending, in which case its own
+  // key-unchanged skip test is unsound (m_spatialCacheHash is stale until the
+  // ordered tail applies the chain) and the op must be recorded unconditionally.
+  // Cleared by InstanceManager::applyDeferredSpatialOp.
+  uint32_t m_spatialOpPendingFrame = kInvalidFrameIndex;
+
   // NV-DXVK [Stable prop ID]: when non-zero, used as the SpatialMap cache
   // key (via the overrideHash param to insert/move/erase) instead of
   // XXH64(matrix). Anchors dedup identity to the draw's per-prop ID
@@ -434,6 +442,40 @@ public:
   std::vector<uint32_t> billboardIndices;
   std::vector<uint32_t> indexOffsets;
 };
+
+// NV-DXVK [Phase2b sharded instance processing]: per-thread context for the
+// flush-side parallel shard phase (see PHASE2B_IMPLEMENTATION_SPEC.md).
+//
+// `info` is non-null exactly while a worker (or the game thread's inline
+// fallback) is running one DrawWorkItem's geom-decide + instance work inside
+// SceneManager::processDeferredDrawBatch; it points at that item's sidecar so
+// deep callees (RtInstance::onTransformChanged / teleport, updateInstance,
+// findSimilarInstance) can record deferred work without new plumbing through a
+// dozen signatures. When null — the CS thread, the ordered tail, the legacy
+// path — every divergence point below compiles to a null test and the code is
+// byte-identical to the pre-Phase2b behavior.
+//
+// `deferredThisDraw` is the miss sentinel: findSimilarInstance sets it (instead
+// of adding/migrating/teleporting on a worker) and processSceneObjectImpl
+// returns nullptr without running mid/add/update; the caller marks the item for
+// the ordered tail, which re-runs the sequential path verbatim.
+struct ShardedInstancePhase {
+  ShardedDrawInfo* info = nullptr;
+  bool deferredThisDraw = false;
+  // Ordered-tail mode: the phase machinery stays ON (CS-domain work — buffer
+  // binds, billboards, OMM, portals, map writes — still defers into the
+  // sidecar, applied/replayed later), but the MISS paths (addInstance,
+  // migration, portal teleport) run inline: the tail is single-threaded and is
+  // exactly where those are supposed to resolve.
+  bool allowMiss = false;
+  // The pending-ops entry for the updateInstance call currently on this thread's
+  // stack — pushed at updateInstance entry, written by the divergence sites
+  // (buffer bind, billboard, OMM) as they are reached. Only ever dereferenced
+  // during that same call, so vector growth from LATER pushes cannot dangle it.
+  ShardedDrawInfo::PendingInstanceOps* currentOps = nullptr;
+};
+extern thread_local ShardedInstancePhase t_shardPhase;
+inline bool inShardedInstancePhase() { return t_shardPhase.info != nullptr; }
 
 // Optional notification callbacks that can be implemented to "opt-in" to InstanceManager events
 struct InstanceEventHandler {
@@ -587,7 +629,63 @@ public:
   void resetSurfaceIndices();
 
   const std::vector<IntersectionBillboard>& getBillboards() const { return m_billboards; }
-  
+
+  // NV-DXVK [Phase2b]: the ONE escape lock of THE_OPTIMISATION_PLAN_2.md Sec 6.
+  // Taken only on cold paths during the sharded instance phase (new-material
+  // creation, capturer flags, player/view-model vector pushes, fanout-record
+  // bookkeeping). Never taken on the memo-hit or find-hit paths. Owned here so
+  // both InstanceManager and SceneManager (which owns this manager) reach the
+  // same mutex without a second object.
+  std::mutex& shardEscapeMutex() { return m_shardEscapeMutex; }
+
+  // NV-DXVK [Phase2b]: apply one deferred spatial-map write recorded by a worker
+  // (see DeferredSpatialOp). Called from the ordered tail, single-threaded, in
+  // arena order. Reads/writes instance->m_spatialCacheHash at apply time so
+  // multi-op chains on one instance resolve exactly like the inline code did.
+  void applyDeferredSpatialOp(const DeferredSpatialOp& op);
+
+  // NV-DXVK [Phase2b]: assign the order-sensitive decal sort order for an
+  // instance whose updateInstance ran on a worker. Called from the ordered tail
+  // in arena order, so the assigned values match the sequential path.
+  void assignDecalSortOrder(RtInstance& instance) {
+    instance.surface.decalSortOrder = m_decalSortOrderCounter++;
+  }
+
+  // NV-DXVK [Phase2b]: CS-record-step half of processInstanceBuffers. Rebinds the
+  // instance's surface buffer indices from the (post-bake, post-updateBufferCache)
+  // BlasEntry — the per-frame m_bufferCache tape is CS-domain under Phase2b, so
+  // this write cannot happen on the flush side. Same body as the non-hoisted
+  // processInstanceBuffers path.
+  void bindInstanceBuffersFromBlas(const BlasEntry& blas, RtInstance& instance) const;
+
+  // NV-DXVK [Phase2b]: CS-record-step half of the updateInstance billboard stage
+  // (createBillboards/createBeams read mapped buffer contents and append to the
+  // CS-domain m_billboards vector). Returns whether billboards were generated,
+  // which gates the deferred OMM callback exactly like billboardsGotGenerated
+  // did inline. cameraDir = main camera direction, as at the inline site.
+  bool runBillboardStage(RtInstance& instance, const Vector3& cameraDir);
+
+  // NV-DXVK [Phase2b]: CS-record-step replay of the deferred (non-skippable) OMM
+  // event-handler dispatch for an instance whose updateInstance ran on a worker.
+  // Fires only handlers that declared skippableWhenNoPendingOmmWork (the
+  // contract that identifies the OMM handler without naming its type) — the
+  // skippable (SceneManager) handler already ran on the flush side.
+  void fireDeferredOmmCallbacks(RtInstance& instance, const DrawCallState& drawCall,
+                                const MaterialData& materialData, bool hasTransformChanged,
+                                bool hasPreviousPositions, bool isFirstUpdateThisFrame);
+
+  // NV-DXVK [Phase2b]: ordered-tail continuation for fanout placements whose
+  // find deferred on a worker. Rebuilds each placement's FanoutSplit with the
+  // SAME composition rules as processSceneObjectFanout's loop (identity-exact
+  // base skip, engine prev-transform history) and runs the sequential impl —
+  // find repeats against the now-current maps, then migrate/add/update inline.
+  // Appends produced instances to out_instances.
+  void processDeferredFanoutPlacements(
+    const CameraManager& cameraManager, const RayPortalManager& rayPortalManager,
+    BlasEntry& blas, const DrawCallState& drawCall, MaterialData& materialData,
+    DrawCallCache* drawCallCache, const std::vector<uint32_t>& placements,
+    std::vector<RtInstance*>& out_instances);
+
 private:
   // NV-DXVK [fanout split]: the per-prop overrides that turn one element of a
   // fanout batch into an ordinary, independently-identified scene object. When a
@@ -747,6 +845,11 @@ private:
   // ================================================================
 
   std::vector<RtInstance*> m_instances;
+
+  // NV-DXVK [Phase2b]: see shardEscapeMutex() above. Leaf lock — nothing is
+  // called out of any hold scope except allocator/logging, so it cannot deadlock
+  // with the probe mutexes on the same paths.
+  std::mutex m_shardEscapeMutex;
   std::vector<RtInstance*> m_viewModelCandidates;
   uint32_t m_viewModelCandidatesFrameId = kInvalidFrameIndex;
   std::vector<RtInstance*> m_playerModelInstances;

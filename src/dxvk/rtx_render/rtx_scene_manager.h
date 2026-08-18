@@ -23,7 +23,9 @@
 
 #include <chrono>
 #include <deque>
+#include <functional>
 #include <mutex>
+#include <optional>
 #include <vector>
 #include <set>
 #include <unordered_set>
@@ -402,7 +404,9 @@ public:
 
   bool isAntiCullingSupported() const { return m_isAntiCullingSupported; }
 
-private:
+public:
+  // NV-DXVK [Phase2b]: public — the instance manager's worker-phase code reads
+  // ShardedDrawInfo::geomResult as this enum to predict post-bake state.
   enum class ObjectCacheState
   {
     kUpdateInstance = 0,
@@ -410,9 +414,58 @@ private:
     KBuildBVH = 2,
     kInvalid = -1
   };
+
+  // NV-DXVK [Phase2b]: one entry of the flush-side batch — parallel views into
+  // the d3d11 arena's DrawWorkItems (the arena type is private to d3d11_rtx.cpp).
+  struct ShardedDrawBatchItem {
+    DrawCallState* dcs = nullptr;
+    ShardedDrawInfo* info = nullptr;
+  };
+  // Schedules one shard task on the caller's worker pool from the CALLING
+  // (game) thread — the pool's Schedule is SPSC. An invalid Future means the
+  // queue was full and the driver runs the shard inline (the A.8 fallback).
+  using ShardScheduleFn = std::function<Future<void>(std::function<void()>&&)>;
+
+  // (t_shardedConsume — the CS-side consume pointer — is declared after the
+  // class; see the definition comment in rtx_scene_manager.cpp.)
+  // NV-DXVK [Phase2b]: THE_OPTIMISATION_PLAN_2.md Steps 1-6 — the flush-side
+  // driver. Runs on the game thread at EndFrame, AFTER the caller has drained
+  // the CS thread (strict alternation contract — see the spec) and joined
+  // Phase B (hashes must be final: the drawCallCache keys on them).
+  //   [ordered pre-pass] camera classify + route + material + cache resolve +
+  //                      stamps + shard build, in arena order
+  //   [parallel]         per-BLAS shard tasks: geom decide/apply + instance work
+  //   [ordered tail]     deferred spatial-map ops + miss continuations, arena order
+  //
+  // maxTasks caps how many tasks the parallel phase schedules. The shard COUNT
+  // (~one per BLAS, so ~460 over ~1350 draws) is a correctness partition, not a
+  // scheduling unit: plan Sec 13 measured this pool collapsing at 119 tasks
+  // (frames/3s 54 -> 17) because each Schedule() is a mutex round trip plus a
+  // notify_one into condvar-sleeping workers. So shards are PACKED into at most
+  // maxTasks bundles of whole shards — exclusive BLAS ownership is preserved
+  // (no BLAS is ever split across bundles) while per-task pool cost stays at
+  // the 1x-per-worker scale Phase B settled on.
+  void processDeferredDrawBatch(std::vector<ShardedDrawBatchItem>& batch, const ShardScheduleFn& schedule, uint32_t maxTasks);
+
+private:
   // Handles conversion of geometry data coming from a draw call, to the data used by the raytracing backend
   template<bool isNew>
   ObjectCacheState processGeometryInfo(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, RaytraceGeometry& modifiedGeometryData);
+
+  // NV-DXVK [Phase2b]: the geometry cache-state DECISION, extracted from
+  // processGeometryInfo so the flush-side shard (which cannot record GPU work)
+  // and the CS-side record (processGeometryInfo itself) share ONE
+  // implementation. Pure function of (drawCallState, inOutGeometry) — both are
+  // stable between the two call sites by the drain contract, so the two sides
+  // cannot disagree.
+  template<bool isNew>
+  static ObjectCacheState computeGeometryCacheState(const DrawCallState& drawCallState, const RaytraceGeometry& inOutGeometry, bool* outForcedByPendingSrcBake = nullptr);
+
+  // NV-DXVK [Phase2b]: shard-task body for one arena item (geom decide/apply +
+  // instance work), and the ordered-tail continuation for items whose find
+  // deferred. Defined in rtx_scene_manager.cpp.
+  void runShardedDrawItem(ShardedDrawBatchItem& item);
+  void runShardedDrawTail(ShardedDrawBatchItem& item);
 
   // Consumes a draw call state and updates the scene state accordingly
   RtInstance* processDrawCallState(Rc<DxvkContext> ctx, 
@@ -619,9 +672,18 @@ private:
   // material from scratch because m_preCreationSurfaceMaterialMap (cleared every
   // frame) had no entry. The ratio is the per-frame dedup rate; the INSERT count
   // into m_surfaceMaterialCache is the part that should be zero in a steady scene.
-  uint64_t m_matLookupCount = 0;
-  uint64_t m_matPreMissCount = 0;
-  uint64_t m_matMemoHitCount = 0;
+  // NV-DXVK [Phase2b]: last frame's final m_bufferCache tape size, captured in
+  // onFrameEnd before the clear. The pre-pass admission gate reads it — the
+  // live count is useless there (the tape is rebuilt on the CS record step,
+  // after the flush).
+  uint32_t m_bufferCacheLastFrameCount = 0;
+
+  // NV-DXVK [Phase2b]: atomics — createSurfaceMaterial's memo-hit path now runs
+  // on workers, and these are bumped there. Relaxed increments; readers use
+  // .load() at the [MatChurn] emit.
+  std::atomic<uint64_t> m_matLookupCount { 0 };
+  std::atomic<uint64_t> m_matPreMissCount { 0 };
+  std::atomic<uint64_t> m_matMemoHitCount { 0 };
 
   // NV-DXVK [perf]: single-entry memo in front of createSurfaceMaterial.
   //
@@ -663,6 +725,13 @@ private:
     bool         isEye                   = false;
     bool         isRaytracedRenderTarget = false;
     bool         valid                   = false;
+    // NV-DXVK [Phase2b]: the memo-hit return value. A COPY, not a reference
+    // into m_surfaceMaterialCache.m_objects — [MatChurn] measures matNew=2-4
+    // EVERY frame, so a concurrent (locked) miss-path insert can reallocate
+    // that vector while a lock-free memo hit is reading it. The copy is filled
+    // under the escape lock at memo-store time; the hit path never touches the
+    // cache at all. optional: RtSurfaceMaterial has no default constructor.
+    std::optional<RtSurfaceMaterial> material;
   };
   // NV-DXVK [Phase2b prerequisite] 2026-08-15: ONE SLOT PER WORKER, not one slot.
   //
@@ -696,5 +765,12 @@ private:
 
   void logMaterialChurn();
 };
+
+// NV-DXVK [Phase2b]: the CS-side consume pointer — non-null only while
+// RtxContext::commitGeometryToRT is executing a batched draw's lambda on
+// dxvk-cs; submitDrawState / processDrawCallState read it to take the slim
+// (consume-precomputed) path when its route is kSharded. Defined in
+// rtx_scene_manager.cpp.
+extern thread_local ShardedDrawInfo* t_shardedConsume;
 
 }  // namespace nvvk

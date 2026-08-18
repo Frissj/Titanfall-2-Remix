@@ -1,401 +1,410 @@
-# THE OPTIMISATION PLAN 2
+# THE OPTIMISATION PLAN 2 -- THE ARCHITECTURE, AND HOW TO BUILD IT
 
 **Written:** 2026-08-15
-**Branch:** `architecture-overhaul`, uncommitted working tree
-**Supersedes:** nothing. **Extends** `THE_OPTIMISATION_PLAN.md` (v1, 2026-08-11) and closes the
-Sec 6e gate that `HANDOFF_2026-08-15_IDENTITY.md` left open.
-**Goal:** unchanged -- 30 fps = 33.3 ms/frame.
+**Branch:** `architecture-overhaul`, uncommitted
+**Extends:** `THE_OPTIMISATION_PLAN.md` (v1). Closes v1 Phase 6e. Specifies Phase 2b for build.
+**This document is an implementation plan, not an analysis.** Numbers appear only where they
+constrain the build.
 
-Confidence markers, same as v1:
-`[M]` measured this session . `[I]` inferred from measured data, not itself measured . `[U]` unknown, needs a capture
+`[M]` measured this session . `[I]` inferred . `[U]` unknown
 
 ---
 
-## 0. THE ONE-LINE ANSWER, v2
+# PART I -- THE TARGET
 
-v1 Sec 0 says:
+## 0. THE ARCHITECTURE, IN ONE PAGE
 
-> The scene is 97% static and we rebuild it every frame. **Stop doing redundant work -- do not
-> parallelise it.**
+v1 Sec 0.1 states it: **one capture, one parallel pass, one ordered handoff.**
 
-That is still true and still the main axis. But this session's largest single win was **neither**
-redundancy elimination nor parallelism, and v1 has no category for it:
+```
+GAME THREAD, per draw
+  captureDrawSnapshot          capture inputs, derive nothing          BUILT
+  collect into m_geoBatch      one DrawWorkItem per draw               BUILT
 
-> **A third of the frame's CPU was not computing anything. It was waiting on the wrong kind of
-> memory.** 17.6 ms/frame of "geometry hashing" was 23 KB of XXH3 running at 8.7 MB/s because the
-> source buffer lived in BAR (device-local, host-visible, uncached). Changing the memory type took
-> it to 0.5 ms. Nothing about the loop, the algorithm, or the redundancy changed.
+GAME THREAD, once at EndFrame -- flushGeometryBatch()
+  [ORDERED pre-pass]   resolve BlasEntry per draw, build shards        BUILD THIS
+  [PARALLEL]           material / hashes / bbox / skinning             BUILT
+  [PARALLEL]           geom -- onSceneObject{Added,Updated}            BUILD THIS
+  [PARALLEL by shard]  find / mid / add / update                       BUILD THIS
+  [ORDERED tail]       migration, creation merge, new materials        BUILD THIS
 
-So the rule to add, and it is now Sec 6 rule R8:
+DXVK-CS, per draw, in draw order
+  the index-stash copyBuffer + VB/IB rebind onto gpuCapture            LEAVE ALONE
+```
 
-> **Before optimising a loop, check what memory it reads.** Bandwidth three orders of magnitude
-> below cached RAM is not an algorithm problem, and no amount of caching the *result*, balancing
-> the *schedule*, or deleting *redundant* calls will touch it.
+Everything on dxvk-cs except that last line moves to the parallel pass. What stays is positional
+and cheap: one `copyBuffer` per draw, 64 vkDraws per frame.
 
-Both prior instances of this in the tree (index buffers 2026-08-06, t31 SRV 2026-08-07) were found
-the same way and fixed the same way. This was the third. It was missed for as long as it was
-because a correct-sounding comment in `d3d11_buffer.cpp` asserted vertex buffers were write-only.
+## 0.1 WHY THE SEAM IS WHERE IT IS
 
-## 0.1 THE THREE COST CLASSES, NAMED
+From `commitGeometryToRT`'s own header (`rtx_context.cpp:4951-4959`):
 
-v1 has two. There are three, and they need different tools:
+> this lambda replays **IN-ORDER on the CS stream**, after this draw's bindings and before any
+> later Map(DISCARD) rename replay, so the logical buffer still resolves to the physical slice
+> the rasterized draw consumed
 
-| class | signature | tool | this session |
+**Anything that reads buffer CONTENTS is positional.** Run it out of order and you read bytes the
+engine has already renamed -- the failure hit twice in this project (the mid-upload bake, the
+renamed dynamic IB). The instance/scene bookkeeping that follows reads no buffers and has no such
+dependency. **That is the seam. Cut there.**
+
+---
+
+# PART II -- WHAT IS ALREADY BUILT (do not redo)
+
+## 1. The parallel machinery, live today
+
+| piece | where |
+|---|---|
+| `WorkerThreadPool` (work-stealing, 30 workers, `LowLatency=false`) | `util_threadpool.h` |
+| `GeometryBatchArena m_geoBatch` -- per-frame arena of `DrawWorkItem` | `d3d11_rtx.h:903` |
+| `flushGeometryBatch()` -- the parallel-for + join + ordered emit | `d3d11_rtx.cpp` |
+| four stages already inside it | material, hashes, bbox, skinning |
+| `DrawSnapshot` -- why deferral is legal at all | `d3d11_rtx.h:65-87` |
+| `rtx.pushInstanceRecords` -- Phase 2 persistent instance records | `rtx_instance_manager.*` |
+
+**The pool is not the constraint.** `[BatchJoinSplit]` 2026-08-15 `[M]`:
+
+```
+disp=120us   JOINIDLE=1us   wake{avg=170us}   ->  taxPerPass ~280us
+```
+
+Two more parallel passes cost ~0.6 ms. **v1 Phase 6e is closed -- build against this pool freely.**
+
+## 2. Built this session, 2026-08-15 `[M]`
+
+| # | change | file | result |
 |---|---|---|---|
-| **redundant** | the same answer recomputed | cache / gate / delete | v1 Phase 3, unchanged |
-| **serial** | one thread, ordered | parallelise / shard | Phase 2b, below |
-| **stalled** | throughput far below the hardware's | fix the memory, not the loop | **-20 ms `[M]`** |
+| 1 | `[BatchJoinSplit]` timer split | `d3d11_rtx.cpp` | closed Phase 6e |
+| 2 | tail chunk scheduled, not kept for the game thread | `d3d11_rtx.cpp` | see Sec 8 -- amends v1 A.8 |
+| 3 | `[BatchJoinCensus]` / `[BatchJoinPeak]` | `d3d11_rtx.cpp` | found the BAR stall |
+| 4 | **`RTX_D3D11_CACHED_DYNAMIC_VERTEX_BUFFERS`** | `d3d11_buffer.cpp` | **hash 17.6 ms -> 0.5 ms** |
+| 5 | per-worker `m_lastSurfaceMaterial` slots | `rtx_scene_manager.{h,cpp}` | **Phase 2b prerequisite, DONE** |
+| 6 | `kBjItemProbe` compile gate | `d3d11_rtx.cpp` | probe off |
 
-Stalled work is the dangerous one because it *looks* like the other two. It shows up as a big
-number next to an innocent-looking function and invites you to parallelise it -- which is exactly
-what Sec 2 below tried, and it made things worse.
+Frame-end stage, before -> after: `sumWork` 29.0 -> 8.5 ms, `tail` 6.5 -> 0.69 ms,
+`parallelForMsPerFrame` 6 -> 0.
 
 ---
 
-## 1. BASELINE
+# PART III -- BUILD IT
 
-### 1a. Frame-end parallel-for (game thread, `flushGeometryBatch`) -- BEFORE and AFTER `[M]`
+## 3. STEP 1 -- ORDERED PRE-PASS: resolve BlasEntry, build shards
 
-| per frame | before | after |
-|---|---|---|
-| `hash` | 17,600 us | **500 us** |
-| `bbox` | 4,700 us | **90 us** |
-| `mat` | 6,000-7,500 us | 7,500-8,800 us |
-| `skin` | 55 us | 55 us |
-| `sumWork` (aggregate across 30 workers) | 29,000 us | **8,500 us** |
-| `tail` (critical path) | 6,500 us | **690 us** |
-| `parallelForMsPerFrame` | 6 | **0** |
+**Where:** new stage at the top of `flushGeometryBatch()`, before the existing parallel-for.
 
-**~5.8 ms off the game thread's critical path, ~20 ms off total CPU.**
+**What:** for each `DrawWorkItem` in arena order, do only the cache lookup that
+`processDrawCallState` does today at `rtx_scene_manager.cpp:3518`:
 
-### 1b. dxvk-cs, current `[M]` (probe OFF, quote these)
-
-```
-[CommitRT] perFrameMs=23-32  finalizeMs=1  submitMs=20-29  otherMs=1
-[ProcDCS]  perFrameMs=18-26  geomMs=5-6    instMs=11-17    otherMs=1-2
+```cpp
+m_drawCallCache.get(drawCallState, &pBlas)   // kExisted -> Updated, else -> Added
 ```
 
-This is now the frame's wall. It did **not** move this session -- everything built so far was on
-the game thread.
+Store `pBlas` on the item. Then group item indices by `pBlas` into shards.
 
-### 1c. `processSceneObjectImpl` split `[M]` 2026-08-15 (probe ON, then turned back off)
+**Why ordered:** `m_drawCallCache.get()` **mutates** the cache (it inserts on miss). It is the one
+step that cannot be parallel. It is also cheap -- a hash lookup per draw.
+
+**Shape `[M]`:** ~450-465 unique BLASes over ~1350 draws => ~460 independent shards. Ample
+parallelism; no shard is large enough to be a straggler on its own.
+
+**Also do here:** `pBlas->frameLastTouched = frameId` and `pBlas->noteDraw(frameId)`
+(`rtx_scene_manager.cpp:3530-3535`). Both are per-BlasEntry writes -- legal in the ordered pass,
+a race in the parallel one.
+
+**Verify:** shard count ~= `uniqueBlas` from `[Perf.Report]`; sum of shard sizes == `drawsCommit`.
+
+## 4. STEP 2 -- PARALLEL: geom
+
+**Where:** a stage in the existing parallel-for.
+
+**What:** `onSceneObjectAdded` / `onSceneObjectUpdated` (`rtx_scene_manager.cpp:3519-3521`) --
+geometry interleave, BLAS input, hashing. **5-6 ms/frame `[M]`.**
+
+**Why it is safe:** each call targets one `BlasEntry`, and Step 1 has already assigned exactly one
+owner per entry. Run it **inside the shard task**, not as a separate per-draw pass, so the
+exclusive-owner guarantee covers it.
+
+**Trap:** the geometry cache is shared. Anything that allocates from it needs the Sec 6 lock.
+
+## 5. STEP 3 -- PARALLEL BY SHARD: find / mid / add / update
+
+**This is the load-bearing step. Everything else depends on it.**
+
+**Where:** the same shard task as Step 2, immediately after geom for that draw.
+
+**What:** `InstanceManager::processSceneObject` (`rtx_scene_manager.cpp:3717`) and
+`processSceneObjectFanout` (`:3709`), i.e. `processSceneObjectImpl` --
+`find` (`rtx_instance_manager.cpp:4599`), `mid` (`:4964`), `add` (`:4968`), `update` (`:4978`).
+
+**Measured shape `[M]` 2026-08-15:**
 
 ```
-pct  find=32-34   mid=7-8   add=4   update=53-55        addedPct=0
+pct  find=32-34   mid=7-8   add=4   update=53-55       addedPct=0
 ms   find=2.9-4.0 mid=0.7-0.9 add=0.4-0.5 update=4.4-6.1
-callsPerFrame 6,598-11,325
 ```
 
-### 1d. GPU `[M]`
+**Why sharding by BlasEntry is sound:** an instance belongs to exactly one BLAS. All of
+`find`/`update` operate within `blas.getSpatialMap()` and that BLAS's instance list, so two shards
+never touch the same state. `getDataAtTransform` is `const` (`util_spatial_map.h`) -- probes are
+pure reads.
 
-```
-[Perf.GpuPass] totalMs=13.2 (stable)
-[Perf.Gpu]     fenceWaitMs=18-25  idleMs=43-46  outsideRtMs=47-57
-```
+**`addedPct=0` is the safety result `[M]`.** In steady state **no instance is created**, so both
+partition escapes (Sec 6) are cold. A lock on a path that never fires costs nothing.
 
-**The frame is CPU-bound with the GPU idle ~45 ms of every ~65 ms frame.** Every trade in this
-document that spends GPU time to save CPU time is being made against that headroom, and that is
-why the Sec 3 memory-type change was affordable.
+## 6. THE ESCAPES -- put these behind one lock
+
+Three things break the BLAS partition. All are on the **miss** path, all are cold at `addedPct=0`.
+Give them **one** `std::mutex` on SceneManager/InstanceManager and take it only on these paths:
+
+| escape | where | why it escapes |
+|---|---|---|
+| cross-BLAS migration | `rtx_instance_manager.cpp` engine-class sibling steal | takes an instance from **another** shard's BLAS |
+| `m_instances.push_back` | `addInstance` | the global instance vector, not per-BLAS |
+| new surface material | `createSurfaceMaterial` -> `m_surfaceMaterialCache` / `m_preCreationSurfaceMaterialMap` | global caches, and the index is handed out |
+
+**Do not** take the lock on the hit path. If profiling shows contention, that means `addedPct` is
+no longer 0 and the assumption above has changed -- re-measure before optimising the lock.
+
+## 7. STEP 4 -- ORDERED TAIL
+
+**Where:** after the join, before the existing Phase C emit loop.
+
+**What must be ordered:**
+- SpatialMap **moves/inserts** (reads are const and parallel-safe; writes are not)
+- creation merge -- anything the Sec 6 lock deferred
+- new material registration, so cache indices are assigned deterministically
+
+**Then the existing Phase C emit is unchanged:** walk the arena in draw order, `EmitCs` the
+`commitGeometryToRT` lambda carrying only the positional `copyBuffer` + rebind.
 
 ---
 
-## 2. WHAT WAS BUILT, 2026-08-15
+# PART IV -- TRAPS THAT WILL BITE
 
-| # | change | file | result `[M]` |
-|---|---|---|---|
-| 1 | `[BatchJoinSplit]` -- split `parallelForMsPerFrame` into disp / self / wake / work / tail / JOINIDLE | `d3d11_rtx.cpp` | answered Sec 6e: pool tax **~280 us/pass** |
-| 2 | tail chunk scheduled instead of kept for the game thread | `d3d11_rtx.cpp` | the game thread was the straggler, not a helper |
-| 3 | 4x chunk oversubscription | `d3d11_rtx.cpp` | **REVERTED** -- made everything worse, see Sec 4 |
-| 4 | `[BatchJoinCensus]` / `[BatchJoinPeak]` -- per-item 4-way attribution + population census | `d3d11_rtx.cpp` | found 72/1070 draws = 74% of the stage |
-| 5 | `RTX_D3D11_CACHED_DYNAMIC_VERTEX_BUFFERS` | `d3d11_buffer.cpp` | **hash 17.6 ms -> 0.5 ms**, bbox 4.7 -> 0.09 |
-| 6 | per-worker `m_lastSurfaceMaterial` slots | `rtx_scene_manager.{h,cpp}` | Phase 2b prerequisite, no-op today |
-| 7 | `kBjItemProbe` compile-time gate | `d3d11_rtx.cpp` | per-item probe OFF; ~220 us/frame recovered |
+## 8. `m_lastSurfaceMaterial` -- DONE, and why it is not a `thread_local`
 
-### 2.1 THE SEC 6e ANSWER -- the gate the handoff blocked Phase 2b on
+**Already built this session.** One slot per worker, claimed on first use
+(`rtx_scene_manager.h`, `surfaceMaterialMemoSlot()` / `invalidateSurfaceMaterialMemo()`).
 
-The handoff said:
+It stores an **index into `m_surfaceMaterialCache`**, and both invalidation sites exist because a
+cache clear renumbers every material. A `thread_local` would leave each worker's entry alive across
+a reset, still naming an index that now points at a **different material** -- silent wrong-material
+corruption, not a stale miss. Hence: slot array + invalidate-all.
 
-> `[BatchSubmitDraw] itemsPerFrame=1068 parallelForMsPerFrame=6 workers=30`. If this pool costs
-> ~6 ms to dispatch and join 1068 items, adding two more parallel passes eats the entire 15 ms
-> win. **Sec 6e is a prerequisite, not a sibling task.**
+It also closes a torn-read failure: with one shared slot a reader could match some fields against
+one writer's entry and the rest against another's **and pass**, serving the wrong material.
 
-Measured, the 6 ms was **none of those things**:
+## 9. `setFrameLastUpdated` clears `m_seenCameraTypes`
 
-```
-disp=120us   JOINIDLE=1us   wake{avg=170us}   ->   taxPerPass ~280us
-```
+From v1 Sec 2.1: the first stamp of a frame clears the camera set, so **any skip path must
+re-register the draw's camera**. `garbageCollection` reaps on `m_frameLastUpdated` and nothing
+else, so "skip" means *stamp and re-register*, never *omit*.
 
-Two extra passes cost ~0.6 ms against a ~15 ms win. **The gate is passed.** The 6 ms was the
-game thread's own chunk stalled on BAR reads, and after Sec 3 the whole stage is 0.69 ms.
+## 10. Do not reorder the emit
 
-The premise was wrong in an instructive way: a single aggregate timer was read as "pool overhead"
-when it contained dispatch, wake, real work on the calling thread, and stall, in unknown
-proportion. **Sec 6 rule R9.**
+`commitGeometryToRT`'s `copyBuffer` depends on its position in the CS stream
+(`rtx_context.cpp:4948-4959`). **Correctness, not performance.** The arena is naturally in draw
+order -- keep it that way through the tail.
 
----
+## 11. AMENDMENT TO v1 APPENDIX A.8 `[M]`
 
-## 3. THE CENTRAL FINDING -- BAR READS `[M]`
+v1 A.8 says:
 
-### The chain, in the order it was actually established
+> **Do not remove the tail-chunk-on-game-thread or the inline fallback.** They are what stop a
+> saturated pool from dropping work or idling the caller.
 
-1. `sumWork` 29 ms/frame across 30 workers, `tail` 6.5 ms. Cross-checked against
-   `work{avg} x chunks` -- the four components **are** the stage, nothing hidden.
-2. `mapPos=72/1070`. **6.7% of draws carry 74% of the work.** The other ~998 are device-local,
-   take the cheap pointer-hash branch in `runBatchHashJob`, and cost ~1 us each.
-3. Peak draw: `v=132 idx=78 hash=2257us`. Mesh size cannot explain it by ~3 orders of magnitude.
-4. Bytes, reported by the clamping code itself: `posB=11648 tcB=11648 idxB=36` against
-   `posBufLen=917504`. **The clamps are correct** -- an 11 KB window of an 896 KB buffer.
-   23 KB / 2.68 ms = **8.7 MB/s**, against XXH3's 10-30 GB/s on cached RAM.
-5. Independent corroboration from a second consumer: `runBatchBboxJob` memcpys before scanning
-   (the standard WC workaround) and still shows 4480 bytes in 1464 us = ~3 MB/s.
-6. `posMem=0x7` = `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT`, `HOST_CACHED` clear, unanimous
-   across every sample and both buffer sizes. **BAR memory.** Every read is a PCIe transaction.
+**The inline-fallback half stands and is preserved.** That is the half that stops work being
+dropped when a worker queue is full.
 
-### The fix
+**The tail-chunk half is refuted and has been removed.** Measured: the game thread's tail chunk ran
+19-24 items at ~320 us/item against the workers' ~24 us/item, so it finished ~6 ms after every
+worker was already idle -- it *was* the straggler. The join it existed to fill costs ~1 us
+(`JOINIDLE`). Scheduling it instead moved `self` 6000us -> `tail`, and after Sec 12 the whole stage
+is 0.69 ms.
 
-`RTX_D3D11_CACHED_DYNAMIC_VERTEX_BUFFERS`, on by default, in `d3d11_buffer.cpp` -- the same three
-lines already applied to DYNAMIC index buffers (2026-08-06) and DYNAMIC SRV buffers (2026-08-07):
-add `HOST_CACHED`, clear `DEVICE_LOCAL`, gated on `D3D11_BIND_VERTEX_BUFFER`.
+## 12. THE MEMORY-TYPE CLASS -- the reason the stage was ever 6 ms
 
-### What kept this hidden
+**Fixed this session; recorded because the same shape will recur.**
 
-The comment at the DYNAMIC case said:
+`[BatchJoinCensus]` showed 72 of 1070 draws carrying 74% of the stage, and the peak draw hashing
+**23 KB in 2.68 ms = 8.7 MB/s** against XXH3's 10-30 GB/s. The byte counts proved the range clamps
+correct; `memFlags()` read `0x7` = `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`, `HOST_CACHED` clear
+-- **BAR memory, every read a PCIe transaction.**
 
-> VERTEX and CONSTANT buffers still keep write-combining: they are genuinely write-only streaming
-> data from our side.
+Fix: `RTX_D3D11_CACHED_DYNAMIC_VERTEX_BUFFERS` in `d3d11_buffer.cpp` -- the same three lines
+already applied to DYNAMIC index buffers (2026-08-06) and DYNAMIC SRV buffers (2026-08-07).
 
-It was written when it was true, it named the one vertex-buffer reader then known (the charIdx
-instance buffer, safe behind `m_instBufCache` at a 100% hit rate), and it did not know about
-`runBatchHashJob`. The CONSTANT half still stands. The comment has been corrected in place.
+**The rule (Sec 16 R8): before optimising a loop, check what memory it reads.** No amount of
+caching the result, balancing the schedule, or deleting redundant calls touches a stall.
 
-### OUTSTANDING `[U]` -- the GPU half of this trade
+**Still open `[U]`:** the GPU half of that trade. Vertex buffers are fetched per-draw by the
+rasteriser and copied for BLAS builds, so system RAM puts real traffic on PCIe. Bounded by only 72
+draws being affected and the GPU sitting at 13.2 ms with 43-46 ms idle. **To close:** flip the
+define to `false`, capture, compare `[Perf.GpuPass] totalMs` distributions across a run. **If it
+loses:** do not revert -- capture a cached shadow at `Map()` time instead (the game writes those
+bytes through the CPU anyway; WC *writes* are fast). Keeps the buffer in VRAM, no GPU exposure.
 
-**This is the one unclosed item in this document and it is load-bearing.** Vertex buffers are
-fetched per-draw by the rasteriser AND copied for BLAS builds, so moving them to system RAM puts
-real per-draw traffic on PCIe. That exposure is larger than either prior case.
+## 13. TOMBSTONE -- chunk oversubscription. DO NOT RETRY. `[M]`
 
-Bounding it: only 72 of ~1070 draws use DYNAMIC vertex buffers at all, and the GPU is idle
-43-46 ms per frame (Sec 1d). Circumstantially, `[Perf.GpuPass] totalMs` sits at a stable 13.2 ms
-and frames/3s did not regress. **That is not the A/B.**
+`kChunksPerWorker` 1 -> 4 (30 -> 119 chunks):
 
-**To close:** set `RTX_D3D11_CACHED_DYNAMIC_VERTEX_BUFFERS` to `false`, capture one run, compare
-`[Perf.GpuPass] totalMs` **distributions across the run** -- never first window against last, this
-game's per-draw cost swings ~2x in a fixed scene.
-
-**If it is a loss:** do not simply revert. The fallback is a cached shadow captured at `Map()`
-time -- the game writes those bytes through the CPU anyway, and WC *writes* are fast; only reads
-are catastrophic. That keeps the buffer in VRAM and has no GPU-side exposure at all. More work,
-strictly better.
-
----
-
-## 4. TOMBSTONE -- CHUNK OVERSUBSCRIPTION. DO NOT RETRY. `[M]`
-
-Reasoning at the time: `work{avg}=1000us` but `tail=6500us`, so the expensive draws must be
-clustered contiguously and equal-count chunking must be grouping them. More chunks than workers
-would let work stealing rebalance. `kChunksPerWorker` 1 -> 4, 30 chunks -> 119.
-
-| | 30 chunks | 119 chunks |
+| | 30 | 119 |
 |---|---|---|
 | `tail` | 6500 us | **7300 us** |
-| `disp` | 120 us | 370 us |
 | `wake` avg | 155 us | **800 us** |
 | `sum(work)` | ~30 ms | **~47 ms** |
 | frames / 3 s | 54 | **17** |
 
-Finer chunks rebalanced nothing; they multiplied the pool's per-task cost. 119 `Schedule()` calls
-are 119 mutex round trips and 119 `notify_one`s into 30 condvar-sleeping workers. Aggregate worker
-time rose 58%, and that CPU competes with the game and CS threads -- which is why the **frame rate**
-fell, not merely this stage.
+119 `Schedule()` calls are 119 mutex round trips and 119 `notify_one`s into 30 condvar-sleeping
+workers. Aggregate worker time rose 58% and that CPU competes with the game and CS threads, so the
+**frame rate** fell. Same failure the `GeometryProcessor` header records from 2026-07-28.
+**Chunk count is not a lever on this pool.** Reverted to 1.
 
-This is the failure the `GeometryProcessor` header already records from 2026-07-28: *"RAISING the
-worker count made this pool slower."* **Chunk count is not a lever on this pool.**
-
-The imbalance was real; the diagnosis was wrong. It was not clustering, it was stall (Sec 3).
-
-### 4.1 Related, unexploited `[M]`
-
-`Schedule()` defaults `Affinity=0xFF`, and `affinityMask = min(popcnt(0xFF)=8, m_numThread=30)`,
-so **only worker queues 0-7 are ever pushed to**; the other 22 acquire work exclusively by
-stealing. It currently works (`wait` ~0), so this is a note, not a defect.
+Related, unexploited `[M]`: `Schedule()` defaults `Affinity=0xFF` and
+`affinityMask = min(popcnt(0xFF)=8, 30)`, so **only queues 0-7 are ever pushed to**; the other 22
+workers acquire work solely by stealing. It works (`wait` ~0) -- a note, not a defect.
 
 ---
 
-## 5. THE REMAINING PLAN
+# PART V -- ORDER OF WORK AND VERIFICATION
 
-### Phase 2b -- shard `processSceneObjectImpl`. **RE-SCOPED on 2026-08-15 numbers.**
+## 14. BUILD ORDER
 
-v1/handoff decomposition, unchanged in shape:
+| # | step | size `[M]` | risk |
+|---|---|---|---|
+| 0 | ~~`m_lastSurfaceMaterial` per-worker~~ | -- | **DONE** |
+| 1 | ordered pre-pass: BlasEntry resolve + shard build | -- | low, no behaviour change |
+| 2 | **sharded claim** -- shard tasks own their BLAS | -- | **highest. everything depends on it** |
+| 3 | move `update` into the shard task | 4.4-6.1 ms | medium |
+| 4 | move `find`/`mid`/`add` into the shard task | 3.3-4.9 ms | medium |
+| 5 | move `geom` into the shard task | 5-6 ms | low |
+| 6 | ordered tail + escapes behind the lock | ~1.2 ms stays ordered | low |
 
-```
-1. PARALLEL   geom          per-draw, independent
-2. SHARDED    claim         by BlasEntry -- instances belong to exactly one BLAS
-3. PARALLEL   update        exclusive owner guaranteed by step 2
-4. ORDERED    tail          migration, creation merge, new materials, SpatialMap moves
-```
+**Do 1 and 2 first even though they move no time.** They are what makes 3-5 legal. Landing 3
+before 2 is a data race on the instance manager.
 
-**What changed `[M]`:**
+## 15. VERIFY AT EACH STEP
 
-| | handoff 2026-08-06 | now 2026-08-15 |
+Correctness first -- these are the ones that fail silently:
+
+| check | where | must read |
 |---|---|---|
-| `find` (ordered) | 24-27% | **32-34%** |
-| `update` (parallel) | 57-60% | **53-55%** |
-| `update/find` | 2.2-2.4x | **~1.6x** |
+| instance count stable | `[Perf.Report]` `inst=` | ~15.4k, unchanged |
+| no instances reaped by accident | `[ReapJoin]` `removed=` / `starved=` | not rising |
+| identity still resolving | `[FindStage]` `exact=` | ~97% (un-deny the tag first) |
+| no new materials appearing | `[Perf.Report]` `matNew=` | **0** |
+| nothing lost between stages | `[MeshTrace]` `BatchEmitted` vs `Submitted` | equal |
+| draws still committing | `drawsIn` vs `drawsCommit` | ratio unchanged |
 
-The plan's ordering argument -- "the parallelisable half dominates the ordered half" -- is a third
-weaker than written. **Step 2, the sharded claim, is now the load-bearing step**, not a supporting
-one, and it is the hardest and riskiest piece.
+Then timing: `[ProcDCS] instMs` / `geomMs` should fall; `[BatchJoinSplit] tail` will rise as work
+moves in -- **that is expected**, it is the parallel-for absorbing the CS thread's work.
 
-Compare percentages, not absolutes: `callsPerFrame` is 6.6-11.3k against the handoff's 15.6k, so
-this is a different scene and the ms figures are not comparable across the two.
+**Do not measure with `rtx.perfSceneObjSplit=True`** -- it taxes both sides. Turn it on only to
+attribute find/mid/add/update, then off.
 
-**And one number cuts strongly the other way: `addedPct=0` in every window.** The handoff's main
-safety concern about sharding was:
+**Check `clkNs` before quoting any absolute ms** (v1 C.3b). Sane is ~32-49 with `xMin=1.00`. This
+session's windows read `clkNs=32-46 xMin=1.00-1.31 cpuSlowX=1` -- sane.
 
-> Two things escape the partition, both on the **miss** path: cross-BLAS migration and
-> `m_instances.push_back`.
-
-In steady state **no instance is created at all**, so both escapes are cold. They can take a plain
-lock: a lock on a path that never fires costs nothing. This makes the sharded claim far more
-tractable than the handoff feared. The `add` stage still burns 0.4-0.5 ms/frame as pure branch
-checking that creates nothing -- a separate, smaller target.
-
-**Build order:**
-
-1. ~~`m_lastSurfaceMaterial` per-worker~~ **DONE 2026-08-15.** See Sec 5.1.
-2. **The sharded claim.** Partition the frame's draws by `BlasEntry`; exclusive owner per shard;
-   both miss-path escapes behind a lock. Everything else depends on this.
-3. Parallel `update` -- legal only once 2 guarantees an exclusive owner.
-4. Parallel `geom` (5-6 ms, per-draw independent).
-5. Ordered tail.
-
-**Expected `[I]`:** `find` will not vanish, so do not size this at the handoff's "~15 ms
-parallelises". With `update` fully parallel and `find` sharded, `inst` 11-17 ms -> `[U]`, gated on
-how well the BLAS partition balances (~450-465 unique BLASes over ~1350 draws).
-
-### 5.1 DONE -- the `m_lastSurfaceMaterial` prerequisite `[M]`
-
-One slot per worker, claimed on first use, in `rtx_scene_manager.{h,cpp}`.
-
-**It is not a `thread_local`, and the reason matters.** The memo stores an **index into
-`m_surfaceMaterialCache`**, and both invalidation sites exist precisely because a cache clear
-renumbers every material. A `thread_local` would leave each worker's entry alive across a reset,
-still naming an index that now points at a *different* material -- silent wrong-material
-corruption, not a stale miss. So: slot array, plus `invalidateSurfaceMaterialMemo()` clearing all
-slots, called from both existing sites.
-
-This also closes a failure the handoff notes but does not separate: with one shared slot a reader
-could match some fields against one writer's entry and the rest against another's **and pass**,
-serving the wrong material. Per-slot makes that structurally impossible.
-
-Behaviourally identical today -- one thread claims slot 0.
-
-### Phase 2c -- `FillMaterialData`. **DEPRIORITISED, and the reason is a trap worth naming.**
-
-After Sec 3, `mat` is 7,500-8,800 us = ~92% of the frame-end stage. It looks like the obvious next
-target. It is not:
-
-> **`sumWork` is aggregate worker time, not wall time.** Spread across 30 workers, `mat`
-> contributes only ~0.3-0.7 ms to the critical path.
-
-Cutting it reduces total CPU -- which does matter in a CPU-bound frame (Sec 1d) -- but it will not
-move the frame the way "8.5 ms" suggests. Phase 2b targets *ordered* time on dxvk-cs, which is
-real serial wall time. **Do 2b first.**
-
-Peak single call is 1314 us on one draw (`v=9058`, `mapPos=0`, device-local -- so unrelated to
-Sec 3). `[U]` what that draw is.
-
-### Phases 3-8
-
-Unchanged from v1. Nothing this session touched them. v1 Sec 3 (within-frame redundancy) remains
-the largest single item in the document and is still the main axis.
-
----
-
-## 6. RULES THAT MUST NOT BE BROKEN
-
-v1 Sec 7's rules stand. Added 2026-08-15:
+## 16. RULES ADDED THIS SESSION
 
 **R8. Before optimising a loop, check what memory it reads.** Throughput orders of magnitude below
-cached RAM is a memory-type problem. No amount of caching the result, balancing the schedule, or
-deleting redundant calls will touch it. Check `memFlags()`: `DEVICE_LOCAL|HOST_VISIBLE` without
-`HOST_CACHED` is BAR, and every CPU read is a PCIe transaction.
+cached RAM is a memory-type problem. `DEVICE_LOCAL|HOST_VISIBLE` without `HOST_CACHED` is BAR and
+every CPU read is a PCIe transaction. Check `memFlags()`.
 
-**R9. One aggregate timer is not a diagnosis.** `parallelForMsPerFrame=6` contained dispatch, wake
-latency, real work on the calling thread, and stall, in unknown proportion -- and the plan built on
-it blocked the wrong task for a week. Split a timer by *mechanism* before acting on it.
+**R9. One aggregate timer is not a diagnosis.** `parallelForMsPerFrame=6` contained dispatch, wake,
+real work on the calling thread, and stall, in unknown proportion -- and it blocked Phase 2b as a
+prerequisite for a week. Split a timer by *mechanism* before acting on it.
 
 **R10. A probe that can only look in one place will keep confirming that place.** The tail-only
-per-item probe kept reporting `@idx1045-1090` because that was the only range it timed. Widened to
-all chunks, the expensive draws were at idx 4, 23, 48, 117, 132, 155, 205, 568, 1058 -- everywhere.
-Size the *population* before believing a *peak*.
+per-item probe kept reporting `@idx1045-1090` because that was the only range it timed. Widened,
+the expensive draws were everywhere. Size the *population* before believing a *peak*.
 
-**R11. Aggregate worker time is not wall time.** Before targeting a big `sum(work)` number, divide
-by the worker count and check it against the critical path. See Phase 2c.
+**R11. Aggregate worker time is not wall time.** Divide `sum(work)` by the worker count and check
+against the critical path before targeting it. `mat` is 92% of the frame-end stage and ~0.3-0.7 ms
+of its critical path.
 
 **R12. In-tree comments decay silently.** Three load-bearing claims were refuted this session, all
-of which were true when written: "vertex buffers are genuinely write-only", "the last range runs on
-the game thread so it is not idle during the join", and the handoff's `vbPtr`-rotates note. When a
-comment justifies *not* measuring something, measure it.
+true when written: "vertex buffers are genuinely write-only", "the last range runs on the game
+thread so it is not idle during the join", and the handoff's `vbPtr`-rotates note. **When a comment
+justifies not measuring something, measure it.**
 
----
-
-## 7. INSTRUMENTATION STATE, 2026-08-15
+## 17. INSTRUMENTATION STATE
 
 | switch | state | notes |
 |---|---|---|
-| `kBjItemProbe` (`d3d11_rtx.cpp`) | **false** | per-item 4-way probe. ~220 us/frame -- was 0.7% of a 29 ms stage, would now be 2.6% of an 8.5 ms one. Flip to `true` for `[BatchJoinPeak]`/`[BatchJoinCensus]`. |
-| `[BatchJoinSplit]` | **on** | per-CHUNK only, ~60 clock reads/frame. Leave on -- this is what shows `tail`/`wait`/`disp`. |
-| `RTX_D3D11_CACHED_DYNAMIC_VERTEX_BUFFERS` | **true** | flip to `false` for the Sec 3 A/B. |
-| `rtx.perfSceneObjSplit` | **False** | answered 2026-08-15 (Sec 1c). Taxes both sides; every timing taken while on is probe-taxed. |
-| `rtx.logDenyTags` | `[FindStage]` **added** | one line/frame, taxes perf runs. Remove when identity evidence is wanted again. |
-| `rtx.pushInstanceRecords` | True | Phase 2, shipped |
-| `rtx.pushInstanceRecordsVerify` | False | |
+| `kBjItemProbe` (`d3d11_rtx.cpp`) | **false** | per-item 4-way probe, ~220 us/frame. `true` for `[BatchJoinPeak]`/`[BatchJoinCensus]` |
+| `[BatchJoinSplit]` | **on** | per-chunk only, ~60 clock reads/frame. Leave on |
+| `RTX_D3D11_CACHED_DYNAMIC_VERTEX_BUFFERS` | **true** | `false` for the Sec 12 A/B |
+| `rtx.perfSceneObjSplit` | **False** | on only to attribute find/mid/add/update |
+| `rtx.logDenyTags` | `[FindStage]` added | **remove it before the Sec 15 identity check** |
+| `rtx.pushInstanceRecords` / `...Verify` | True / False | Phase 2, shipped |
 
-### Known interaction, carried from the SRV case
-
-The `HOST_CACHED` substitution depends on the `HostVisibleSmallPool` fix in `dxvk_memory.cpp`
-(present), and produces a once-per-frame VRAM sawtooth against the geometry-cache trim. **That is
-not a leak** -- see the long note in `d3d11_buffer.cpp`.
+Carried from the SRV case: the `HOST_CACHED` substitution needs the `HostVisibleSmallPool` fix in
+`dxvk_memory.cpp` (present) and produces a once-per-frame VRAM sawtooth against the geometry-cache
+trim. **Not a leak** -- see the note in `d3d11_buffer.cpp`.
 
 ---
 
-## 8. DOES IT CLOSE?
+## 18. WHAT THIS BUYS
 
-```
-frame now              ~65 ms          [M]
-                                       (GPU 13.2 ms of it, idle 43-46 -- CPU-bound)
-game thread            -5.8 ms         [M] Sec 3, banked
-dxvk-cs CommitRT       23-32 ms        [M] the wall, untouched
-  Phase 2b on inst     11-17 ms  -> ?  [U] gated on BLAS partition balance
-  v1 Phase 3           largest item    unchanged
-target                 33.3 ms
-```
+`commitGeometryToRT` is 23-32 ms/frame, of which `submitDrawState` is 20-29 and
+`processDrawCallState` 18-26 (`geom` 5-6, `inst` 11-17, other 1-2) `[M]`.
 
-**It does not close on what is banked.** Sec 3 bought 5.8 ms of critical path and 20 ms of total
-CPU; the frame is still CPU-bound and `commitGeometryToRT` at 23-32 ms is still the wall. Phase 2b
-plus v1 Phase 3 are what have to carry the rest, and 2b is now smaller than the handoff scoped it.
+Steps 2-5 move `geom` + `inst` -- **16-23 ms/frame** -- off dxvk-cs into a pool whose measured tax
+is ~280 us/pass. What remains ordered is the `copyBuffer` + rebind, plus the ~1.2 ms tail.
 
-The honest read: this session removed a whole class of cost that was not in either plan, and made
-the *next* measurement trustworthy. It did not move the pole.
+**v1 Appendix B.6's conclusion is the point:** once ordered GPU recording is the only thing left on
+dxvk-cs, that thread never becomes the bottleneck again at any frame rate, and the question of
+widening it never has to be asked. That is why this is the architecture and not an optimisation.
 
 ---
 
-## APPENDIX A -- probes added, and where
+# ANNEX — BUILT 2026-08-15 (night)
 
-| tag | file | gate | what it answers |
-|---|---|---|---|
-| `[BatchJoinSplit]` | `d3d11_rtx.cpp` `flushGeometryBatch` | always on | disp / wait / tail / JOINIDLE / wake / work / taxPerPass |
-| `[BatchJoinPeak]` | same | `kBjItemProbe` | worst single item, 4-way split, bytes read, `memFlags` decoded |
-| `[BatchJoinCensus]` | same | `kBjItemProbe` | every item summed; `mapPos` population; `sumWork` cross-check |
-| `BatchHashBytes` | `d3d11_rtx.cpp` `runBatchHashJob` | out-param, `nullptr` when off | bytes ACTUALLY read, reported by the clamping code itself |
+Steps 0-6 are implemented, gated on `rtx.shardInstanceProcessing` (default True; set False in
+rtx.conf for the byte-identical pre-2b path, no rebuild). Design record + as-built deltas:
+`PHASE2B_IMPLEMENTATION_SPEC.md`. The load-bearing addition beyond this plan: a full CS-thread
+drain at flush start (overlapped with Phase B) that gives strict mutate/read alternation between
+the game thread and dxvk-cs — it is what makes Steps 2-5 legal with one cold lock and no hit-path
+synchronization. Sky/terrain/replacement/unready draws take the unchanged legacy CS path in draw
+order (`[Shard2b] legacy=` counts them).
 
-Design notes worth keeping:
+**Where the build DIVERGES from Part III — read this before reading the timings.** `[I]` unless marked.
 
-- `BatchHashBytes` is filled by `runBatchHashJob` rather than recomputed at the call site. A second
-  copy of the clamp logic would be free to drift and then agree with itself while lying.
-- `[BatchJoinSplit]`'s `work{max}` is a **window** max over ~50 frames, not a per-frame max.
-  `avg` is the reliable half of that pair.
-- The per-chunk timestamp slots are cleared before each flush; a flush with fewer chunks than the
-  last would otherwise fold the previous flush's timestamps into `max()` and report a straggler
-  that did not happen.
+1. **Step 5 (`geom`, 5-6 ms) did not move, and cannot.** Only the cache-state DECISION is on the
+   flush side; `processGeometryInfo`'s bake — interleave, dispatches, `updateBufferCache` — still
+   records on dxvk-cs at the draw's stream position, because it reads mapped buffer contents and
+   emits GPU commands. **Sec 0.1 is the reason: that is the positional half of the seam.** So
+   Sec 18's "Steps 2-5 move geom + inst -- 16-23 ms/frame" overstates this phase. What moves is
+   `inst` (11-17 ms) minus the CS record residue (per-instance buffer binds, billboards, OMM,
+   ray portals). `[ProcDCS] geomMs` staying flat is CORRECT, not a failure.
+2. **The drain is a new serialization point this plan never costed.** Pre-2b the game thread and
+   dxvk-cs overlapped; the drain makes them strictly alternate, so whatever remains on CS —
+   including the previous frame's `injectRTX` and GC — is now exposed to the game thread as
+   `[BatchSubmitDraw] csDrainUs`. The net win is (work removed from CS) minus (csDrainUs + the
+   ordered pre-pass). Read csDrainUs before any other number.
+3. **The pre-pass does more than Sec 3 specifies.** Beyond `drawCallCache.get` it runs
+   `finalizePendingFutures`, `processCameraData`, the fog block, up to three replacement probes
+   and `determineMaterialData` — 1350x, single-threaded, on the game thread. Correct placement
+   (they mutate shared caches) but a new serial cost, reported as `[Shard2b] preUs`.
+4. **Sec 6's escapes 1 and 2 are implemented as DEFERRAL, not locking.** Migration and
+   `addInstance` never run on a worker at all; a miss defers the draw to the ordered tail, which
+   re-runs `find` a second time. Safer than a lock, and still cold at addedPct=0 — but a rise in
+   `[Shard2b] deferred=` now costs double finds, not just contention.
+5. **Sec 7's "new material registration in the tail" is not built.** `createSurfaceMaterial`
+   misses run inside the shard under the escape lock, so new-material cache indices follow shard
+   completion order, not draw order. Believed benign (lookup is by hash); see the correction in
+   the spec's Sec 3.2.
+6. **Sec 13's tombstone applies to the shard dispatch and was violated by the first build.**
+   ~460 shards scheduled as ~460 tasks is 4x the count Sec 13 measured as catastrophic. Fixed
+   2026-08-18: shards are the ownership unit, BUNDLES (one per worker) are the scheduling unit.
+   `[Shard2b] bundles=` must track the worker count. **Sec 13 is not just about `kChunksPerWorker`
+   — it is about the number of `Schedule()` calls per frame, whatever produces them.**
+
+**Verification state — be honest with yourself before trusting a run:** built without compiling
+(user compiles); mapped by a 6-agent deep-read before design; self-reviewed + brace-delta-checked
+against HEAD after. The adversarial review fleet died on a session usage cap with ZERO findings
+REPORTED — that is "not reviewed", not "clean". First build: check `[Shard2b]` appears,
+`deferred~0`, then the full Sec 15 table. First anomaly: `rtx.shardInstanceProcessing = False`
+and diff the two runs' logs.

@@ -53,6 +53,10 @@
 
 namespace dxvk {
 
+  // NV-DXVK [Phase2b]: the sharded-instance-phase context — see the declaration
+  // comment in rtx_instance_manager.h and PHASE2B_IMPLEMENTATION_SPEC.md.
+  thread_local ShardedInstancePhase t_shardPhase;
+
   // Forward decl for the engine-hook main-cam capture counter (defined in
   // rtx_camera_manager.cpp at dxvk::tf2 scope). Used as a gameplay-active
   // gate for the PropCensus probe so thread-local accumulators don't fill
@@ -559,6 +563,7 @@ namespace dxvk {
        m_frameCreated
        m_isCreatedByRenderer
        m_spatialCacheHash
+       m_spatialOpPendingFrame  (one value with m_spatialCacheHash - see the size note)
        m_primInstanceOwner
        buildGeometries
        buildRanges
@@ -662,7 +667,28 @@ namespace dxvk {
       // record's own back-pointer cleanup would skip the clone because it never
       // walks it. Left at 0, a clone simply owns no record until some placement
       // loop genuinely resolves to it, which is the truth.
-      static_assert(RtInstanceSize == 944, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+      // 944 -> 952 on 2026-08-18: added uint32_t m_spatialOpPendingFrame
+      // ([Phase2b] — the frame id of the last DEFERRED spatial-map op recorded
+      // for this instance during the sharded instance phase. onTransformChanged
+      // reads it to detect that an earlier op of the SAME frame is still
+      // pending, in which case its own key-unchanged skip test is unsound:
+      // m_spatialCacheHash is not written until the ordered tail applies the
+      // chain. Cleared by applyDeferredSpatialOp. 4 bytes of payload; the other
+      // 4 are alignment padding.
+      // COPY CTOR: DELIBERATELY NOT COPIED, and it must stay that way for as
+      // long as m_spatialCacheHash is also not copied (see the skip list). The
+      // pair is one value: where this instance currently sits in the SpatialMap,
+      // and whether a write to that position is still queued. A clone sits
+      // NOWHERE — it starts at kEmptyHash, is in no map, and no deferred op
+      // names it, because ops are recorded against the instance pointer that
+      // existed when the worker ran. Inheriting the source's pending-frame would
+      // tell the clone's first onTransformChanged that a write it never queued
+      // is still in flight (`chained`), forcing an unconditional record for a
+      // hash it does not own. Left at kInvalidFrameIndex the clone takes the
+      // ordinary first-use path: its key is kEmptyHash, so the key test fires on
+      // its own merits and the op resolves as a plain insert. If you ever make
+      // the copy ctor carry m_spatialCacheHash, carry this with it.
+      static_assert(RtInstanceSize == 952, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }
@@ -969,6 +995,44 @@ namespace dxvk {
         ? getBlas()->input.getGeometryData().boundingBox.getTransformedCentroid(firstInstanceObjectToWorld)
         : Vector3();
 
+      // NV-DXVK [Phase2b]: on a worker during the sharded instance phase, the
+      // spatial-map write is RECORDED, not applied. During that phase every
+      // SpatialMap is read-only by contract — that is what makes the migration
+      // path's cross-shard sibling reads (findSimilarInstance) safe without a
+      // lock on this, the hot path. The ordered tail applies the op in arena
+      // order via InstanceManager::applyDeferredSpatialOp. In allowMiss (tail)
+      // mode the write runs INLINE — single-threaded, and later work in the
+      // same tail item must see it (e.g. a later placement finding this one).
+      if (inShardedInstancePhase() && !t_shardPhase.allowMiss) {
+        // With an earlier op of this frame still pending, m_spatialCacheHash is
+        // stale and the newKey comparison above proves nothing — record
+        // unconditionally and let SpatialMap::move's own key compare decide at
+        // apply time (it no-ops when the key is unchanged).
+        const bool chained = (m_spatialOpPendingFrame == m_frameLastUpdated);
+        if (newKey != m_spatialCacheHash || chained) {
+          DeferredSpatialOp op;
+          op.kind = DeferredSpatialOp::Kind::kMove;
+          op.instance = this;
+          op.targetBlas = m_linkedBlas;
+          // Eager centroid on the chained path: the lazy derivation above keyed
+          // off the stale hash, so newPos may be empty even though the
+          // apply-time move will re-file and read it.
+          op.centroid = (newKey != m_spatialCacheHash)
+            ? newPos
+            : getBlas()->input.getGeometryData().boundingBox.getTransformedCentroid(firstInstanceObjectToWorld);
+          op.transform = firstInstanceObjectToWorld;
+          op.stablePropId = m_stablePropId;
+          op.precomputedMatrixHash = precomputedMatrixHash;
+          t_shardPhase.info->spatialOps.push_back(op);
+          m_spatialOpPendingFrame = m_frameLastUpdated;
+        } else {
+          // Key provably unchanged, no pending chain: exactly the inline no-op
+          // move. Keep [MapGate]'s write balance intact via the skip counter.
+          mapSkipAccount();
+        }
+        return;
+      }
+
       // NV-DXVK [Otc2904]: pre-move state for VS_2904d2 instances. If we
       // see m_spatialCacheHash != m_stablePropId here, this move() will
       // erase the propId slot and re-insert at a new slot — that's how an
@@ -1102,6 +1166,22 @@ namespace dxvk {
     if (!m_isCreatedByRenderer) {
       const Matrix4 firstInstanceObjectToWorld = calcFirstInstanceObjectToWorld();
       const Vector3 centroid = getBlas()->input.getGeometryData().boundingBox.getTransformedCentroid(firstInstanceObjectToWorld);
+      // NV-DXVK [Phase2b]: defensive — teleport should not be reachable on a
+      // worker (new instances are created in the ordered tail, in allowMiss
+      // mode, where this runs inline; the portal path defers the whole draw),
+      // but if a parallel-phase path does reach it, record the insert like the
+      // move site does rather than mutate a map the phase declares read-only.
+      if (inShardedInstancePhase() && !t_shardPhase.allowMiss) {
+        DeferredSpatialOp op;
+        op.kind = DeferredSpatialOp::Kind::kInsert;
+        op.instance = this;
+        op.targetBlas = m_linkedBlas;
+        op.centroid = centroid;
+        op.transform = firstInstanceObjectToWorld;
+        op.stablePropId = m_stablePropId;
+        t_shardPhase.info->spatialOps.push_back(op);
+        m_spatialOpPendingFrame = m_frameLastUpdated;
+      } else {
       // NV-DXVK [MapWrite]: see the note at the move() site in
       // onTransformChanged. teleport() is the OTHER way an entry enters the map,
       // and unlike move() it can seed a brand-new entry outright.
@@ -1135,13 +1215,14 @@ namespace dxvk {
             firstInstanceObjectToWorld[3][1], ",",
             firstInstanceObjectToWorld[3][2], ")"));
       }
+      }  // NV-DXVK [Phase2b]: end of the deferred/inline insert split.
     }
-    
+
     // The D3D matrix on input, needs to be transposed before feeding to the VK API (left/right handed conversion)
     // NOTE: VkTransformMatrixKHR is 4x3 matrix, and Matrix4 is 4x4
     const auto t = transpose(surface.objectToWorld);
     memcpy(&m_vkInstance.transform, &t, sizeof(VkTransformMatrixKHR));
-    
+
     return false; // freshly teleported instances are always treated as still.
   }
 
@@ -3708,6 +3789,15 @@ namespace dxvk {
     FanoutBatchRecord* piRec = nullptr;
     bool piPredictHit = false;
     if (piOn) {
+      // NV-DXVK [Phase2b]: m_fanoutRecords / m_fanoutOrdinals / the m_pi*
+      // counters are shared unlocked members; under the sharded phase two
+      // fanout draws in different shards reach this bookkeeping concurrently.
+      // One lock per fanout DRAW (tens per frame), never per placement — the
+      // placement loop below runs unlocked.
+      std::unique_lock<std::mutex> piBookLock;
+      if (inShardedInstancePhase()) {
+        piBookLock = std::unique_lock<std::mutex>(m_shardEscapeMutex);
+      }
       if (m_piFrame != currentFrameIdx) {
         m_piFrame = currentFrameIdx;
         m_piBatches = m_piHit = m_piMissKey = m_piMissInput = 0;
@@ -3913,9 +4003,16 @@ namespace dxvk {
 
         out_instances.push_back(inst);
       }
-      piRec->frameLastServed = currentFrameIdx;
-      m_piHit += 1;
-      m_piServedInst += static_cast<uint32_t>(piRec->instances.size());
+      {
+        // NV-DXVK [Phase2b]: same shared-member rule as the bookkeeping block.
+        std::unique_lock<std::mutex> piServeLock;
+        if (inShardedInstancePhase()) {
+          piServeLock = std::unique_lock<std::mutex>(m_shardEscapeMutex);
+        }
+        piRec->frameLastServed = currentFrameIdx;
+        m_piHit += 1;
+        m_piServedInst += static_cast<uint32_t>(piRec->instances.size());
+      }
       st.draws += 1;
       st.nInst += static_cast<uint32_t>(transforms->size());
       st.live  += static_cast<uint32_t>(out_instances.size());
@@ -4037,6 +4134,16 @@ namespace dxvk {
       const size_t instanceCountBefore = m_instances.size();
       RtInstance* instance = processSceneObjectImpl(cameraManager, rayPortalManager, blas, drawCall,
                                                     materialData, nullptr, drawCallCache, &split, drawState);
+      // NV-DXVK [Phase2b]: this placement's find missed on the worker — record
+      // the index for the ordered tail (which re-runs exactly these placements
+      // sequentially) and move on. The REFRESH below self-suppresses (short
+      // out_instances) and the VERIFY is gated on deferredPlacements.empty(), so
+      // the record machinery never sees the deliberately-incomplete list.
+      if (inShardedInstancePhase() && t_shardPhase.deferredThisDraw) {
+        t_shardPhase.deferredThisDraw = false;
+        t_shardPhase.info->deferredPlacements.push_back(static_cast<uint32_t>(placement));
+        continue;
+      }
       if (m_instances.size() > instanceCountBefore) {
         ++created;
         // The decisive split of `created`. A prop the game did not submit last
@@ -4225,7 +4332,13 @@ namespace dxvk {
     // of acting on it would be an instance in the wrong place or a stale
     // instance held alive by a stamp it never earned. Same failure class, and
     // the same remedy, as memoExtractVerify's FAIL.
-    if (piOn && piPredictHit && piVerify && piRec != nullptr) {
+    // NV-DXVK [Phase2b]: with deferred placements the produced list is
+    // deliberately incomplete until the tail runs — a verify against it would
+    // report a spurious FAIL for a fingerprint that is not at fault.
+    const bool piListComplete2b =
+      !inShardedInstancePhase() || t_shardPhase.info->deferredPlacements.empty();
+
+    if (piOn && piPredictHit && piVerify && piRec != nullptr && piListComplete2b) {
       bool diverged = (piRec->instances.size() != out_instances.size());
       size_t badIdx = SIZE_MAX;
       if (!diverged) {
@@ -4238,7 +4351,14 @@ namespace dxvk {
         }
       }
       if (diverged) {
+        // NV-DXVK [Phase2b]: shared counter — locked under the phase (cold:
+        // FAIL must read 0 in any healthy run anyway).
+        if (inShardedInstancePhase()) {
+          std::lock_guard<std::mutex> failLock(m_shardEscapeMutex);
+          m_piFail += 1;
+        } else {
         m_piFail += 1;
+        }
         // Throttled: a systematic fingerprint hole would otherwise emit one
         // line per batch per frame and bury the first (most diagnosable) case.
         thread_local uint32_t sPiFailLog = 0;
@@ -4294,6 +4414,12 @@ namespace dxvk {
     // per-placement state this fingerprint does not claim to cover -- so such a
     // batch stays on the loop rather than being recorded and mispredicted.
     if (piOn && out_instances.size() == transforms->size() && !out_instances.empty()) {
+      // NV-DXVK [Phase2b]: m_fanoutRecords insert + back-pointer rewrites are
+      // shared-member writes — locked under the phase, once per fanout draw.
+      std::unique_lock<std::mutex> piRefreshLock;
+      if (inShardedInstancePhase()) {
+        piRefreshLock = std::unique_lock<std::mutex>(m_shardEscapeMutex);
+      }
       if (piRec == nullptr) {
         // THE CAP IS A BACKSTOP, NOT THE MECHANISM. Retirement is the per-frame
         // age sweep in onFrameEnd; if the map is still at the ceiling after that
@@ -4344,6 +4470,67 @@ namespace dxvk {
     st.missProp    += missProp;
     st.mtxStable    += mtxStable;
     st.basisStable  += basisStable;
+  }
+
+  // NV-DXVK [Phase2b]: see the declaration comment. Runs in the ORDERED TAIL
+  // only — the phase flag is off, so every path inside (migration, addInstance,
+  // teleport, spatial-map writes) executes inline exactly like the legacy code.
+  void InstanceManager::processDeferredFanoutPlacements(
+    const CameraManager& cameraManager, const RayPortalManager& rayPortalManager,
+    BlasEntry& blas, const DrawCallState& drawCall, MaterialData& materialData,
+    DrawCallCache* drawCallCache, const std::vector<uint32_t>& placements,
+    std::vector<RtInstance*>& out_instances) {
+    const std::vector<Matrix4>* transforms = drawCall.getTransformData().instancesToObject;
+    if (transforms == nullptr || transforms->empty()) {
+      return;
+    }
+    const std::vector<Matrix4>* prevTransforms = drawCall.getTransformData().prevInstancesToObject;
+    if (prevTransforms != nullptr && prevTransforms->size() != transforms->size()) {
+      prevTransforms = nullptr;
+    }
+    const Matrix4& drawObjectToWorld = drawCall.getTransformData().objectToWorld;
+    // MUST match processSceneObjectFanout's composition bit-for-bit — the
+    // SpatialMap key is hashed from the composed matrix bytes, so a differently
+    // rounded product would file the instance under a key nothing else agrees
+    // with. Same identity-exact rule, same multiply, same prev handling.
+    const bool fanoutBaseIsIdentity = isIdentityExact(drawObjectToWorld);
+    const DrawScopedState drawState = computeDrawScopedState(blas, drawCall, materialData);
+
+    for (const uint32_t placement : placements) {
+      if (placement >= transforms->size()) {
+        continue;
+      }
+      FanoutSplit split;
+      if (fanoutBaseIsIdentity) {
+        split.objectToWorld = (*transforms)[placement];
+      } else {
+        split.objectToWorld = drawObjectToWorld * (*transforms)[placement];
+      }
+      if (prevTransforms != nullptr) {
+        if (fanoutBaseIsIdentity) {
+          split.prevObjectToWorld = (*prevTransforms)[placement];
+        } else {
+          split.prevObjectToWorld = drawObjectToWorld * (*prevTransforms)[placement];
+        }
+        split.hasPrevObjectToWorld = true;
+      }
+      RtInstance* instance = processSceneObjectImpl(cameraManager, rayPortalManager, blas, drawCall,
+                                                    materialData, nullptr, drawCallCache, &split, drawState);
+      if (instance != nullptr) {
+        // Duplicate suppression mirrors the wrapper's collide scan: two
+        // placements resolving to one instance must not double-register it.
+        bool duplicate = false;
+        for (const RtInstance* seen : out_instances) {
+          if (seen == instance) {
+            duplicate = true;
+            break;
+          }
+        }
+        if (!duplicate) {
+          out_instances.push_back(instance);
+        }
+      }
+    }
   }
 
   // NV-DXVK [Perf.SceneObj]: stage timer for processSceneObjectImpl.
@@ -4594,6 +4781,16 @@ namespace dxvk {
         ? &split->prevObjectToWorld
         : nullptr;
       currentInstance = findSimilarInstance(blas, materialData, firstInstanceObjectToWorld, drawCall.cameraType, rayPortalManager, lookupStablePropId, drawCallCache, prevO2W, &queryMatrixHash);
+
+      // NV-DXVK [Phase2b]: findSimilarInstance raised the defer sentinel (full
+      // miss, portal teleport, or migration candidate) — this draw/placement is
+      // re-run by the ordered tail with the phase flag off. Skip mid/add/update
+      // entirely: creating or updating anything here would double-run when the
+      // tail replays it. The caller reads t_shardPhase.deferredThisDraw.
+      if (inShardedInstancePhase() && t_shardPhase.deferredThisDraw) {
+        psoSplit.markFind();
+        return nullptr;
+      }
     }
 
     psoSplit.markFind();   // NV-DXVK [Perf.SceneObj]: end of `find`
@@ -4964,6 +5161,16 @@ namespace dxvk {
     psoSplit.markMid();   // NV-DXVK [Perf.SceneObj]: end of `mid`
 
     if (currentInstance == nullptr) {
+      // NV-DXVK [Phase2b]: catch-all — no worker may ever reach addInstance
+      // (m_instances.push_back + m_nextInstanceId, the Sec-6 escape). The find
+      // stage's own defer sites cover its normal miss paths; this covers every
+      // OTHER way currentInstance can be null here (e.g. the
+      // enableInstanceDebuggingTools early return, or a future null path).
+      // allowMiss (the ordered tail) creates inline, as the legacy path does.
+      if (inShardedInstancePhase() && !t_shardPhase.allowMiss) {
+        t_shardPhase.deferredThisDraw = true;
+        return nullptr;
+      }
       // No existing match - so need to create one
       currentInstance = addInstance(blas);
       psoSplit.noteAdded();
@@ -5686,23 +5893,38 @@ namespace dxvk {
     //   withPropId ~ 0            -> nothing in this scene keys on prop identity at
     //                                all, so the round-robin cannot be the cost
     //                                whatever else is true.
+    // NV-DXVK [Phase2b]: was `static thread_local FindStageAgg` — with find
+    // sharded across up to 30 workers a per-thread census fragments into 30
+    // partial lines and the Sec-15 "exact= ~97%" check stops being one number.
+    // File-scope relaxed atomics keep it a single truthful census (the same
+    // relaxed-counter shape rtx.logSurfaceGeomDiag documents as ~free); the
+    // frame CAS elects exactly one thread to emit-and-reset per rollover.
+    // Emission reads are relaxed loads racing late stragglers of the old frame
+    // by at most a few counts — a diagnostic tolerance, not a correctness one.
     struct FindStageAgg {
-      uint32_t frame = 0xFFFFFFFFu;
-      uint32_t calls = 0, exact = 0, withPropId = 0, propIdMiss = 0, noPropIdMiss = 0;
+      std::atomic<uint32_t> frame { 0xFFFFFFFFu };
+      std::atomic<uint32_t> calls { 0 }, exact { 0 }, withPropId { 0 }, propIdMiss { 0 }, noPropIdMiss { 0 };
     };
-    static thread_local FindStageAgg sFindStage;
-    if (sFindStage.frame != currentFrameIdx) {
-      if (sFindStage.frame != 0xFFFFFFFFu && sFindStage.calls > 0u) {
-        Logger::info(str::format(
-          "[FindStage] f=", sFindStage.frame,
-          " calls=", sFindStage.calls,
-          " exact=", sFindStage.exact,
-          " withPropId=", sFindStage.withPropId,
-          " propIdMiss=", sFindStage.propIdMiss,
-          " noPropIdMiss=", sFindStage.noPropIdMiss));
+    static FindStageAgg sFindStage;
+    {
+      uint32_t seenFrame = sFindStage.frame.load(std::memory_order_relaxed);
+      if (seenFrame != currentFrameIdx
+          && sFindStage.frame.compare_exchange_strong(seenFrame, currentFrameIdx, std::memory_order_relaxed)) {
+        const uint32_t emitCalls = sFindStage.calls.exchange(0, std::memory_order_relaxed);
+        const uint32_t emitExact = sFindStage.exact.exchange(0, std::memory_order_relaxed);
+        const uint32_t emitWith  = sFindStage.withPropId.exchange(0, std::memory_order_relaxed);
+        const uint32_t emitPm    = sFindStage.propIdMiss.exchange(0, std::memory_order_relaxed);
+        const uint32_t emitNpm   = sFindStage.noPropIdMiss.exchange(0, std::memory_order_relaxed);
+        if (seenFrame != 0xFFFFFFFFu && emitCalls > 0u) {
+          Logger::info(str::format(
+            "[FindStage] f=", seenFrame,
+            " calls=", emitCalls,
+            " exact=", emitExact,
+            " withPropId=", emitWith,
+            " propIdMiss=", emitPm,
+            " noPropIdMiss=", emitNpm));
+        }
       }
-      sFindStage = FindStageAgg{};
-      sFindStage.frame = currentFrameIdx;
     }
 
     RtInstance* pSimilar = nullptr;
@@ -5771,16 +5993,16 @@ namespace dxvk {
       // A non-zero propId that missed here is the round-robin signature: the key
       // is position-independent, so a stationary prop can only miss if the ID
       // itself changed since the instance was filed.
-      ++sFindStage.calls;
+      sFindStage.calls.fetch_add(1, std::memory_order_relaxed);
       if (stablePropId != 0ull) {
-        ++sFindStage.withPropId;
+        sFindStage.withPropId.fetch_add(1, std::memory_order_relaxed);
       }
       if (exactHit) {
-        ++sFindStage.exact;
+        sFindStage.exact.fetch_add(1, std::memory_order_relaxed);
       } else if (stablePropId != 0ull) {
-        ++sFindStage.propIdMiss;
+        sFindStage.propIdMiss.fetch_add(1, std::memory_order_relaxed);
       } else {
-        ++sFindStage.noPropIdMiss;
+        sFindStage.noPropIdMiss.fetch_add(1, std::memory_order_relaxed);
       }
       if (result != nullptr) {
         if (isProbeVS) {
@@ -6161,6 +6383,15 @@ namespace dxvk {
       // If the match was against a virtual equivalent of the instance from previous frame,
       // update the instance's transform to that of the virtual one
       if (teleportMatrix) {
+        // NV-DXVK [Phase2b]: teleportWithHistory rewrites transforms, moves the
+        // spatial-map entry AND recurses over replacement prims that may live in
+        // other shards' BLASes. Cold path (ViewModel through a portal) — defer
+        // the whole draw to the ordered tail, which re-runs this find and
+        // teleports inline (allowMiss).
+        if (inShardedInstancePhase() && !t_shardPhase.allowMiss) {
+          t_shardPhase.deferredThisDraw = true;
+          return nullptr;
+        }
         result->teleportWithHistory(*teleportMatrix);
       }
     }
@@ -6185,6 +6416,19 @@ namespace dxvk {
     // from the new entry (processInstanceBuffers runs on every first update
     // of a frame), so the instance renders the new entry's geometry while
     // keeping its id, TLAS slot continuity, and temporal history.
+    // NV-DXVK [Phase2b]: a full miss on a worker is DEFERRED, not resolved. Both
+    // resolutions of a miss (the engine-class migration below — which erases from
+    // another shard's spatial map and relinks instance lists — and addInstance in
+    // the caller — the global-vector escape) are the plan's Sec-6 escapes. The
+    // ordered tail re-runs the whole draw sequentially: this find repeats against
+    // the by-then-current maps, and the migration/add path runs inline with full
+    // fidelity. addedPct=0 in steady state, so this trigger is cold by
+    // construction, and instance IDs stay in arena order (deterministic).
+    if (inShardedInstancePhase() && !t_shardPhase.allowMiss && result == nullptr) {
+      t_shardPhase.deferredThisDraw = true;
+      return nullptr;
+    }
+
     if (result == nullptr && drawCallCache != nullptr && blas.engineClassKey != 0) {
       RtInstance* migrated = nullptr;
       BlasEntry* migratedFrom = nullptr;
@@ -6410,6 +6654,67 @@ namespace dxvk {
     currentInstance.surface.vguiFontBoundsBufferIndex = binding.vguiFontBoundsBufferIndex;
     currentInstance.surface.vguiImgBoundsBufferIndex = binding.vguiImgBoundsBufferIndex;
     currentInstance.surface.vguiStylesBufferIndex = binding.vguiStylesBufferIndex;
+  }
+
+  // NV-DXVK [Phase2b]: ordered-tail application of a worker-recorded op. Reads
+  // and writes m_spatialCacheHash HERE, at apply time, so multi-op chains on one
+  // instance (move-then-move across cameras, migration erase-then-insert) resolve
+  // exactly like the inline code did. Single-threaded by contract (the tail).
+  void InstanceManager::applyDeferredSpatialOp(const DeferredSpatialOp& op) {
+    RtInstance* inst = op.instance;
+    switch (op.kind) {
+      case DeferredSpatialOp::Kind::kMove:
+        inst->m_spatialCacheHash = op.targetBlas->getSpatialMap().move(
+            inst->m_spatialCacheHash, op.centroid, op.transform, inst, op.stablePropId,
+            op.precomputedMatrixHash);
+        mapWriteAccount(/*isInsert*/ false, static_cast<uint32_t>(op.targetBlas->getSpatialMap().size()));
+        break;
+      case DeferredSpatialOp::Kind::kInsert:
+        inst->m_spatialCacheHash = op.targetBlas->getSpatialMap().insert(
+            op.centroid, op.transform, inst, op.stablePropId);
+        mapWriteAccount(/*isInsert*/ true, static_cast<uint32_t>(op.targetBlas->getSpatialMap().size()));
+        break;
+      case DeferredSpatialOp::Kind::kDecalOrder:
+        assignDecalSortOrder(*inst);
+        break;
+    }
+    inst->m_spatialOpPendingFrame = kInvalidFrameIndex;
+  }
+
+  // NV-DXVK [Phase2b]: CS-record-step surface buffer rebind — same body as the
+  // non-hoisted processInstanceBuffers path, reading the post-bake,
+  // post-updateBufferCache BlasEntry directly. See the declaration comment.
+  void InstanceManager::bindInstanceBuffersFromBlas(const BlasEntry& blas, RtInstance& instance) const {
+    applySurfaceBufferBinding(resolveSurfaceBufferBinding(blas), instance);
+  }
+
+  // NV-DXVK [Phase2b]: CS-record-step billboard stage. The eligibility gate ran
+  // (and passed) on the worker — this replays only the creation, whose buffer
+  // reads are positional and whose m_billboards appends are CS-domain.
+  bool InstanceManager::runBillboardStage(RtInstance& instance, const Vector3& cameraDir) {
+    if (instance.testCategoryFlags(InstanceCategories::Beam)) {
+      createBeams(instance);
+    } else if (!instance.surface.alphaState.isDecal) {
+      createBillboards(instance, cameraDir);
+    }
+    return instance.m_billboardCount != 0;
+  }
+
+  // NV-DXVK [Phase2b]: CS-record-step replay of the deferred OMM half of the
+  // updateInstance event fanout. Selects handlers by the
+  // skippableWhenNoPendingOmmWork contract — the same discriminator the worker
+  // used to defer them — so a future third handler routes itself by what it
+  // declared, not by name.
+  void InstanceManager::fireDeferredOmmCallbacks(RtInstance& instance, const DrawCallState& drawCall,
+                                                 const MaterialData& materialData, bool hasTransformChanged,
+                                                 bool hasPreviousPositions, bool isFirstUpdateThisFrame) {
+    for (auto& event : m_eventHandlers) {
+      if (!event.skippableWhenNoPendingOmmWork) {
+        continue;
+      }
+      event.onInstanceUpdatedCallback(instance, drawCall, materialData, hasTransformChanged,
+                                      hasPreviousPositions, isFirstUpdateThisFrame);
+    }
   }
 
   void InstanceManager::processInstanceBuffers(const BlasEntry& blas, const DrawScopedState& drawState,
@@ -6923,6 +7228,16 @@ namespace dxvk {
                                        const FanoutSplit* split,
                                        const SpatialKeyHint& keyHint) {
     UpdInstSplitGuard uiSplit(RtxOptions::perfUpdateInstSplit(), m_device->getCurrentFrameId());
+
+    // NV-DXVK [Phase2b]: open this call's per-instance deferred-ops record. The
+    // divergence sites below (buffer bind, billboard stage, OMM fanout) write
+    // into it; the CS record step replays it after the bake. One entry per
+    // updateInstance call keeps fanout placements' event args exact.
+    if (inShardedInstancePhase()) {
+      t_shardPhase.info->pendingOps.push_back(
+          ShardedDrawInfo::PendingInstanceOps { &currentInstance });
+      t_shardPhase.currentOps = &t_shardPhase.info->pendingOps.back();
+    }
     // NV-DXVK [sticky IgnoreAntiCulling]: preserve IgnoreAntiCulling across
     // shader-variant draws that update the same RtInstance within a frame.
     // The mountain mesh is drawn with multiple d3d11 shader variants (e.g.
@@ -7310,7 +7625,14 @@ namespace dxvk {
 
           if (fastReject == kFastReasonCount) {
             // COMMIT the fast update: only the genuinely per-frame writes.
-            processInstanceBuffers(blas, drawState, currentInstance);
+            // NV-DXVK [Phase2b]: on a worker the surface buffer binding is
+            // deferred to the CS record step — the per-frame m_bufferCache tape
+            // those indices point into is only built there (see the spec Sec 3.4).
+            if (inShardedInstancePhase()) {
+              t_shardPhase.currentOps->bindBuffers = true;
+            } else {
+              processInstanceBuffers(blas, drawState, currentInstance);
+            }
             currentInstance.surface.hasMaterialChanged = false;
             currentInstance.surface.isInsideFrustum =
               RtxOptions::AntiCulling::isObjectAntiCullingEnabled() ? currentInstance.m_isInsideFrustum : true;
@@ -7340,6 +7662,20 @@ namespace dxvk {
             {
               const bool ommPendingWork = currentInstance
                 .getOpacityMicromapInstanceData().hasPendingNumTexelsCalculation();
+              // NV-DXVK [Phase2b]: the surviving handlers on this path are the
+              // non-skippable ones — OMM. Its callback reads buffer contents
+              // (texel calc) and writes unlocked OMM maps, both CS-domain, so on
+              // a worker it is deferred to the CS record step with these args.
+              if (inShardedInstancePhase()) {
+                if (ommPendingWork) {
+                  t_shardPhase.currentOps->omm = true;
+                  t_shardPhase.currentOps->evHasTransformChanged = false;
+                  t_shardPhase.currentOps->evHasPreviousPositions = false;
+                  t_shardPhase.currentOps->evIsFirstUpdateThisFrame = true;
+                } else {
+                  s_fastInstOmmSkips.fetch_add(1, std::memory_order_relaxed);
+                }
+              } else {
               for (auto& event : m_eventHandlers) {
                 if (event.skippableWhenBindingUnchanged) {
                   continue;
@@ -7352,6 +7688,7 @@ namespace dxvk {
                                                 /*hasTransformChanged*/ false,
                                                 /*hasPreviousPositions*/ false,
                                                 /*isFirstUpdateThisFrame*/ true);
+              }
               }
             }
 
@@ -7392,7 +7729,15 @@ namespace dxvk {
         // left instances bound to the previous frame's freed slices.
         // The "every skipped read is a key input" argument does not reach this
         // call, and it must stay outside the guard.
-        processInstanceBuffers(blas, drawState, currentInstance);
+        // NV-DXVK [Phase2b]: NOT skipped — DEFERRED to the CS record step, which
+        // rebinds after this frame's m_bufferCache tape exists. The 2026-08-07
+        // freeze was a skip with NO later rebind; the deferred rebind still
+        // happens every frame, before prepareSceneData consumes the surface.
+        if (inShardedInstancePhase()) {
+          t_shardPhase.currentOps->bindBuffers = true;
+        } else {
+          processInstanceBuffers(blas, drawState, currentInstance);
+        }
 
         currentInstance.m_materialType = materialData.getType();
 
@@ -7811,7 +8156,22 @@ namespace dxvk {
                                    || currentInstance.testCategoryFlags(InstanceCategories::Particle)
                                    || currentInstance.testCategoryFlags(InstanceCategories::WorldUI);
 
-        hasPreviousPositions = blas.modifiedGeometryData.previousPositionBuffer.defined() && !isMotionUnstable;
+        // NV-DXVK [Phase2b]: on a worker the bake has not run yet (it records on
+        // CS after the flush), so previousPositionBuffer still holds LAST frame's
+        // state. Predict this frame's value from the geometry decision the shard
+        // already made: kUpdateBVH always produces a previous-position buffer,
+        // KBuildBVH always resets it, kUpdateInstance leaves it as-is. This is
+        // exactly what processGeometryInfo's bake switch does to the field.
+        bool prevPosDefinedAfterBake = blas.modifiedGeometryData.previousPositionBuffer.defined();
+        if (inShardedInstancePhase() && t_shardPhase.info->geomResult >= 0) {
+          const auto r = static_cast<SceneManager::ObjectCacheState>(t_shardPhase.info->geomResult);
+          if (r == SceneManager::ObjectCacheState::kUpdateBVH) {
+            prevPosDefinedAfterBake = true;
+          } else if (r == SceneManager::ObjectCacheState::KBuildBVH) {
+            prevPosDefinedAfterBake = false;
+          }
+        }
+        hasPreviousPositions = prevPosDefinedAfterBake && !isMotionUnstable;
         const bool isFirstUpdateAfterCreation = currentInstance.isCreatedThisFrame(m_device->getCurrentFrameId()) && isFirstUpdateThisFrame;
 
         // Note: objectToView is aliased on updates, since findSimilarInstance() doesn't discern it
@@ -8124,12 +8484,25 @@ namespace dxvk {
 
     // Apply the decal sort index for this instance so we can approximate order correctness on the GPU in AHS
     if (currentInstance.surface.alphaState.isDecal) {
+      // NV-DXVK [Phase2b]: m_decalSortOrderCounter is ORDER-SENSITIVE — its value
+      // must reflect draw order, which the parallel shard phase does not have.
+      // Defer to the ordered tail, which assigns in arena (= draw) order via
+      // InstanceManager::assignDecalSortOrder, so the values match the
+      // sequential path exactly instead of racing. Tail continuations
+      // (allowMiss) assign inline — they already run in arena order.
+      if (inShardedInstancePhase() && !t_shardPhase.allowMiss) {
+        DeferredSpatialOp op;
+        op.kind = DeferredSpatialOp::Kind::kDecalOrder;
+        op.instance = &currentInstance;
+        t_shardPhase.info->spatialOps.push_back(op);
+      } else {
       currentInstance.surface.decalSortOrder = m_decalSortOrderCounter++;
 #if !NDEBUG
       if (m_decalSortOrderCounter > 255) {
         ONCE(Logger::err("Too many decals in this scene to sort correctly, may see some decal corruption issues."));
       }
 #endif
+      }  // NV-DXVK [Phase2b]: end of the deferred/inline decal-order split.
     }
 
     // NV-DXVK [Perf.NonOpaque]: which branch below claimed this instance. Only
@@ -8212,12 +8585,23 @@ namespace dxvk {
       if (currentInstance.m_isPlayerModel && drawCall.cameraType != CameraType::ViewModel) {
         mask |= OBJECT_MASK_PLAYER_MODEL;
         // Lazy-clear stale instances if onFrameEnd() was skipped last frame (e.g. device loss on alt+tab)
+        // NV-DXVK [Phase2b]: m_playerModelInstances is a global vector — a Sec-6
+        // escape. Player-model draws are a handful per frame, so the lock is
+        // cold; taking it around the lazy clear keeps the clear-then-push atomic.
         const uint32_t currentFrameId = m_device->getCurrentFrameId();
-        if (m_playerModelInstancesFrameId != currentFrameId) {
-          m_playerModelInstances.clear();
-          m_playerModelInstancesFrameId = currentFrameId;
+        const auto pushPlayerModel = [&]() {
+          if (m_playerModelInstancesFrameId != currentFrameId) {
+            m_playerModelInstances.clear();
+            m_playerModelInstancesFrameId = currentFrameId;
+          }
+          m_playerModelInstances.push_back(&currentInstance);
+        };
+        if (inShardedInstancePhase()) {
+          std::lock_guard<std::mutex> lock(m_shardEscapeMutex);
+          pushPlayerModel();
+        } else {
+          pushPlayerModel();
         }
-        m_playerModelInstances.push_back(&currentInstance);
       } else {
         currentInstance.m_isPlayerModel = false;
         if (currentInstance.m_isUnordered && RtxOptions::enableSeparateUnorderedApproximations()) {
@@ -8271,26 +8655,42 @@ namespace dxvk {
     
     if (drawCall.cameraType == CameraType::ViewModel && !currentInstance.m_isHidden && isFirstUpdateThisFrame) {
       // Lazy-clear stale candidates if onFrameEnd() was skipped last frame (e.g. device loss on alt+tab)
+      // NV-DXVK [Phase2b]: m_viewModelCandidates is a global vector — Sec-6
+      // escape, same treatment as m_playerModelInstances above. ViewModel draws
+      // are a handful per frame; the lock is cold.
       const uint32_t currentFrameId = m_device->getCurrentFrameId();
-      if (m_viewModelCandidatesFrameId != currentFrameId) {
-        m_viewModelCandidates.clear();
-        m_viewModelCandidatesFrameId = currentFrameId;
+      const auto pushVmCandidate = [&]() {
+        if (m_viewModelCandidatesFrameId != currentFrameId) {
+          m_viewModelCandidates.clear();
+          m_viewModelCandidatesFrameId = currentFrameId;
+        }
+        m_viewModelCandidates.push_back(&currentInstance);
+        Logger::info(str::format(
+          "[VM.candidate] f=", currentFrameId,
+          " candidates=", m_viewModelCandidates.size()));
+      };
+      if (inShardedInstancePhase()) {
+        std::lock_guard<std::mutex> lock(m_shardEscapeMutex);
+        pushVmCandidate();
+      } else {
+        pushVmCandidate();
       }
-      m_viewModelCandidates.push_back(&currentInstance);
-      Logger::info(str::format(
-        "[VM.candidate] f=", currentFrameId,
-        " candidates=", m_viewModelCandidates.size()));
     }
     // NV-DXVK [VM.instance]: log every draw that reaches instance update so
     // we can see whether ViewModel-classified draws arrive here (proves
     // SceneManager → InstanceManager plumbing works).
     if (drawCall.cameraType == CameraType::ViewModel) {
-      static uint32_t sLastF = 0;
-      static uint32_t sCount = 0;
+      // NV-DXVK [Phase2b]: atomics — this path now runs on workers. The CAS on
+      // the frame id makes exactly one thread reset the count per frame; the
+      // fetch_add caps total lines at ~16/frame regardless of interleaving.
+      static std::atomic<uint32_t> sLastF { 0 };
+      static std::atomic<uint32_t> sCount { 0 };
       const uint32_t fid = m_device->getCurrentFrameId();
-      if (fid != sLastF) { sLastF = fid; sCount = 0; }
-      if (sCount < 16) {
-        ++sCount;
+      uint32_t seenF = sLastF.load(std::memory_order_relaxed);
+      if (seenF != fid && sLastF.compare_exchange_strong(seenF, fid, std::memory_order_relaxed)) {
+        sCount.store(0, std::memory_order_relaxed);
+      }
+      if (sCount.fetch_add(1, std::memory_order_relaxed) < 16) {
         Logger::info(str::format(
           "[VM.instance] f=", fid,
           " isHidden=", (currentInstance.m_isHidden ? 1 : 0),
@@ -8329,6 +8729,15 @@ namespace dxvk {
         // below. The pointed-to RtInstance may have been freed since it was tagged
         // (device loss on alt+tab), so the getBlas() comparison would be a
         // use-after-free (rax=0xDD). Same-frame retags stay valid.
+        // NV-DXVK [Phase2b]: the (s_zigGunInstance, s_zigGunInstanceFrameId) PAIR
+        // must stay consistent — a torn (stale ptr, fresh fid) pair is exactly
+        // the frame-gate-defeating UAF this tag already crashed on once. VS-gated
+        // to a handful of draws per frame, so the escape lock is cold here.
+        {
+          std::unique_lock<std::mutex> zigLock;
+          if (inShardedInstancePhase()) {
+            zigLock = std::unique_lock<std::mutex>(m_shardEscapeMutex);
+          }
         const uint32_t zigFid = m_device->getCurrentFrameId();
         if (s_zigGunInstanceFrameId != zigFid) {
           s_zigGunInstance = nullptr;
@@ -8340,11 +8749,14 @@ namespace dxvk {
             || (s_zigGunInstance->getBlas() && vtx > s_zigGunInstance->getBlas()->modifiedGeometryData.vertexCount)) {
           s_zigGunInstance = &currentInstance;
         }
-        static uint32_t sGunF = 0; static uint32_t sGunC = 0;
+        }
+        static std::atomic<uint32_t> sGunF { 0 }; static std::atomic<uint32_t> sGunC { 0 };
         const uint32_t fid = m_device->getCurrentFrameId();
-        if (fid != sGunF) { sGunF = fid; sGunC = 0; }
-        if (sGunC < 6) {
-          ++sGunC;
+        uint32_t seenGunF = sGunF.load(std::memory_order_relaxed);
+        if (seenGunF != fid && sGunF.compare_exchange_strong(seenGunF, fid, std::memory_order_relaxed)) {
+          sGunC.store(0, std::memory_order_relaxed);
+        }
+        if (sGunC.fetch_add(1, std::memory_order_relaxed) < 6) {
           const auto& mainCam = cameraManager.getMainCamera();
           const Matrix4 w2v = mainCam.getWorldToView(false);
           const Matrix4 v2p = mainCam.getViewToProjection();
@@ -8374,6 +8786,18 @@ namespace dxvk {
         !currentInstance.m_isHidden &&
         currentInstance.getVkInstance().mask != 0) {
 
+      // NV-DXVK [Phase2b]: createBillboards reads MAPPED BUFFER CONTENTS (a
+      // positional read — the physical slice a logical buffer resolves to is a
+      // property of CS stream position) and both create paths append to the
+      // CS-domain m_billboards vector. On a worker, record eligibility and let
+      // the CS record step run InstanceManager::runBillboardStage after the
+      // capture rebind, exactly where the read is well-defined today.
+      // billboardsGotGenerated stays false here; the flush-side event gate below
+      // substitutes the pending flag, and the CS side re-evaluates with the real
+      // outcome before firing the deferred OMM callback.
+      if (inShardedInstancePhase()) {
+        t_shardPhase.currentOps->billboard = true;
+      } else {
       if (currentInstance.testCategoryFlags(InstanceCategories::Beam)) {
         createBeams(currentInstance);
       } else if(!currentInstance.surface.alphaState.isDecal) {
@@ -8381,6 +8805,7 @@ namespace dxvk {
       }
 
       billboardsGotGenerated = currentInstance.m_billboardCount != 0;
+      }
     }
 
     // NV-DXVK [Perf.NonOpaque]: census of the classification above, over the
@@ -8638,9 +9063,18 @@ namespace dxvk {
 
     uiSplit.mark(7);   // NV-DXVK [Perf.UpdInst]: end of `anticull`
 
+    // NV-DXVK [Phase2b]: on a worker the billboard stage was deferred, so
+    // billboardsGotGenerated is structurally false. Substitute the pending flag
+    // — the conservative "would have generated" — so the flush-side (SceneManager)
+    // half of the fanout fires in the same cases as the sequential path. The
+    // deferred (OMM) half is re-gated on the CS record step with the REAL
+    // outcome of runBillboardStage, so over-prediction never reaches OMM.
+    const bool billboardsPredicted = billboardsGotGenerated
+      || (inShardedInstancePhase() && t_shardPhase.currentOps->billboard);
+
     // Updates done only once a frame unless overriden due to an explicit state
     if (isFirstUpdateThisFrame || overridePreviousCameraUpdate ||
-        (billboardsGotGenerated && RtxOptions::getEnableOpacityMicromap())) {
+        (billboardsPredicted && RtxOptions::getEnableOpacityMicromap())) {
 
       // NV-DXVK [perf] handoff v5 sec 4c: SKIP THE FANOUT ITSELF.
       //
@@ -8681,7 +9115,7 @@ namespace dxvk {
       // skipped. Per-handler is the correct granularity here; a global flag can
       // only ever be as permissive as its most demanding listener.
       const bool fanoutMustRun =
-        hasTransformChanged || hasPreviousPositions || billboardsGotGenerated ||
+        hasTransformChanged || hasPreviousPositions || billboardsPredicted ||
         materialData.getType() == MaterialDataType::RayPortal;
 
       // NO SECOND KEY. instStateUnchanged was decided once in the `surf` block from
@@ -8702,8 +9136,20 @@ namespace dxvk {
       // handlers that OPTED IN to being skippable are dropped; everything else
       // still sees every instance, so a listener that does per-frame work
       // unrelated to the material cannot be starved by this gate.
+      // NV-DXVK [Phase2b]: on a worker the fanout splits by CONTRACT, not type:
+      // handlers that declared skippableWhenNoPendingOmmWork (OMM — reads buffer
+      // contents, writes unlocked CS-domain maps) are deferred to the CS record
+      // step with these exact args; everything else (SceneManager — materials,
+      // capturer, ray portals; internally Phase2b-aware) runs inline here.
       for (auto& event : m_eventHandlers) {
         if (skipFanout && event.skippableWhenBindingUnchanged) {
+          continue;
+        }
+        if (inShardedInstancePhase() && event.skippableWhenNoPendingOmmWork) {
+          t_shardPhase.currentOps->omm = true;
+          t_shardPhase.currentOps->evHasTransformChanged = hasTransformChanged;
+          t_shardPhase.currentOps->evHasPreviousPositions = hasPreviousPositions;
+          t_shardPhase.currentOps->evIsFirstUpdateThisFrame = isFirstUpdateThisFrame;
           continue;
         }
         event.onInstanceUpdatedCallback(currentInstance, drawCall, materialData, hasTransformChanged, hasPreviousPositions, isFirstUpdateThisFrame);

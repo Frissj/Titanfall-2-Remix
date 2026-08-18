@@ -1298,6 +1298,7 @@ namespace dxvk { namespace tf2 {
 #include "../dxvk/dxvk_barrier.h"
 
 #include "d3d11_context.h"
+#include "d3d11_context_imm.h"  // NV-DXVK [Phase2b]: SynchronizeCsThread — the flush-side CS drain
 #include "d3d11_buffer.h"
 #include "d3d11_input_layout.h"
 #include "d3d11_device.h"
@@ -25441,6 +25442,11 @@ namespace dxvk {
     BatchHashJob   hashJob;     bool hasHashJob = false;   // -> dcs.geometryData.hashes
     BatchBboxJob   bboxJob;     bool hasBboxJob = false;   // -> dcs.geometryData.boundingBox
     BatchSkinJob   skinJob;     bool hasSkinJob = false;   // -> dcs.skinningData.pBoneMatrices
+    // NV-DXVK [Phase2b]: sharded-instance sidecar — filled by
+    // SceneManager::processDeferredDrawBatch between the Phase B join and the
+    // Phase C emit, then moved into the commit lambda so dxvk-cs consumes the
+    // precomputed results. Default (route kNone) = full legacy CS path.
+    ShardedDrawInfo p2b;
 
     DrawWorkItem() = default;
     DrawWorkItem(DrawWorkItem&&) = default;
@@ -25509,6 +25515,12 @@ namespace dxvk {
   // (counter frozen) — which is the fork that decides the fix.
   // ============================================================
   static std::atomic<uint32_t> g_bjActive    { 0 };
+  // NV-DXVK [Phase2b]: WHICH join is being watched. flushGeometryBatch now has
+  // two: Phase B's per-chunk parallel-for and the sharded-instance pass. They
+  // fail for different reasons (Phase B: a monster draw; shards: a worker that
+  // never ran, or an escape-lock hold), so the STUCK line has to say which.
+  // 0 = Phase B, 1 = Phase 2b shard join.
+  static std::atomic<uint32_t> g_bjPhase     { 0 };
   static std::atomic<uint32_t> g_bjFrame     { 0 };
   static std::atomic<uint32_t> g_bjItems     { 0 };  // n, arena size this flush
   static std::atomic<uint32_t> g_bjChunks    { 0 };
@@ -25672,6 +25684,11 @@ namespace dxvk {
           ++episodes;
           Logger::warn(str::format(
             "[BatchJoin] STUCK f=", g_bjFrame.load(),
+            // NV-DXVK [Phase2b]: which of the two joins. In the shard phase
+            // `joiningFuture` is not tracked (the join lives inside
+            // SceneManager::processDeferredDrawBatch); futures= is the number of
+            // shard BUNDLES scheduled and itemsDone counts task starts+ends.
+            " phase=", (g_bjPhase.load() == 1u ? "shard2b" : "phaseB"),
             " heldMs=", heldMs,
             " joiningFuture=", g_bjIndex.load(), "/", g_bjFutCount.load(),
             " items=", g_bjItems.load(),
@@ -30076,14 +30093,36 @@ namespace dxvk {
       begin = end;
     }
 
+    // NV-DXVK [Phase2b]: DRAIN THE CS THREAD while Phase B runs on the workers.
+    // This is the linchpin of the sharded-instance architecture: after it, the
+    // CS thread has consumed EVERYTHING — last frame's commits, injectRTX (and
+    // its GC), and this frame's raster replay — so until Phase C emits, the RT
+    // scene state (instances, spatial maps, caches, BlasEntries) belongs
+    // exclusively to this thread and its shard workers. Strict alternation, no
+    // finer-grained synchronization anywhere else. Overlapped with Phase B's
+    // parallel work so its cost hides behind compute that already exists; in
+    // the steady state the CS thread is nearly caught up here anyway.
+    const bool shardOn = RtxOptions::shardInstanceProcessing()
+        && (m_context->GetType() == D3D11_DEVICE_CONTEXT_IMMEDIATE);
+    int64_t csDrainNs = 0;
+    if (shardOn) {
+      const auto tDrain0 = std::chrono::steady_clock::now();
+      static_cast<D3D11ImmediateContext*>(m_context)->SynchronizeCsThread(DxvkCsThread::SynchronizeAll);
+      csDrainNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - tDrain0).count();
+    }
+
     // Everything is dispatched; this thread now only joins. `self` is gone from the
-    // split -- an inline-fallback range lands in `disp` instead.
+    // split -- an inline-fallback range lands in `disp` instead. (Under Phase2b
+    // the CS drain above is also inside `disp` — read csDrainUs on
+    // [BatchSubmitDraw] before attributing a disp rise to dispatch itself.)
     const auto tDispatch = std::chrono::steady_clock::now();
 
     // [BatchJoin] publish the join state for the watchdog thread. The join below
     // is a busy spin inside Result::get() with no timeout, so if it never returns
     // this is the only record of where the frame thread went. Cleared after.
     bjStartWatchdog();
+    g_bjPhase.store(0u, std::memory_order_relaxed);   // NV-DXVK [Phase2b]: this is the Phase B join
     g_bjFrame.store(g_remixFrameId.load(std::memory_order_relaxed), std::memory_order_relaxed);
     g_bjItems.store(n, std::memory_order_relaxed);
     g_bjChunks.store(chunks, std::memory_order_relaxed);
@@ -30161,6 +30200,64 @@ namespace dxvk {
     const uint64_t slowChunkItemPct = slowChunkWorkNs
         ? (100u * slowChunkMaxItemNs / slowChunkWorkNs) : 0u;
 
+    // NV-DXVK [Phase2b]: THE SHARDED INSTANCE PASSES (plan Steps 1-6). All
+    // scene/instance mutation happens HERE, on this thread and its shard
+    // workers, inside the drained window — pre-pass (ordered), shards
+    // (parallel by BLAS), tail (ordered). By Phase C below, every sidecar is
+    // final and dxvk-cs only consumes.
+    if (shardOn && n > 0) {
+      static thread_local std::vector<SceneManager::ShardedDrawBatchItem> sShardBatch;
+      sShardBatch.clear();
+      sShardBatch.reserve(n);
+      for (DrawWorkItem& it : items) {
+        sShardBatch.push_back(SceneManager::ShardedDrawBatchItem { &it.dcs, &it.p2b });
+      }
+      SceneManager& sceneManager = m_context->m_device->getCommon()->getSceneManager();
+
+      // [BatchJoin] the shard join is a second busy-spin join on this thread and
+      // fails in its own ways (a bundle that never ran, a worker parked on the
+      // escape lock). Publish the same state so the existing watchdog covers it;
+      // g_bjIndex stays 0 because the join itself lives inside the driver.
+      bjStartWatchdog();
+      g_bjPhase.store(1u, std::memory_order_relaxed);
+      g_bjFrame.store(g_remixFrameId.load(std::memory_order_relaxed), std::memory_order_relaxed);
+      g_bjItems.store(n, std::memory_order_relaxed);
+      g_bjChunks.store(0u, std::memory_order_relaxed);
+      g_bjFutCount.store(0u, std::memory_order_relaxed);
+      g_bjIndex.store(0u, std::memory_order_relaxed);
+      g_bjStartNs.store(bjNowNs(), std::memory_order_relaxed);
+      g_bjActive.store(1u, std::memory_order_release);
+
+      sceneManager.processDeferredDrawBatch(sShardBatch,
+        [this](std::function<void()>&& fn) -> Future<void> {
+          // SPSC contract: Schedule is only ever called from this (game)
+          // thread — the driver runs its dispatch loop here. An invalid
+          // Future tells the driver to run that bundle inline (A.8 fallback).
+          if (m_pGeometryWorkers == nullptr) {
+            return Future<void>();
+          }
+          g_bjFutCount.fetch_add(1u, std::memory_order_relaxed);
+          // Heartbeat at task entry AND exit — two samples 250 ms apart then
+          // separate "a bundle is running but slow" from "no bundle ever
+          // started", which is the same fork the Phase B per-item bump answers.
+          return m_pGeometryWorkers->Schedule(
+            [inner = std::move(fn)]() mutable {
+              g_bjItemsDone.fetch_add(1u, std::memory_order_relaxed);
+              inner();
+              g_bjItemsDone.fetch_add(1u, std::memory_order_relaxed);
+            });
+        },
+        // Task budget: ONE task per worker, the same 1x rule Phase B settled on
+        // after the 4x oversubscription tombstone (see kChunksPerWorker). The
+        // driver packs its ~460 per-BLAS shards into this many bundles rather
+        // than scheduling each shard, so per-task pool cost stays at Phase B's
+        // proven scale instead of 15x it.
+        workers);
+
+      g_bjActive.store(0u, std::memory_order_release);
+      g_bjPhase.store(0u, std::memory_order_relaxed);
+    }
+
     // Phase C â€” hand the now-complete DrawCallStates to the CS thread in the original
     // draw order (the arena is naturally ordered). finalizePendingFutures on the CS
     // thread finds no material future and no-ops it (dcs.materialData is fully filled).
@@ -30175,8 +30272,11 @@ namespace dxvk {
         it.dcs.getGeometryData().vertexCount,
         dxvk::meshtrace::Stage::BatchEmitted);
       DrawParameters params = it.params;
-      m_context->EmitCs([params, dcs = std::move(it.dcs)](DxvkContext* ctx) mutable {
-        static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, dcs);
+      // NV-DXVK [Phase2b]: the sidecar rides the lambda (moved — the arena item
+      // is cleared below). Route kNone (option off) keeps commitGeometryToRT's
+      // body byte-identical to the pre-Phase2b path.
+      m_context->EmitCs([params, dcs = std::move(it.dcs), p2b = std::move(it.p2b)](DxvkContext* ctx) mutable {
+        static_cast<RtxContext*>(ctx)->commitGeometryToRT(params, dcs, &p2b);
       });
     }
 
@@ -30190,6 +30290,7 @@ namespace dxvk {
       static thread_local std::chrono::steady_clock::time_point sLast{};
       static thread_local uint64_t sItemAcc      = 0;
       static thread_local int64_t  sDispatchAccNs = 0;
+      static thread_local int64_t  sCsDrainAccNs = 0;   // NV-DXVK [Phase2b]
       static thread_local uint32_t sFrames       = 0;
       static thread_local bool     sInit         = false;
       // [BatchJoinSplit] accumulators, same 3 s window as the line above.
@@ -30206,6 +30307,7 @@ namespace dxvk {
       if (!sInit) { sLast = tBatch0; sInit = true; }
       sItemAcc      += n;
       sDispatchAccNs += std::chrono::duration_cast<std::chrono::nanoseconds>(tBatch1 - tBatch0).count();
+      sCsDrainAccNs += csDrainNs;   // NV-DXVK [Phase2b]
       ++sFrames;
       sDispAcc += dispNs; sWaitAcc += waitNs;
       sTailAcc += tailNs; sIdleAcc += idleNs;
@@ -30225,6 +30327,7 @@ namespace dxvk {
           "[BatchSubmitDraw] frames=", sFrames,
           " itemsPerFrame=", sItemAcc / uint64_t(fr),
           " parallelForMsPerFrame=", sDispatchAccNs / 1000000 / fr,
+          " csDrainUs=", sCsDrainAccNs / 1000 / fr,   // NV-DXVK [Phase2b]: the strict-alternation wait
           " workers=", workers));
         // Per-frame us for the four components, plus the two per-CHUNK distributions.
         // `tax` is the read that Â§6e exists to produce: what one extra parallel pass
@@ -30300,7 +30403,7 @@ namespace dxvk {
             " CACHEABLE=", (sCensus.mapPosHashBboxNs / uint64_t(fr)) / 1000, "us"
             " (", pct, "% of sumWork)"));
         }
-        sLast = tBatch1; sItemAcc = 0; sDispatchAccNs = 0; sFrames = 0;
+        sLast = tBatch1; sItemAcc = 0; sDispatchAccNs = 0; sCsDrainAccNs = 0; sFrames = 0;
         sDispAcc = sWaitAcc = sTailAcc = sIdleAcc = 0;
         sWakeSum = sWakeMax = sWorkSum = sWorkMax = sChunkCnt = 0;
         sPeak = BjItemBreak {};

@@ -4968,8 +4968,16 @@ namespace dxvk {
     }
   }
 
-  void RtxContext::commitGeometryToRT(const DrawParameters& params, DrawCallState& drawCallState){
+  void RtxContext::commitGeometryToRT(const DrawParameters& params, DrawCallState& drawCallState, ShardedDrawInfo* shardInfo){
     ScopedCpuProfileZone();
+
+    // NV-DXVK [Phase2b]: publish the sidecar for the scene-manager consumers
+    // (submitDrawState / processDrawCallState read t_shardedConsume). RAII so
+    // every early return below (unknown camera, sky SkipSubmit) clears it.
+    struct ShardedConsumeScope {
+      explicit ShardedConsumeScope(ShardedDrawInfo* info) { t_shardedConsume = info; }
+      ~ShardedConsumeScope() { t_shardedConsume = nullptr; }
+    } shardedConsumeScope(shardInfo);
 
     // NV-DXVK [perf, GPU index stash]: record the dynamic-IB stash copy HERE —
     // this lambda replays IN-ORDER on the CS stream, after this draw's bindings
@@ -5271,7 +5279,13 @@ namespace dxvk {
     s_commitFinalizeNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - tCommitFin0).count();
     if (futuresReady) {
-      drawCallState.cameraType = cameraManager.processCameraData(drawCallState);
+      // NV-DXVK [Phase2b]: the flush-side pre-pass classified EVERY batched
+      // draw's camera in arena order (the exact op order this call would have
+      // produced) — re-running it here would double-apply the CameraManager's
+      // per-draw state updates. Legacy/unbatched draws still classify here.
+      if (shardInfo == nullptr || !shardInfo->cameraDone) {
+        drawCallState.cameraType = cameraManager.processCameraData(drawCallState);
+      }
 
       // NV-DXVK [ShipDraw]: per-DRAW world AABB + camera classification for the hull shaders,
       // logged BEFORE the Unknown-skip / sky / merge so it reflects each individual submission

@@ -115,7 +115,12 @@ namespace dxvk {
     void clearRenderTarget(const Rc<DxvkImageView>& imageView, VkImageAspectFlags clearAspects, VkClearValue clearValue);
     void clearImageView(const Rc<DxvkImageView>& imageView, VkOffset3D offset, VkExtent3D extent, VkImageAspectFlags aspect, VkClearValue value);
 
-    void commitGeometryToRT(const DrawParameters& params, DrawCallState& drawCallState);
+    // NV-DXVK [Phase2b]: shardInfo — the per-draw sidecar produced by the
+    // flush-side driver (SceneManager::processDeferredDrawBatch). Null (or
+    // route kNone/kLegacyCS) keeps the full legacy body; route kSharded makes
+    // submitDrawState/processDrawCallState consume the precomputed results and
+    // record only the GPU residue. Owned by the Phase C EmitCs lambda.
+    void commitGeometryToRT(const DrawParameters& params, DrawCallState& drawCallState, ShardedDrawInfo* shardInfo = nullptr);
     void commitExternalGeometryToRT(ExternalDrawState&& state);
 
     static void blitImageHelper(Rc<DxvkContext> ctx, const Rc<DxvkImage>& srcImage, const Rc<DxvkImage>& dstImage, VkFilter filter);
