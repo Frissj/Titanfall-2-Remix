@@ -7551,8 +7551,11 @@ namespace dxvk {
   }
 
   // NV-DXVK: static definitions (shared across all D3D11Rtx instances).
-  bool D3D11Rtx::m_foundRealProjThisFrame = false;
-  bool D3D11Rtx::m_hasEverFoundProj       = false;
+  // NV-DXVK [XfDefer] 2026-08-19: atomic. Within-frame monotone latches, so a
+  // relaxed store cannot lose information however the writes interleave. See
+  // the declarations for why these two and not m_lastGoodTransforms.
+  std::atomic<bool> D3D11Rtx::m_foundRealProjThisFrame { false };
+  std::atomic<bool> D3D11Rtx::m_hasEverFoundProj       { false };
   DrawCallTransforms D3D11Rtx::m_lastGoodTransforms = {};
   std::mutex D3D11Rtx::m_lastGoodTransformsMutex;
 
@@ -8009,7 +8012,7 @@ namespace dxvk {
     // top of the RT image).  Frames where no gameplay was captured (menu,
     // loading) never fire early-inject at all â€” same behaviour as the
     // original code before this fix.
-    if (!m_remixActiveThisFrame) {
+    if (!m_remixActiveThisFrame.load(std::memory_order_acquire)) {
       static uint64_t sSkipCount = 0;
       if ((sSkipCount++ & 0xFF) == 0) {
         Logger::info(str::format(
@@ -9845,6 +9848,64 @@ namespace dxvk {
   // it is detectable, which is exactly why the gate has to be a learned set and
   // not a per-draw prediction that is allowed to miss.
   static thread_local uint32_t s_xfSharedEscape = 0;
+  // ==================================================================
+  // NV-DXVK [XfDefer] 2026-08-19 -- STEP 3 ROUTING TALLIES.
+  //
+  //   xfRouted        draws the gate passed. THE SIZING NUMBER: it says how
+  //                   many of the ~1080 draws/frame would leave the frame
+  //                   thread, and it is readable before any dispatcher exists.
+  //   refusedRec      refused on the record alone (not arena-backed, layout
+  //                   unresolved, or overflowed). Nothing can fix these.
+  //   refusedTaint    refused because the shader is in the shared-carrier set.
+  //                   A THROUGHPUT refusal, not a safety one -- see
+  //                   xfDeferShouldRoute.
+  //   abortGeo/Cb     the derivation read bytes the record could not serve.
+  //   abortCarrier    the derivation moved shared carrier state despite the
+  //                   gate. NOT a correctness failure any more (every such
+  //                   write now lands on thread-private storage or a monotone
+  //                   atomic) -- it is the cost of the taint set being a
+  //                   predictor rather than a proof, and abortCarrier/xfRouted
+  //                   is the rate at which it is wrong.
+  //
+  // abort* are counted on ROUTED draws only, so their denominator is xfRouted
+  // and not draws. Counting them on every draw would fold the inline
+  // population into a rate that is meant to describe the routed one -- the same
+  // denominator error R19 is about.
+  static thread_local uint32_t s_xfRouted = 0;
+  static thread_local uint32_t s_xfRouteRefusedRec = 0;
+  static thread_local uint32_t s_xfRouteRefusedTaint = 0;
+  static thread_local uint32_t s_xfAbortGeo = 0;
+  static thread_local uint32_t s_xfAbortCb = 0;
+  static thread_local uint32_t s_xfAbortCarrier = 0;
+  // [XfDefer] step 4b: draws refused because a site in the tail needed live
+  // D3D11 context state the record could not stand in for. Its per-site split
+  // is xfEsc{} on the same line -- this is the draw count, that is the site
+  // census, and they answer different questions (how much work is lost, versus
+  // which twelve-site edit would recover it).
+  static thread_local uint32_t s_xfAbortLive = 0;
+
+  // NV-DXVK [XfDefer] 2026-08-19c -- PRICE THE SECOND SEAM ON THIS BUILD.
+  //
+  // The only offload available without changing what a D3D11 draw call returns
+  // is everything AFTER `m_lastDrawCaptured = true` in SubmitDrawTail -- see the
+  // seam comment there and the block in d3d11_rtx.h. Its size has only ever
+  // been INFERRED, by adding the `emit` and `commit` stage buckets from the
+  // 2026-08-19 03:00 split (~8.4 ms of 22.4). That split was taken on a
+  // different build, with marks live, and this file's history is a list of
+  // large buckets whose contents were guessed wrong. So it gets measured.
+  //
+  // ONE CLOCK PAIR PER DRAW, taken by an RAII object rather than a second
+  // stamp, because the region has many early returns and a paired stamp would
+  // silently drop every draw that takes one -- biasing the number toward the
+  // draws that do the MOST work, i.e. in the flattering direction for a
+  // decision about whether to move it.
+  //
+  // Gated on s_submitDrawSubMarkers (RTX_D3D11_SUBMARK=1, no rebuild), so it
+  // costs exactly zero by default -- the same switch and the same reasoning as
+  // the dsi_* leaf split.
+  static thread_local int64_t  s_xfPostVerdictAccNs = 0;
+  static thread_local int64_t  s_xfPostVerdictMaxNs = 0;
+  static thread_local uint32_t s_xfPostVerdictN     = 0;
   // Billed the same way the eligibility split was: re-using the interval
   // markStg already computed, no extra clock read. This is what replaces
   // xfElig/xfElig3 as the thing worth reading once the deferral is live --
@@ -10731,11 +10792,11 @@ namespace dxvk {
   //
   // What the batched commit actually does, and what these name:
   //   bc_item_ns     items.emplace_back + params (DrawWorkItem construction)
-  //   bc_matSnap_ns  captureMatSnapshotInto(deferForWorker=true) -- copies the
-  //                  whole 128-slot PS SRV array + 14 cbuffer bindings, and
-  //                  PINS each bound cbuffer (incRef + acquire(Read)). The
-  //                  same function's own comment prices the untrimmed version
-  //                  at ~18 us/draw of Com<> churn.
+  //   bc_matSnap_ns  item.matSnap = std::move(pend.matSnap). SINCE B2 THIS IS
+  //                  THE MOVE, NOT THE CAPTURE -- if you are comparing against
+  //                  a log from before 2026-08-19d, that number was the capture
+  //                  and this one is not the same quantity. The capture is
+  //                  xfMatCapSeam_ns below.
   //   bc_dcsMove_ns  item.dcs = std::move(dcs)
   //   bc_jobs_ns     the three pending hash/bbox/skin job moves
   // Independent ns timers that do NOT consume tStg, so tail_emit keeps its
@@ -10748,6 +10809,22 @@ namespace dxvk {
   static thread_local int64_t s_perfBcMatSnapAccNs = 0, s_perfBcMatSnapMaxNs = 0;
   static thread_local int64_t s_perfBcDcsMoveAccNs = 0, s_perfBcDcsMoveMaxNs = 0;
   static thread_local int64_t s_perfBcJobsAccNs    = 0, s_perfBcJobsMaxNs    = 0;
+
+  // NV-DXVK [XfDefer] B2: xfMatCapSeam_ns -- captureMatSnapshotInto at the SEAM.
+  //
+  // This is the cost bc_matSnap_ns used to carry: the whole 128-slot PS SRV
+  // array + 14 cbuffer bindings copied, and each bound cbuffer PINNED (incRef +
+  // acquire(Read)). The same function's own comment prices the untrimmed
+  // version at ~18 us/draw of Com<> churn. It did not get cheaper by moving; it
+  // moved, and it gets its own bucket so a log cannot read the relocation as a
+  // saving. Expect it slightly ABOVE the old bc_matSnap_ns: the seam is reached
+  // by every draw, the append only by draws that survive to commit.
+  //
+  // thread_local IS CORRECT HERE, unlike the §9 atomics. Those are atomic
+  // because the chain fills them; this one is only ever touched on the frame
+  // thread -- being on the frame thread is the entire content of B2 -- so a
+  // thread_local copy is the whole population by construction.
+  static thread_local int64_t s_perfXfMatCapSeamAccNs = 0, s_perfXfMatCapSeamMaxNs = 0;
 
   // NV-DXVK [Perf.Replay] v6.5 -- the path-3 camera derivation, lifted out of
   // ExtractTransforms so the full run and the replay REFRESH share ONE
@@ -10945,20 +11022,146 @@ namespace dxvk {
     return true;
   }
 
+  // ==================================================================
+  // NV-DXVK [XfDefer] 2026-08-19c -- STEP 4c, PART 1: THE VERDICT CELL.
+  //
+  // WHAT THIS CHANGES TODAY: NOTHING, AND THAT IS THE POINT. With cells off
+  // (the default) beginDrawVerdict allocates nothing, TakePendingDrawVerdict
+  // returns empty, and each entry point takes the same `if (!deCap)` branch it
+  // takes now. With cells ON the cell is filled from the SAME bool on the same
+  // thread at the same instant, and the entry point reads the cell instead --
+  // so a capture with RTX_D3D11_VERDICT_CELLS=1 that renders identically is
+  // the proof that the mechanism is behaviour-neutral BEFORE anything is
+  // actually deferred through it. That separation is why step 4a was worth
+  // doing on its own, and this is the same move one level up.
+  //
+  // WHY AN ENV VAR AND NOT AN RTX_OPTION. rtx_options.h is included nearly
+  // everywhere; a new option there costs a ~20 minute full rebuild for a
+  // switch that exists to be flipped twice. Same idiom and same reasoning as
+  // s_submitDrawSubMarkers / RTX_PERF_MARKS.
+  //
+  // WHY THE CELL IS FILLED IN OnDraw* AND NOT AT THE VERDICT SITE IN THE TAIL.
+  // The entry point's answer is not `m_lastDrawCaptured`; it is
+  // `m_lastDrawFilteredAsUI ? false : m_remixActiveThisFrame`, plus the
+  // composite-chain rescue that can flip m_lastDrawCaptured back to false
+  // AFTER SubmitDraw returns. Filling the cell from the tail would encode a
+  // DIFFERENT decision that happens to agree today -- the exact class of
+  // near-duplicate that R23 is about. It is filled from the returned bool, so
+  // it cannot drift.
+  // ==================================================================
+  static const bool s_drawVerdictCells = []() {
+    const char* v = std::getenv("RTX_D3D11_VERDICT_CELLS");
+    if (v == nullptr || v[0] == '\0')
+      return false;         // default OFF -- nothing defers yet
+    return v[0] != '0';
+  }();
+
+  void D3D11Rtx::beginDrawVerdict() {
+    m_curVerdictBlock.reset();
+    m_curVerdictIndex = 0;
+    // ALL DRAWS TODAY, ROUTED DRAWS ONLY LATER. In this pass-through mode every
+    // hooked draw takes a cell, because the point is to exercise the mechanism
+    // on the whole population. That is not free: a captured draw emits a CS
+    // command it emits nothing for today (a small lambda in the chunk plus one
+    // branch on the CS thread). Once a dispatcher exists the allocation belongs
+    // behind xfDeferShouldRoute -- an unrouted draw's verdict is final before
+    // the entry point returns and it should keep the immediate path.
+    if (!s_drawVerdictCells)
+      return;
+    if (m_verdictBlock == nullptr
+        || m_verdictBlock->used >= DrawVerdictBlock::kCapacity) {
+      // REPLACED, NOT GROWN, and never recycled by hand: the CS commands
+      // holding the old block keep it alive through their own shared_ptr and
+      // it frees itself once the last of them has run. That is the only
+      // lifetime rule here, and it is why the cells are in a block at all.
+      m_verdictBlock = std::make_shared<DrawVerdictBlock>();
+    }
+    m_curVerdictIndex = m_verdictBlock->used++;
+    m_curVerdictBlock = m_verdictBlock;
+    m_curVerdictBlock->cells[m_curVerdictIndex]
+        .state.store(0u, std::memory_order_relaxed);
+  }
+
+  void D3D11Rtx::resolveDrawVerdict(bool captured) {
+    if (m_curVerdictBlock == nullptr)
+      return;
+    m_curVerdictBlock->cells[m_curVerdictIndex]
+        .state.store(captured ? 1u : 2u, std::memory_order_release);
+  }
+
+  // CS thread. See the declarations for the ordering argument.
+  bool D3D11Rtx::PendingVerdict::waitRunNative() const {
+    const DrawVerdict* c = cell();
+    uint32_t s = c->state.load(std::memory_order_acquire);
+    if (s != 0u)
+      return s != 1u;
+    // SLOW PATH: the CS thread got to this command before the chain resolved
+    // it. Bounded, because an unbounded wait on a dispatcher bug is a hung
+    // game rather than a slow frame -- and on timeout it takes DrawVerdict's
+    // documented fail direction and says so once.
+    block->waiters.fetch_add(1u, std::memory_order_relaxed);
+    {
+      std::unique_lock<std::mutex> lk(block->mu);
+      const bool ok = block->cv.wait_for(
+          lk, std::chrono::milliseconds(250),
+          [c]() { return c->state.load(std::memory_order_acquire) != 0u; });
+      if (!ok) {
+        static std::atomic<bool> sWarned { false };
+        if (!sWarned.exchange(true, std::memory_order_relaxed)) {
+          Logger::err("[XfDefer] verdict cell still pending after 250 ms -- the "
+                      "deferred chain did not resolve this draw. Running the "
+                      "native draw (the safe direction). This is a dispatcher "
+                      "bug, not a timing problem; it will not be reported again.");
+        }
+      }
+    }
+    block->waiters.fetch_sub(1u, std::memory_order_relaxed);
+    return c->state.load(std::memory_order_acquire) != 1u;
+  }
+
+  void D3D11Rtx::PendingVerdict::resolve(bool captured) const {
+    // Not cell(): store() is non-const. shared_ptr does not propagate const, so
+    // the block is writable through a const PendingVerdict -- which is what we
+    // want, because the CELL is the mutable thing here, not the handle.
+    block->cells[index].state.store(captured ? 1u : 2u, std::memory_order_release);
+    if (block->waiters.load(std::memory_order_relaxed) != 0u) {
+      std::lock_guard<std::mutex> lk(block->mu);
+      block->cv.notify_all();
+    }
+  }
+
+  D3D11Rtx::PendingVerdict D3D11Rtx::TakePendingDrawVerdict() {
+    PendingVerdict p;
+    if (m_curVerdictBlock != nullptr) {
+      p.block = std::move(m_curVerdictBlock);
+      p.index = m_curVerdictIndex;
+    }
+    m_curVerdictBlock.reset();
+    m_curVerdictIndex = 0;
+    return p;
+  }
+
   bool D3D11Rtx::OnDraw(UINT vertexCount, UINT startVertex) {
     ++m_rawDrawCount;
     { if (auto* vsP = m_context->m_state.vs.shader.ptr()) { if (auto* csP = vsP->GetCommonShader()) { const auto& shP = csP->GetShader(); if (shP != nullptr) { const uint64_t vsR = static_cast<uint64_t>(shP->getHash()); ++m_rawVsHistogram[vsR]; const auto& vmVps = m_context->m_state.rs.viewports; const float vmW = m_context->m_state.rs.numViewports > 0 ? vmVps[0].Width : 0.0f; const float vmH = m_context->m_state.rs.numViewports > 0 ? vmVps[0].Height : 0.0f; const float vmMaxD = m_context->m_state.rs.numViewports > 0 ? vmVps[0].MaxDepth : 1.0f; captureVanishStackIfTarget(vsR, vmW, vmH, vmMaxD); } } } }
     m_lastDrawCaptured = false;
     m_lastDrawFilteredAsUI = false;
     m_lastDrawIsHudClass   = false;
+    // [XfDefer] step 4c: this draw's verdict cell, allocated beside the flags
+    // it will be derived from. No-op unless RTX_D3D11_VERDICT_CELLS=1.
+    beginDrawVerdict();
     const auto tD = std::chrono::steady_clock::now();
     SubmitDraw(false, vertexCount, startVertex, 0);
     const int64_t dUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tD).count();
     s_perfSubmitDrawAccUs += dUs; s_perfSubmitDrawCount++; if (dUs > s_perfSubmitDrawMaxUs) s_perfSubmitDrawMaxUs = dUs;
     recordSubmitStall("Draw", dUs, vertexCount, 1);
-    if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
-    if (m_lastDrawFilteredAsUI) return false;
-    return m_remixActiveThisFrame;
+    if (m_lastDrawCaptured) m_remixActiveThisFrame.store(true, std::memory_order_release);
+    // [XfDefer] step 4c: the cell carries EXACTLY the bool returned below --
+    // filled here, from the same expression, so the two cannot drift.
+    const bool deCapV = m_lastDrawFilteredAsUI
+        ? false : m_remixActiveThisFrame.load(std::memory_order_acquire);
+    resolveDrawVerdict(deCapV);
+    return deCapV;
   }
 
   bool D3D11Rtx::OnDrawIndexed(UINT indexCount, UINT startIndex, INT baseVertex) {
@@ -10967,12 +11170,15 @@ namespace dxvk {
     m_lastDrawCaptured = false;
     m_lastDrawFilteredAsUI = false;
     m_lastDrawIsHudClass   = false;
+    // [XfDefer] step 4c: this draw's verdict cell, allocated beside the flags
+    // it will be derived from. No-op unless RTX_D3D11_VERDICT_CELLS=1.
+    beginDrawVerdict();
     const auto tD = std::chrono::steady_clock::now();
     SubmitDraw(true, indexCount, startIndex, baseVertex);
     const int64_t dUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tD).count();
     s_perfSubmitDrawAccUs += dUs; s_perfSubmitDrawCount++; if (dUs > s_perfSubmitDrawMaxUs) s_perfSubmitDrawMaxUs = dUs;
     recordSubmitStall("DrawIndexed", dUs, indexCount, 1);
-    if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
+    if (m_lastDrawCaptured) m_remixActiveThisFrame.store(true, std::memory_order_release);
     // NV-DXVK [HUD-Option5 v4]: rescue-override for TF2's composite-
     // chain VSes. In gameplay, Remix's classifier was capturing these
     // draws for RT (m_lastDrawCaptured=true), so OnDrawIndexed returned
@@ -10999,8 +11205,12 @@ namespace dxvk {
         m_lastDrawCaptured = false;
       }
     }
-    if (m_lastDrawFilteredAsUI) return false;
-    return m_remixActiveThisFrame;
+    // [XfDefer] step 4c: the cell carries EXACTLY the bool returned below --
+    // filled here, from the same expression, so the two cannot drift.
+    const bool deCapV = m_lastDrawFilteredAsUI
+        ? false : m_remixActiveThisFrame.load(std::memory_order_acquire);
+    resolveDrawVerdict(deCapV);
+    return deCapV;
   }
 
   bool D3D11Rtx::OnDrawInstanced(UINT vertexCountPerInstance, UINT instanceCount, UINT startVertex, UINT startInstance) {
@@ -11009,14 +11219,21 @@ namespace dxvk {
     m_lastDrawCaptured = false;
     m_lastDrawFilteredAsUI = false;
     m_lastDrawIsHudClass   = false;
+    // [XfDefer] step 4c: this draw's verdict cell, allocated beside the flags
+    // it will be derived from. No-op unless RTX_D3D11_VERDICT_CELLS=1.
+    beginDrawVerdict();
     const auto tD = std::chrono::steady_clock::now();
     SubmitInstancedDraw(false, vertexCountPerInstance, startVertex, 0, instanceCount, startInstance);
     const int64_t dUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tD).count();
     s_perfSubmitDrawAccUs += dUs; s_perfSubmitDrawCount++; if (dUs > s_perfSubmitDrawMaxUs) s_perfSubmitDrawMaxUs = dUs;
     recordSubmitStall("DrawInstanced", dUs, vertexCountPerInstance, instanceCount);
-    if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
-    if (m_lastDrawFilteredAsUI) return false;
-    return m_remixActiveThisFrame;
+    if (m_lastDrawCaptured) m_remixActiveThisFrame.store(true, std::memory_order_release);
+    // [XfDefer] step 4c: the cell carries EXACTLY the bool returned below --
+    // filled here, from the same expression, so the two cannot drift.
+    const bool deCapV = m_lastDrawFilteredAsUI
+        ? false : m_remixActiveThisFrame.load(std::memory_order_acquire);
+    resolveDrawVerdict(deCapV);
+    return deCapV;
   }
 
   bool D3D11Rtx::OnDrawIndexedInstanced(UINT indexCountPerInstance, UINT instanceCount, UINT startIndex, INT baseVertex, UINT startInstance) {
@@ -11025,14 +11242,21 @@ namespace dxvk {
     m_lastDrawCaptured = false;
     m_lastDrawFilteredAsUI = false;
     m_lastDrawIsHudClass   = false;
+    // [XfDefer] step 4c: this draw's verdict cell, allocated beside the flags
+    // it will be derived from. No-op unless RTX_D3D11_VERDICT_CELLS=1.
+    beginDrawVerdict();
     const auto tD = std::chrono::steady_clock::now();
     SubmitInstancedDraw(true, indexCountPerInstance, startIndex, baseVertex, instanceCount, startInstance);
     const int64_t dUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - tD).count();
     s_perfSubmitDrawAccUs += dUs; s_perfSubmitDrawCount++; if (dUs > s_perfSubmitDrawMaxUs) s_perfSubmitDrawMaxUs = dUs;
     recordSubmitStall("DrawIdxInst", dUs, indexCountPerInstance, instanceCount);
-    if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
-    if (m_lastDrawFilteredAsUI) return false;
-    return m_remixActiveThisFrame;
+    if (m_lastDrawCaptured) m_remixActiveThisFrame.store(true, std::memory_order_release);
+    // [XfDefer] step 4c: the cell carries EXACTLY the bool returned below --
+    // filled here, from the same expression, so the two cannot drift.
+    const bool deCapV = m_lastDrawFilteredAsUI
+        ? false : m_remixActiveThisFrame.load(std::memory_order_acquire);
+    resolveDrawVerdict(deCapV);
+    return deCapV;
   }
 
   // NV-DXVK [Perf.DrawEntry]: forward declaration â€” the definition sits next to
@@ -12311,6 +12535,262 @@ namespace dxvk {
     return XXH64(&e, sizeof(e), 0xC0A11D01ull);
   }
 
+  // ==================================================================
+  // NV-DXVK [XfDefer] 2026-08-19 -- STEP 3. Contract and the correctness
+  // argument are on the declarations in d3d11_rtx.h. Defined here because they
+  // read s_xfSharedCarrierVsIl and vsIlIdentity, both file scope above.
+  // ==================================================================
+
+  // THE GATE. Frame thread, at capture, before the derivation runs.
+  bool D3D11Rtx::xfDeferShouldRoute(const DrawSnapshot& s) {
+    if (!RtxOptions::xfDeferRoute())
+      return false;
+    // deferrable = arenaBacked && layoutResolved && !overflowed. Every term is
+    // a property of the RECORD, so this is exact rather than predicted -- the
+    // distinction the whole three-axis split turned on.
+    if (!s.deferrable) {
+      ++s_xfRouteRefusedRec;
+      return false;
+    }
+    // THE THROUGHPUT HINT. A shader that has ever moved shared carrier state is
+    // likely to do it again, and a routed draw that does costs a dispatch plus
+    // an inline re-derivation. Refusing it up front is cheaper. This is NOT
+    // what makes routing safe -- xfDeferMustAbort is.
+    //
+    // A shader NOT in the set is not proven clean, and must not be read as
+    // such: the set is learned, so a shader's first shared-carrier draw always
+    // passes this. sharedEscape counts exactly that population and reads 0 in
+    // 42 of 44 measured windows, the exceptions being the cold-start windows
+    // where everVs itself is still climbing. That is the cost of the hint being
+    // a hint, and it is bounded by the abort.
+    const uint64_t k = vsIlIdentity(s.vs.ptr(), s.inputLayout.ptr());
+    if (s_xfSharedCarrierVsIl.find(k) != s_xfSharedCarrierVsIl.end()) {
+      ++s_xfRouteRefusedTaint;
+      return false;
+    }
+    ++s_xfRouted;
+    return true;
+  }
+
+  // THE ABORT. After the derivation. True means the result is not trustworthy
+  // and the draw must be re-derived inline.
+  //
+  // THREE AXES, AND THEY FAIL FOR DIFFERENT REASONS:
+  //   geoLiveReads  the derivation fell back to a live DYNAMIC geometry source.
+  //                 On a worker those bytes may have been renamed away, so the
+  //                 result may be built from a stranger's vertices. THE ONLY
+  //                 ONE THAT COULD EVER HAVE CORRUPTED, and it is measured at 6
+  //                 live reads in 36,015 draws.
+  //   cbLiveReads   the same for cbuffer content: the record could not serve a
+  //                 span the derivation asked for, so it read the live buffer,
+  //                 which a worker has no claim on.
+  //   sharedCarrier the derivation moved cross-draw state. Its WRITE is
+  //                 harmless (thread-private or a monotone atomic -- see the
+  //                 declaration), but a later draw expected to observe it and
+  //                 will not, so this draw's result is discarded and re-derived
+  //                 on the frame thread where the write lands where it belongs.
+  //
+  // Deliberately NOT folded into one bool: they have different fixes, and a
+  // fold could only ever say "something went wrong" -- the same reason
+  // carrierGrp is per group.
+  bool D3D11Rtx::xfDeferMustAbort(const DrawSnapshot& s) {
+    return s.geoLiveReads != 0
+        || s.cbLiveReads  != 0
+        || s.liveStateEscapes != 0
+        || s.wroteSharedCarrier();
+  }
+
+  // ==================================================================
+  // NV-DXVK [XfDefer] 2026-08-19c -- STEP 4b: THE LIVE-STATE CHOKE POINT.
+  //
+  // WHY THE ABORT IS NOT ENOUGH FOR THIS ONE. xfDeferMustAbort above is a
+  // POST-HOC test: let the derivation run, then ask whether it did anything a
+  // worker had no right to do. That is sound for STALENESS -- bytes renamed
+  // underneath the read are wrong, not fatal, and the abort reclaims the draw
+  // by re-deriving it inline. It is NOT sound for m_context->m_state. Those
+  // arrays hold Com<> references that the frame thread RELEASES and overwrites
+  // on every IASetVertexBuffers / *SetConstantBuffers / *SetShaderResources
+  // call -- 23,396 entry points per frame in the 05:42 capture. A worker
+  // reading one concurrently is not reading stale data; it is racing a
+  // refcount and can dereference a freed view. There is nothing left to detect
+  // afterwards.
+  //
+  // So the twelve residual live-state reads in SubmitDrawTail cannot be
+  // "scored like geoLiveReads". They have to become UNREACHABLE on a worker.
+  // In a deferred scope this hands back a shared, permanently-empty
+  // D3D11ContextState instead of the live one.
+  //
+  // WHY AN EMPTY STATE AND NOT TWELVE EARLY-OUTS. Every one of the twelve
+  // already null-checks what it pulls out -- `cb.buffer == nullptr`,
+  // `vb.buffer == nullptr`, `if (!srv) continue`, `slot >= size()`. An empty
+  // state makes each of them take the branch it already has, so the conversion
+  // is a one-token edit per site and introduces no new control flow. Twelve
+  // bespoke early-outs would be twelve chances to skip one line too many, in a
+  // 12,946-line body where a skipped line is a silent behaviour change.
+  //
+  // WHY IT IS NOT A CORRECTNESS COMPROMISE. An escape stamps liveStateEscapes
+  // on the record, xfDeferMustAbort refuses the draw, and the frame thread
+  // re-derives it inline -- where this returns the real state and the site runs
+  // exactly as it does today. An escape costs its draw a re-derivation. It
+  // never changes what the draw produces.
+  //
+  // WHAT IT DOES NOT COVER, stated so the next reader does not over-trust it:
+  // m_context->EmitCs (two sites, ~:52515 and ~:52704) writes the CS command
+  // stream in draw order and is NOT routed through here. A dispatcher must run
+  // with rtx.batchSubmitDrawStages ON, where the tail's terminal act is the
+  // arena append instead, or keep the emit on the frame thread. m_context->
+  // m_device (31 sites) is a stable pointer to an object with no per-draw
+  // state and is deliberately left alone.
+  //
+  // ZERO COST TODAY. s_xfDeferExecuting is false on every thread until a
+  // dispatcher opens a scope, so every site gets the same reference it had
+  // before, behind one thread_local load.
+  // ==================================================================
+  static thread_local bool s_xfDeferExecuting = false;
+  // Per-site escape tally, zeroes omitted at emit -- same idiom as
+  // s_drawSnapWcMissBySlot, and for the same reason: one dominant site has to
+  // be visible at a glance, and a site that never fires is a site that is
+  // genuinely converted rather than one nobody checked.
+  //
+  // ATOMIC AND NOT thread_local, WHICH IS THE WHOLE POINT OF THE COUNTER. An
+  // escape happens on the WORKER, by definition -- s_xfDeferExecuting is only
+  // ever true there. The census is emitted from EndFrame on the frame thread.
+  // A thread_local tally would therefore have the worker fill its own copy and
+  // the report read the frame thread's, printing 0 forever and reading as "no
+  // site needs converting". That is exactly the trap 6.2 already records for
+  // xfDeferLearn, one level down. relaxed is right: these are counters, no
+  // other memory is being published through them.
+  // No initialiser: static storage duration zero-initialises before any
+  // dynamic init runs, which is what std::atomic's pre-C++20 default ctor does
+  // NOT promise on its own -- and `= { }` on an array of a non-copyable type is
+  // the kind of aggregate-init corner MSVC has been inconsistent about.
+  static std::atomic<uint32_t>
+    s_xfLiveEscapeBySite[size_t(XfLiveSite::Count)];
+  static const char* const kXfLiveSiteNames[] = {
+    "vguiSb", "vbTc", "vbPos", "vbTc2", "psCbDump", "psUvXform",
+    "skinVbs", "camOrigDiag", "garbO2w", "tspSrv", "memoCeil", "recCbSnap"
+  };
+  static_assert(sizeof(kXfLiveSiteNames) / sizeof(kXfLiveSiteNames[0])
+                    == size_t(XfLiveSite::Count),
+                "kXfLiveSiteNames must have one entry per XfLiveSite");
+
+  // Zeroes omitted, and the WHOLE GROUP omitted when nothing escaped -- so on
+  // the all-inline path this adds nothing to the line, and the first character
+  // of xfEsc{ appearing is itself the finding.
+  static std::string xfLiveEscapeCensus() {
+    std::string out;
+    for (size_t i = 0; i < size_t(XfLiveSite::Count); ++i) {
+      const uint32_t n = s_xfLiveEscapeBySite[i].load(std::memory_order_relaxed);
+      if (n == 0)
+        continue;
+      out += out.empty() ? " xfEsc{ " : " ";
+      out += kXfLiveSiteNames[i];
+      out += "=";
+      out += std::to_string(n);
+    }
+    if (!out.empty())
+      out += " }";
+    return out;
+  }
+
+  bool D3D11Rtx::xfDeferExecutingDeferred() {
+    return s_xfDeferExecuting;
+  }
+
+  // Shared-write census. Atomic and file-scope for the same reason as the live
+  // escapes: these only ever fire on the chain, and the report reads them on
+  // the frame thread.
+  static std::atomic<uint32_t>
+    s_xfSharedRefuseBySite[size_t(XfSharedSite::Count)];
+  static const char* const kXfSharedSiteNames[] = {
+    "phase2Arena", "geoCapWanted", "geoCapStable", "vmHunt", "hudClass"
+  };
+  static_assert(sizeof(kXfSharedSiteNames) / sizeof(kXfSharedSiteNames[0])
+                    == size_t(XfSharedSite::Count),
+                "kXfSharedSiteNames must have one entry per XfSharedSite");
+
+  static std::string xfSharedRefuseCensus() {
+    std::string out;
+    for (size_t i = 0; i < size_t(XfSharedSite::Count); ++i) {
+      const uint32_t n = s_xfSharedRefuseBySite[i].load(std::memory_order_relaxed);
+      if (n == 0)
+        continue;
+      out += out.empty() ? " xfShared{ " : " ";
+      out += kXfSharedSiteNames[i];
+      out += "=";
+      out += std::to_string(n);
+    }
+    if (!out.empty())
+      out += " }";
+    return out;
+  }
+
+  // NV-DXVK [XfDefer] 2026-08-19c -- STEP 4c: THE SHARED-WRITE CHOKE.
+  //
+  // WHY THESE CANNOT USE THE ABORT ALONE. The abort is post-hoc: let it happen,
+  // then discard the draw. That works for a wrong VALUE. It does not work for
+  // m_captureArena.push_back or an unordered_set::insert -- two threads inside
+  // either one is a reallocated buffer or a rehashed bucket table, and there is
+  // no "discard" that un-corrupts those. So the write is REFUSED, not detected,
+  // exactly like xfLiveState one axis over.
+  //
+  // MARKING kSdepStatic RATHER THAN A NEW AXIS. A refused shared write means
+  // this draw did not leave the cross-draw state a later draw expects, which is
+  // what kSdepStatic already means and what wroteSharedCarrier() already gates.
+  // Reusing it keeps xfDeferMustAbort at three terms and puts the count on the
+  // existing xfAbort{carrier=} row; the per-site split is xfShared{} above, and
+  // that is the row that says which block to convert.
+  //
+  // ALL FOUR ARE DIAGNOSTICS, so in a normal run their enclosing gates are off
+  // and this never fires. If xfShared{} is non-zero in a routed run, the block
+  // it names is running in production and needs converting rather than refusing
+  // -- read it before believing xfRouted.
+  bool D3D11Rtx::xfMayWriteShared(XfSharedSite site) {
+    if (!s_xfDeferExecuting)
+      return true;
+    s_xfSharedRefuseBySite[size_t(site)].fetch_add(1u, std::memory_order_relaxed);
+    if (m_drawSnapCur != nullptr && m_drawSnapValid)
+      m_drawSnapCur->carrierMask |= static_cast<uint8_t>(1u << kSdepStatic);
+    return false;
+  }
+
+  D3D11Rtx::XfDeferExecScope::XfDeferExecScope()
+    : m_prev(s_xfDeferExecuting) {
+    s_xfDeferExecuting = true;
+  }
+
+  D3D11Rtx::XfDeferExecScope::~XfDeferExecScope() {
+    s_xfDeferExecuting = m_prev;
+  }
+
+  const D3D11ContextState& D3D11Rtx::xfLiveState(XfLiveSite site) {
+    if (!s_xfDeferExecuting)
+      return m_context->m_state;
+    // One shared instance is enough because nothing may write it, and `const`
+    // is what enforces that: a site that tried would fail to compile rather
+    // than corrupt the sentinel for every other draw. Its Com<> members are
+    // null for the life of the process, so handing it out releases nothing and
+    // keeps no resource alive.
+    static const D3D11ContextState s_emptyState { };
+    s_xfLiveEscapeBySite[size_t(site)].fetch_add(1u, std::memory_order_relaxed);
+    // Saturating: the record's counter is 16-bit and the only question asked of
+    // it is != 0, so wrapping to zero on a pathological draw would turn an
+    // abort into a silent accept.
+    if (m_drawSnapCur != nullptr && m_drawSnapValid
+        && m_drawSnapCur->liveStateEscapes != UINT16_MAX)
+      ++m_drawSnapCur->liveStateEscapes;
+    return s_emptyState;
+  }
+
+  // THE LEARNING. FRAME THREAD ONLY -- see the declaration. Idempotent, so a
+  // dispatcher calling it from the ordered join for routed draws and the exit
+  // block calling it for inline ones cannot double-count anything that matters.
+  void D3D11Rtx::xfDeferLearn(const DrawSnapshot& s) {
+    if (!s.wroteSharedCarrier())
+      return;
+    s_xfSharedCarrierVsIl.insert(vsIlIdentity(s.vs.ptr(), s.inputLayout.ptr()));
+  }
+
   // NV-DXVK [DrawSnapshot] 2026-08-10: per-draw content-read purity tally.
   // Incremented by drawCbSpan, published onto the record at the end of the
   // derivation (DrawSnapshot::cbLiveReads / cbRecordReads), reset at the top of
@@ -12337,10 +12817,15 @@ namespace dxvk {
   // shader), agree/disagree = prediction vs the producing draw's actual path.
   // DISAGREE IS THE NUMBER THAT DECIDES THIS FEATURE: non-zero means the
   // substitution would serve a view matrix built by a different fixup.
-  static uint64_t s_vkPathAgree = 0, s_vkPathDisagree = 0, s_vkPathCold = 0;
+  // [XfDefer] step 4c: ATOMIC, not thread_local. These are incremented inside
+  // the tail -- which the dispatcher runs on the ordered chain -- and READ at
+  // the window dump on the frame thread. A thread_local pair would have the
+  // chain fill its own copy and the report print the frame thread's, i.e. zero.
+  // Same trap, same fix, as s_xfLiveEscapeBySite.
+  static std::atomic<uint64_t> s_vkPathAgree { 0 }, s_vkPathDisagree { 0 }, s_vkPathCold { 0 };
   // Serves where the entry was built by a DIFFERENT shader -- i.e. how much
   // merging bit 256 is actually doing. See XfViewPart::vsIl.
-  static uint64_t s_vkXShader = 0;
+  static std::atomic<uint64_t> s_vkXShader { 0 };
 
   // NV-DXVK [DropByPath] 2026-08-13. The o2w sibling of s_vkPathByVsIl, and it
   // exists for rtx.splitTransformKeyDropByPath -- see that option's doc.
@@ -12355,7 +12840,7 @@ namespace dxvk {
   static thread_local std::unordered_map<uint64_t, uint32_t> s_o2wPathByVsIl;
   static thread_local uint32_t s_o2wPathPredicted = UINT32_MAX;
   // Serve-time census, same shape and same purpose as vkPath's.
-  static uint64_t s_o2wPathAgree = 0, s_o2wPathDisagree = 0, s_o2wPathCold = 0;
+  static std::atomic<uint64_t> s_o2wPathAgree { 0 }, s_o2wPathDisagree { 0 }, s_o2wPathCold { 0 };
 
   // NV-DXVK [DrawSnapshot] 2026-08-10: WHAT THE RESIDUAL IS MADE OF.
   //
@@ -16555,11 +17040,43 @@ namespace dxvk {
           else if (sharedMoved)
             ++s_xfSharedEscape;
 
+          // [XfDefer] STEP 3: SCORE THE ROUTED POPULATION, on the same
+          // score-then-store rule as everything else in this block. Counted
+          // only when this draw was actually routed, so the denominator is
+          // xfRouted rather than draws -- see the tally declarations.
+          //
+          // NOT DISJOINT, deliberately: a draw can trip more than one axis and
+          // each is the count of draws that axis would have aborted, not a
+          // partition of the aborts. Reading them as a partition is the same
+          // error the refuse{} split warns about.
+          if (snap != nullptr && snap->deferRouted) {
+            if (snap->geoLiveReads != 0) ++s_xfAbortGeo;
+            if (snap->cbLiveReads  != 0) ++s_xfAbortCb;
+            if (snap->liveStateEscapes != 0) ++s_xfAbortLive;
+            if (sharedMoved)             ++s_xfAbortCarrier;
+          }
+
           s_xfEverVsIl.insert(s_vkVsIlCur);
           if (carrierMoved)
             s_xfCarrierVsIl.insert(s_vkVsIlCur);
-          if (sharedMoved)
-            s_xfSharedCarrierVsIl.insert(s_vkVsIlCur);
+          // THE GATE'S OWN SET, fed THROUGH xfDeferLearn rather than by a
+          // direct insert, so the key has exactly one definition.
+          //
+          // IT IS NOT s_vkVsIlCur, AND THAT MATTERS. s_vkVsIlCur is assigned
+          // inside drawMemoComponents, so a draw that never reaches
+          // drawSplitKeys leaves the PREVIOUS draw's key standing and the
+          // census above attributes that draw to the wrong shader. The gate
+          // computes the key from the record instead and is always right; a set
+          // written one way and read the other is R19's defect in its cheapest
+          // form.
+          //
+          // FRAME THREAD ONLY. Today every derivation is here, which is where
+          // xfDeferShouldRoute reads the set. A dispatcher MUST call this from
+          // the ordered join for routed draws -- a worker learning into its own
+          // thread_local copy would leave the frame thread's gate permanently
+          // blind to whatever that worker discovered.
+          if (snap != nullptr)
+            xfDeferLearn(*snap);
 
           const bool actual = s_xtElig3Last;
           if (s_xfPredCur == UINT8_MAX) {
@@ -25900,6 +26417,64 @@ namespace dxvk {
     return built;
   }
 
+  // ============================================================
+  // NV-DXVK [XfDefer] B1: THE PENDING STAGE-JOB SLOTS, PER DRAW.
+  //
+  // Declared on D3D11Rtx (d3d11_rtx.h, above SubmitDrawTailCtx) and defined
+  // here because the three job types are file-local to this TU. One instance
+  // lives on SubmitDraw's stack and is reached by the tail through
+  // SubmitDrawTailCtx::pend, so the slots travel with the DRAW instead of
+  // sitting on the frame-lifetime arena. The header field carries the argument
+  // for why that distinction is the blocker rather than a tidiness point.
+  //
+  // RAII RATHER THAN A resetPending() AT THE NEXT DRAW'S ENTRY. The pins exist
+  // to keep a write-combined mapping valid until the flush worker reads it, so
+  // the only requirement is that a draw which never reaches the append releases
+  // them. A destructor does that at the exact scope exit, on every early return,
+  // instead of leaving them held until whenever the next SubmitDraw happens to
+  // run -- which is also what let the leak window straddle a frame boundary.
+  //
+  // release() IS FLAG-GATED, NOT POINTER-GATED, because the append MOVES each
+  // job out and clears its flag; a moved-from BatchHashJob still carries the
+  // old pointer values and must not release the pins the item now owns.
+  // ============================================================
+  struct D3D11Rtx::PendingDrawSlot {
+    BatchHashJob hash;  bool hasHash = false;
+    BatchBboxJob bbox;  bool hasBbox = false;
+    BatchSkinJob skin;  bool hasSkin = false;
+    // [XfDefer] B2: THE MATERIAL SNAPSHOT, captured at the seam.
+    //
+    // captureMatSnapshotInto used to run AT the arena append, inside the tail.
+    // Its own comment there -- "PS state is stable across SubmitDraw (verified:
+    // no m_state.ps rebind)" -- is true only for a draw that stays on the frame
+    // thread. It reads m_context->m_state.ps/.om/.vs LIVE and it is NOT one of
+    // the twelve sites routed through xfLiveState(), so a tail running behind
+    // the frame thread would not read stale material state, it would race the
+    // Com<> refcounts the frame thread is releasing and rewriting -- the same
+    // shape as the render-target deref this struct's own header block records.
+    // There is nothing to detect afterwards and nothing the abort can reclaim.
+    //
+    // So the capture happens on the FRAME THREAD at the seam and lands here;
+    // the append only moves it into the item.
+    MatSnapshot matSnap;  bool hasMatSnap = false;
+    void release() {
+      if (hasHash) { hash.releasePins(); hasHash = false; }
+      if (hasBbox) { bbox.releasePins(); hasBbox = false; }
+      hasSkin = false;   // skin job holds a byte copy, no pins to release
+      // MatSnapshot is an aggregate with no user-defined move, so a moved-from
+      // copy still holds the same CbCap::pinned raw pointers. The flag, not the
+      // pointer, is what says who owns them -- the append clears it.
+      if (hasMatSnap) { matSnap.releasePins(); hasMatSnap = false; }
+    }
+    PendingDrawSlot() = default;
+    ~PendingDrawSlot() { release(); }
+    // Non-copyable and non-movable: exactly one owner, and it is the stack
+    // frame of the draw that created it. Anything that wants the jobs takes
+    // them by std::move out of the individual members, as the append does.
+    PendingDrawSlot(const PendingDrawSlot&) = delete;
+    PendingDrawSlot& operator=(const PendingDrawSlot&) = delete;
+  };
+
   // NV-DXVK [BatchSubmitDraw]: one collected RT commit. Move-only: it owns a moved
   // DrawCallState and a MatSnapshot that holds pinned constant-buffer references (the
   // pins are released by the flush worker via matSnap.releasePins()). The arena is a
@@ -25918,6 +26493,12 @@ namespace dxvk {
     // Phase C emit, then moved into the commit lambda so dxvk-cs consumes the
     // precomputed results. Default (route kNone) = full legacy CS path.
     ShardedDrawInfo p2b;
+    // NV-DXVK [XfDefer] B3: DRAW-ORDER KEY. Copied from dcs.drawCallID at the
+    // append, which is allocated on the frame thread in draw order on BOTH paths
+    // -- at the seam for a routed draw, at the commit line for an unrouted one.
+    // IDs have gaps (a draw that filters out above the commit line consumes
+    // none), which is fine: the merge needs an ORDER, not a dense index.
+    uint32_t seq = 0;
 
     DrawWorkItem() = default;
     DrawWorkItem(DrawWorkItem&&) = default;
@@ -25928,18 +26509,37 @@ namespace dxvk {
 
   struct GeometryBatchArena {
     std::vector<DrawWorkItem> items;
-    // Per-draw scratch: stages capture here at their natural site during SubmitDraw
-    // (which runs BEFORE the commit point), then the commit moves them into the item.
-    // resetPending() at SubmitDraw entry releases pins from any draw that was rejected
-    // before it reached the commit point (so a filtered draw can't leak a buffer pin).
-    BatchHashJob pendHash;  bool pendHasHash = false;
-    BatchBboxJob pendBbox;  bool pendHasBbox = false;
-    BatchSkinJob pendSkin;  bool pendHasSkin = false;
-    void resetPending() {
-      if (pendHasHash) { pendHash.releasePins(); pendHasHash = false; }
-      if (pendHasBbox) { pendBbox.releasePins(); pendHasBbox = false; }
-      pendHasSkin = false;   // skin job holds a byte copy, no pins to release
-    }
+    // ==========================================================
+    // NV-DXVK [XfDefer] B3: THE CHAIN'S OWN ARENA.
+    //
+    // `items` is written by the FRAME THREAD for every unrouted draw. The chain
+    // appending into the same vector is not a wrong value, it is a reallocation
+    // under another thread's reference -- and unlike a stale read there is no
+    // abort that un-corrupts it. So the chain appends HERE and nothing else does.
+    //
+    // ORDER IS THE SECOND REASON, and it would matter even with a lock. A routed
+    // draw finishes after inline draws that came later, so a shared vector would
+    // record them interleaved wrongly no matter how the writes were serialised.
+    // The join merges the two by `seq`, which restores true draw order -- see
+    // mergeStagedLocked() at the top of flushGeometryBatch.
+    //
+    // ONLY COMMITTED ITEMS BELONG HERE. §5.4's abort recovery -- discard the
+    // staged item and re-run the tail inline -- is the DISPATCHER's half and
+    // happens before the join. An aborted draw must never be staged; there is
+    // deliberately no `aborted` flag on DrawWorkItem, because a merge that
+    // silently dropped items would turn a dispatcher bug into missing geometry.
+    // ==========================================================
+    std::vector<DrawWorkItem> staged;
+    // Persistent merge target. Kept across frames so the ordered merge does not
+    // allocate every join -- §5.2's whole objection to doing work at the join is
+    // that the frame thread has nothing left to overlap it with.
+    std::vector<DrawWorkItem> mergeScratch;
+    // NV-DXVK [XfDefer] B1: THE PER-DRAW SCRATCH USED TO BE HERE, and that was
+    // the defect. `pendHash/pendBbox/pendSkin` + their flags + resetPending()
+    // moved to D3D11Rtx::PendingDrawSlot, one instance per SubmitDraw call.
+    // Nothing per-DRAW may live on this object: it has FRAME lifetime, so a
+    // tail running behind the frame thread reads a later draw's values. Keep it
+    // to state that is genuinely per-batch.
   };
 
   // NV-DXVK [BatchSubmitDraw]: out-of-line dtor so unique_ptr<GeometryBatchArena>
@@ -25950,13 +26550,24 @@ namespace dxvk {
   // to avoid leaking the pinned DxvkBuffer references.
   D3D11Rtx::~D3D11Rtx() {
     if (m_geoBatch) {
-      for (auto& it : m_geoBatch->items) {
-        it.matSnap.releasePins();
-        if (it.hasHashJob) it.hashJob.releasePins();
-        if (it.hasBboxJob) it.bboxJob.releasePins();
-      }
-      m_geoBatch->items.clear();
-      m_geoBatch->resetPending();
+      // [XfDefer] B3: BOTH arenas. A teardown between a chain append and the
+      // join would otherwise leak every pin the staged items hold -- the same
+      // reason `items` is drained here, applied to the vector that now exists
+      // beside it. mergeScratch is left alone: it is only ever non-empty inside
+      // the merge, which cannot be in flight while this runs.
+      auto drain = [](std::vector<DrawWorkItem>& v) {
+        for (auto& it : v) {
+          it.matSnap.releasePins();
+          if (it.hasHashJob) it.hashJob.releasePins();
+          if (it.hasBboxJob) it.bboxJob.releasePins();
+        }
+        v.clear();
+      };
+      drain(m_geoBatch->items);
+      drain(m_geoBatch->staged);
+      // [XfDefer] B1: no resetPending() here any more -- the pending slots are
+      // a stack local of whatever SubmitDraw is on the call stack, and that
+      // frame releases its own pins when it unwinds.
     }
   }
 
@@ -29166,6 +29777,32 @@ namespace dxvk {
   thread_local size_t   D3D11Rtx::m_viewOffset       = SIZE_MAX;
   thread_local int      D3D11Rtx::m_viewStage        = -1;
   thread_local bool     D3D11Rtx::m_projIsCombinedVP = false;
+  // NV-DXVK [XfDefer] 2026-08-19 -- kSdepCamSmooth, the one true accumulator.
+  // Private per thread because its exit value depends on the draw SEQUENCE, and
+  // free to privatise because nothing reads it to build a transform. See the
+  // declarations.
+  thread_local Vector3  D3D11Rtx::m_smoothedCamPos    = Vector3(0.0f);
+  thread_local bool     D3D11Rtx::m_hasPrevCamPos     = false;
+  // kSdepCam's PER-DRAW SCRATCH half. Reset at the top of ExtractTransforms
+  // before any read, so these initialisers are only ever seen by a thread that
+  // has not derived yet. The frame-state half of the group (the fanout and
+  // viewmodel latches, the VP rows) is written OUTSIDE the derivation and stays
+  // shared -- see the declarations.
+  thread_local Vector3  D3D11Rtx::m_lastDrawCamOrigin    = Vector3(0.0f, 0.0f, 0.0f);
+  thread_local bool     D3D11Rtx::m_lastDrawCamOriginSet = false;
+  thread_local Vector3  D3D11Rtx::m_lastO2wCamOrigin     = Vector3(0.0f, 0.0f, 0.0f);
+  thread_local bool     D3D11Rtx::m_lastO2wCamValid      = false;
+  thread_local bool     D3D11Rtx::m_lastO2wCamFromFanout = false;
+  thread_local uint32_t D3D11Rtx::m_lastO2wCamOff        = 0;
+  // [XfDefer] step 4b: kSdepRoute's member, which kSdepThreadPrivateMask
+  // already asserted was thread-private. See the declaration.
+  thread_local uint32_t D3D11Rtx::m_lastO2wPathId        = 0;
+  // [XfDefer] step 4b: per-draw MeshTrace scratch. See the declarations.
+  thread_local bool     D3D11Rtx::m_meshTraceReported    = false;
+  thread_local uint32_t D3D11Rtx::m_meshTraceCp          = 0;
+  // [XfDefer] step 4c: the two PER-DRAW verdict flags. See the declarations.
+  thread_local bool     D3D11Rtx::m_lastDrawCaptured     = false;
+  thread_local bool     D3D11Rtx::m_lastDrawFilteredAsUI = false;
 
   void D3D11Rtx::captureDrawSnapshot(uint32_t drawIndex, bool indexed,
                                      uint32_t count, uint32_t start,
@@ -29220,6 +29857,10 @@ namespace dxvk {
       m_drawSnapCur->layoutResolved = false;
       m_drawSnapCur->cbLiveReads    = 0;
       m_drawSnapCur->cbRecordReads  = 0;
+      // [XfDefer] step 4b: on the same unconditional-reassign list. The slot is
+      // reused, and inheriting a previous draw's escape would abort a draw that
+      // never touched live state -- wasted work that looks like a real finding.
+      m_drawSnapCur->liveStateEscapes = 0;
       // [5b] CONDITIONALLY WRITTEN -- the t31/COLOR1 capture below runs only for
       // draws on the instanced route, so without these a non-instanced draw
       // would inherit the previous draw's charIdx and 48-byte entry and serve
@@ -30394,6 +31035,17 @@ namespace dxvk {
       // both are only knowable once it asks. See DrawSnapshot::deferrable.
       s.deferrable = s.arenaBacked && s.layoutResolved && !s.overflowed;
 
+      // NV-DXVK [XfDefer] 2026-08-19 -- STEP 3: THE ROUTING VERDICT, taken here
+      // because this is the first moment `deferrable` is final and the last
+      // moment that is still on the frame thread before the derivation. On the
+      // unconditional-reassign list by construction: it is assigned every draw.
+      //
+      // NOTHING DISPATCHES ON IT YET. The value is published and counted so
+      // xfRouted sizes the population that would leave the frame thread --
+      // which is the number that says whether the extractXf -> end-of-SubmitDraw
+      // code motion is worth starting, and it is answerable without doing it.
+      s.deferRouted = xfDeferShouldRoute(s);
+
       static thread_local uint32_t sDraws = 0, sResolved = 0, sRanges = 0, sOvf = 0;
       static thread_local uint32_t sCbOff = 0;
       // Manifest occupancy: how full the six-entry per-VS manifest is on the
@@ -30602,8 +31254,53 @@ namespace dxvk {
 
   void D3D11Rtx::flushGeometryBatch() {
     pinDeferVerifyFrame();
-    if (!m_geoBatch || m_geoBatch->items.empty())
+    // [XfDefer] B3: `staged` counts toward emptiness. A frame in which every
+    // captured draw routed would have an empty `items` and a full `staged`, and
+    // the old guard would have returned and silently dropped the whole frame.
+    if (!m_geoBatch || (m_geoBatch->items.empty() && m_geoBatch->staged.empty()))
       return;
+
+    // ==================================================================
+    // [XfDefer] B3: MERGE THE CHAIN'S ARENA IN, IN DRAW ORDER.
+    //
+    // Both vectors are individually ascending in `seq` -- each has exactly one
+    // writer appending in draw order -- so this is a two-way merge, not a sort.
+    // It runs BEFORE Phase B so every phase downstream sees one complete,
+    // draw-ordered arena and is untouched by B3.
+    //
+    // FREE WHILE ROUTING IS OFF. `staged` is empty on every frame until a
+    // dispatcher exists, so this is one empty() test per frame -- which matters,
+    // because §5.2's objection to work at the join is that the frame thread has
+    // nothing left to overlap it with. Even when it does run it is a move-merge
+    // into a scratch kept across frames, so it neither allocates nor copies a
+    // DrawCallState.
+    //
+    // THE CHAIN MUST BE JOINED BEFORE THIS POINT. The merge reads `staged`
+    // without a lock, which is correct only because the dispatcher's join
+    // happens-before it. That ordering is the dispatcher's to establish; there
+    // is nothing to establish yet because nothing stages.
+    // ==================================================================
+    if (!m_geoBatch->staged.empty()) {
+      auto& dst = m_geoBatch->mergeScratch;
+      auto& a   = m_geoBatch->items;
+      auto& b   = m_geoBatch->staged;
+      dst.clear();
+      dst.reserve(a.size() + b.size());
+      size_t i = 0, j = 0;
+      while (i < a.size() && j < b.size()) {
+        // `<=` keeps an inline draw ahead of a routed draw of equal seq. Equal
+        // seq should be impossible (one allocator, on one thread), so this is
+        // about being deterministic if it ever happens rather than about a case
+        // that is expected.
+        if (a[i].seq <= b[j].seq) dst.push_back(std::move(a[i++]));
+        else                      dst.push_back(std::move(b[j++]));
+      }
+      while (i < a.size()) dst.push_back(std::move(a[i++]));
+      while (j < b.size()) dst.push_back(std::move(b[j++]));
+      a.clear();
+      b.clear();
+      a.swap(dst);   // `items` is now the merged arena; dst keeps the old capacity
+    }
 
     auto& items = m_geoBatch->items;
     const uint32_t n = static_cast<uint32_t>(items.size());
@@ -34543,7 +35240,13 @@ namespace dxvk {
     // would change the contention this probe is meant to characterise. A torn
     // read can only manufacture a false "wrote", never a false "clean", so the
     // error is in the conservative direction for a parallelisation decision.
-    mix(&m_foundRealProjThisFrame, 1);
+    // NV-DXVK [XfDefer] 2026-08-19: LOADED, not addressed. m_foundRealProjThisFrame
+    // is std::atomic<bool> now, and mix() reads raw bytes -- taking its address
+    // would read the atomic's storage non-atomically, which is the exact race
+    // this change removed. One relaxed load into a local, same one byte hashed.
+    { const uint8_t frp = m_foundRealProjThisFrame.load(std::memory_order_relaxed)
+                          ? 1u : 0u;
+      mix(&frp, 1); }
     mixM4(m_lastGoodTransforms.objectToWorld);
     mixM4(m_lastGoodTransforms.objectToView);
     mixM4(m_lastGoodTransforms.worldToView);
@@ -34830,6 +35533,39 @@ namespace dxvk {
     };
   }
 
+  // ==================================================================
+  // NV-DXVK [XfDefer] 2026-08-19c -- PROMOTED OUT OF SubmitDraw's BODY, AND
+  // THIS IS A STEP-4a DEFECT, NOT A NEW REQUIREMENT.
+  //
+  // The 4a extraction moved 12,946 lines into SubmitDrawTail verbatim -- which
+  // was the point, and is what made the diff proof possible -- but four of the
+  // names that body uses were FUNCTION-LOCAL STATICS of SubmitDraw, and one
+  // (s_d3d11DiagEnabled) is read at eleven sites in the moved half. A local
+  // cannot be seen from another function, so the extraction as landed does not
+  // compile. The handoff's Sec 0 records 4a as "compiled and running" while its
+  // Sec 8 step 1 asks for it to be built -- the second was right.
+  //
+  // Promoting them is semantics-preserving: they were already `static
+  // thread_local`, so this widens the NAME's scope and changes neither storage
+  // nor lifetime. sdStallMark, which both halves reconstruct, closes over these
+  // by static lookup rather than by capture, so both copies now bind the same
+  // objects -- which is what the per-stage segment accounting assumed all along.
+  //
+  // s_sdRegistered and s_sdStallDrawCounter stay local to SubmitDraw: only the
+  // head touches them, and a name that does not need widening should not get it.
+  // ==================================================================
+  static thread_local SdThreadStat s_sdStat;
+  static thread_local bool         s_sdStallSampleActive = false;
+  static thread_local uint64_t     s_sdStallLastCyc      = 0;
+  static thread_local std::chrono::steady_clock::time_point s_sdStallLastWall {};
+  // Read at eleven sites in the moved half. `static const` with a lambda
+  // initialiser is a magic static: initialised once, thread-safely, on first
+  // use, exactly as it was inside the function.
+  static const bool s_d3d11DiagEnabled = []() {
+    const char* v = std::getenv("RTX_D3D11_DIAG");
+    return v != nullptr && v[0] == '1';
+  }();
+
   void D3D11Rtx::SubmitDraw(bool indexed,
                              UINT count,
                              UINT start,
@@ -34939,8 +35675,30 @@ namespace dxvk {
     if (sBatchDraw) {
       if (!m_geoBatch) m_geoBatch = std::make_unique<GeometryBatchArena>();
       if (m_geoBatch->items.capacity() == 0) m_geoBatch->items.reserve(2048);
-      m_geoBatch->resetPending();
+      // [XfDefer] B3: the chain's arena and the merge target get the same
+      // treatment -- reserved once, then kept. A growth reallocation inside the
+      // chain's append is not a correctness problem (one writer) but it is a
+      // stall on the exact thread the whole exercise exists to keep moving.
+      if (m_geoBatch->staged.capacity() == 0)       m_geoBatch->staged.reserve(2048);
+      if (m_geoBatch->mergeScratch.capacity() == 0) m_geoBatch->mergeScratch.reserve(2048);
     }
+    // NV-DXVK [XfDefer] B1: THIS DRAW'S STAGE-JOB SLOTS. Replaces
+    // m_geoBatch->resetPending() on the line above, and the arena members it
+    // reset. Declared UNCONDITIONALLY and outside the sBatchDraw block on
+    // purpose: it has to be in scope at the hash capture below, at the skin and
+    // bbox captures inside SubmitDrawTail, and at the arena append -- and the
+    // three capture sites each re-test sBatchDraw themselves, so gating the
+    // storage as well would only add a second condition that must agree.
+    //
+    // COST OF THE UNCONDITIONAL DECLARATION, since it is on the pole thread's
+    // hottest path: zero-init of two PODs plus an empty std::vector (no
+    // allocation), and a three-branch destructor. The one real difference from
+    // the arena version is that BatchSkinJob::boneBytes no longer keeps its
+    // capacity between draws, so a skin capture reallocates instead of reusing.
+    // That branch requires needPalette && RtxOptions::batchSkinning() and never
+    // fires on TF2 (it skins GPU-side); if a title does hit it every draw, the
+    // fix is a per-draw arena, NOT moving this back onto m_geoBatch.
+    PendingDrawSlot xfPend;
 
     // NV-DXVK [DrawSnapshot]: capture this draw's D3D11 inputs HERE, before any
     // derivation stage runs and while every binding is still this draw's. This
@@ -35001,7 +35759,8 @@ namespace dxvk {
     // the draw. One thread_local increment per draw; the lock fires only on a
     // thread's very first SubmitDraw. See SdThreadStat decl for the question this
     // answers (is SubmitDraw one game thread, or many?).
-    static thread_local SdThreadStat s_sdStat;
+    // [XfDefer] step 4c: s_sdStat is now file-scope (see above SubmitDraw) so
+    // SubmitDrawTail can see it too. Only the registration latch stays local.
     static thread_local bool s_sdRegistered = false;
     if (!s_sdRegistered) {
       s_sdRegistered = true;
@@ -35018,10 +35777,9 @@ namespace dxvk {
     // accumulate BOTH wall time and executed cycles. A segment where
     // wall >> cycles/rate is where the thread blocks â€” this pins the
     // [Perf.SdThreads] stallUs to an actual stage instead of a guess.
-    static thread_local bool s_sdStallSampleActive = false;
+    // [XfDefer] step 4c: the other three are file-scope now -- see above
+    // SubmitDraw. This counter is read only here, so it stays local.
     static thread_local uint32_t s_sdStallDrawCounter = 0;
-    static thread_local uint64_t s_sdStallLastCyc = 0;
-    static thread_local std::chrono::steady_clock::time_point s_sdStallLastWall {};
 
     // NV-DXVK [Perf] 2026-08-08: same rtx.perfSubmitCpuCycles gate as
     // SubmitCpuGuard. The 1-in-64 sampling already bounded this to ~0.125
@@ -35106,10 +35864,8 @@ namespace dxvk {
     // NO pipeline side effects are gated on this â€” they merely read state and
     // Logger::info. The REAL work they sit beside (per-vertex skinning capture,
     // bone-mirror merge, textureTransform install) is NEVER gated.
-    static const bool s_d3d11DiagEnabled = []() {
-      const char* v = std::getenv("RTX_D3D11_DIAG");
-      return v != nullptr && v[0] == '1';
-    }();
+    // [XfDefer] step 4c: file-scope now -- the moved half reads it at eleven
+    // sites. See the declaration above SubmitDraw.
 
     // NV-DXVK: cache VS hash at entry so BumpFilter() / submit tracking can
     // attribute stats without re-fetching it at every reject site.
@@ -39424,8 +40180,8 @@ namespace dxvk {
       // parallel-for instead of scheduling a per-draw Future. finalizeGeometryHashes
       // takes the pre-computed branch on the CS thread. There is no queue-full path,
       // so the per-draw HashFailed validity gate does not apply here.
-      captureBatchHashJob(geo, drawVertexCount, hashStart, hashCount, m_geoBatch->pendHash);
-      m_geoBatch->pendHasHash = true;
+      captureBatchHashJob(geo, drawVertexCount, hashStart, hashCount, xfPend.hash);
+      xfPend.hasHash = true;
     } else {
       geo.futureGeometryHashes = ComputeGeometryHashes(geo, drawVertexCount,
                                                        hashStart, hashCount);
@@ -39447,6 +40203,271 @@ namespace dxvk {
     std::memcpy(dcs.studioModelName, m_curStudioName, sizeof(dcs.studioModelName));
     dcs.geometryData     = geo;
     markStg(s_perfBtGeoCopyAcc, s_perfBtGeoCopyMax);
+
+    // ==================================================================
+    // NV-DXVK [XfDefer] 2026-08-19 -- STEP 4, PART 1: THE SEAM.
+    //
+    // Everything from here to the commit used to be inline. It is now
+    // SubmitDrawTail, called synchronously, on this thread, in this order --
+    // so this edit changes NOTHING and is meant to. Contract, and why a
+    // context struct rather than a parameter list, are on SubmitDrawTailCtx.
+    //
+    // THE CUT IS HERE AND NOWHERE ELSE. `dcs.transformData = ExtractTransforms()`
+    // sits four brace levels deep inside `if (splitOn)`, so the plan's literal
+    // seam -- "extractXf -> end" -- is not a seam at all. The nearest enclosing
+    // function-body boundary is this line, immediately after bt_geoCopy's stage
+    // mark and immediately before the split-transform cache block that owns the
+    // derivation call. Cutting anywhere else means cutting inside a brace.
+    //
+    // NAMED ASSIGNMENT. Five of these are bools; a positional initialiser would
+    // not fail to compile when two adjacent fields share a type.
+    // NV-DXVK [XfDefer] 2026-08-19c -- STEP 4c: THE ROUTING DECISION LIVES HERE.
+    //
+    // This is the frame-thread point where a draw would be handed to the
+    // ordered chain instead of finished inline, and it is deliberately a named
+    // local rather than an inline condition: the ID allocation below and the
+    // dispatch arm that will follow must ask the SAME question, and two sites
+    // computing it separately is how they come to disagree.
+    //
+    // FALSE UNTIL THE CHAIN EXISTS. 2026-08-19d: B1-B3 in the header block
+    // ("WHAT STILL BLOCKS THE CHAIN ITSELF") are all fixed -- the pending-job
+    // slots and the material capture travel in PendingDrawSlot, and the chain
+    // has its own arena merged by seq at the join. So this no longer reads false
+    // because the terminal act would corrupt; it reads false because there is
+    // nothing to dispatch TO. §5's ordered worker is the next piece.
+    //
+    // WHAT THE DISPATCHER OWES BEFORE FLIPPING THIS, so it is not rediscovered:
+    // its join must happen-before flushGeometryBatch (the merge reads `staged`
+    // unlocked), §5.4's abort recovery must discard and re-run inline BEFORE
+    // staging, and xfDeferLearn must be called from the join on the frame thread
+    // because the set it teaches is thread_local there.
+    //
+    // AND NOTE WHAT IS STILL UNPROVEN: none of B1-B3 has ever executed with a
+    // routed draw. They are correct-by-construction and measured only as no-ops,
+    // so the first run with this true is a bring-up, not a regression test.
+    const bool xfRouteThisDraw = false;
+    SubmitDrawTailCtx xfTail { };
+    xfTail.dcs               = &dcs;
+    xfTail.geo               = &geo;
+    xfTail.posBuffer         = &posBuffer;
+    xfTail.posSem            = posSem;
+    xfTail.biSem             = biSem;
+    xfTail.bwSem             = bwSem;
+    xfTail.tStg              = &tStg;
+    xfTail.instanceTransform = instanceTransform;
+    xfTail.count             = count;
+    xfTail.start             = start;
+    xfTail.base              = base;
+    xfTail.indexed           = indexed;
+    xfTail.sBatchDraw        = sBatchDraw;
+    xfTail.zEnable           = zEnable;
+    xfTail.zWriteEnable      = zWriteEnable;
+    xfTail.stencilEnabled    = stencilEnabled;
+    xfTail.isNdcScreenQuad   = isNdcScreenQuad;
+    // [XfDefer] B1: the slots cross the seam BY POINTER, and this is the whole
+    // point of the change -- the object is owned by this stack frame, so when
+    // the tail is eventually dispatched the slot travels in the work item and
+    // no two draws can ever be looking at the same storage. Non-null on every
+    // path; the tail's capture sites still gate on sBatchDraw, not on this.
+    xfTail.pend              = &xfPend;
+    // [XfDefer] B2: THE MATERIAL SNAPSHOT IS TAKEN HERE, ON THE FRAME THREAD.
+    //
+    // It used to be taken at the arena append inside the tail. See the slot's
+    // matSnap field for why that cannot survive deferral: the capture reads
+    // m_context->m_state LIVE and is not one of the twelve xfLiveState() sites,
+    // so off-thread it races Com<> refcounts rather than reading stale values.
+    //
+    // IDENTICAL BYTES TODAY, which is what makes this safe to land before the
+    // chain exists. The premise the append's comment already asserted -- PS/OM
+    // state is not rebound between here and the commit point -- is exactly the
+    // premise that holds on the frame thread, and both points are on it while
+    // routing is off. The one field that does differ is MatSnapshot::drawCallID:
+    // the append ran after the tail's m_drawCallID++ and this runs before it, so
+    // it is now this draw's ID rather than the next one. Nothing reads that
+    // field -- it is written here and consumed nowhere -- so the difference is
+    // recorded rather than corrected.
+    //
+    // GATED ON sBatchDraw ONLY. The non-batch material paths take their own
+    // snapshots at their own sites (~:46112 and the two inline ones) and are
+    // untouched; those run only when sBatchDraw is false, which is also when
+    // the chain cannot run at all.
+    //
+    // A DRAW THAT NEVER REACHES THE APPEND still took the pins. ~PendingDrawSlot
+    // releases them when this frame unwinds -- the same contract the three stage
+    // jobs get, and the reason the slot owns a destructor at all.
+    if (sBatchDraw) {
+      const bool xfMcTime = s_submitDrawSubMarkers;
+      const auto tMc0 = xfMcTime ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
+      captureMatSnapshotInto(xfPend.matSnap, /*deferForWorker*/ true);  // pins CBs; freed in flush
+      xfPend.hasMatSnap = true;
+      if (xfMcTime) {
+        const int64_t d = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - tMc0).count();
+        s_perfXfMatCapSeamAccNs += d;
+        if (d > s_perfXfMatCapSeamMaxNs) s_perfXfMatCapSeamMaxNs = d;
+      }
+    }
+    // [XfDefer] step 4c: ROUTING DECIDES WHETHER THIS IS AN ALLOCATION OR A
+    // SNAPSHOT. Routed -> allocate here, on the frame thread, in draw order, so
+    // the chain never touches the counter. Unrouted -> snapshot only, and the
+    // tail increments at the commit line exactly as it always has. Either way
+    // the tail's diagnostic reads see a stable value instead of racing the
+    // frame thread. See the ctx fields for why the member is not atomic.
+    // [XfDefer] B3: the terminal act's arena, decided by the SAME named local as
+    // the ID allocation below. See SubmitDrawTailCtx::routed.
+    xfTail.routed            = xfRouteThisDraw;
+    xfTail.drawCallIdPreset  = xfRouteThisDraw;
+    xfTail.drawCallId        = m_drawCallID;
+    xfTail.rawDrawCount      = m_rawDrawCount;
+    // Written as an if rather than `route ? m_drawCallID++ : m_drawCallID` so a
+    // compile-time-constant condition cannot raise C4127 under werror while the
+    // routing arm is still false. Same value either way.
+    if (xfRouteThisDraw)
+      ++m_drawCallID;
+    SubmitDrawTail(xfTail);
+    // sdepGuard stays HERE, in SubmitDraw's scope, and that is deliberate: it
+    // opens the per-draw census window and closes it in its destructor, and it
+    // has to outlive every markStg call. Calling the tail before it goes out of
+    // scope keeps that true without the tail knowing it exists.
+  }
+
+  // ==================================================================
+  // NV-DXVK [XfDefer] 2026-08-19 -- STEP 4, PART 1. Contract on
+  // SubmitDrawTailCtx. MOVED VERBATIM: not one line of the body below was
+  // rewritten, so a diff of this function against the old SubmitDraw's tail is
+  // empty apart from indentation-free relocation. The bindings immediately
+  // below are the entire adaptation -- they reproduce every name the moved code
+  // used, so the 318 `dcs` references, the 68 `geo` references and the 37
+  // timing-lambda calls need no edit.
+  //
+  // WHY THE LAMBDAS ARE RECONSTRUCTED RATHER THAN PASSED. markStg captures
+  // `tStg` by reference and `this`; markSub captures markStg. Passing them
+  // would mean std::function on a path that runs ~30 times per draw across
+  // ~1080 draws/frame. Rebuilding them over the SAME tStg cursor costs nothing
+  // and keeps the stage boundaries measuring exactly what they measured before.
+  // ==================================================================
+  void D3D11Rtx::SubmitDrawTail(SubmitDrawTailCtx& c) {
+    DrawCallState&  dcs       = *c.dcs;
+    RasterGeometry& geo       = *c.geo;
+    RasterBuffer&   posBuffer = *c.posBuffer;
+    const D3D11RtxSemantic* const posSem = c.posSem;
+    const D3D11RtxSemantic* const biSem  = c.biSem;
+    const D3D11RtxSemantic* const bwSem  = c.bwSem;
+    const Matrix4* const instanceTransform = c.instanceTransform;
+    const UINT count   = c.count;
+    const UINT start   = c.start;
+    const INT  base    = c.base;
+    const bool indexed = c.indexed;
+    const bool sBatchDraw      = c.sBatchDraw;
+    const bool zEnable         = c.zEnable;
+    const bool zWriteEnable    = c.zWriteEnable;
+    const bool stencilEnabled  = c.stencilEnabled;
+    const bool isNdcScreenQuad = c.isNdcScreenQuad;
+    // [XfDefer] B1: BY REFERENCE, same trick as dcs/geo/posBuffer above -- the
+    // three capture sites in the moved body keep reading a bare name and stay
+    // verbatim. Points at THIS draw's stack slot in SubmitDraw, never at the
+    // arena, which is the entire content of the fix.
+    PendingDrawSlot& pend = *c.pend;
+    // BY REFERENCE, and this one matters. markStg bills the interval since the
+    // PREVIOUS stage mark, so the cursor has to be the head's own. A copy would
+    // make the first stage below bill from the wrong instant and shift every
+    // number on [Perf.SubmitDraw].
+    auto& tStg = *c.tStg;
+    // [XfDefer] step 4c: FRAME-THREAD SNAPSHOTS OF TWO COUNTERS THE TAIL READS.
+    //
+    // m_drawCallID and m_rawDrawCount are advanced by the frame thread while a
+    // deferred tail is still running, so the tail's 19 + 6 diagnostic reads
+    // would race them. They read these instead -- the values as of the seam.
+    //
+    // RENAMED RATHER THAN SHADOWED. Binding them as `m_drawCallID` would have
+    // left the moved body untouched, which is the trick the dcs/geo/posBuffer
+    // bindings above use -- but a local hiding a class member is C4458, this
+    // TU builds with werror=true, and whether that fires depends on a warning
+    // level nobody should have to check. The rename is 25 mechanical sites.
+    // The one site that must still reach the MEMBER -- the ID allocation at the
+    // commit line -- says `this->m_drawCallID` explicitly.
+    const uint32_t xfDrawCallId  = c.drawCallId;
+    const uint32_t xfRawDrawCount = c.rawDrawCount;
+    // [XfDefer] step 4c: PER-DRAW VERDICT FLAGS, CLEARED HERE AND NOT ONLY IN
+    // OnDraw*. They are thread_local now, so on the chain the copies OnDraw*
+    // cleared belong to the frame thread and these would otherwise still hold
+    // the PREVIOUS deferred draw's answer. Clearing at the top of the tail is
+    // correct for both paths: inline, this is the same thread and the same
+    // instant as OnDraw*'s clear; deferred, it is the only clear that runs.
+    m_lastDrawCaptured     = false;
+    m_lastDrawFilteredAsUI = false;
+    // All five below ARE referenced by the moved body, but some of those uses
+    // sit under probe gates that can compile out (kRtxPerfMarks and friends),
+    // and this TU builds with werror=true. A (void) cast is correct whether or
+    // not the use survives, which is exactly why it is here rather than a
+    // judgement about which gate is on.
+    (void) posBuffer; (void) isNdcScreenQuad;
+    (void) zEnable; (void) zWriteEnable; (void) stencilEnabled;
+    auto markStg = [&tStg, this](int64_t& acc, int64_t& max) -> int64_t {
+      // [Perf.MarksCompileOut]: discards the whole body, clock read included.
+      // The (void) casts are not decoration: this TU builds with werror=true,
+      // and at 0 the taken branch touches neither the parameters nor the
+      // captures, which is exactly what unused-parameter / unused-capture
+      // diagnostics fire on. Cheaper than discovering it after a full rebuild.
+      if constexpr (!kRtxPerfMarks) {
+        (void) acc; (void) max; (void) tStg; (void) this;
+        return 0;
+      } else {
+      // Runtime half: RTX_PERF_MARKS=0. Before the clock read, so what remains
+      // when marks are off is this branch and nothing else.
+      if (!s_perfMarksEnabled)
+        return 0;
+      const auto now = std::chrono::steady_clock::now();
+      const int64_t dNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now - tStg).count();
+      acc += dNs;
+      if (dNs > max) max = dNs;
+      tStg = now;
+      // NV-DXVK [Perf.StageDep]: every stage boundary is already here, so the
+      // census hooks in HERE rather than at 21 call sites -- no call-site edits,
+      // and a stage added later is covered the day it is added. `&acc` is the
+      // stage's identity. s_sdepSampled is false whenever the probe is off, so
+      // the cost in that case is one predictable branch.
+      if (s_sdepSampled) {
+        uint64_t sdepNow[kSdepGroupCount];
+        stageDepCarrierGroups(sdepNow);
+        stageDepMark(&acc, sdepNow);
+        // Re-stamp AFTER hashing so the probe's own cost is not billed to the
+        // next stage. Without this the census would inflate exactly the stage
+        // timings the rest of the report is read from.
+        tStg = std::chrono::steady_clock::now();
+      }
+      return dNs;
+      }  // if constexpr (kRtxPerfMarks)
+    };
+
+    auto markSub = [&tStg, &markStg](int64_t& acc, int64_t& max) {
+      // [Perf.MarksCompileOut]: markStg is already a no-op, but return before
+      // even reading the env-var flag so nothing of markSub survives either.
+      if constexpr (!kRtxPerfMarks) {
+        (void) acc; (void) max; (void) tStg; (void) markStg;
+        return;
+      } else {
+      if (!s_submitDrawSubMarkers)
+        return;
+      markStg(acc, max);
+      }
+    };
+
+    auto sdStallMark = [](int seg) {
+      if (!s_sdStallSampleActive) {
+        return;
+      }
+      uint64_t cyc = 0;
+      QueryThreadCycleTime(GetCurrentThread(), &cyc);
+      const auto now = std::chrono::steady_clock::now();
+      s_sdStat.segCyc[seg] += int64_t(cyc - s_sdStallLastCyc);
+      s_sdStat.segWallUs[seg] += std::chrono::duration_cast<std::chrono::microseconds>(
+        now - s_sdStallLastWall).count();
+      s_sdStallLastCyc = cyc;
+      s_sdStallLastWall = now;
+    };
+
     // ==================================================================
     // NV-DXVK [Perf.SplitXf] 2026-08-12 -- THE OPTIMISATION PLAN Phase 3.
     // Object half cached ACROSS frames, view half cached per frame, composed.
@@ -40700,7 +41721,45 @@ namespace dxvk {
             // the view key), which is what makes recording these safe here and
             // unsafe on the object half. Order and membership mirror
             // stageDepCarrierGroups' kSdepCam block exactly.
-            if (xRepG & (1u << kSdepCam)) {
+            // NV-DXVK [XfDefer] 2026-08-19c -- STEP 4b: REFUSED ON A WORKER,
+            // AND THIS IS THE ONE THE HANDOFF'S SEC 2 TABLE GETS WRONG.
+            //
+            // That table says the frame-state half of kSdepCam -- the fanout /
+            // viewmodel latches and the three VP rows -- is written only by the
+            // fanout and engine-hook sites OUTSIDE the derivation, and that the
+            // derivation merely READS it. The fourteen assignments below are
+            // inside SubmitDrawTail and write exactly those eight fields, on
+            // every kSdepCam replay serve.
+            //
+            // WHY IT SURVIVED THE CENSUS. carrierGrp fingerprints the group at
+            // capture and re-hashes at DERIVATION EXIT. A serve never runs the
+            // derivation, so nothing re-hashes, and the replay writes a
+            // recorded exit state that usually equals what was already there.
+            // carrierGrp{cam=0} in every window means "no derivation moved it",
+            // NOT "nothing wrote it". That is R25 one level deeper than R25
+            // states it: not a group whose members two threads would clobber,
+            // but a WRITE SITE the fingerprint cannot see at all.
+            //
+            // WHY IT MATTERS. A worker doing these fourteen non-atomic writes
+            // (Vector3 is 12 bytes) while the frame thread's fanout writes the
+            // same fields is a torn read away from a wrong camera -- and the
+            // abort cannot catch it, because the abort reads carrierMask and
+            // carrierMask is 0 on this path.
+            //
+            // THE FIX, in the shape the file already uses everywhere else:
+            // refuse rather than race. On a worker the block does not run, the
+            // kSdepCam bit is set on carrierMask by hand, wroteSharedCarrier()
+            // goes true and the abort reclaims the draw. The frame thread then
+            // re-derives it, takes this same serve, and performs the writes
+            // where they belong. No new axis -- the existing xfAbort{carrier=}
+            // census counts it, which is exactly what it is.
+            bool xCamReplayRefused = false;
+            if ((xRepG & (1u << kSdepCam)) && xfDeferExecutingDeferred()) {
+              xCamReplayRefused = true;
+              if (m_drawSnapCur != nullptr && m_drawSnapValid)
+                m_drawSnapCur->carrierMask |=
+                    static_cast<uint8_t>(1u << kSdepCam);
+            } else if (xRepG & (1u << kSdepCam)) {
               m_lastDrawCamOrigin      = vrep.camLastDrawOrigin;
               m_lastDrawCamOriginSet   = vrep.camLastDrawOriginSet;
               m_lastO2wCamOrigin       = vrep.camO2wOrigin;
@@ -40744,7 +41803,15 @@ namespace dxvk {
             // arbitrate, because a group is replayable only if its exit value
             // is a pure function of this draw's inputs.
             ++xCarServe;
-            xReplayedGroups = xRepG;
+            // [XfDefer] step 4b: a REFUSED kSdepCam replay must not be reported
+            // as replayed. The verify pass compares the replayed groups against
+            // a re-hash, so leaving the bit set would raise a [Perf.SplitXf]
+            // FAIL on a draw that is about to be discarded and re-derived --
+            // and FAIL=0 is the arbiter for this whole line of work. A
+            // misleading FAIL is worse than no instrument.
+            xReplayedGroups = xCamReplayRefused
+                ? static_cast<uint8_t>(xRepG & ~uint32_t(1u << kSdepCam))
+                : xRepG;
             if (xVerify)
               stageDepCarrierGroups(xGrpReplayed);
           }
@@ -42444,21 +43511,21 @@ namespace dxvk {
               // It is counted with the bit OFF too, so this reads as "how
               // often it WOULD be wrong" before ever shipping the risk.
               // cold = served before this shader had been derived once.
-              " vkPath{agree=", s_vkPathAgree,
-              " disagree=", s_vkPathDisagree,
-              " cold=", s_vkPathCold,
+              " vkPath{agree=", s_vkPathAgree.load(std::memory_order_relaxed),
+              " disagree=", s_vkPathDisagree.load(std::memory_order_relaxed),
+              " cold=", s_vkPathCold.load(std::memory_order_relaxed),
               " vs=", s_vkPathByVsIl.size(),
               // xShader = serves whose entry was built by a different shader.
               // This is the size of what bit 256 is actually merging; read it
               // against FAILcarrier before believing any cross-shader story.
-              " xShader=", s_vkXShader, "}",
+              " xShader=", s_vkXShader.load(std::memory_order_relaxed), "}",
               // [DropByPath] -- the gate on rtx.splitTransformKeyDropByPath.
               // disagree MUST be 0 before any path's 3-bit field is set: this
               // prediction selects what the VALIDITY hash covers, so being
               // wrong is a wrong serve, not a missed hit.
-              " o2wPath{agree=", s_o2wPathAgree,
-              " disagree=", s_o2wPathDisagree,
-              " cold=", s_o2wPathCold, "}",
+              " o2wPath{agree=", s_o2wPathAgree.load(std::memory_order_relaxed),
+              " disagree=", s_o2wPathDisagree.load(std::memory_order_relaxed),
+              " cold=", s_o2wPathCold.load(std::memory_order_relaxed), "}",
               // EVICTION. live{obj} above is one instantaneous sample of a
               // value that may be sawtoothing; these are window totals and
               // cannot be. wipes>0 means the stable working set is being
@@ -42502,8 +43569,8 @@ namespace dxvk {
           // s_vkPathByVsIl is NOT reset -- it is the learned cache, not a
           // count, and clearing it per window would make every window measure
           // cold start. The three counters are per-window and do reset.
-          s_vkPathAgree = s_vkPathDisagree = s_vkPathCold = s_vkXShader = 0;
-          s_o2wPathAgree = s_o2wPathDisagree = s_o2wPathCold = 0;
+          s_vkPathAgree = 0; s_vkPathDisagree = 0; s_vkPathCold = 0; s_vkXShader = 0;
+          s_o2wPathAgree = 0; s_o2wPathDisagree = 0; s_o2wPathCold = 0;
           xIdNew = xIdSame = xIdNear = xIdFar = xIdNoProp = 0;
           xCarStore = xCarServe = xReplayFail = 0;
           for (uint32_t g = 0; g < kSdepGroupCount; ++g) {
@@ -43158,7 +44225,7 @@ namespace dxvk {
           const float mdz = o.z - m_subPassMainOrigin.z;
           Logger::info(str::format(
             "[subPassSky] n=", sSubPassSkyFires,
-            " drawID=", m_drawCallID,
+            " drawID=", xfDrawCallId,
             " vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)),
             " subPassIdx=", m_subPassIndex,
             " cb2=(", o.x, ",", o.y, ",", o.z, ")",
@@ -43221,7 +44288,7 @@ namespace dxvk {
         //              mismatch), and the fix is to align them.
         {
           const uint32_t zbFrame = m_context->m_device->getCurrentFrameId();
-          static uint32_t s_zbLastFrame = UINT32_MAX;
+          static thread_local uint32_t s_zbLastFrame = UINT32_MAX;
           if (zbFrame != s_zbLastFrame) {
             s_zbLastFrame = zbFrame;
             uint32_t rdefSlot = UINT32_MAX;
@@ -43311,7 +44378,7 @@ namespace dxvk {
           // offset was real and this fix removes it; if identical, look elsewhere.
           {
             const uint32_t zsFrame = m_context->m_device->getCurrentFrameId();
-            static uint32_t s_zsLastFrame = UINT32_MAX;
+            static thread_local uint32_t s_zsLastFrame = UINT32_MAX;
             if (zsFrame != s_zsLastFrame) {
               s_zsLastFrame = zsFrame;
               const Matrix4 rv2w = inverse(renderW2v);
@@ -43372,7 +44439,7 @@ namespace dxvk {
         // here (when capCnt>0) instead of m_lastGoodTransforms.worldToView.
         {
           const uint32_t zvFrame = m_context->m_device->getCurrentFrameId();
-          static uint32_t s_zvLastFrame = UINT32_MAX;
+          static thread_local uint32_t s_zvLastFrame = UINT32_MAX;
           if (zvFrame != s_zvLastFrame) {
             s_zvLastFrame = zvFrame;
             const auto& o2w = dcs.transformData.objectToWorld;
@@ -43412,7 +44479,7 @@ namespace dxvk {
         // so if maxTrans here is in the hundreds it cannot be a 1-frame lag.
         {
           const uint32_t zmFrame = m_context->m_device->getCurrentFrameId();
-          static uint32_t s_zmLastFrame = UINT32_MAX;
+          static thread_local uint32_t s_zmLastFrame = UINT32_MAX;
           const uint32_t zmCap =
             tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed);
           if (zmFrame != s_zmLastFrame && zmCap > 0) {
@@ -43596,7 +44663,7 @@ namespace dxvk {
             ++sPath11W2vRestore;
             const auto& w2v = dcs.transformData.worldToView;
             Logger::info(str::format(
-              "[D3D11Rtx.path11.w2vRestore] drawID=", m_drawCallID,
+              "[D3D11Rtx.path11.w2vRestore] drawID=", xfDrawCallId,
               " vs=", m_currentVsHashCache.substr(0, 19),
               " restored cached w2vT=(", w2v[3][0], ",", w2v[3][1], ",", w2v[3][2], ")"));
           }
@@ -43688,7 +44755,7 @@ namespace dxvk {
         if (sBadMatLog < 20) {
           ++sBadMatLog;
           Logger::err(str::format(
-            "[TLAS-FILTER] reject draw=", m_drawCallID,
+            "[TLAS-FILTER] reject draw=", xfDrawCallId,
             " non-finite/absurd o2w: T=(", m[3][0], ",", m[3][1], ",", m[3][2], ")",
             " diag=(", m[0][0], ",", m[1][1], ",", m[2][2], ")"));
         }
@@ -43740,12 +44807,12 @@ namespace dxvk {
       const bool mainEverValid = mainRecentlyLatched;
 
       // Per-frame stats â€” reset when we see the drawCallID counter roll over.
-      static uint32_t s_tlasFilterFrame = UINT32_MAX;
-      static uint32_t s_tlasAccept = 0;
-      static uint32_t s_tlasReject = 0;
-      static uint32_t s_tlasNoMain = 0;
-      static uint32_t s_tlasPrevID = UINT32_MAX;
-      if (m_drawCallID == 0 || m_drawCallID < s_tlasPrevID) {
+      static thread_local uint32_t s_tlasFilterFrame = UINT32_MAX;
+      static thread_local uint32_t s_tlasAccept = 0;
+      static thread_local uint32_t s_tlasReject = 0;
+      static thread_local uint32_t s_tlasNoMain = 0;
+      static thread_local uint32_t s_tlasPrevID = UINT32_MAX;
+      if (xfDrawCallId == 0 || xfDrawCallId < s_tlasPrevID) {
         if (s_tlasFilterFrame != UINT32_MAX
             && (s_tlasAccept + s_tlasReject + s_tlasNoMain) > 0
             && s_tlasFilterFrame < 600) {
@@ -43760,7 +44827,7 @@ namespace dxvk {
         s_tlasReject = 0;
         s_tlasNoMain = 0;
       }
-      s_tlasPrevID = m_drawCallID;
+      s_tlasPrevID = xfDrawCallId;
 
       if (mainEverValid) {
         // RtCamera::getPosition returns the world-space camera position,
@@ -43790,7 +44857,7 @@ namespace dxvk {
             seenOrigins.push_back(k);
             Logger::info(str::format(
               "[TLAS-FILTER] new foreign cam #", seenOrigins.size(),
-              " draw=", m_drawCallID, " frame=", s_tlasFilterFrame,
+              " draw=", xfDrawCallId, " frame=", s_tlasFilterFrame,
               " drawCamPos=(", drawCamPos.x, ",", drawCamPos.y, ",", drawCamPos.z, ")",
               " mainCamPos=(", mainCamPos.x, ",", mainCamPos.y, ",", mainCamPos.z, ")",
               " |delta|=", std::sqrt(d2)));
@@ -44041,7 +45108,7 @@ namespace dxvk {
               (ccY - fanY) * (ccY - fanY) +
               (ccZ - fanZ) * (ccZ - fanZ));
             Logger::info(str::format(
-              "[cachedConsume] @", m_drawCallID, " (rawDraw=", m_rawDrawCount, ")",
+              "[cachedConsume] @", xfDrawCallId, " (rawDraw=", xfRawDrawCount, ")",
               " vs=", m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u)),
               " w2v=(", cached[3][0], ",", cached[3][1], ",", cached[3][2], ")",
               " camPos=(", ccX, ",", ccY, ",", ccZ, ")",
@@ -44057,7 +45124,8 @@ namespace dxvk {
           m_lastDrawFilteredAsUI = true;
           // NV-DXVK: cached camera was never populated (we've never
           // extracted a real VP) â€” treat as HUD-class for hash logging.
-          m_lastDrawIsHudClass = true;
+          if (xfMayWriteShared(XfSharedSite::HudClassLatch))
+            m_lastDrawIsHudClass = true;
           LogPsHashesForHudFilter("UIFallback.degen_w2v");
           if (kDiagLogs) {
             static std::unordered_set<std::string> sDegenVs;
@@ -44065,7 +45133,7 @@ namespace dxvk {
             if (sDegenVs.insert(vkd).second) {
               Logger::info(str::format(
                 "[UIFallback.reason] vs=", vkd,
-                " drawID=", m_drawCallID,
+                " drawID=", xfDrawCallId,
                 " site=degenerate_cached_w2v",
                 " hasEverFoundProj=", m_hasEverFoundProj ? 1 : 0,
                 " foundRealProjThisFrame=", m_foundRealProjThisFrame ? 1 : 0,
@@ -44120,7 +45188,7 @@ namespace dxvk {
               if (sExtremeVs.insert(vke).second) {
                 Logger::info(str::format(
                   "[UIFallback.reason] vs=", vke,
-                  " drawID=", m_drawCallID,
+                  " drawID=", xfDrawCallId,
                   " site=extreme_o2v",
                   " o2vT=(", o2v[3][0], ",", o2v[3][1], ",", o2v[3][2], ")"));
               }
@@ -44132,13 +45200,13 @@ namespace dxvk {
           }
         }
         // Fall through to submit to RTX.
-        static uint32_t s_reusedCount = 0;
+        static thread_local uint32_t s_reusedCount = 0;
         if (kDiagLogs && s_reusedCount < 100) {
           ++s_reusedCount;
           const auto& T = dcs.transformData;
           Logger::info(str::format(
               "[D3D11Rtx] Reusing frame VP for fallback draw #",
-              m_drawCallID, " (rawDraw=", m_rawDrawCount, ")",
+              xfDrawCallId, " (rawDraw=", xfRawDrawCount, ")",
               " o2w T=(", T.objectToWorld[3][0], ",", T.objectToWorld[3][1], ",", T.objectToWorld[3][2], ")",
               " w2v T=(", T.worldToView[3][0], ",", T.worldToView[3][1], ",", T.worldToView[3][2], ")"));
         }
@@ -44150,7 +45218,8 @@ namespace dxvk {
         m_lastDrawFilteredAsUI = true;
         // NV-DXVK: classifier or projection scan definitively says UI â€”
         // safe to treat as HUD-class for PS-hash logging.
-        m_lastDrawIsHudClass = true;
+        if (xfMayWriteShared(XfSharedSite::HudClassLatch))
+          m_lastDrawIsHudClass = true;
         LogPsHashesForHudFilter("UIFallback.true_ui");
 
         if (kDiagLogs) {
@@ -44159,7 +45228,7 @@ namespace dxvk {
           if (sTrueUiVs.insert(vkt).second) {
             Logger::info(str::format(
               "[UIFallback.reason] vs=", vkt,
-              " drawID=", m_drawCallID,
+              " drawID=", xfDrawCallId,
               " site=true_ui",
               " foundRealProjThisFrame=", m_foundRealProjThisFrame ? 1 : 0,
               " classifierSaidUi=", m_lastClassifierSaidUi ? 1 : 0,
@@ -44193,7 +45262,7 @@ namespace dxvk {
         if (sFanoutO2wLog.insert(vsH).second)
         Logger::info(str::format(
           "[D3D11Rtx.o2w.fanout] vs=", vsH,
-          " drawID=", m_drawCallID,
+          " drawID=", xfDrawCallId,
           " inst.T=(", (*instanceTransform)[3][0], ",",
           (*instanceTransform)[3][1], ",", (*instanceTransform)[3][2], ")"));
       }
@@ -44878,7 +45947,7 @@ namespace dxvk {
           ++sPath10W2vRestore;
           const auto& w2v = dcs.transformData.worldToView;
           Logger::info(str::format(
-            "[D3D11Rtx.path10.w2vRestore] drawID=", m_drawCallID,
+            "[D3D11Rtx.path10.w2vRestore] drawID=", xfDrawCallId,
             " restored cached w2vT=(", w2v[3][0], ",", w2v[3][1], ",", w2v[3][2], ")"));
         }
         {
@@ -45032,8 +46101,74 @@ namespace dxvk {
     dcs.zWriteEnable     = zWriteEnable;
     dcs.zEnable          = zEnable;
     dcs.stencilEnabled   = stencilEnabled;
-    dcs.drawCallID       = m_drawCallID++;
+    // [XfDefer] step 4c: STILL ALLOCATED HERE, and deliberately. Moving the
+    // increment to the seam would have changed WHICH draws consume an ID -- the
+    // tail early-returns above this line, and those draws have never taken one.
+    //
+    // CORRECTED 2026-08-19d: an earlier version of this comment said "the member
+    // is atomic now, so the allocation is safe from the chain". m_drawCallID is
+    // a plain uint32_t (d3d11_rtx.h ~:2803) and the ctx field comment records
+    // that making it atomic was considered and REJECTED -- it is passed by value
+    // to ~40 str::format sites that would not deduce through std::atomic. The
+    // conclusion happened to be right and the reason was false, which is the
+    // more dangerous half: what actually makes this safe is that a ROUTED draw
+    // takes the `c.drawCallIdPreset` branch and never reaches the increment, so
+    // every increment -- seam or commit line -- is on the frame thread. Do not
+    // "simplify" the preset branch away on the strength of an atomic that is not
+    // there.
+    // [XfDefer] step 4c: a routed draw's ID was allocated at the seam, in draw
+    // order, on the frame thread; an unrouted one increments here exactly as it
+    // always did. `this->` is needed because the bare name is the frame-thread
+    // snapshot bound at the top of this function. See the ctx fields.
+    dcs.drawCallID       = c.drawCallIdPreset ? c.drawCallId
+                                              : this->m_drawCallID++;
+    // ==================================================================
+    // NV-DXVK [XfDefer] 2026-08-19c -- THE SECOND SEAM IS THE LINE BELOW.
+    //
+    // This assignment is the LAST write to the caller's verdict. OnDraw /
+    // OnDrawIndexed / OnDraw*Instanced read m_lastDrawCaptured and
+    // m_lastDrawFilteredAsUI immediately after SubmitDraw returns and use them
+    // to decide whether the game's native rasterization runs (~:10997, :11014,
+    // :11025, :11055). Their only writes are the two UIFallback sites (~:44551
+    // / :44644 with their HudClass siblings) and this line -- all upstream of
+    // here -- so from the next statement onward the answer the entry point will
+    // give the game is FIXED.
+    //
+    // That, and not a brace level, is where a deferred tail may begin WITHOUT
+    // touching the entry point. Everything above it -- ExtractTransforms and
+    // the filter cascade that reads its worldToView -- has to complete before
+    // the D3D11 call returns, AS THE ENTRY POINT IS WRITTEN TODAY.
+    //
+    // THAT IS A PROPERTY OF THE ENTRY POINT, NOT OF THIS CODE. The verdict's
+    // only consumer is `if (!deCap) EmitCs(native draw)` in
+    // d3d11_context.cpp:1441, and EmitCs RECORDS a command the dxvk-cs thread
+    // runs later. Make that command conditional on a per-draw cell and the
+    // deadline moves from "before this function returns" to "before the CS
+    // thread reaches it" -- at which point the seam moves back up to the
+    // derivation and this line stops being a boundary at all. See "HOW THE
+    // VERDICT DEPENDENCY IS BROKEN" in d3d11_rtx.h.
+    // ==================================================================
     m_lastDrawCaptured   = true;  // Signal caller to skip D3D11 rasterization
+    // Opens the post-verdict measurement. Declared HERE so its scope is exactly
+    // the deferrable region, and destructor-based so the region's many early
+    // returns are all counted. See the accumulator declarations for why a
+    // paired stamp would have been wrong rather than merely incomplete.
+    struct XfPostVerdictTimer {
+      std::chrono::steady_clock::time_point t0;
+      XfPostVerdictTimer()
+        : t0(s_submitDrawSubMarkers ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{}) { }
+      ~XfPostVerdictTimer() {
+        if (!s_submitDrawSubMarkers)
+          return;
+        const int64_t d = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        s_xfPostVerdictAccNs += d;
+        ++s_xfPostVerdictN;
+        if (d > s_xfPostVerdictMaxNs)
+          s_xfPostVerdictMaxNs = d;
+      }
+    } xfPostVerdictTimer;
     markStg(s_perfSubmitDrawStageFiltersAcc, s_perfSubmitDrawStageFiltersMax);
     sdStallMark(3);  // [SdStall] seg3 "xform": boneTrack + ExtractTransforms + filters
     // NV-DXVK: record the successful submit against the current VS hash.
@@ -45048,7 +46183,12 @@ namespace dxvk {
         " vs=", m_currentVsHashCache.substr(0, 19),
         " verdict=PASS o2wPathId=", m_lastO2wPathId,
         " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")"));
-      m_vmHuntIsSuspect = false; // consumed
+      // [XfDefer] step 4c: a cross-draw latch set by the head and CLEARED here.
+      // Clearing it from the chain would consume a flag the frame thread set
+      // for a different draw. Refused there; the draw aborts and the inline
+      // re-run consumes it where it belongs.
+      if (xfMayWriteShared(XfSharedSite::VmHuntConsume))
+        m_vmHuntIsSuspect = false; // consumed
     }
 
     // NV-DXVK: orientation probe â€” log the world-space directions that each
@@ -45284,7 +46424,8 @@ namespace dxvk {
           if (slot == UINT32_MAX) continue;
           if (slot >= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) continue;
           D3D11ShaderResourceView* srv =
-            m_context->m_state.ps.shaderResources.views[slot].ptr();
+            xfLiveState(XfLiveSite::VguiStructuredBuffers)
+              .ps.shaderResources.views[slot].ptr();
           if (!srv) continue;
           if (srv->GetResourceType() != D3D11_RESOURCE_DIMENSION_BUFFER) continue;
           Rc<DxvkBufferView> view = srv->GetBufferView();
@@ -45817,7 +46958,9 @@ namespace dxvk {
                   // while the BYTES come from the live slice would pair two
                   // instants, which is the exact half-conversion A.7 forbids.
                   // Convert this only together with a routed byte read.
-                  const auto& vb = m_context->m_state.ia.vertexBuffers[s.inputSlot];
+                  const auto& vb =
+                    xfLiveState(XfLiveSite::VbTexcoordDump)
+                      .ia.vertexBuffers[s.inputSlot];
                   if (vb.buffer == nullptr || vb.stride == 0) continue;
                   auto* d3dBuf = vb.buffer.ptr();
                   if (d3dBuf == nullptr) continue;
@@ -45954,7 +47097,9 @@ namespace dxvk {
                 // back to GetMappedSlice() when the immutable shadow is empty,
                 // so binding and bytes must come from the same instant. See the
                 // TEXCOORD dump above for the full reason.
-                const auto& vb = m_context->m_state.ia.vertexBuffers[s.inputSlot];
+                const auto& vb =
+                  xfLiveState(XfLiveSite::VbPositionDump)
+                    .ia.vertexBuffers[s.inputSlot];
                 if (vb.buffer == nullptr || vb.stride == 0) continue;
                 auto* d3dBuf = vb.buffer.ptr();
                 if (d3dBuf == nullptr) continue;
@@ -46074,7 +47219,9 @@ namespace dxvk {
 
                 // NV-DXVK [PhaseB tail] DELIBERATELY LIVE -- same immutable-or-
                 // GetMappedSlice fallback as the POSITION dump above.
-                const auto& vb = m_context->m_state.ia.vertexBuffers[s.inputSlot];
+                const auto& vb =
+                  xfLiveState(XfLiveSite::VbTexcoordDump2)
+                    .ia.vertexBuffers[s.inputSlot];
                 if (vb.buffer == nullptr || vb.stride == 0) continue;
                 auto* d3dBuf = vb.buffer.ptr();
                 if (d3dBuf == nullptr) continue;
@@ -46350,7 +47497,9 @@ namespace dxvk {
                   continue;
                 // NV-DXVK [PhaseB batch 2] DELIBERATELY LIVE -- dump
                 // diagnostic reading contents. See the sibling note on psCbs.
-                const auto& cbBinding = m_context->m_state.ps.constantBuffers[cbSlot];
+                const auto& cbBinding =
+                  xfLiveState(XfLiveSite::PsCbFieldDump)
+                    .ps.constantBuffers[cbSlot];
                 const uint8_t* base = nullptr;
                 size_t bufLen = 0;
                 if (cbBinding.buffer != nullptr) {
@@ -46429,7 +47578,8 @@ namespace dxvk {
             // without its bytes mixes two instants -- the exact bug class the
             // record exists to prevent. Route through drawCbSpan/the manifest
             // when the PS span manifest lands.
-            const auto& cb = m_context->m_state.ps.constantBuffers[rsx->slot];
+            const auto& cb =
+              xfLiveState(XfLiveSite::PsUvXform).ps.constantBuffers[rsx->slot];
             if (cb.buffer != nullptr) {
               // NV-DXVK [Perf.UvXformCache]: probe before touching the WC
               // mapping. Key contract documented at the cache decl (~9840).
@@ -46612,7 +47762,7 @@ namespace dxvk {
         || vsH_diag == 0x1953b6e9cc252e4eull
         || vsH_diag == 0xe7abcf4ea24b0fa7ull
         || vsH_diag == 0x448e372f6d5e78e1ull;
-      const bool gameplayReady_diag = (m_rawDrawCount > 50);
+      const bool gameplayReady_diag = (xfRawDrawCount > 50);
       if (vsIsBspAllowed_diag && psH_diag != 0) {
         bool firstForThisPs = false;
         {
@@ -47441,9 +48591,9 @@ namespace dxvk {
               // leak) so the worker can build it; the boneHash change-detector above
               // already ran synchronously. Rare on TF2 (it skins GPU-side, so
               // needPalette=false), so this branch usually never fires.
-              m_geoBatch->pendSkin.boneBytes.assign(boneReadPtr, boneReadPtr + size_t(maxBones) * 48u);
-              m_geoBatch->pendSkin.maxBones = maxBones;
-              m_geoBatch->pendHasSkin = true;
+              pend.skin.boneBytes.assign(boneReadPtr, boneReadPtr + size_t(maxBones) * 48u);
+              pend.skin.maxBones = maxBones;
+              pend.hasSkin = true;
               ++sPalBuilds;
             } else {
               // Build with reserve + emplace_back rather than resize()-then-
@@ -47537,7 +48687,7 @@ namespace dxvk {
               }
               uint64_t bh = 1469598103934665603ull;
               for (size_t i = 0; i < boneBufLen; ++i) { bh ^= bonePtr[i]; bh *= 1099511628211ull; }
-              static uint64_t s_boneSrcHash = 0; static uint32_t s_boneSrcFrame = 0xFFFFFFFFu;
+              static thread_local uint64_t s_boneSrcHash = 0; static thread_local uint32_t s_boneSrcFrame = 0xFFFFFFFFu;
               const uint32_t bsf = g_remixFrameId.load(std::memory_order_relaxed);
               if (bsf != s_boneSrcFrame) {
                 const int changed = (bh != s_boneSrcHash) ? 1 : 0;
@@ -47574,7 +48724,7 @@ namespace dxvk {
                 vpMaxD = vpZb.MaxDepth;
               if (vpMaxD <= 0.08f && maxBones > 0) {
                 const uint32_t zb2Frame = m_context->m_device->getCurrentFrameId();
-                static uint32_t s_zb2LastFrame = UINT32_MAX;
+                static thread_local uint32_t s_zb2LastFrame = UINT32_MAX;
                 if (zb2Frame != s_zb2LastFrame) {
                   s_zb2LastFrame = zb2Frame;
                   const uint32_t bi = (maxBones > 1u) ? 1u : 0u; // bone[0] is often identity
@@ -47586,7 +48736,7 @@ namespace dxvk {
                   // never-cleared mirror merge is staleifying fresh bones.
                   uint64_t ph = 1469598103934665603ull;
                   for (size_t i = 0; i < boneBufLen; ++i) { ph ^= bonePtr[i]; ph *= 1099511628211ull; }
-                  static uint64_t s_zb2LastHash = 0;
+                  static thread_local uint64_t s_zb2LastHash = 0;
                   const int readChanged = (ph != s_zb2LastHash) ? 1 : 0;
                   s_zb2LastHash = ph;
                   // Read the GUN/HANDS palette slots (documented at element ~672/688)
@@ -47677,13 +48827,13 @@ namespace dxvk {
     }
 
     // === PER-DRAW TRANSFORM + VERTEX DIAGNOSTIC ===
-    // Log every draw for the first 5 in-game frames (m_drawCallID-based gate).
+    // Log every draw for the first 5 in-game frames (xfDrawCallId-based gate).
     // NV-DXVK PERF (2026-08-08d §1): the frame-counting statics ran on EVERY
     // draw to feed a kDiagLogs-only log; kDiagLogs is constexpr so this whole
     // block now compiles out with it.
     if (kDiagLogs) {
-      static uint32_t s_submitLogFrame = 0;
-      static uint32_t s_submitPrevID   = UINT32_MAX;
+      static thread_local uint32_t s_submitLogFrame = 0;
+      static thread_local uint32_t s_submitPrevID   = UINT32_MAX;
       if (dcs.drawCallID == 0 || dcs.drawCallID < s_submitPrevID)
         ++s_submitLogFrame;
       s_submitPrevID = dcs.drawCallID;
@@ -47733,7 +48883,7 @@ namespace dxvk {
     // detecting oscillation magnitude visible to the user.
     //
     // Implementation: hash (VS, frame) â€” emit one log per (VS, frame).
-    // We use m_drawCallID as a per-frame-ish counter; combined with
+    // We use xfDrawCallId as a per-frame-ish counter; combined with
     // a frame-tag derived from m_currentFanoutFrame or similar, we
     // get one entry per frame per VS. Simpler: just throttle by
     // globally counting every Nth frame approximated by raw count.
@@ -47839,7 +48989,7 @@ namespace dxvk {
             " o2wT=(", T.objectToWorld[3][0], ",", T.objectToWorld[3][1], ",", T.objectToWorld[3][2], ")",
             " w2vT=(", T.worldToView[3][0], ",", T.worldToView[3][1], ",", T.worldToView[3][2], ")",
             " o2vT=(", T.objectToView[3][0], ",", T.objectToView[3][1], ",", T.objectToView[3][2], ")",
-            " raw=", m_rawDrawCount));
+            " raw=", xfRawDrawCount));
         }
       }
       // NV-DXVK [ShipSkinDiag]: per-draw skinning-INPUT state for the garbled
@@ -48672,7 +49822,7 @@ namespace dxvk {
         // record and context agree until the game rebinds -- but it is exactly
         // the half-conversion that becomes wrong the day this block runs
         // deferred. Close BOTH halves together (route the bytes), or neither.
-        const auto& vbs = m_context->m_state.ia.vertexBuffers;
+        const auto& vbs = xfLiveState(XfLiveSite::SkinCpuVbs).ia.vertexBuffers;
         if (posSem != nullptr && posSem->inputSlot < vbs.size() && vbs[posSem->inputSlot].buffer != nullptr) {
           const auto& vb = vbs[posSem->inputSlot];
           pbase = cpuBaseSk(vb.buffer.ptr(), pLen);
@@ -49599,7 +50749,8 @@ namespace dxvk {
           // NV-DXVK [PhaseB] BATCH 3: reads cbuffer CONTENTS (GetMappedSlice)
           // below, so binding and bytes must come from one instant. Route
           // through drawCbSpan together, or leave both live.
-          const auto& vsCbsDiag = m_context->m_state.vs.constantBuffers;
+          const auto& vsCbsDiag =
+            xfLiveState(XfLiveSite::CamOriginDiag).vs.constantBuffers;
           const auto& camCbDiag = vsCbsDiag[camLocDiag->slot];
           if (camCbDiag.buffer != nullptr) {
             const auto mapDiag = camCbDiag.buffer->GetMappedSlice();
@@ -49647,7 +50798,8 @@ namespace dxvk {
               " cbuffer dump ==="));
             // NV-DXVK [PhaseB] BATCH 3: cbuffer CONTENT dump -- binding + bytes
             // convert together or not at all.
-            const auto& vsCbsC = m_context->m_state.vs.constantBuffers;
+            const auto& vsCbsC =
+              xfLiveState(XfLiveSite::GarbageO2wDump).vs.constantBuffers;
             for (uint32_t s = 0; s < 8; ++s) {
               const auto& cb = vsCbsC[s];
               if (cb.buffer == nullptr) continue;
@@ -50330,19 +51482,20 @@ namespace dxvk {
                 // Batch mode: capture the bbox scan inputs (pin the position buffer) for
                 // the frame-end parallel-for instead of scheduling a per-draw Future. The
                 // decode params are the same locals, and runBatchBboxJob is the same body,
-                // so the box is identical. Pin released by runRange (or resetPending on a
-                // draw rejected before commit).
+                // so the box is identical. Pin released by runRange once the append
+                // has moved the job into the item, or by ~PendingDrawSlot if this
+                // draw is rejected before it reaches the append.
                 DxvkBuffer* bbPin = posBuf.buffer().ptr();
                 if (bbPin) { bbPin->incRef(); bbPin->acquire(DxvkAccess::Read); }
-                m_geoBatch->pendBbox.baseBytes       = baseBytes;
-                m_geoBatch->pendBbox.sampStride      = sampStride;
-                m_geoBatch->pendBbox.minBytesPerVert = minBytesPerVert;
-                m_geoBatch->pendBbox.bufLen          = bufLen;
-                m_geoBatch->pendBbox.vertCount       = vertCount;
-                m_geoBatch->pendBbox.isBspPacked     = isBspPacked;
-                m_geoBatch->pendBbox.is16F4          = is16F4;
-                m_geoBatch->pendBbox.pin             = bbPin;
-                m_geoBatch->pendHasBbox              = true;
+                pend.bbox.baseBytes       = baseBytes;
+                pend.bbox.sampStride      = sampStride;
+                pend.bbox.minBytesPerVert = minBytesPerVert;
+                pend.bbox.bufLen          = bufLen;
+                pend.bbox.vertCount       = vertCount;
+                pend.bbox.isBspPacked     = isBspPacked;
+                pend.bbox.is16F4          = is16F4;
+                pend.bbox.pin             = bbPin;
+                pend.hasBbox              = true;
               } else if (!posIsStatic && vertCount > 0u && m_pGeometryWorkers != nullptr) {
                 DxvkBuffer* bbPin = posBuf.buffer().ptr();
                 if (bbPin) { bbPin->incRef(); bbPin->acquire(DxvkAccess::Read); }
@@ -51101,7 +52254,8 @@ namespace dxvk {
         // calls once per distinct SRV per thread instead of twice per draw.
         // Same idiom as sTspDsCached immediately above, which retired the
         // per-draw GetDesc on the depth-stencil state for the same reason.
-        const auto& tspSrvs = m_context->m_state.ps.shaderResources.views;
+        const auto& tspSrvs =
+          xfLiveState(XfLiveSite::TspSrvScan).ps.shaderResources.views;
         for (uint32_t s = 0;
              s < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++s) {
           D3D11ShaderResourceView* tspSv = tspSrvs[s].ptr();
@@ -51457,7 +52611,8 @@ namespace dxvk {
       size_t slotLenMc[4] = { 0, 0, 0, 0 };
       // NV-DXVK [PhaseB] BATCH 3: hashes cbuffer CONTENT below -- binding and
       // bytes convert together.
-      const auto& vsCbsMc = m_context->m_state.vs.constantBuffers;
+      const auto& vsCbsMc =
+        xfLiveState(XfLiveSite::MemoCeilingCbs).vs.constantBuffers;
       for (uint32_t sl = 0; sl < 4u; ++sl) {
         const auto& cb = vsCbsMc[sl];
         if (cb.buffer == nullptr) { continue; }
@@ -51674,10 +52829,12 @@ namespace dxvk {
     // STRICTER than [DupPass]'s classifier -- see the rtx.filterDupSameDraws
     // option doc for the key fields and the safety argument. v1 scope guards:
     // fanout draws (per-instance transform arrays) and blending-enabled draws
-    // are never filtered. An early return here is safe by construction: pins
-    // pending in the batch arena are released by resetPending() at the next
-    // SubmitDraw entry (that is that function's documented contract for draws
-    // rejected before the commit point).
+    // are never filtered. An early return here is safe by construction: the
+    // pending stage-job pins belong to this draw's PendingDrawSlot, whose
+    // destructor releases them as this SubmitDraw frame unwinds. (Before B1
+    // they were the arena's and survived until the NEXT SubmitDraw entry called
+    // resetPending() -- same guarantee, one draw later and one frame boundary
+    // wider.)
     if (RtxOptions::filterDupSameDraws()) {
       const auto& itoDf = dcs.transformData.instancesToObject;
       const bool dfFanout = (itoDf != nullptr) && !itoDf->empty();
@@ -51807,7 +52964,12 @@ namespace dxvk {
     // not run the Phase-1 population, or a fallback draw that still committed).
     if (RtxOptions::capturePhase2()) {
       const uint32_t p2Frame = m_context->m_device->getCurrentFrameId();
-      if (p2Frame != m_captureFrame) {
+      // [XfDefer] step 4c: m_captureArena is a std::vector the frame thread also
+      // pushes to, and m_captureFrame is its frame stamp. Refused on the chain
+      // -- a concurrent push_back reallocates under the other thread. See
+      // xfMayWriteShared.
+      if (p2Frame != m_captureFrame
+          && xfMayWriteShared(XfSharedSite::Phase2CaptureArena)) {
         if (m_captureFrame != UINT32_MAX) {
           // Break the misses into exclusive buckets so we can see WHY a commit
           // lacks a layoutId: no VS bound / ExtractTransforms took the UI-ortho
@@ -51869,7 +53031,7 @@ namespace dxvk {
 
       DrawCaptureRecord rec;
       rec.layoutId         = m_currentLayoutId;
-      rec.drawCallID       = m_drawCallID;
+      rec.drawCallID       = xfDrawCallId;
       rec.o2wPathId        = m_lastO2wPathId;
       rec.o2wSrcClass      = o2wSrcClassOf(m_lastO2wPathId);
       rec.usedFallback     = m_lastExtractUsedFallback;
@@ -51889,7 +53051,8 @@ namespace dxvk {
           // NV-DXVK [PhaseB] BATCH 3: stagedCbBytes falls back to
           // GetMappedSlice(), so this is a CONTENT read -- binding and bytes
           // convert together, via drawCbSpan, or neither.
-          const auto& cb = m_context->m_state.vs.constantBuffers[slot];
+          const auto& cb =
+            xfLiveState(XfLiveSite::RecordCbSnapshot).vs.constantBuffers[slot];
           if (cb.buffer == nullptr) return false;
           size_t len = 0;
           const uint8_t* p = stagedCbBytes(cb.buffer.ptr(), len);
@@ -51906,7 +53069,9 @@ namespace dxvk {
         rec.viewCbValid = snapCb(d.viewSlot, d.viewByteOffset, rec.viewCb);
       }
 
-      m_captureArena.push_back(rec);
+      // [XfDefer] step 4c: see the frame-stamp guard above.
+      if (xfMayWriteShared(XfSharedSite::Phase2CaptureArena))
+        m_captureArena.push_back(rec);
     }
 
     // NV-DXVK [flicker V8: SubmitDraw-ordered geometry capture — issue side].
@@ -52065,7 +53230,11 @@ namespace dxvk {
           // converge (the entry dies before its recovery bake), and a 30-frame
           // window kept re-arming captures for ~115 such keys all session
           // (2026-08-02 21:23 run, [GeoCapture.wanted] = 100% sprite VSes).
-          if (m_geomCaptureWantedSnapshotFrame != fid) {
+          // [XfDefer] step 4c: unordered_set clear+insert. A concurrent insert
+          // rehashes the bucket table under the other thread, which no abort
+          // can undo -- so it is refused on the chain, not detected.
+          if (m_geomCaptureWantedSnapshotFrame != fid
+              && xfMayWriteShared(XfSharedSite::GeomCaptureWantedSet)) {
             m_geomCaptureWantedSnapshotFrame = fid;
             m_geomCaptureWantedSnapshot.clear();
             // NV-DXVK [capture feedback v2]: one lock per frame. Stale keys
@@ -52108,7 +53277,9 @@ namespace dxvk {
           // which submit's DrawCallState lands on which entry is decided
           // later by the cache, so every submit of an unstable key carries
           // its own capture (same rationale the feedback path had).
-          if (m_geomCaptureStableSnapshotFrame != fid) {
+          // [XfDefer] step 4c: see the sibling guard on the wanted set above.
+          if (m_geomCaptureStableSnapshotFrame != fid
+              && xfMayWriteShared(XfSharedSite::GeomCaptureStableSet)) {
             m_geomCaptureStableSnapshotFrame = fid;
             m_geomCaptureStableSnapshot.clear();
             std::lock_guard<std::mutex> lkSt(dxvk::tf2::g_geomCaptureStableMutex);
@@ -52306,7 +53477,7 @@ namespace dxvk {
     // the commit point keeps the arena 1:1 with real commits (past every early-return)
     // and lets the flush worker release the CB pins. flushGeometryBatch (at EndFrame)
     // runs the parallel-for and re-emits every collected commit in this draw order.
-    if (sBatchDraw) {   // arena already created + resetPending()'d at SubmitDraw entry
+    if (sBatchDraw) {   // arena already created at SubmitDraw entry; slots are c.pend's
       // NV-DXVK [perf] 2026-08-10: THIS is the tail_emit remainder, not the
       // EmitCs hand-off below -- we return before ever reaching it. Four
       // independent ns timers (they do not consume tStg, so tail_emit's span is
@@ -52318,23 +53489,50 @@ namespace dxvk {
       const bool bcTime = s_submitDrawSubMarkers;
       const auto tBc0 = bcTime ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
-      m_geoBatch->items.emplace_back();
-      DrawWorkItem& item = m_geoBatch->items.back();
+      // [XfDefer] B3: THE TERMINAL ACT PICKS ITS OWN ARENA. A routed draw is on
+      // the chain and appends to `staged`, which nothing else writes; an
+      // unrouted one is on the frame thread and appends to `items` exactly as
+      // before. Two vectors, one writer each -- no lock, and no reallocation
+      // under another thread's `DrawWorkItem&`. `c.routed` is false on every
+      // path today, so this resolves to the old line plus one branch.
+      std::vector<DrawWorkItem>& dstArena = c.routed ? m_geoBatch->staged
+                                                     : m_geoBatch->items;
+      dstArena.emplace_back();
+      DrawWorkItem& item = dstArena.back();
       item.params = params;
       const auto tBc1 = bcTime ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
-      captureMatSnapshotInto(item.matSnap, /*deferForWorker*/ true);  // pins CBs; freed in flush
+      // [XfDefer] B2: MOVE, NOT CAPTURE. The snapshot was taken at the seam on
+      // the frame thread; this only transfers ownership of it (and of the CB
+      // pins it holds) to the item, which the flush worker then frees. Clearing
+      // the flag is what stops ~PendingDrawSlot from releasing pins the item now
+      // owns -- MatSnapshot has no user-defined move, so the moved-from copy
+      // still carries the same CbCap::pinned pointers.
+      item.matSnap = std::move(pend.matSnap);
+      pend.hasMatSnap = false;
       const auto tBc2 = bcTime ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
       item.dcs = std::move(dcs);
+      // [XfDefer] B3: the merge key, read AFTER the move because dcs is gone.
+      // Assigned at the commit line above on the frame thread in draw order for
+      // both paths, which is what makes it a valid ordering across the two arenas.
+      item.seq = item.dcs.drawCallID;
       const auto tBc3 = bcTime ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
-      // Transfer the deferred stage jobs captured earlier this draw. Clear each pending
-      // flag WITHOUT releasing pins â€” ownership moves to the item (freed in runRange).
-      GeometryBatchArena& arena = *m_geoBatch;
-      if (arena.pendHasHash) { item.hashJob = std::move(arena.pendHash); item.hasHashJob = true; arena.pendHasHash = false; }
-      if (arena.pendHasBbox) { item.bboxJob = std::move(arena.pendBbox); item.hasBboxJob = true; arena.pendHasBbox = false; }
-      if (arena.pendHasSkin) { item.skinJob = std::move(arena.pendSkin); item.hasSkinJob = true; arena.pendHasSkin = false; }
+      // Transfer the deferred stage jobs captured earlier THIS DRAW. Clear each pending
+      // flag WITHOUT releasing pins â€” ownership moves to the item (freed in runRange),
+      // and the cleared flag is also what stops ~PendingDrawSlot from releasing pins
+      // the item now owns (a moved-from job still carries the old pointers).
+      //
+      // [XfDefer] B1: `pend` is THIS draw's stack slot, not the arena's. Before, these
+      // three reads came off m_geoBatch, which outlives the draw -- so a tail running
+      // behind the frame thread appended whichever draw's jobs happened to be sitting
+      // there. Reading them through the ctx is what makes the append safe to defer;
+      // it is not a rename. `pend` is the preamble alias; re-binding it here
+      // would shadow that local and this TU builds with werror.
+      if (pend.hasHash) { item.hashJob = std::move(pend.hash); item.hasHashJob = true; pend.hasHash = false; }
+      if (pend.hasBbox) { item.bboxJob = std::move(pend.bbox); item.hasBboxJob = true; pend.hasBbox = false; }
+      if (pend.hasSkin) { item.skinJob = std::move(pend.skin); item.hasSkinJob = true; pend.hasSkin = false; }
       if (bcTime) {
         const auto tBc4 = std::chrono::steady_clock::now();
         auto bill = [](const std::chrono::steady_clock::time_point& a,
@@ -64185,7 +65383,7 @@ namespace dxvk {
     m_drawSnapCur = nullptr;
     m_drawSnapValid = false;
     m_rawDrawCount = 0;
-    m_remixActiveThisFrame = false;
+    m_remixActiveThisFrame.store(false, std::memory_order_release);
     m_foundRealProjThisFrame = false;
     // Projection cache (m_projSlot, m_projOffset, m_projStage, m_columnMajor)
     // is NOT reset for pure projections (cls 1/2) â€” the validation path at
@@ -64655,6 +65853,53 @@ namespace dxvk {
                                  " sharedCarrierVs=",  s_xfSharedCarrierVsIl.size(),
                                  " sharedDrawsIn=",    s_xfDrawsInSharedCarrierVs,
                                  " sharedEscape=",     s_xfSharedEscape,
+                                 // [XfDefer] STEP 3. xfRouted is THE SIZING
+                                 // NUMBER: how many of the ~1080 draws/frame
+                                 // would leave the frame thread. Read it against
+                                 // [Perf.EligCost] xfElig_ns to price the code
+                                 // motion BEFORE doing it.
+                                 //
+                                 // The abort* fields have xfRouted as their
+                                 // denominator, not draws, and they are NOT
+                                 // disjoint -- a draw can trip more than one.
+                                 // abortGeo is the only one that could ever have
+                                 // corrupted anything and was measured at 6 live
+                                 // reads in 36,015 draws. abortCarrier is the
+                                 // rate at which the shader-taint hint is wrong;
+                                 // it costs a re-derivation and nothing else,
+                                 // because every carrier a deferred derivation
+                                 // can write is thread-private or a monotone
+                                 // atomic now.
+                                 " xfRouted=",         s_xfRouted,
+                                 " xfRefuse{rec=",     s_xfRouteRefusedRec,
+                                 " taint=",            s_xfRouteRefusedTaint,
+                                 "}",
+                                 " xfAbort{geo=",      s_xfAbortGeo,
+                                 " cb=",               s_xfAbortCb,
+                                 // [XfDefer] step 4b. live= is the draw count
+                                 // lost to a tail site that needed live D3D11
+                                 // state; xfEsc{} below names WHICH sites, and
+                                 // is the work list for converting them. Both
+                                 // stay 0 until a dispatcher opens a scope --
+                                 // a non-zero reading on the all-inline path
+                                 // means a scope leaked, not that a site
+                                 // misbehaved.
+                                 " live=",             s_xfAbortLive,
+                                 " carrier=",          s_xfAbortCarrier,
+                                 "}",
+                                 xfLiveEscapeCensus(),
+                                 xfSharedRefuseCensus(),
+                                 // [XfDefer] step 4b: THE SIZE OF THE ONLY
+                                 // OFFLOAD THAT IS ACTUALLY AVAILABLE -- the
+                                 // post-verdict region. Reads 0 unless
+                                 // RTX_D3D11_SUBMARK=1. Divide acc by the
+                                 // window's frame count for ms/frame and
+                                 // compare against the frame thread's 57.66;
+                                 // that ratio, not xfRouted, is the prize.
+                                 " xfPostVerdict{ns=", s_xfPostVerdictAccNs,
+                                 " n=",                s_xfPostVerdictN,
+                                 " maxNs=",            s_xfPostVerdictMaxNs,
+                                 "}",
                                  // NV-DXVK [GenVal] 2026-08-19. Decides whether
                                  // the split cache's staleness proof can move
                                  // from hashing the draw's input BYTES to
@@ -64928,6 +66173,11 @@ namespace dxvk {
                                  " bc_matSnap_ns=",  s_perfBcMatSnapAccNs,
                                  " bc_dcsMove_ns=",  s_perfBcDcsMoveAccNs,
                                  " bc_jobs_ns=",     s_perfBcJobsAccNs,
+                                 // [XfDefer] B2: the CAPTURE that bc_matSnap_ns
+                                 // used to carry, now taken at the seam. Compare
+                                 // THIS against a pre-B2 bc_matSnap_ns; the field
+                                 // of that name above is now only the move.
+                                 " xfMatCapSeam_ns=", s_perfXfMatCapSeamAccNs,
                                  // DIRECT (non-batched) path ONLY. Reads 0 whenever
                                  // rtx.batchSubmitDrawStages is on, because that path
                                  // returns above without reaching the timed block --
@@ -66292,6 +67542,7 @@ namespace dxvk {
                                  " bc_matSnap_ns=",  s_perfBcMatSnapMaxNs,
                                  " bc_dcsMove_ns=",  s_perfBcDcsMoveMaxNs,
                                  " bc_jobs_ns=",     s_perfBcJobsMaxNs,
+                                 " xfMatCapSeam_ns=", s_perfXfMatCapSeamMaxNs,
                                  " emitCs_ns=",      s_perfSubmitDrawStageEmitCsMaxNs,
                                  " tail=",           s_perfSubmitDrawStageTailMax));
         sLastLog = tEndFrameEnd;
@@ -66371,6 +67622,22 @@ namespace dxvk {
         // shader every 5 s. sharedEscape is a correctness counter and therefore
         // MUST clear, or a single early escape would be forgiven by dilution.
         s_xfDrawsInSharedCarrierVs = 0; s_xfSharedEscape = 0;
+        // [XfDefer] step 3: rates, so they clear. s_xfSharedCarrierVsIl is the
+        // learned set the gate reads and is deliberately NOT cleared -- wiping
+        // it every window would re-open the gate on every tainted shader every
+        // few seconds, which is the one thing that would make sharedEscape's
+        // cold-start spike recur forever instead of once.
+        s_xfRouted = 0; s_xfRouteRefusedRec = 0; s_xfRouteRefusedTaint = 0;
+        s_xfAbortGeo = 0; s_xfAbortCb = 0; s_xfAbortCarrier = 0;
+        // [XfDefer] step 4b: rates too, and the per-site census with them --
+        // a site converted mid-session must be able to read 0 in the next
+        // window rather than carry its history forever.
+        s_xfAbortLive = 0;
+        s_xfPostVerdictAccNs = 0; s_xfPostVerdictMaxNs = 0; s_xfPostVerdictN = 0;
+        for (uint32_t i = 0; i < uint32_t(XfLiveSite::Count); ++i)
+          s_xfLiveEscapeBySite[i].store(0u, std::memory_order_relaxed);
+        for (uint32_t i = 0; i < uint32_t(XfSharedSite::Count); ++i)
+          s_xfSharedRefuseBySite[i].store(0u, std::memory_order_relaxed);
         // [GenVal]: same rule -- it is a RATE over the window's lookups, and
         // the ratio genHitStale/(genHitHit+genHitStale) is only meaningful
         // against the same window's serve count. s_genValCur is NOT cleared:
@@ -66483,6 +67750,7 @@ namespace dxvk {
         s_perfBcMatSnapAccNs                  = 0; s_perfBcMatSnapMaxNs                  = 0;
         s_perfBcDcsMoveAccNs                  = 0; s_perfBcDcsMoveMaxNs                  = 0;
         s_perfBcJobsAccNs                     = 0; s_perfBcJobsMaxNs                     = 0;
+        s_perfXfMatCapSeamAccNs               = 0; s_perfXfMatCapSeamMaxNs               = 0;
         s_perfTeCamDiagAcc                    = 0; s_perfTeCamDiagMax                    = 0;
         s_perfTeCensusAcc                     = 0; s_perfTeCensusMax                     = 0;
         s_perfTePropIdAcc                     = 0; s_perfTePropIdMax                     = 0;

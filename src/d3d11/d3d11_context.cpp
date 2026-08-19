@@ -1402,8 +1402,27 @@ namespace dxvk {
     const bool deCap = m_rtx.OnDraw(VertexCount, StartVertexLocation);
     if (deOn) PerfDeAccum(deT0, deT1, std::chrono::steady_clock::now());
 
-    if (!deCap) {
+    // NV-DXVK [XfDefer] 2026-08-19c -- THE VERDICT MAY BE PENDING.
+    //
+    // EmitCs RECORDS this command; the dxvk-cs thread executes it later, and
+    // permanently behind the frame thread. So the capture decision does not
+    // have to be final HERE -- only before the CS thread reaches the command.
+    // That is what lets Remix's per-draw work leave the frame thread at all;
+    // without it the UI/HUD filter's answer is needed synchronously and
+    // nothing downstream of ExtractTransforms can be deferred.
+    //
+    // When a cell is pending, emit unconditionally and let the command consult
+    // it at execution time. Skipping there is equivalent to never emitting:
+    // DxvkContext binds its state INSIDE the draw call, so an un-taken command
+    // changes nothing. Contract on D3D11Rtx::DrawVerdict.
+    //
+    // `pend` is empty on every draw until a dispatcher exists, so today this is
+    // the `if (!deCap)` branch it replaces, with one null compare added.
+    D3D11Rtx::PendingVerdict pend = m_rtx.TakePendingDrawVerdict();
+    if (pend || !deCap) {
       EmitCs([=] (DxvkContext* ctx) {
+        if (pend && !pend.waitRunNative())
+          return;
         ctx->draw(
           VertexCount, 1,
           StartVertexLocation, 0);
@@ -1441,8 +1460,12 @@ namespace dxvk {
     const bool deCap = m_rtx.OnDrawIndexed(IndexCount, StartIndexLocation, BaseVertexLocation);
     if (deOn) PerfDeAccum(deT0, deT1, std::chrono::steady_clock::now());
 
-    if (!deCap) {
+    // [XfDefer] step 4c -- see the contract on the same block in Draw() above.
+    D3D11Rtx::PendingVerdict pend = m_rtx.TakePendingDrawVerdict();
+    if (pend || !deCap) {
       EmitCs([=] (DxvkContext* ctx) {
+        if (pend && !pend.waitRunNative())
+          return;
         ctx->drawIndexed(
           IndexCount, 1,
           StartIndexLocation,
@@ -1472,8 +1495,12 @@ namespace dxvk {
     const bool deCap = m_rtx.OnDrawInstanced(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
     if (deOn) PerfDeAccum(deT0, deT1, std::chrono::steady_clock::now());
 
-    if (!deCap) {
+    // [XfDefer] step 4c -- see the contract on the same block in Draw() above.
+    D3D11Rtx::PendingVerdict pend = m_rtx.TakePendingDrawVerdict();
+    if (pend || !deCap) {
       EmitCs([=] (DxvkContext* ctx) {
+        if (pend && !pend.waitRunNative())
+          return;
         ctx->draw(
           VertexCountPerInstance,
           InstanceCount,
@@ -1513,8 +1540,12 @@ namespace dxvk {
     const bool deCap = m_rtx.OnDrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
     if (deOn) PerfDeAccum(deT0, deT1, std::chrono::steady_clock::now());
 
-    if (!deCap) {
+    // [XfDefer] step 4c -- see the contract on the same block in Draw() above.
+    D3D11Rtx::PendingVerdict pend = m_rtx.TakePendingDrawVerdict();
+    if (pend || !deCap) {
       EmitCs([=] (DxvkContext* ctx) {
+        if (pend && !pend.waitRunNative())
+          return;
         ctx->drawIndexed(
           IndexCountPerInstance,
           InstanceCount,
