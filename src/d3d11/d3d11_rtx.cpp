@@ -2739,8 +2739,18 @@ namespace dxvk {
       // the FULL pass: main view 0x21 builds twice/frame, an empty PVS pass (count=43,
       // nothing seeded -> bogus pre=0) and the real pass (count~150). Gating on
       // count>64 drops the empty pass so the widow's true pre/seed state is clean.
+      // NV-DXVK [Perf] 2026-08-18: GATED. This dump was 20.8 MB of a 26.9 MB log
+      // over 2.8 minutes — 77% of all logging, ~26 KB built and written EVERY
+      // frame (1349 renderables through a std::string `+=` loop, then one
+      // 26 KB Logger::warn) on the frame thread, which is the measured
+      // bottleneck (96-98% busy). rtx.logDenyTags CANNOT save this: the filter
+      // runs inside Logger::emitMsg, i.e. AFTER the string is built, so a
+      // silenced tag still pays the whole cost. The gate has to be here.
+      // Rides rtx.logGeomDiag ("DIAGNOSTIC, COSTS REAL TIME ... turn on only
+      // while chasing"), which is exactly what this is — the widow/ship
+      // engine-cull investigation.
       bool dump = false;
-      if (count > 64) {
+      if (count > 64 && RtxOptions::logGeomDiag()) {
         static std::mutex s_dmu;
         static std::unordered_map<uint32_t, uint32_t> s_lastFrame;  // vflags-low -> last frame
         std::lock_guard<std::mutex> g(s_dmu);
@@ -8764,6 +8774,60 @@ namespace dxvk {
     return p;
   }
 
+  // NV-DXVK [Perf.SrvDimCache] 2026-08-19: ViewDimension ONLY, for the two
+  // 128-slot PS-SRV cube scans (the Tf2SkyShaderPropId detector and the
+  // tagTF2SkyShaders detector). Both ran a raw GetDesc per bound slot per
+  // depth-write-off draw -- a virtual call plus a 40-byte struct copy, ~100-200
+  // ns each, to read one enum.
+  //
+  // WHY THIS IS A SEPARATE TABLE FROM probeSrvCached, WHICH ALREADY CACHES
+  // ViewDimension. probeSrvCached serves the boneTrack path, whose working set
+  // is a handful of SRVs -- it reports hits=228012 misses=0 evicts=0 over a 5 s
+  // window, i.e. permanently warm. These scans walk every BOUND PS SRV, which is
+  // textures, and routing them through that table would push a small hot set
+  // toward the 1024-entry cap whose overflow handler is sCache.clear(). That
+  // trades a ~0.2 ms win for the risk of cold-starting a 100%-hit cache on the
+  // same thread. Two tables, no interaction.
+  //
+  // It is also strictly cheaper for this use: 4 bytes per entry instead of 28,
+  // and no GetResource() on the miss path -- probeSrvCached pays an
+  // AddRef/Release pair to resolve the underlying buffer, which these callers
+  // have no use for.
+  //
+  // Cache key is the raw SRV pointer, and the invariant is the same one
+  // probeSrvCached already documents and relies on: an SRV's descriptor is
+  // immutable for its lifetime, so pointer equality means same ViewDimension.
+  static thread_local uint64_t s_perfSrvDimHits   = 0;
+  static thread_local uint64_t s_perfSrvDimMisses = 0;
+  static thread_local uint64_t s_perfSrvDimEvicts = 0;
+
+  static uint32_t srvViewDimCached(ID3D11ShaderResourceView* srv) {
+    static thread_local std::unordered_map<ID3D11ShaderResourceView*, uint32_t> sDimCache;
+    if (srv == nullptr)
+      return uint32_t(D3D11_SRV_DIMENSION_UNKNOWN);
+
+    auto it = sDimCache.find(srv);
+    if (it != sDimCache.end()) {
+      ++s_perfSrvDimHits;
+      return it->second;
+    }
+    ++s_perfSrvDimMisses;
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+    srv->GetDesc(&sd);
+    const uint32_t dim = uint32_t(sd.ViewDimension);
+
+    // Same cap and same wholesale-clear policy as probeSrvCached. A level
+    // change retires every view at once, so a bounded table with a rare full
+    // clear beats per-entry eviction bookkeeping on the draw path.
+    if (sDimCache.size() >= 1024) {
+      sDimCache.clear();
+      ++s_perfSrvDimEvicts;
+    }
+    sDimCache.emplace(srv, dim);
+    return dim;
+  }
+
   bool D3D11Rtx::IsStablePropIdSuppressed() const {
     // Empty set is the default and the common case — check it first so the
     // per-draw cost is one empty() call, not a shader deref plus a hash lookup.
@@ -9611,6 +9675,145 @@ namespace dxvk {
   // them.
   static thread_local bool s_xtEligLast  = false;  // safeToDefer() -- axes 1+2
   static thread_local bool s_xtElig3Last = false;  // ...&& geoBytesStatic() -- all 3
+
+  // NV-DXVK [XfDefer] 2026-08-19 -- THE PREDICTOR, and why the split above is
+  // being retired in its favour.
+  //
+  // WHAT THE ELIGIBILITY SPLIT WAS FOR, AND WHY IT IS DONE. xfElig/xfInelig/
+  // xfElig3 bill the derivation's interval into "could have been deferred" vs
+  // "could not". That was a SIZING question -- is a deferral worth building --
+  // and it has been answered: 303.5 of 395.2 ms, 87,173 of 98,554 draws, 88.5%.
+  // Asking it again every frame tells nobody anything new.
+  //
+  // WHY IT CANNOT BECOME THE DECISION. safeToDefer() is published by
+  // XtPurityGuard as the derivation RETURNS. It is a verdict about a draw that
+  // has already been derived, on the thread we are trying to take work off. You
+  // cannot decide to defer using a fact that only exists once you did not.
+  //
+  // SO: LEARN IT PER (vs, il). A shader's derivation reads the same inputs and
+  // takes the same paths every time it runs -- that is the identical assumption
+  // s_vkPathByVsIl already makes one block below, and its DISAGREE counter is
+  // how that assumption was checked rather than assumed. Same key, same
+  // storage class, same reason.
+  //
+  // AND SCORE IT predicted-vs-actual, NOT eligible-vs-not. Once the decision is
+  // a prediction, the two ways it goes wrong are different in kind and the old
+  // split can express neither:
+  //   MISS-UNSAFE  predicted deferrable, certificate came back ineligible.
+  //                A CORRECTNESS event. The fallback must catch it, and this
+  //                counter is how you find out whether it ever fires.
+  //   MISS-MISSED  predicted inline, certificate came back eligible. Pure lost
+  //                opportunity -- sizes what tightening the predictor is worth.
+  //   COLD         no entry yet for this (vs, il). Always runs inline. Should
+  //                decay to ~0 within a second of a scene settling; a COLD that
+  //                stays high means the key is too fine and is never learning.
+  // MISS-UNSAFE is the one that can ship a wrong transform, which is exactly
+  // why a predictor without a miss counter must not ship. Same shape as
+  // s_mfPredCold/Hit/Miss in XtPurityGuard three lines from where this is set.
+  //
+  // xfInelig is deliberately KEPT below as an absolute: it is the floor on what
+  // can never move, and that stays true however the decision is keyed.
+  // NV-DXVK [GenVal] 2026-08-19: this draw's generation fingerprint, published
+  // by drawSplitKeys so the lookup can cross-tab it against the content hash.
+  // Same publish-then-consume shape as s_vkVsIlCur, and for the same reason:
+  // one site computes it, so the two consumers cannot drift.
+  static thread_local uint64_t s_genValCur = 0ull;
+  // The 2x2. Rows are the CONTENT verdict (what ships today), columns the
+  // GENERATION verdict (the candidate). Only entries that were FOUND are
+  // counted -- a never-seen identity is a miss under either proof and would
+  // dilute both diagonals.
+  //   hitHit    both agree it is current. The population generation validation
+  //             keeps -- this is the win, if it is most of hitAny.
+  //   hitStale  content says current, generation says stale. THE COST: a
+  //             rename that rewrote identical bytes. Large => generation
+  //             validation gives back real serves and is a wash.
+  //   staleHit  generation says current, content says stale. MUST BE 0. Any
+  //             non-zero means the bytes changed without the generation moving
+  //             -- i.e. an in-place write -- and generation validation would
+  //             serve a stale transform. This is the correctness column, and
+  //             [Perf.EntryMapBind] WRITE_NO_OVERWRITE cb=0 predicts it stays 0.
+  //   staleStale both agree it is stale. Derives either way, no difference.
+  static thread_local uint64_t s_genValHitHit = 0, s_genValHitStale = 0;
+  static thread_local uint64_t s_genValStaleHit = 0, s_genValStaleStale = 0;
+
+  static thread_local std::unordered_map<uint64_t, uint8_t> s_xfEligByVsIl;
+  // This draw's prediction, latched before the derivation runs so the guard can
+  // score it afterwards. 0 = predict inline, 1 = predict deferrable,
+  // UINT8_MAX = cold. Reset to cold per draw, so a draw that never reached the
+  // prediction site cannot inherit the previous draw's verdict -- the same
+  // silent-carry rule the record's per-draw clears follow.
+  static thread_local uint8_t  s_xfPredCur = UINT8_MAX;
+  static thread_local uint32_t s_xfPredHit = 0, s_xfPredMissUnsafe = 0;
+  static thread_local uint32_t s_xfPredMissMissed = 0, s_xfPredCold = 0;
+
+  // NV-DXVK [XfDefer] 2026-08-19 -- WHY THE (vs, il) KEY MISPREDICTS.
+  //
+  // THE OBSERVATION THAT MOTIVATES THIS, from the first run: predMissUnsafe and
+  // predMissMissed came back EXACTLY EQUAL in all four windows (1442/1442,
+  // 985/987, 1997/1997, 2293/2293). Equality that precise is not noise -- it is
+  // what a shader whose consecutive draws ALTERNATE verdict produces, because
+  // each flip contributes one miss of each kind. So eligibility is not a
+  // property of the shader, and no amount of learning on (vs, il) will fix it.
+  //
+  // THE HYPOTHESIS, from the certificate rather than from the counters:
+  // safeToDefer() includes !wroteCarrier(), and carrier state is exactly the
+  // cross-draw caching a FIRST draw populates and later draws of the same
+  // shader then hit. First draw writes -> ineligible; the rest read -> eligible.
+  // That is a first-of-N pattern, and on a shader drawn twice it is a perfect
+  // alternation.
+  //
+  // WHICH IS A GUESS UNTIL IT IS COUNTED, so it is counted. If the unsafe
+  // misses are overwhelmingly first-of-frame draws, the fix is cheap and
+  // principled -- never defer a shader's first draw in a frame, and the
+  // remainder become predictable. If they are spread evenly, the carrier
+  // hypothesis is wrong and the key needs a component nobody has identified
+  // yet, which is a different and much larger piece of work. The two answers do
+  // not share a next step, which is the whole reason to spend a counter here
+  // rather than an afternoon.
+  static thread_local std::unordered_map<uint64_t, uint32_t> s_xfLastFrameByVsIl;
+  static thread_local bool     s_xfFirstOfFrameCur = false;
+  static thread_local uint32_t s_xfMissUnsafeFirst = 0, s_xfMissUnsafeLater = 0;
+  static thread_local uint32_t s_xfHitFirst = 0, s_xfHitLater = 0;
+  // NV-DXVK [XfDefer] 2026-08-19: the unsafe misses, split by WHICH axis of
+  // safeToDefer() refused. Only missAxisGeo can corrupt off-thread; see the
+  // block at the scoring site. missAxisNone must stay 0 -- a miss with all
+  // three axes clean would mean the scoring and the certificate disagree, i.e.
+  // the probe is broken, not the predictor.
+  static thread_local uint32_t s_xfMissAxisGeo = 0, s_xfMissAxisCarrier = 0;
+  static thread_local uint32_t s_xfMissAxisCb = 0, s_xfMissAxisNone = 0;
+
+  // NV-DXVK [XfDefer] 2026-08-19 -- PARTITION OR REPLAY? See the block at
+  // ScopedDrawSnap. The carrier dependency is the last blocker, and the two
+  // ways out cost wildly different amounts of work, so the choice gets a
+  // counter rather than an opinion.
+  //
+  //   carrierVs   distinct (vs, il) observed writing carrier state, ever.
+  //   everVs      distinct (vs, il) observed at all.
+  // CONCENTRATED (carrierVs << everVs) -> PARTITION: a handful of shaders do
+  //   the carrier work, the rest are cleanly deferrable, and the predictor only
+  //   has to recognise that handful. Cheap, and it takes ~86% of the prize.
+  // SPREAD (carrierVs ~= everVs) -> every shader writes carrier on some draws,
+  //   no partition exists, and the derivation needs the full record-and-replay
+  //   treatment the split cache already implements.
+  //
+  // Sets, not counters, because the question is about DISTINCT shaders and a
+  // draw count cannot answer it: 1110 carrier writes could be one shader drawn
+  // 1110 times or 1110 shaders drawn once, and those have opposite conclusions.
+  // Both are bounded by the shader count, and neither is cleared per window --
+  // they are cumulative populations, not rates, and the window reset below
+  // deliberately leaves them alone.
+  static thread_local std::unordered_set<uint64_t> s_xfCarrierVsIl;
+  static thread_local std::unordered_set<uint64_t> s_xfEverVsIl;
+  // The DRAW-VOLUME half of the same question. carrierVs/everVs counts distinct
+  // shaders; these count the draws a shader-keyed partition would actually
+  // refuse. Per-window rates, so they clear with the window -- unlike the two
+  // sets above, which are cumulative populations.
+  static thread_local uint32_t s_xfDrawsInCarrierVs = 0, s_xfDrawsSeen = 0;
+  // Billed the same way the eligibility split was: re-using the interval
+  // markStg already computed, no extra clock read. This is what replaces
+  // xfElig/xfElig3 as the thing worth reading once the deferral is live --
+  // "what does the work I am ROUTING look like", not "what could it have been".
+  static thread_local int64_t  s_xfPredHitNs = 0, s_xfPredColdNs = 0;
   // NV-DXVK [Perf.ServeCost] 2026-08-14 -- WHAT DOES A SERVED DRAW ACTUALLY COST?
   //
   // THE QUESTION, and it is the one that decides whether the split cache is
@@ -16234,6 +16437,107 @@ namespace dxvk {
         // the honest reading: a draw the gate cannot judge is not deferrable.
         s_xtEligLast  = elig;
         s_xtElig3Last = elig && geoStatic;
+
+        // NV-DXVK [XfDefer] 2026-08-19: SCORE THE PREDICTION, THEN TEACH IT.
+        // Here for the same reason the two publishes above and the
+        // s_vkPathByVsIl write below are here: this is the one point where the
+        // actual verdict exists, and it is RAII so no future early return can
+        // skip it. Order matters -- score against the prediction this draw was
+        // ROUTED on, then overwrite the entry, or the miss counters read 0 by
+        // construction and the predictor would look perfect while being wrong.
+        {
+          // [XfDefer] partition-vs-replay census. Recorded on EVERY derivation,
+          // not just on mispredictions: the question is which shaders ever
+          // write carrier state, and scoring only the mispredicted draws would
+          // measure the predictor instead of the shaders.
+          //
+          // MEMBERSHIP IS TESTED BEFORE THE INSERT, and that ordering is the
+          // measurement rather than a detail. A partition gate decides using the
+          // set as learned SO FAR, so a shader's first carrier-writing draw is
+          // one the gate would have let through. Testing after the insert would
+          // count that draw as already-known and quietly overstate what the
+          // partition catches -- the same score-then-store rule the predictor
+          // above follows, for the same reason.
+          //
+          // THIS IS THE NUMBER THAT SIZES OPTION (b). carrierVs/everVs says half
+          // the SHADERS are tainted; it cannot say what that costs, because a
+          // shader-keyed partition refuses every draw of a tainted shader and
+          // not merely the ~14% that actually write. drawsInCarrierVs/drawsSeen
+          // is the real refusal rate:
+          //   low  -> the tainted shaders are rare draws. Partition takes most
+          //           of the prize for three bools and no replay.
+          //   high -> the tainted shaders are the bulk of the frame, partition
+          //           yields almost nothing, and record-and-replay (a) is the
+          //           only route that pays.
+          if (s_xfCarrierVsIl.find(s_vkVsIlCur) != s_xfCarrierVsIl.end())
+            ++s_xfDrawsInCarrierVs;
+          ++s_xfDrawsSeen;
+
+          s_xfEverVsIl.insert(s_vkVsIlCur);
+          if (carrierMoved)
+            s_xfCarrierVsIl.insert(s_vkVsIlCur);
+
+          const bool actual = s_xtElig3Last;
+          if (s_xfPredCur == UINT8_MAX) {
+            ++s_xfPredCold;
+          } else if ((s_xfPredCur != 0u) == actual) {
+            ++s_xfPredHit;
+            // The CONTROL for the split below. Without it, a high
+            // missUnsafeFirst% could just mean most draws are first-of-frame,
+            // and the hypothesis would look confirmed by the population rather
+            // than by the mechanism. Compare the two RATES, never the raw counts.
+            if (s_xfFirstOfFrameCur) ++s_xfHitFirst;
+            else                     ++s_xfHitLater;
+          } else if (s_xfPredCur != 0u) {
+            // Predicted deferrable, is not. THE CORRECTNESS COUNTER. Non-zero
+            // means a draw was routed off-thread on a promise the certificate
+            // then refused, so the fallback is load-bearing and not theoretical.
+            // Read this before trusting any frame time from a deferred run.
+            ++s_xfPredMissUnsafe;
+            // Split by first-of-frame: this is the test of the carrier
+            // hypothesis. See s_xfLastFrameByVsIl.
+            if (s_xfFirstOfFrameCur) ++s_xfMissUnsafeFirst;
+            else                     ++s_xfMissUnsafeLater;
+            // NV-DXVK [XfDefer] 2026-08-19 -- WHICH AXIS REFUSED, and this is
+            // the split that decides whether the deferral lives or dies.
+            //
+            // A misprediction is only disqualifying if the axis that failed can
+            // produce a WRONG RESULT off-thread. The three cannot:
+            //
+            //   geo    geoBytesStatic() false = the derivation read geometry
+            //          bytes live from a rename-capable source. On a worker
+            //          those bytes may have been renamed away. THIS IS THE ONLY
+            //          ONE THAT CORRUPTS. Previously measured at 6 live reads in
+            //          36,015 draws, so it should be ~0 here; if it is, the
+            //          deferral is viable and the other two are a throughput
+            //          question, not a safety one.
+            //   carrier wroteCarrier() = the draw moved cross-draw D3D11Rtx
+            //          state. The carrier caches on this path are already
+            //          thread_local (s_vkPathByVsIl and siblings), so a worker
+            //          writes its OWN copy and no other draw can observe it.
+            //          Costs cache warmth per worker, corrupts nothing.
+            //   cb     cbSafeToDefer() = layoutResolved && contentPure() &&
+            //          !overflowed. Every term is a property of the RECORD and
+            //          is therefore knowable AT CAPTURE TIME, before any
+            //          derivation runs. So this axis does not need predicting at
+            //          all -- it can be tested exactly, on the frame thread, for
+            //          the price of three bools.
+            //
+            // If cb dominates, the predictor is the wrong instrument for it and
+            // the routing gate should read the record directly.
+            if      (!geoStatic)    ++s_xfMissAxisGeo;
+            else if (carrierMoved)  ++s_xfMissAxisCarrier;
+            else if (!cbSafe)       ++s_xfMissAxisCb;
+            else                    ++s_xfMissAxisNone;
+          } else {
+            ++s_xfPredMissMissed;   // predicted inline, was deferrable: lost work
+          }
+          // Learn. One byte per (vs, il), bounded by the shader count, same as
+          // the two path maps below. A shader that flips verdicts between draws
+          // will thrash this and show up as a sustained miss rate rather than
+          // silently alternating -- which is the point of scoring before storing.
+          s_xfEligByVsIl[s_vkVsIlCur] = actual ? 1u : 0u;
+        }
         static thread_local uint32_t sDraws = 0, sPure = 0, sTouched = 0, sElig = 0;
         static thread_local uint32_t sCarrier = 0;
         // Per-group move counts, and the two numbers that size a per-group
@@ -26973,6 +27277,27 @@ namespace dxvk {
       if (itO != s_o2wPathByVsIl.end())
         s_o2wPathPredicted = itO->second;
     }
+    // NV-DXVK [XfDefer]: the deferral prediction, resolved here for exactly the
+    // reasons the two above are -- this runs before the derivation, and
+    // s_vkVsIlCur has just been published for THIS draw. Cold (UINT8_MAX) is
+    // the safe default and means "run inline", so a shader nobody has seen yet
+    // behaves exactly as it does today.
+    s_xfPredCur = UINT8_MAX;
+    {
+      const auto itE = s_xfEligByVsIl.find(s_vkVsIlCur);
+      if (itE != s_xfEligByVsIl.end())
+        s_xfPredCur = itE->second;
+    }
+    // [XfDefer]: is this the first draw of this (vs, il) THIS FRAME? Resolved
+    // here for the same timing reason the prediction is, and stamped forward
+    // immediately so the second draw of the shader reads false. See the
+    // s_xfLastFrameByVsIl declaration for what this is testing.
+    {
+      const uint32_t xfFid = g_remixFrameId.load(std::memory_order_relaxed);
+      auto& lastSeen = s_xfLastFrameByVsIl[s_vkVsIlCur];
+      s_xfFirstOfFrameCur = (lastSeen != xfFid);
+      lastSeen = xfFid;
+    }
 
     // Spans, split by slot. slot 2 is the view/projection buffer; slots 0 and 1
     // are near-constant per frame (perFrameDistinct cb0=4 cb1=2) and go into
@@ -26981,6 +27306,60 @@ namespace dxvk {
     // camera-relative re-base below can replace it wholesale. Folding it into accObj first
     // and trying to subtract it out would depend on the accumulator being a
     // sum, which is an implementation detail nothing else relies on.
+    // NV-DXVK [GenVal] 2026-08-19: the generation fingerprint, computed beside
+    // the content hash so the probe compares two answers to the same question
+    // taken at the same instant. See XfObjectPart::genHash.
+    //
+    // IT MUST COVER EXACTLY THE SLOTS accObj COVERS, and the first version of
+    // this did not -- corrected 2026-08-19 after one run, recorded because the
+    // failure looked exactly like a real result.
+    //
+    // outObjVal's span component is `accObj` ALONE. The loop below routes slot 2
+    // (view) and slots 0/1 (shared per-frame globals) into accView, and slot 3
+    // into accObjCb3 for the camera-relative rebase. Only what is left reaches
+    // the object validity hash.
+    //
+    // The first version folded in every slot this draw's ranges named. cb0/cb1
+    // are the per-frame globals -- time, frame counters, fog, lighting -- and
+    // the comment on their routing below says exactly what that costs: they take
+    // "a NEW value every frame", which is "fatal in the object key, where it
+    // re-keys every entry every frame no matter how still the world is". So the
+    // fingerprint churned every frame by construction and the probe reported
+    // genHitStale=98.7%: a measurement of cb0/cb1/cb2 renames wearing the shape
+    // of a verdict on generation validation. A probe whose slot set does not
+    // match the hash it is being compared against is not a conservative probe,
+    // it is a wrong one.
+    //
+    // A range on a slot with no bound buffer contributes a fixed sentinel rather
+    // than being skipped: skipping would make {slot unbound} and {no range for
+    // that slot} fingerprint identically.
+    uint64_t genAcc = 0ull;
+    {
+      uint32_t genSlotsSeen = 0u;   // bitmask, so each slot folds in once
+      for (uint32_t i = 0; i < s.numCbRanges; ++i) {
+        const DrawSnapshot::CbRange& r = s.cbRanges[i];
+        if (r.stage != 0u || r.slot >= s.vsCbs.size())
+          continue;
+        // The accObj membership test, stated the same way the loop below states
+        // it so the two cannot drift.
+        const bool gIsView   = (r.slot == 2u);
+        const bool gIsShared = (r.slot == 0u || r.slot == 1u);
+        if (gIsView || gIsShared || r.slot == 3u)
+          continue;
+        const uint32_t bit = 1u << r.slot;
+        if (genSlotsSeen & bit)
+          continue;
+        genSlotsSeen |= bit;
+        const DrawSnapshot::CbBinding& b = s.vsCbs[r.slot];
+        struct GenE { uint32_t slot; uint32_t pad; uint64_t gen; };
+        static_assert(sizeof(GenE) == 16, "GenE must have no implicit padding");
+        const GenE g { r.slot, 0u,
+                       (b.buffer != nullptr) ? b.contentGen : UINT64_MAX };
+        genAcc += XXH64(&g, sizeof(g), 0x6E4EC0DEull);
+      }
+    }
+    s_genValCur = genAcc;
+
     uint64_t accView = 0ull, accObj = 0ull, accObjCb3 = 0ull;
     for (uint32_t i = 0; i < s.numCbRanges; ++i) {
       const DrawSnapshot::CbRange& r = s.cbRanges[i];
@@ -28553,6 +28932,18 @@ namespace dxvk {
     sCurMap[key] = row;
   }
 
+  // NV-DXVK [XfDefer] 2026-08-19: out-of-line definitions for the two
+  // `static thread_local` members declared in d3d11_rtx.h. See the block on
+  // m_drawSnapCur there for why "the draw currently being derived" belongs to
+  // the thread rather than to the D3D11Rtx object.
+  //
+  // Each thread starts with no record, which is the correct default everywhere:
+  // a worker that has not been handed a draw takes the live path, and the live
+  // path is what every consumer already does when drawSnap() returns null. So a
+  // thread that never participates behaves exactly as it does today.
+  thread_local DrawSnapshot* D3D11Rtx::m_drawSnapCur   = nullptr;
+  thread_local bool          D3D11Rtx::m_drawSnapValid = false;
+
   void D3D11Rtx::captureDrawSnapshot(uint32_t drawIndex, bool indexed,
                                      uint32_t count, uint32_t start,
                                      int32_t base) {
@@ -28617,6 +29008,12 @@ namespace dxvk {
       m_drawSnapCur->t31CharIdx     = 0;
       m_drawSnapCur->geoLiveReads   = 0;
       m_drawSnapCur->geoRecordReads = 0;
+      // NV-DXVK [XfDefer] 2026-08-19: this record lives in the arena, so it
+      // outlives its draw and a worker may read it after SubmitDraw returns.
+      // On the unconditional-reassign list for the same reason as everything
+      // above it: the slot is reused, and inheriting a stale `true` here would
+      // hand a deferred reader the scratch slot.
+      m_drawSnapCur->arenaBacked    = true;
     } else {
       // Arena full (pathological draw count): still capture, into the scratch
       // slot, so consumers behave identically. Only a deferred reader would
@@ -28624,6 +29021,14 @@ namespace dxvk {
       // beyond the cap.
       m_drawSnapCur = &m_drawSnapScratch;
       m_drawSnapCur->reset();
+      // [XfDefer] THE FLAG THAT ENFORCES THE SENTENCE ABOVE. The scratch slot
+      // is one object reused by every past-cap draw, so its contents are the
+      // LAST such draw's, not this one's. Deferring off it would serve a
+      // stranger's cb2 bytes as this draw's transforms -- silent, and wrong in
+      // the same way the m_drawSnapValid latch note describes. Consumers on the
+      // frame thread are unaffected: they read it inside the draw that wrote
+      // it, which is exactly when it is correct.
+      m_drawSnapCur->arenaBacked    = false;
     }
     DrawSnapshot& s = *m_drawSnapCur;
     {
@@ -29719,6 +30124,20 @@ namespace dxvk {
       // sVsCbLocCache lookup the span capture above just performed, taken at
       // the instant the bindings were this draw's.
       s.layoutResolved = layoutResolved;
+
+      // NV-DXVK [XfDefer] 2026-08-19: THE ROUTING GATE, set at the one moment
+      // every term is final. layoutResolved is assigned on the line above,
+      // overflowed is set by the span capture that has just finished, and
+      // arenaBacked by the slot acquisition at the top of this function.
+      //
+      // cbLiveReads is deliberately NOT in this conjunction even though
+      // cbSafeToDefer() reads it through contentPure(): it counts reads made BY
+      // THE DERIVATION, which has not run yet, so at capture time it is always
+      // 0 and testing it here would be testing nothing. The derivation's own
+      // live cb reads are covered by the same abort path as the geometry axis --
+      // both are "the record did not serve what the derivation asked for", and
+      // both are only knowable once it asks. See DrawSnapshot::deferrable.
+      s.deferrable = s.arenaBacked && s.layoutResolved && !s.overflowed;
 
       static thread_local uint32_t sDraws = 0, sResolved = 0, sRanges = 0, sOvf = 0;
       static thread_local uint32_t sCbOff = 0;
@@ -39711,6 +40130,25 @@ namespace dxvk {
             || s_o2wPathPredicted == UINT32_MAX
             || !xObjSeen
             || itObj->second.storePath == s_o2wPathPredicted;
+        // NV-DXVK [GenVal] 2026-08-19: score the candidate proof against the
+        // shipping one. PROBE ONLY -- haveObj below is unchanged and still
+        // decides on valHash, so this cannot alter a single serve. It only
+        // records what WOULD have happened, which is the order that has to hold
+        // before the cheaper proof can replace the expensive one.
+        //
+        // Gated on xObjSeen: an identity that was never stored is a miss under
+        // both proofs and counting it would flatter whichever diagonal it fell
+        // in. xPathOk is deliberately EXCLUDED -- it is a third, orthogonal
+        // gate, and folding it in would bill a path-blocked draw as a staleness
+        // disagreement it has nothing to do with.
+        if (xObjSeen) {
+          const bool contentCurrent = (itObj->second.valHash == objVal);
+          const bool genCurrent     = (itObj->second.genHash == s_genValCur);
+          if      ( contentCurrent &&  genCurrent) ++s_genValHitHit;
+          else if ( contentCurrent && !genCurrent) ++s_genValHitStale;
+          else if (!contentCurrent &&  genCurrent) ++s_genValStaleHit;
+          else                                     ++s_genValStaleStale;
+        }
         const bool haveObj   = xObjSeen && (itObj->second.valHash == objVal)
                              && xPathOk;
         // A path-blocked draw lands in objStale, which is the correct bucket:
@@ -40982,6 +41420,11 @@ namespace dxvk {
                 np.isSubViewSkybox   = t.isSubViewSkybox;
                 np.lastFrame         = xFid;
                 np.valHash           = objVal;
+            // NV-DXVK [GenVal]: stored beside valHash and from the same draw,
+            // so the two proofs always describe the same recorded state. If
+            // this were written from a different point the 2x2 would measure
+            // the skew between two capture instants rather than the two proofs.
+            np.genHash           = s_genValCur;
                 np.dropMask          = uint8_t(objDrop);
                 np.storePath         = uint8_t(pid < 255u ? pid : 255u);
                 np.restoreCount      = priorRestores;
@@ -42266,6 +42709,13 @@ namespace dxvk {
       const int64_t xfNs = markStg(s_perfBtExtractXformAcc, s_perfBtExtractXformMax);
       if (s_xtEligLast) { s_xfEligNs   += xfNs; ++s_xfEligN;   }
       else              { s_xfIneligNs += xfNs; ++s_xfIneligN; }
+      // NV-DXVK [XfDefer]: the same interval, billed a third time -- onto the
+      // ROUTING decision rather than the retrospective verdict. Same
+      // zero-extra-clock-read contract as the two lines above: xfNs is already
+      // computed. See the predictor declaration for why this is the number that
+      // stays useful after the deferral ships, and why xfElig/xfElig3 do not.
+      if      (s_xfPredCur == UINT8_MAX) { s_xfPredColdNs += xfNs; }
+      else if (s_xfPredCur != 0u)        { s_xfPredHitNs  += xfNs; }
       // Subset of the eligible bucket, not a third disjoint one -- elig3 implies
       // elig, so xfElig3 <= xfElig by construction.
       if (s_xtElig3Last) { s_xfElig3Ns += xfNs; ++s_xfElig3N; }
@@ -50292,15 +50742,31 @@ namespace dxvk {
         // 128 to serve this would cost every draw ~what the VS-side 128-slot
         // walk was measured at, to serve a consumer already gated behind
         // tspDepthWriteOff. Revisit with a measurement, not by assumption.
+        //
+        // NV-DXVK [Perf.SrvDimCache] 2026-08-19: THE MEASUREMENT ARRIVED, and it
+        // does not change the "stays live" verdict above -- it changes what the
+        // scan COSTS. GetDesc is a virtual call with a 40-byte struct copy
+        // (~100-200 ns, per the probeSrvCached header) to read one enum;
+        // srvViewDimCached's hit path is one pointer-keyed hash lookup.
+        // ViewDimension is immutable for the life of an SRV -- the same
+        // invariant probeSrvCached already documents and relies on -- so this is
+        // the same value by a cheaper route, not an approximation.
+        //
+        // Why it is worth doing at all: this loop runs on every depth-write-off
+        // draw, and there is a SECOND identical 128-slot scan in the
+        // tagTF2SkyShaders detector further down this same function, on the same
+        // gate. Both are now cached, so a depth-write-off draw pays the COM
+        // calls once per distinct SRV per thread instead of twice per draw.
+        // Same idiom as sTspDsCached immediately above, which retired the
+        // per-draw GetDesc on the depth-stencil state for the same reason.
         const auto& tspSrvs = m_context->m_state.ps.shaderResources.views;
         for (uint32_t s = 0;
              s < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++s) {
           D3D11ShaderResourceView* tspSv = tspSrvs[s].ptr();
           if (tspSv == nullptr) continue;
-          D3D11_SHADER_RESOURCE_VIEW_DESC tspSd = {};
-          tspSv->GetDesc(&tspSd);
-          if (tspSd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBE
-           || tspSd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBEARRAY) {
+          const uint32_t tspViewDim = srvViewDimCached(tspSv);
+          if (tspViewDim == uint32_t(D3D11_SRV_DIMENSION_TEXTURECUBE)
+           || tspViewDim == uint32_t(D3D11_SRV_DIMENSION_TEXTURECUBEARRAY)) {
             tspPsHasCubeSrv = true;
             break;
           }
@@ -51715,15 +52181,18 @@ namespace dxvk {
       if (depthWriteOff) {
         // NV-DXVK [PhaseB batch 2] DELIBERATELY LIVE -- 128-slot scan. See the
         // sibling note on tspPsHasCubeSrv for the reasoning.
+        // NV-DXVK [Perf.SrvCache] 2026-08-19: cached, same change and same
+        // reasoning as the tspPsHasCubeSrv scan above -- see the block there.
+        // These two loops are the pair the sibling note refers to; keep them
+        // identical so a future change to one is obviously owed to the other.
         const auto& srvs = m_context->m_state.ps.shaderResources.views;
         for (uint32_t s = 0;
              s < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++s) {
           D3D11ShaderResourceView* sv = srvs[s].ptr();
           if (sv == nullptr) continue;
-          D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
-          sv->GetDesc(&sd);
-          if (sd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBE
-           || sd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBEARRAY) {
+          const uint32_t svViewDim = srvViewDimCached(sv);
+          if (svViewDim == uint32_t(D3D11_SRV_DIMENSION_TEXTURECUBE)
+           || svViewDim == uint32_t(D3D11_SRV_DIMENSION_TEXTURECUBEARRAY)) {
             psHasCubeSrv = true;
             break;
           }
@@ -56884,7 +57353,11 @@ namespace dxvk {
       //   raw[VS] == 0 in cliff vs > 0 in good   -> engine stopped sending
       static std::unordered_map<uint64_t, uint32_t> s_baselineRawVs;
       static bool s_haveBaselineRawVs = false;
-      if (rawDeficit || capDeficit || anyDeficit) {
+      // NV-DXVK [Perf] 2026-08-18: GATED on rtx.logGeomDiag, same reason as
+      // [VanishDiag] in the scene manager — the deficit predicate fires on every
+      // frame in practice (9393 lines / 789 frames = the full 12-line cap each
+      // time), and it builds + sorts a per-VS delta vector before formatting.
+      if ((rawDeficit || capDeficit || anyDeficit) && RtxOptions::logGeomDiag()) {
         if (s_haveBaselineRawVs) {
           struct VsDelta { uint64_t hash; int32_t delta; uint32_t base; uint32_t cur; };
           std::vector<VsDelta> deltas;
@@ -61169,6 +61642,297 @@ namespace dxvk {
                   double(entN[vanish_diag::DrawIdxInst] + entN[vanish_diag::DrawIndexed]
                        + entN[vanish_diag::Draw]) / sf);
               }
+
+              // NV-DXVK [Perf.EntryCensus] -- TIER 1(b) of HANDOFF_PERF_2026-08-18.
+              //
+              // WHAT IT ANSWERS. "D3D11 entry points" is ~50% of the frame
+              // thread, the frame thread is the pole, and until now the only
+              // split under it was three draw call ids against one lump called
+              // "state-setting". [Perf.Entry] above prints the TOP EIGHT by
+              // milliseconds; this prints EVERY non-zero entry point, ranked by
+              // what is left after the instrument's own cost is removed, with
+              // the call count and the payload next to it.
+              //
+              // WHY NOT MILLISECONDS (§0.2 of the handoff). This laptop
+              // downclocks up to 2.4x and every absolute ms on this thread
+              // moves with it. A SHARE does not: throttling inflates the row
+              // and the wall together. So every figure here is a percentage of
+              // the frame wall, a count per frame, or a byte count per frame,
+              // and all three survive a bad clock window. Read `[Perf.Entry]`
+              // for the ms and only when [Perf.SessionState] xMin is ~1.00;
+              // read THIS line always.
+              //
+              // WHY `probe` IS THE FIRST THING TO READ. ScopedCall pays two
+              // steady_clock reads per call, ~35-64 ns each on this machine,
+              // and ONE of them plus the gap bookkeeping lands INSIDE the span
+              // it reports. At the call rates in this title that is not a
+              // rounding error: [Perf.Query] measures ~302,000 GetData polls
+              // per frame, so GetData alone carries ~10 ms/frame of pure
+              // measurement inside its own bucket. `probe` is that estimate,
+              // `net` is the row minus it, and the header's probeWallPct is
+              // what the whole instrument costs the frame (two reads, not one).
+              // A row whose share is nearly all probe is an artifact of being
+              // watched and there is nothing to optimise in it.
+              //
+              // HOW TO READ THE RESULT -- the three-way fork the plan names:
+              //   high net, low  n  -> one expensive call. Go inside it.
+              //   high net, high n  -> a thousand cheap ones. Cut the call
+              //                        RATE (dedup, batch, cache the state).
+              //   high KB on maps   -> upload traffic. Fix the path, not the
+              //                        call - and check the buffer is HOST_CACHED
+              //                        before assuming the copy is the cost (R13).
+              {
+                uint64_t entBytes[vanish_diag::CALL_COUNT];
+                uint64_t entUnits[vanish_diag::CALL_COUNT];
+                vanish_diag::drainVolumes(entBytes, entUnits);
+
+                uint64_t mapCalls[vanish_diag::kMapKindSlots];
+                uint64_t mapBytes[vanish_diag::kMapKindSlots];
+                uint64_t mapImageCalls = 0;
+                uint64_t mapBindCalls[vanish_diag::kMapKindSlots][vanish_diag::kMapBindSlots];
+                uint64_t mapBindBytes[vanish_diag::kMapKindSlots][vanish_diag::kMapBindSlots];
+                vanish_diag::drainMapKinds(mapCalls, mapBytes, mapImageCalls,
+                                           mapBindCalls, mapBindBytes);
+
+                const double sfc    = double(s_frameTimeSamples);
+                const double wallNs = double(s_frameTimeSumNs) / sfc;
+
+                // Calibrated HERE rather than read from [Perf.SessionState],
+                // which runs later in this same emit and would therefore hand
+                // back the PREVIOUS window's value. The correction below is the
+                // whole point of the line, so it gets a fresh, same-thread,
+                // same-window number. 1000 reads is ~40 us once per 5 s.
+                uint64_t clkNs = 0;
+                {
+                  const auto c0 = clk::now();
+                  auto c1 = c0;
+                  for (uint32_t i = 0; i < 1000u; ++i)
+                    c1 = clk::now();
+                  clkNs = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    c1 - c0).count()) / 1000u;
+                }
+
+                const auto pctOfWall = [wallNs](const double nsPerFrame) {
+                  return wallNs > 0.0 ? (nsPerFrame * 100.0 / wallNs) : 0.0;
+                };
+                const auto f2 = [](const double v) {
+                  char b[32];
+                  std::snprintf(b, sizeof(b), "%.2f", v);
+                  return std::string(b);
+                };
+                // Counts here span six orders of magnitude (2 OMSetRT vs
+                // 302,000 GetData vs 40 M indices) and a raw integer column is
+                // unreadable at that spread.
+                const auto vol = [](const double v) {
+                  char b[32];
+                  if (v >= 1.0e7)      std::snprintf(b, sizeof(b), "%.1fM", v / 1.0e6);
+                  else if (v >= 1.0e4) std::snprintf(b, sizeof(b), "%.0fk", v / 1.0e3);
+                  else                 std::snprintf(b, sizeof(b), "%.0f",  v);
+                  return std::string(b);
+                };
+
+                // ---- per-row derivation, then rank by NET, not by raw ns.
+                // The two orders differ exactly where the instrument is the
+                // cost, and that difference is the finding, not a nuisance.
+                struct CenRow {
+                  int      id;
+                  double   sharePct;
+                  double   probePct;
+                  double   netPct;
+                  double   callsPf;
+                  double   unitsPf;
+                  double   bytesPf;
+                };
+                CenRow rows[vanish_diag::CALL_COUNT];
+                int    nRows = 0;
+
+                double famNetPct[vanish_diag::kFamCount]   = {};
+                double famSharePct[vanish_diag::kFamCount] = {};
+                double famCalls[vanish_diag::kFamCount]    = {};
+                double famUnits[vanish_diag::kFamCount]    = {};
+                double famBytes[vanish_diag::kFamCount]    = {};
+
+                double allCallsPf = 0.0;
+                for (int i = 0; i < vanish_diag::CALL_COUNT; ++i) {
+                  if (entNs[i] == 0 && entN[i] == 0)
+                    continue;
+
+                  CenRow r {};
+                  r.id       = i;
+                  r.callsPf  = double(entN[i])     / sfc;
+                  r.unitsPf  = double(entUnits[i]) / sfc;
+                  r.bytesPf  = double(entBytes[i]) / sfc;
+                  r.sharePct = pctOfWall(double(entNs[i]) / sfc);
+                  r.probePct = pctOfWall(r.callsPf * double(clkNs));
+                  r.netPct   = std::max(0.0, r.sharePct - r.probePct);
+
+                  allCallsPf += r.callsPf;
+
+                  const int fam = int(vanish_diag::familyOf(i));
+                  famNetPct[fam]   += r.netPct;
+                  famSharePct[fam] += r.sharePct;
+                  famCalls[fam]    += r.callsPf;
+                  famUnits[fam]    += r.unitsPf;
+                  famBytes[fam]    += r.bytesPf;
+
+                  rows[nRows++] = r;
+                }
+
+                std::sort(rows, rows + nRows,
+                          [](const CenRow& a, const CenRow& b) { return a.netPct > b.netPct; });
+
+                // Instrument cost against the WALL is two reads per call: the
+                // one charged into the row above, plus the entry read that is
+                // charged to nobody. Both are real frame time.
+                const double probeWallPct = pctOfWall(allCallsPf * 2.0 * double(clkNs));
+                const double entryPct     = pctOfWall(totalMs * 1.0e6);
+                const double netEntryPct  = std::max(0.0, entryPct - pctOfWall(allCallsPf * double(clkNs)));
+
+                Logger::warn(str::format(
+                  "[Perf.EntryCensus] frames=", s_frameTimeSamples,
+                  " wallMs=", f2(wallNs / 1.0e6),
+                  " clkNs=", clkNs,
+                  " calls=", vol(allCallsPf),
+                  " entryPct=", f2(entryPct),
+                  " netEntryPct=", f2(netEntryPct),
+                  " probeWallPct=", f2(probeWallPct),
+                  (probeWallPct > 10.0
+                    ? "   *** the INSTRUMENT is >10% of the frame: every ms on this"
+                      " thread, [Perf.Entry] included, is inflated by it ***"
+                    : "")));
+
+                // Four rows per line: long enough to be one grep, short enough
+                // to read in a terminal without wrapping.
+                {
+                  std::string line;
+                  int onLine = 0;
+                  for (int k = 0; k < nRows; ++k) {
+                    const CenRow& r = rows[k];
+                    const char* unit = vanish_diag::unitNameOf(r.id);
+
+                    line += str::format(
+                      " ", vanish_diag::kNames[r.id],
+                      " net=", f2(r.netPct),
+                      " sh=", f2(r.sharePct),
+                      " n=", vol(r.callsPf),
+                      (unit != nullptr && r.unitsPf > 0.0
+                        ? str::format(" u=", vol(r.unitsPf), unit) : std::string()),
+                      (r.bytesPf > 0.0
+                        ? str::format(" KB=", vol(r.bytesPf / 1024.0)) : std::string()),
+                      " |");
+
+                    if (++onLine == 4 || k == nRows - 1) {
+                      Logger::warn(str::format("[Perf.EntryCensus]  ", line));
+                      line.clear();
+                      onLine = 0;
+                    }
+                  }
+                }
+
+                // ---- the family roll-up: this is the line that picks the fix.
+                {
+                  std::string famLine;
+                  for (int f = 0; f < vanish_diag::kFamCount; ++f) {
+                    if (famCalls[f] == 0.0 && famSharePct[f] == 0.0)
+                      continue;
+                    famLine += str::format(
+                      " ", vanish_diag::kFamilyNames[f],
+                      " net=", f2(famNetPct[f]),
+                      " sh=", f2(famSharePct[f]),
+                      " n=", vol(famCalls[f]),
+                      (famUnits[f] > 0.0 ? str::format(" u=", vol(famUnits[f])) : std::string()),
+                      (famBytes[f] > 0.0 ? str::format(" KB=", vol(famBytes[f] / 1024.0)) : std::string()),
+                      " |");
+                  }
+                  Logger::warn(str::format(
+                    "[Perf.EntryFam] (net/sh = % of frame wall, n = calls/frame):", famLine));
+                }
+
+                // ---- Map by kind. WRITE_DISCARD is the rename; if the KB here
+                // is the story, the fix is upstream of D3D11 entirely.
+                {
+                  static const char* kMapKindNames[vanish_diag::kMapKindSlots] = {
+                    "bad", "READ", "WRITE", "READ_WRITE", "WRITE_DISCARD", "WRITE_NO_OVERWRITE"
+                  };
+                  std::string mapLine;
+                  for (uint32_t k = 0; k < vanish_diag::kMapKindSlots; ++k) {
+                    if (mapCalls[k] == 0)
+                      continue;
+                    mapLine += str::format(
+                      " ", kMapKindNames[k],
+                      " n=", vol(double(mapCalls[k]) / sfc),
+                      " KB=", vol(double(mapBytes[k]) / sfc / 1024.0),
+                      " avgB=", uint64_t(double(mapBytes[k]) / double(mapCalls[k])),
+                      " |");
+                  }
+                  if (mapImageCalls != 0)
+                    mapLine += str::format(" imageMaps n=", vol(double(mapImageCalls) / sfc),
+                                           " (bytes not counted) |");
+                  if (!mapLine.empty()) {
+                    Logger::warn(str::format(
+                      "[Perf.EntryMap] (buffer Map by D3D11_MAP, per frame):", mapLine));
+                  }
+
+                  // ---- THE ARCHITECTURE LINE. Renames split by bind role, so
+                  // "can a draw own its cbuffer inputs BY REFERENCE" stops being
+                  // an argument. Read the WRITE_DISCARD row:
+                  //   cb=0            -> the derivation's cbuffers are never
+                  //                      renamed. A reference captured at draw
+                  //                      time is still valid at frame end, and
+                  //                      captureDrawSnapshot's span memcpy can
+                  //                      become a (buffer, offset, mapGen) record.
+                  //   cb>0            -> it cannot. A deferred read returns some
+                  //                      later draw's bytes: a silently wrong
+                  //                      transform, which is the exact failure
+                  //                      the m_t31ReadCache note in HANDOFF sec
+                  //                      0.1 records paying for on the sibling
+                  //                      buffer. Keep the copy; move the
+                  //                      CONSUMER instead.
+                  // vbib renames are expected and irrelevant here -- the
+                  // derivation reads no index/vertex bytes (see the geoBytesStatic
+                  // certificate in d3d11_rtx.h), so they cannot invalidate it.
+                  std::string bindLine;
+                  for (uint32_t k = 0; k < vanish_diag::kMapKindSlots; ++k) {
+                    if (mapCalls[k] == 0)
+                      continue;
+                    bindLine += str::format(" ", kMapKindNames[k], "{");
+                    for (uint32_t r = 0; r < vanish_diag::kMapBindSlots; ++r) {
+                      bindLine += str::format(
+                        " ", vanish_diag::kMapBindNames[r], "=",
+                        vol(double(mapBindCalls[k][r]) / sfc),
+                        "/", vol(double(mapBindBytes[k][r]) / sfc / 1024.0), "KB");
+                    }
+                    bindLine += " }";
+                  }
+                  if (!bindLine.empty()) {
+                    Logger::warn(str::format(
+                      "[Perf.EntryMapBind] (renames by bind role, calls/KB per frame;"
+                      " WRITE_DISCARD cb=0 is the by-reference precondition):", bindLine));
+                  }
+                }
+
+                // ---- hand the assembler the family split, so [Perf.Report]'s
+                // frame-thread section can finally show something under
+                // "D3D11 entry points" other than three draws and a lump.
+                // Published as ms/frame like every other Ms slot: the report
+                // renders its own percentages, and a share published into an Ms
+                // slot would be silently rescaled against the wall twice.
+                {
+                  const auto famMs = [&](const vanish_diag::Family f) {
+                    return famSharePct[int(f)] * wallNs / 1.0e6 / 100.0;
+                  };
+                  perfreport::publish(perfreport::Slot::EntryMapMs,    famMs(vanish_diag::kFamMap));
+                  perfreport::publish(perfreport::Slot::EntryCbSetMs,  famMs(vanish_diag::kFamCbSet));
+                  perfreport::publish(perfreport::Slot::EntrySrvSetMs, famMs(vanish_diag::kFamSrvSet));
+                  perfreport::publish(perfreport::Slot::EntryQueryMs,  famMs(vanish_diag::kFamQuery));
+                  perfreport::publish(perfreport::Slot::EntryCopyMs,   famMs(vanish_diag::kFamCopy));
+                  perfreport::publish(perfreport::Slot::EntryProbeMs,
+                    probeWallPct * wallNs / 1.0e6 / 100.0);
+                  perfreport::publish(perfreport::Slot::EntryCallsPerFrame, allCallsPf);
+                  perfreport::publish(perfreport::Slot::EntryMapKbPerFrame,
+                    famBytes[int(vanish_diag::kFamMap)] / 1024.0);
+                }
+              }
             }
           }
 
@@ -63438,6 +64202,120 @@ namespace dxvk {
                                  " xfIneligN=",      s_xfIneligN,
                                  " xfElig3=",        s_xfElig3Ns,
                                  " xfElig3N=",       s_xfElig3N,
+                                 // NV-DXVK [XfDefer] 2026-08-19: the ROUTING
+                                 // instrument that replaces the three fields
+                                 // above once the deferral is live. Printed
+                                 // even when every field is zero, for the same
+                                 // reason [Perf.MemoXf]'s FAIL is: a missing
+                                 // counter and a zero counter must not look
+                                 // alike.
+                                 //
+                                 // READ predMissUnsafe FIRST AND ALONE. It is
+                                 // the only field here that can indicate a
+                                 // WRONG FRAME rather than a slow one: a draw
+                                 // routed off-thread on a prediction the
+                                 // certificate then refused. Non-zero means the
+                                 // inline fallback is carrying real traffic, so
+                                 // check it is actually wired before trusting
+                                 // any frame time from the run.
+                                 // predCold should decay to ~0 within a second
+                                 // of a scene settling; sustained cold means the
+                                 // (vs, il) key is too fine to ever learn.
+                                 // predMissMissed is opportunity only -- draws
+                                 // left inline that could have moved.
+                                 " predHit=",        s_xfPredHit,
+                                 " predMissUnsafe=", s_xfPredMissUnsafe,
+                                 " predMissMissed=", s_xfPredMissMissed,
+                                 " predCold=",       s_xfPredCold,
+                                 " predHitNs=",      s_xfPredHitNs,
+                                 " predColdNs=",     s_xfPredColdNs,
+                                 " predModel=",      s_xfEligByVsIl.size(),
+                                 // [XfDefer] the carrier hypothesis, as a pair
+                                 // of RATES. Compare
+                                 //   missUnsafeFirst/(missUnsafeFirst+hitFirst)
+                                 // against
+                                 //   missUnsafeLater/(missUnsafeLater+hitLater).
+                                 // First-rate >> later-rate: eligibility flips
+                                 // on a shader's FIRST draw of the frame, the
+                                 // carrier hypothesis holds, and the fix is to
+                                 // never defer that draw. Rates equal: the
+                                 // hypothesis is dead and the key is missing a
+                                 // component nobody has named. Raw counts alone
+                                 // cannot separate these -- hence the controls.
+                                 " missUnsafeFirst=", s_xfMissUnsafeFirst,
+                                 " missUnsafeLater=", s_xfMissUnsafeLater,
+                                 " hitFirst=",        s_xfHitFirst,
+                                 " hitLater=",        s_xfHitLater,
+                                 // [XfDefer] THE GO/NO-GO. missAxisGeo is the
+                                 // only axis whose misprediction can produce a
+                                 // wrong transform on a worker; carrier is
+                                 // thread_local and harmless, and cb is
+                                 // knowable at capture time so it should be
+                                 // tested exactly rather than predicted.
+                                 //   geo ~0      -> deferral is viable; gate on
+                                 //                 the record for cb, ignore
+                                 //                 carrier, and the remaining
+                                 //                 misprediction costs
+                                 //                 throughput only.
+                                 //   geo large   -> the derivation really does
+                                 //                  read renameable geometry,
+                                 //                  and it cannot leave the
+                                 //                  frame thread at all.
+                                 // missAxisNone must read 0; non-zero means
+                                 // this scoring disagrees with safeToDefer()
+                                 // and the probe is wrong, not the predictor.
+                                 " missAxisGeo=",     s_xfMissAxisGeo,
+                                 " missAxisCarrier=", s_xfMissAxisCarrier,
+                                 " missAxisCb=",      s_xfMissAxisCb,
+                                 " missAxisNone=",    s_xfMissAxisNone,
+                                 // [XfDefer] PARTITION OR REPLAY -- the last
+                                 // open question. carrierVs/everVs near 0 means
+                                 // a few shaders do all the carrier work and a
+                                 // clean partition exists (cheap, ~86% of the
+                                 // prize). Near 1 means every shader writes it
+                                 // on some draw, no partition exists, and the
+                                 // derivation needs record-and-replay. These are
+                                 // CUMULATIVE distinct-shader counts, not rates,
+                                 // so they are not cleared per window -- read
+                                 // the ratio once the scene has settled.
+                                 " carrierVs=",       s_xfCarrierVsIl.size(),
+                                 " everVs=",          s_xfEverVsIl.size(),
+                                 // THE REFUSAL RATE a shader-keyed partition
+                                 // would actually pay: drawsInCarrierVs/drawsSeen.
+                                 // carrierVs/everVs counts shaders and cannot
+                                 // answer this -- half the shaders being tainted
+                                 // is compatible with them owning 5% of draws or
+                                 // 95%. Low -> partition (b) is the answer and
+                                 // costs three bools. High -> only
+                                 // record-and-replay (a) pays.
+                                 " drawsInCarrierVs=", s_xfDrawsInCarrierVs,
+                                 " drawsSeen=",        s_xfDrawsSeen,
+                                 // NV-DXVK [GenVal] 2026-08-19. Decides whether
+                                 // the split cache's staleness proof can move
+                                 // from hashing the draw's input BYTES to
+                                 // comparing four generation words -- i.e.
+                                 // whether ~2 us of every served draw is
+                                 // removable. Probe only; it gates nothing.
+                                 //
+                                 // READ genStaleHit FIRST. It must be 0. Any
+                                 // non-zero means bytes changed without the
+                                 // generation moving (an in-place write), and
+                                 // the cheap proof would serve a STALE
+                                 // transform. [Perf.EntryMapBind]
+                                 // WRITE_NO_OVERWRITE cb=0 predicts 0; a
+                                 // non-zero here refutes that and ends the idea.
+                                 //
+                                 // THEN genHitStale / (genHitHit+genHitStale)
+                                 // = the fraction of today's serves the cheap
+                                 // proof would GIVE BACK (renames that rewrote
+                                 // identical bytes). Small => swap it and take
+                                 // ~2 us off every served draw. Near 1 => the
+                                 // generation churns independently of content
+                                 // and this is a wash; leave the hash alone.
+                                 " genHitHit=",      s_genValHitHit,
+                                 " genHitStale=",    s_genValHitStale,
+                                 " genStaleHit=",    s_genValStaleHit,
+                                 " genStaleStale=",  s_genValStaleStale,
                                  // [Perf.ServeCost] 2026-08-14. DIVIDE BEFORE
                                  // CONCLUDING, same as xfElig above: the answer
                                  // is xfServe/xfServeN against
@@ -64842,6 +65720,32 @@ namespace dxvk {
         s_perfSrvCacheMisses = 0;
         s_perfSrvCacheEvicts = 0;
 
+        // [Perf.SrvDimCache] the ViewDimension-only table behind the two
+        // 128-slot PS-SRV cube scans. THIS IS THE ACCEPTANCE TEST for that
+        // change, and it is deliberately a cache counter rather than a timing
+        // bucket -- per PERF_INSTRUMENTATION_MAP section 3c, a cache win is
+        // confirmed in its hit rate, not in a ms that a downclock can move.
+        // READ IT:
+        //   hitPct near 100, evicts 0  -> working as intended; the GetDesc pair
+        //     that used to run per bound slot per depth-write-off draw is gone.
+        //   evicts > 0                 -> the bound-SRV working set exceeds 1024
+        //     and the table is clearing wholesale. That is the failure mode this
+        //     table was split off from [Perf.SrvCache] to keep away from the
+        //     boneTrack path; raise the cap here, do NOT merge the two.
+        //   hits == 0                  -> no depth-write-off draws reached the
+        //     detectors this window, so the change is untested, not proven.
+        const uint64_t srvDimTotal = s_perfSrvDimHits + s_perfSrvDimMisses;
+        const uint32_t srvDimHitPct = srvDimTotal
+          ? uint32_t((s_perfSrvDimHits * 100u) / srvDimTotal) : 0u;
+        Logger::info(str::format("[Perf.SrvDimCache]"
+                                 " hits=", s_perfSrvDimHits,
+                                 " misses=", s_perfSrvDimMisses,
+                                 " hitPct=", srvDimHitPct,
+                                 " evicts=", s_perfSrvDimEvicts));
+        s_perfSrvDimHits = 0;
+        s_perfSrvDimMisses = 0;
+        s_perfSrvDimEvicts = 0;
+
         // [Perf.FillMatCache] Regression detector for the FillMaterialData
         // per-PS slot cache. Same shape as Perf.SrvCache.
         const uint64_t fmTotal = s_perfFillMatCacheHits + s_perfFillMatCacheMisses;
@@ -65060,6 +65964,31 @@ namespace dxvk {
         // a cut of the same window's bt_extractXf.
         s_xfServeNs = 0; s_xfDeriveNs = 0;
         s_xfServeN  = 0; s_xfDeriveN  = 0;
+        // [XfDefer]: same rule again. The counters are a RATE over the window's
+        // draws, so they must clear with the window that produced them --
+        // carrying them would make a settled scene's miss rate look better and
+        // better forever, which is precisely the shape a correctness counter
+        // must never have. s_xfEligByVsIl is NOT cleared: it is the learned
+        // model, and throwing it away every 5 s would keep the predictor
+        // permanently cold.
+        s_xfPredHitNs = 0; s_xfPredColdNs = 0;
+        s_xfPredHit = 0; s_xfPredMissUnsafe = 0;
+        s_xfPredMissMissed = 0; s_xfPredCold = 0;
+        s_xfMissUnsafeFirst = 0; s_xfMissUnsafeLater = 0;
+        s_xfHitFirst = 0; s_xfHitLater = 0;
+        s_xfMissAxisGeo = 0; s_xfMissAxisCarrier = 0;
+        s_xfMissAxisCb = 0; s_xfMissAxisNone = 0;
+        // Rates, so they clear. s_xfCarrierVsIl / s_xfEverVsIl deliberately do
+        // NOT -- they are cumulative distinct-shader populations and resetting
+        // them would restart the census every 5 s and never converge.
+        s_xfDrawsInCarrierVs = 0; s_xfDrawsSeen = 0;
+        // [GenVal]: same rule -- it is a RATE over the window's lookups, and
+        // the ratio genHitStale/(genHitHit+genHitStale) is only meaningful
+        // against the same window's serve count. s_genValCur is NOT cleared:
+        // it is per-draw state rewritten by every drawSplitKeys call, not an
+        // accumulator.
+        s_genValHitHit = 0; s_genValHitStale = 0;
+        s_genValStaleHit = 0; s_genValStaleStale = 0;
         s_perfXtVsLocCacheHits                = 0;
         s_perfXtVsLocCacheMisses              = 0;
         s_perfRpKeyAcc                        = 0; s_perfRpKeyMax                        = 0;

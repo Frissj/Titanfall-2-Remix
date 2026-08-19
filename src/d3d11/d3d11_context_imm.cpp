@@ -964,6 +964,30 @@ namespace dxvk {
       // upload pattern (TF2's skinned-character bone matrices).
       auto* b = static_cast<D3D11Buffer*>(pResource);
       const uint32_t sz = b->Desc()->ByteWidth;
+
+      // NV-DXVK [Perf.EntryCensus] / [Perf.EntryMap]: Map is one of the three
+      // ways the ~50% "D3D11 entry points" share can be shaped, and the only
+      // one whose fix is an upload-path change rather than a call-rate change.
+      //
+      // ByteWidth is the MAPPABLE size, not the bytes the game goes on to
+      // write - that is unknowable from here, since the write happens in engine
+      // code against the returned pointer. It is still the right axis: a
+      // WRITE_DISCARD costs the rename of the whole allocation regardless of
+      // how much of it is touched, which is exactly what this number is.
+      vanish_diag::addBytes(vanish_diag::Map, sz);
+      // Bind role, classified here because the D3D11_BIND_* constants are in
+      // scope and the census header is not the place to know about them.
+      // CONSTANT_BUFFER wins over VB/IB when a buffer carries both: the
+      // question this bucket exists to answer is "are the buffers the
+      // derivation reads being renamed", so a buffer that is ever a cbuffer
+      // belongs in the cbuffer population.
+      const UINT bindFlags = b->Desc()->BindFlags;
+      const uint32_t bindRole =
+          (bindFlags & D3D11_BIND_CONSTANT_BUFFER)                     ? 0u
+        : (bindFlags & (D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER)) ? 1u
+        :                                                                2u;
+      vanish_diag::noteMapBuffer(uint32_t(MapType), sz, bindRole);
+
       if (tf2::boneDiagEnabled() && sz == 393216) {
         static uint32_t sMapBoneLog = 0;
         if (sMapBoneLog < 20) {
@@ -978,6 +1002,12 @@ namespace dxvk {
         }
       }
     } else {
+      // [Perf.EntryMap]: counted separately and WITHOUT bytes. An image map
+      // has no single byte width (it is a mip footprint), and MapImage is a
+      // different code path with a different cost, so blending it into the
+      // buffer KB/frame figure would corrupt the one number this axis exists
+      // to produce.
+      vanish_diag::noteMapImage();
       hr = MapImage(
         GetCommonTexture(pResource),
         Subresource, MapType, MapFlags,
@@ -1009,6 +1039,37 @@ namespace dxvk {
     }
   }
 
+  // NV-DXVK [Perf.EntryCensus]: bytes moved by one UpdateSubresource.
+  //
+  // Buffers are exact - the box, or the whole buffer when there is no box.
+  // Textures are an APPROXIMATION and are marked as such on the census line:
+  // SrcDepthPitch is the full slice for a 2D/3D upload when the caller supplies
+  // it, and SrcRowPitch is a floor of one row when it does not. Deliberately
+  // not resolved through GetCommonTexture: this runs on the frame thread inside
+  // the measured scope, and a wrong-by-a-mip byte count is worth far less than
+  // not perturbing the thing being measured. If textures ever dominate this
+  // bucket, that is the point to make it exact.
+  static uint64_t UpdateSubBytes(
+          ID3D11Resource*   pDstResource,
+    const D3D11_BOX*        pDstBox,
+          UINT              SrcRowPitch,
+          UINT              SrcDepthPitch) {
+    if (unlikely(pDstResource == nullptr))
+      return 0;
+
+    D3D11_RESOURCE_DIMENSION dim = D3D11_RESOURCE_DIMENSION_UNKNOWN;
+    pDstResource->GetType(&dim);
+
+    if (dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
+      if (pDstBox != nullptr)
+        return pDstBox->right > pDstBox->left ? uint64_t(pDstBox->right - pDstBox->left) : 0;
+      return uint64_t(static_cast<D3D11Buffer*>(pDstResource)->Desc()->ByteWidth);
+    }
+
+    return SrcDepthPitch != 0 ? uint64_t(SrcDepthPitch) : uint64_t(SrcRowPitch);
+  }
+
+
   void STDMETHODCALLTYPE D3D11ImmediateContext::UpdateSubresource(
           ID3D11Resource*                   pDstResource,
           UINT                              DstSubresource,
@@ -1017,6 +1078,9 @@ namespace dxvk {
           UINT                              SrcRowPitch,
           UINT                              SrcDepthPitch) {
     vanish_diag::ScopedCall vdScope(vanish_diag::UpdateSub);
+    if (vanish_diag::t_isFrameThread)
+      vanish_diag::addBytes(vanish_diag::UpdateSub,
+        UpdateSubBytes(pDstResource, pDstBox, SrcRowPitch, SrcDepthPitch));
     UpdateResource<D3D11ImmediateContext>(this, pDstResource,
       DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch, 0);
   }
@@ -1031,6 +1095,9 @@ namespace dxvk {
           UINT                              SrcDepthPitch,
           UINT                              CopyFlags) {
     vanish_diag::ScopedCall vdScope_UpdateSub(vanish_diag::UpdateSub);
+    if (vanish_diag::t_isFrameThread)
+      vanish_diag::addBytes(vanish_diag::UpdateSub,
+        UpdateSubBytes(pDstResource, pDstBox, SrcRowPitch, SrcDepthPitch));
     UpdateResource<D3D11ImmediateContext>(this, pDstResource,
       DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch, CopyFlags);
   }

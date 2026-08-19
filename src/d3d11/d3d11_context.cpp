@@ -167,6 +167,14 @@ namespace dxvk {
     std::atomic<uint64_t> g_boundaryPostMaxNs { 0 };
     std::atomic<uint64_t> g_boundaryCount { 0 };
     std::atomic<uint64_t> g_boundaryNoPresent { 0 };
+    // NV-DXVK [Perf.EntryCensus]: the volume axis. See d3d11_vanish_diag.h.
+    std::atomic<uint64_t> g_bytes[CALL_COUNT];
+    std::atomic<uint64_t> g_units[CALL_COUNT];
+    std::atomic<uint64_t> g_mapCalls[kMapKindSlots];
+    std::atomic<uint64_t> g_mapBytes[kMapKindSlots];
+    std::atomic<uint64_t> g_mapImageCalls { 0 };
+    std::atomic<uint64_t> g_mapBindCalls[kMapKindSlots][kMapBindSlots];
+    std::atomic<uint64_t> g_mapBindBytes[kMapKindSlots][kMapBindSlots];
     thread_local std::chrono::steady_clock::time_point t_lastExit;
     thread_local bool     t_haveLastExit = false;
     thread_local int      t_lastCallId   = 0;
@@ -1379,6 +1387,9 @@ namespace dxvk {
           UINT            StartVertexLocation) {
     g_d3d11DrawAny.fetch_add(1, std::memory_order_relaxed);
     vanish_diag::ScopedCall vdScope_Draw(vanish_diag::Draw);
+    // NV-DXVK [Perf.EntryCensus]: vertices, so a rising draw cost can be told
+    // apart from a rising draw COUNT without a second capture.
+    vanish_diag::addUnits(vanish_diag::Draw, VertexCount);
 
     // NV-DXVK [Perf.DrawEntry]: see the helper near the top of this file.
     const bool deOn  = g_perfDeEnabled;
@@ -1419,6 +1430,7 @@ namespace dxvk {
     // itself; those are separated by comparing against totalInjectUs.
     ++t_d3d11DrawTls;   // NV-DXVK [MatBatch]
     vanish_diag::ScopedCall vdScope_DrawIndexed(vanish_diag::DrawIndexed);
+    vanish_diag::addUnits(vanish_diag::DrawIndexed, IndexCount);   // [Perf.EntryCensus]
     DrawEntryProbe(IndexCount, false, m_device.ptr());
 
     // NV-DXVK [Perf.DrawEntry]: time the lock and the hook separately.
@@ -1447,6 +1459,10 @@ namespace dxvk {
           UINT            StartInstanceLocation) {
     g_d3d11DrawAny.fetch_add(1, std::memory_order_relaxed);
     vanish_diag::ScopedCall vdScope_DrawInstanced(vanish_diag::DrawInstanced);
+    // [Perf.EntryCensus]: vertices ACTUALLY drawn, i.e. per-instance x instances
+    // - the fanout is the whole reason the instanced paths are expensive here.
+    vanish_diag::addUnits(vanish_diag::DrawInstanced,
+      uint64_t(VertexCountPerInstance) * uint64_t(InstanceCount));
 
     // NV-DXVK [Perf.DrawEntry]: see the helper near the top of this file.
     const bool deOn  = g_perfDeEnabled;
@@ -1477,6 +1493,8 @@ namespace dxvk {
     g_d3d11DrawAny.fetch_add(1, std::memory_order_relaxed);
     ++t_d3d11DrawTls;   // NV-DXVK [MatBatch]
     vanish_diag::ScopedCall vdScope_DrawIdxInst(vanish_diag::DrawIdxInst);
+    vanish_diag::addUnits(vanish_diag::DrawIdxInst,                // [Perf.EntryCensus]
+      uint64_t(IndexCountPerInstance) * uint64_t(InstanceCount));
     DrawEntryProbe(IndexCountPerInstance, true, m_device.ptr());
     // NV-DXVK [ZeroInst]: see the block near the top of this file. A draw with no
     // instances renders nothing, so catch it here at the entry point -- above
@@ -1697,6 +1715,7 @@ namespace dxvk {
     const UINT*                             pStrides,
     const UINT*                             pOffsets) {
     vanish_diag::ScopedCall vdScope_IASetVB(vanish_diag::IASetVB);
+    vanish_diag::addUnits(vanish_diag::IASetVB, NumBuffers);   // [Perf.EntryCensus]
     D3D11DeviceLock lock = LockContext();
     
     for (uint32_t i = 0; i < NumBuffers; i++) {
@@ -1832,6 +1851,7 @@ namespace dxvk {
           UINT                              NumBuffers,
           ID3D11Buffer* const*              ppConstantBuffers) {
     vanish_diag::ScopedCall vdScope_VSSetCB(vanish_diag::VSSetCB);
+    vanish_diag::addUnits(vanish_diag::VSSetCB, NumBuffers);   // [Perf.EntryCensus]
     D3D11DeviceLock lock = LockContext();
 
     SetConstantBuffers<DxbcProgramType::VertexShader>(
@@ -1848,6 +1868,7 @@ namespace dxvk {
     const UINT*                             pFirstConstant,
     const UINT*                             pNumConstants) {
     vanish_diag::ScopedCall vdScope_VSSetCB(vanish_diag::VSSetCB);
+    vanish_diag::addUnits(vanish_diag::VSSetCB, NumBuffers);   // [Perf.EntryCensus]
     D3D11DeviceLock lock = LockContext();
     
     SetConstantBuffers1<DxbcProgramType::VertexShader>(
@@ -1864,6 +1885,7 @@ namespace dxvk {
           UINT                              NumViews,
           ID3D11ShaderResourceView* const*  ppShaderResourceViews) {
     vanish_diag::ScopedCall vdScope_VSSetSRV(vanish_diag::VSSetSRV);
+    vanish_diag::addUnits(vanish_diag::VSSetSRV, NumViews);    // [Perf.EntryCensus]
     D3D11DeviceLock lock = LockContext();
     
     SetShaderResources<DxbcProgramType::VertexShader>(
@@ -2404,6 +2426,7 @@ namespace dxvk {
           UINT                              NumBuffers,
           ID3D11Buffer* const*              ppConstantBuffers) {
     vanish_diag::ScopedCall vdScope_PSSetCB(vanish_diag::PSSetCB);
+    vanish_diag::addUnits(vanish_diag::PSSetCB, NumBuffers);   // [Perf.EntryCensus]
     D3D11DeviceLock lock = LockContext();
 
     SetConstantBuffers<DxbcProgramType::PixelShader>(
@@ -2420,6 +2443,7 @@ namespace dxvk {
     const UINT*                             pFirstConstant,
     const UINT*                             pNumConstants) {
     vanish_diag::ScopedCall vdScope_PSSetCB(vanish_diag::PSSetCB);
+    vanish_diag::addUnits(vanish_diag::PSSetCB, NumBuffers);   // [Perf.EntryCensus]
     D3D11DeviceLock lock = LockContext();
     
     SetConstantBuffers1<DxbcProgramType::PixelShader>(
@@ -2436,6 +2460,7 @@ namespace dxvk {
           UINT                              NumViews,
           ID3D11ShaderResourceView* const*  ppShaderResourceViews) {
     vanish_diag::ScopedCall vdScope_PSSetSRV(vanish_diag::PSSetSRV);
+    vanish_diag::addUnits(vanish_diag::PSSetSRV, NumViews);    // [Perf.EntryCensus]
     D3D11DeviceLock lock = LockContext();
     
     SetShaderResources<DxbcProgramType::PixelShader>(
@@ -2772,6 +2797,7 @@ namespace dxvk {
           ID3D11RenderTargetView* const*    ppRenderTargetViews,
           ID3D11DepthStencilView*           pDepthStencilView) {
     vanish_diag::ScopedCall vdScope_OMSetRT(vanish_diag::OMSetRT);
+    vanish_diag::addUnits(vanish_diag::OMSetRT, NumViews);     // [Perf.EntryCensus]
     OMSetRenderTargetsAndUnorderedAccessViews(
       NumViews, ppRenderTargetViews, pDepthStencilView,
       NumViews, 0, nullptr, nullptr);

@@ -66,6 +66,25 @@ namespace dxvk {
       DrawEntryLockMs,         // [Perf.DrawEntry] deLock, normalised
       DrawEntryOnDrawMs,       // [Perf.DrawEntry] deOnDraw, normalised
 
+      // ---- the entry-point census ([Perf.EntryCensus], Tier 1(b)) ----
+      // EntryStateMs above is "everything that is not a draw entry point", one
+      // lump covering ~40 distinct call ids. These are its real families, so
+      // the report can name the second half of the pole instead of printing a
+      // remainder. They are siblings of the three Entry*Draw* slots and
+      // together with them cover EntryTotalMs, so they are all kNested.
+      //
+      // EntryProbeMs is NOT a family. It is what the ScopedCall instrument
+      // itself costs the frame (two steady_clock reads x every timed call), and
+      // it is INSIDE every row above including the draws. It is published so
+      // the report can state the measurement error rather than leave every
+      // reader to rediscover it: at ~302,000 GetData polls/frame it is tens of
+      // ms, which is the difference between "half the frame is D3D11" and
+      // "a third of the frame is us watching D3D11".
+      EntryMapMs, EntryCbSetMs, EntrySrvSetMs, EntryQueryMs, EntryCopyMs,
+      EntryProbeMs,
+      EntryCallsPerFrame,      // total timed immediate-ctx entry-point calls
+      EntryMapKbPerFrame,      // buffer bytes handed out by Map, KB/frame
+
       // ---- frame thread: inside SubmitDraw ([Perf.SdStall], 8 stages) ----
       SdHeadMs, SdVsIdxMs, SdSkinCullMs, SdXformMs,
       SdCommitMs, SdCaptureMs, SdEmitMs, SdRestMs,

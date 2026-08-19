@@ -706,6 +706,63 @@ namespace dxvk {
     // the capture set is wrong; raise the caps and find out which consumer.
     bool overflowed = false;
 
+    // NV-DXVK [XfDefer] 2026-08-19: true when this record occupies an ARENA
+    // slot and therefore outlives the draw that wrote it; false when it is the
+    // shared scratch slot used past the arena cap.
+    //
+    // THE DISTINCTION ONLY MATTERS OFF-THREAD, which is why it did not exist
+    // before. Every frame-thread consumer reads the record inside the draw that
+    // wrote it, so scratch is perfectly correct for them. A deferred reader runs
+    // after SubmitDraw has returned, by which time the scratch slot holds some
+    // later past-cap draw's bytes -- and serving those as this draw's transforms
+    // is silent and wrong, not a crash. So deferral gates on this; nothing else
+    // needs to.
+    bool arenaBacked = false;
+
+    // NV-DXVK [XfDefer] 2026-08-19 -- THE ROUTING GATE, decided at capture time
+    // on the frame thread. Set once, read by the flush; never predicted.
+    //
+    // WHY THIS IS NOT safeToDefer(). safeToDefer() conjoins three axes and the
+    // measurement (missAxisGeo=0, missAxisCarrier=1110, missAxisCb~0) showed
+    // they behave completely differently off-thread:
+    //
+    //   cbSafeToDefer()   layoutResolved && contentPure() && !overflowed.
+    //                     ALL THREE ARE PROPERTIES OF THIS RECORD, so they are
+    //                     known here, exactly, before any derivation runs.
+    //                     That is this flag.
+    //   wroteCarrier()    NOT RESOLVED BY THIS FLAG, and the first version of
+    //                     this comment was wrong about why. It claimed the
+    //                     carrier caches are thread_local and therefore
+    //                     harmless off-thread. That is true of s_vkPathByVsIl
+    //                     and its siblings, which XtPurityGuard writes -- and
+    //                     they are NOT what wroteCarrier() tracks.
+    //                     stageDepCarrierGroups hashes D3D11Rtx MEMBERS:
+    //                     m_lastDrawCamOrigin, m_lastO2wPathId, m_projSlot,
+    //                     m_smoothedCamPos, m_lastGoodTransforms. Plain
+    //                     instance state, shared by every thread. A worker
+    //                     writing them races the frame thread, and a worker
+    //                     READING them gets whatever the frame thread happens
+    //                     to hold rather than what draw N-1 left -- which is a
+    //                     sequential dependency that no amount of locking
+    //                     removes. Measured at ~14% of scored draws
+    //                     (missAxisCarrier ~1110/window).
+    //                     THIS IS THE REMAINING BLOCKER FOR THE DERIVATION
+    //                     ITSELF. It does not block this flag, which is a
+    //                     necessary condition either way; see the note at
+    //                     ScopedDrawSnap for the two resolutions and the
+    //                     measurement that picks between them.
+    //   geoBytesStatic()  NOT here, because it cannot be: it counts reads the
+    //                     derivation makes, so it is only true or false once the
+    //                     derivation has run. It is the ONE axis that can
+    //                     corrupt off-thread, and it is handled by DETECTION
+    //                     rather than prediction -- see geoLiveReads and the
+    //                     abort path. Measured at 6 live reads in 36,015 draws,
+    //                     so the abort is a safety net, not a hot path.
+    //
+    // arenaBacked is conjoined because a scratch-slot record does not outlive
+    // its draw and a worker would read a stranger's bytes.
+    bool deferrable = false;
+
     // NV-DXVK [CbSpanWaste] 2026-08-13 -- per-range bit, set when THIS range's
     // capture had to issue a write-combined transaction (the wcMiss branch in
     // captureDrawSnapshot) rather than being served by the staging ring or an
@@ -1148,7 +1205,33 @@ namespace dxvk {
     size_t                    m_drawSnapNext = 0;
     // The draw currently being derived. Null when capture is off or the arena
     // is full -- every consumer treats null as "take the live path".
-    DrawSnapshot*             m_drawSnapCur = nullptr;
+    //
+    // NV-DXVK [XfDefer] 2026-08-19: `static thread_local`, NOT a plain member,
+    // and this is the change that makes an off-thread consumer possible at all.
+    //
+    // WHY IT WAS WRONG AS A MEMBER. "The draw currently being derived" is a
+    // property of the THREAD doing the deriving, never of the D3D11Rtx object --
+    // there is one D3D11Rtx and there are 30 workers. It was only ever a member
+    // because only one thread ever derived. The moment a second thread derives
+    // a different draw, a single member cursor means both threads' accessors
+    // resolve to whichever record was stored last: every identity accessor,
+    // every drawCbSpan read, silently served from another draw's bytes. That is
+    // not a crash, it is a wrong transform, which is the failure mode this file
+    // has paid for twice (the m_t31ReadCache rename race, and the cb2 note on
+    // m_drawSnapValid immediately below).
+    //
+    // WHY THIS EXACT SPELLING. `static thread_local` keeps BOTH spellings that
+    // already exist across the 87 use sites compiling untouched -- unqualified
+    // `m_drawSnapCur` inside member functions, and `self->m_drawSnapCur` inside
+    // the local guard structs -- because C++ permits naming a static member
+    // through an object expression. So this is a storage-class change with no
+    // call-site churn and therefore no site that can be missed, which matters
+    // more here than the fact that `m_` now prefixes a static.
+    //
+    // SINGLE-THREADED BEHAVIOUR IS BYTE-IDENTICAL: with one thread, a
+    // thread_local IS the member. The deferral is what makes use of the
+    // difference; this change alone is a no-op and can be verified as one.
+    static thread_local DrawSnapshot* m_drawSnapCur;
     // Used when the arena is at cap, so m_drawSnapCur is ALWAYS valid once
     // capture has run. That keeps the consumer guard a single flag test rather
     // than a flag test plus a null test on every read.
@@ -1168,7 +1251,13 @@ namespace dxvk {
     // same rule sec 1c applies to the record as a whole.
     //
     // Costs the consumer exactly what the old guard did: one bool test.
-    bool                      m_drawSnapValid = false;
+    //
+    // NV-DXVK [XfDefer] 2026-08-19: thread_local for exactly the reason
+    // m_drawSnapCur above is -- the latch and the cursor are one fact and must
+    // move together. A thread-local cursor paired with a shared valid flag
+    // would be worse than either alone: a worker clearing the flag at the end
+    // of its draw would blind the frame thread's consumers mid-draw.
+    static thread_local bool  m_drawSnapValid;
 
     // Fallback-safe accessor. Returns nullptr whenever this draw has no usable
     // snapshot -- capture off, capture skipped, or the record incomplete -- and
@@ -1179,6 +1268,87 @@ namespace dxvk {
       return (m_drawSnapValid && m_drawSnapCur != nullptr
               && !m_drawSnapCur->overflowed) ? m_drawSnapCur : nullptr;
     }
+
+    // NV-DXVK [XfDefer] 2026-08-19: bind a record to THIS thread for the length
+    // of a scope, then restore whatever was there.
+    //
+    // This is what a worker uses to derive draw N: every identity accessor and
+    // every drawCbSpan read inside the scope resolves to N's record, because
+    // the cursor is thread_local (see m_drawSnapCur). Outside the scope the
+    // thread has no record and every consumer takes the live path, which is the
+    // correct default for a worker that is not deriving.
+    //
+    // RAII, AND NOT AS A STYLE PREFERENCE. XtPurityGuard exists in this file for
+    // exactly this reason, stated at its definition: the function it guards
+    // "has grown exits and a hand-placed publish would be wrong at whichever one
+    // gets added next". A derivation that returns early without restoring the
+    // cursor would leave a worker pointed at a retired record, and the symptom
+    // would be a wrong transform on some LATER draw -- silent, and nowhere near
+    // the edit that caused it.
+    //
+    // SAVES AND RESTORES rather than clearing: the frame thread also derives
+    // (cold shaders, aborts, ineligible draws), and it must come out of a nested
+    // scope holding the record it had on the way in.
+    struct ScopedDrawSnap {
+      DrawSnapshot* prevCur;
+      bool          prevValid;
+      ScopedDrawSnap(DrawSnapshot* s)
+      : prevCur(m_drawSnapCur), prevValid(m_drawSnapValid) {
+        m_drawSnapCur   = s;
+        m_drawSnapValid = (s != nullptr);
+      }
+      ~ScopedDrawSnap() {
+        m_drawSnapCur   = prevCur;
+        m_drawSnapValid = prevValid;
+      }
+      ScopedDrawSnap(const ScopedDrawSnap&) = delete;
+      ScopedDrawSnap& operator=(const ScopedDrawSnap&) = delete;
+    };
+
+    // NV-DXVK [XfDefer] 2026-08-19 -- WHAT IS BUILT, WHAT IS LEFT, AND WHY.
+    //
+    // BUILT AND LANDABLE NOW (all no-ops until something routes a draw):
+    //   m_drawSnapCur/m_drawSnapValid   thread_local -- "the draw being derived"
+    //                                   belongs to the thread, not the object.
+    //   DrawSnapshot::arenaBacked       scratch-slot records cannot be deferred.
+    //   DrawSnapshot::deferrable        the exact, capture-time record gate.
+    //   ScopedDrawSnap                  binds a record to a thread by scope.
+    //   geoLiveReads / cbLiveReads      already incremented by the routed read
+    //                                   sites, and with a thread_local cursor a
+    //                                   worker's reads land on its OWN record --
+    //                                   so "did this derivation read something
+    //                                   the record could not serve" is answered
+    //                                   after the fact, per draw, for free. That
+    //                                   is the ABORT signal: discard the result
+    //                                   and re-derive inline. Measured 6 live
+    //                                   geo reads in 36,015 draws, so it is a
+    //                                   safety net and not a hot path.
+    //
+    // THE ONE THING LEFT, and it is a real dependency rather than plumbing:
+    // the derivation both READS and WRITES D3D11Rtx member state (the carrier
+    // groups above). Reading it off-thread gets whatever the frame thread holds
+    // at that instant instead of what draw N-1 left, which is a SEQUENTIAL
+    // dependency -- a lock makes it safe and still wrong. ~14% of draws write it.
+    //
+    // TWO RESOLUTIONS, and the repo already contains the machinery for both:
+    //   (a) REPLAY, which is what the split cache already does. XfObjectPart
+    //       records the carrier state its producing draw left (carGroups,
+    //       carProjSlot, ...) and the serve path replays it, gated by
+    //       kXfReplayable and validated by REPLAYFAIL. A deferred derivation is
+    //       the same shape: derive against a private copy, record the writes,
+    //       and let an ordered tail apply them in draw order -- exactly the
+    //       ordered-tail rule THE_OPTIMISATION_PLAN_2 Sec 7 states for the
+    //       spatial map. REPLAYFAIL already exists to say whether it holds.
+    //   (b) PARTITION. Defer only draws that neither read nor write carrier
+    //       state. missAxisCarrier says that is ~86% of them, which is most of
+    //       the prize, and it needs no replay at all -- but it is post-hoc, so
+    //       it needs the per-(vs,il) predictor with the abort as the net.
+    //
+    // WHICH ONE IS A MEASUREMENT, NOT A PREFERENCE: (b) is far simpler and is
+    // enough if carrier writes concentrate in few shaders; (a) is required if
+    // they are spread across all of them. missAxisCarrier split by (vs, il)
+    // distinctness answers it, and that is the next counter to write -- not the
+    // next thousand lines of code.
 
     // Captures m_context->m_state into the arena and points m_drawSnapCur at
     // it. Frame thread only, called at SubmitDraw entry while every binding is
@@ -1439,6 +1609,39 @@ namespace dxvk {
       // compare -- where a narrowed KEY produced a hit on a different entry
       // and the wrong serve was invisible (handoff 2.5's blind spot).
       uint64_t valHash;
+
+      // NV-DXVK [GenVal] 2026-08-19 -- PROBE ONLY, gates nothing yet.
+      //
+      // THE QUESTION. valHash above is the staleness proof, and it is a hash of
+      // the derivation's INPUT BYTES. Producing it costs an XXH64 per captured
+      // cb range over the range's bytes, on every draw, hit or miss -- and it
+      // is only obtainable because captureDrawSnapshot copied those bytes first
+      // (4.29 ms/frame). So the cache pays a per-draw byte copy plus a per-draw
+      // byte hash to avoid a per-draw derivation of similar size. Measured:
+      // serve 2.45 us vs derive 7.2 us, 67% served, and bt_extractXf did not
+      // move -- which is the plan's recorded [U], explained.
+      //
+      // THE CHEAPER PROOF. D3D11Buffer::DiscardSlice() bumps m_contentGen on
+      // every rename, and the snapshot ALREADY records it per binding
+      // (DrawSnapshot::CbBinding::contentGen). Equal generations => the bytes
+      // were never rewritten => the entry is current, without reading a byte.
+      // Four generation words instead of ~640 B through ~20 XXH64 calls.
+      // Its one soundness hazard is Map(WRITE_NO_OVERWRITE), which writes in
+      // place without bumping contentGen -- and [Perf.EntryMapBind] measured
+      // WRITE_NO_OVERWRITE cb=0 in this title, so for cbuffers the generation
+      // is a sound proof here. GetMapGeneration() is the strictly-conservative
+      // variant if that ever stops being true.
+      //
+      // WHY THIS IS A PROBE AND NOT THE SWITCH. Generation is more conservative
+      // than content: a rename that rewrites IDENTICAL bytes hashes the same
+      // (valHash hit) but bumps the generation (genHash miss). At 714 cb
+      // renames/frame against ~1083 draws that population could be large enough
+      // to give back every hit the cheaper proof buys. The 2x2 of
+      // (valHash same) x (genHash same) is the only thing that can tell a
+      // ~3.5 ms win from a wash, so it gets counted before anything is swapped
+      // -- the same publish-then-read order that caught the cbLoc dependency
+      // instead of shipping it.
+      uint64_t genHash;
 
       // ---- PROBE STATE. [Perf.SplitXf.Stale] / entry provenance. ------------
       // Written on every store, read on every stale miss and every FAIL. Kept

@@ -139,7 +139,11 @@ Closure check that proves you have it all:
 
 | tag | file | measures |
 |---|---|---|
-| `[Perf.Entry]` | `d3d11_rtx.cpp` | ms + call count **inside** each immediate-context entry point |
+| `[Perf.Entry]` | `d3d11_rtx.cpp` | ms + call count **inside** each immediate-context entry point. **Prints only the TOP EIGHT** — use `[Perf.EntryCensus]` for the full list |
+| `[Perf.EntryCensus]` | `d3d11_rtx.cpp` (emit) / `d3d11_vanish_diag.h` (counters) | **the Tier 1(b) census.** EVERY non-zero entry point as `net` / `sh` (% of frame wall) / `n` (calls/frame) / `u` (units: indices, vertices, or slots bound) / `KB`. **No milliseconds anywhere on purpose** — shares and counts survive a throttled window, ms do not (§5). Ranked by `net`, not by raw time |
+| — `probe` on that line | same | **read this first.** `ScopedCall` costs two `steady_clock` reads per call and one of them lands inside the span it reports. At ~302,000 `GetData` polls/frame that is tens of ms. `net = sh - probe`. `probeWallPct` in the header is what the whole instrument costs the frame; over 10% and every frame-thread ms in the log, `[Perf.Entry]`'s included, is inflated by it |
+| `[Perf.EntryFam]` | `d3d11_rtx.cpp` | the same census rolled up into `draws` / `maps` / `cbSet` / `srvSet` / `state` / `query` / `copy` / `create` / `other`. **This is the line that picks the fix**: high `net` + low `n` = one expensive call; high `net` + high `n` = cut the call RATE; high `KB` on `maps` = upload path (check `HOST_CACHED` first — R13) |
+| `[Perf.EntryMap]` | `d3d11_rtx.cpp` | buffer `Map` split by `D3D11_MAP`: `WRITE_DISCARD` (the rename) vs `WRITE_NO_OVERWRITE` vs `READ`, each with `n` / `KB` / `avgB`, plus an `imageMaps` count. Bytes are the buffer's `ByteWidth` — the mappable size, not what the game writes, which is unknowable from D3D11 |
 | `[Perf.Gap]` | `d3d11_rtx.cpp` | complement of the above: time **between** entry points, attributed to the previous call. Large `afterQueryEnd` = engine code at the frame boundary |
 | `[Perf.GapQ]` | `d3d11_rtx.cpp` | the `QueryEnd` gap bucket split by query type |
 | `[Perf.Boundary]` | `d3d11_rtx.cpp` | of the TS_DISJOINT gap, how much fell before vs after `Present` |

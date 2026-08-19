@@ -115,6 +115,121 @@ namespace dxvk { namespace vanish_diag {
   inline thread_local uint64_t t_accGapMaxNs              = 0;
   inline thread_local int      t_accGapMaxCall            = 0;
 
+  // NV-DXVK [Perf.EntryCensus] — TIER 1(b): the VOLUME axis.
+  //
+  // WHY THIS EXISTS. [Perf.Entry] answers "how many ms are inside the D3D11
+  // entry points" and nothing else, and on a machine that downclocks 2.4x
+  // (HANDOFF_PERF_2026-08-18 §0.2) an ms is not a usable unit. Half the frame
+  // thread lives in here and the only split that has ever existed is the three
+  // draw entry points vs one undifferentiated "state-setting" bucket. Counts
+  // and bytes are clock-independent, so they read correctly on a throttled
+  // window, and they are what forks the problem:
+  //
+  //   one expensive call     -> high share, low `n`   -> fix the call
+  //   a thousand cheap ones  -> high share, high `n`  -> fix the call RATE
+  //   Map traffic            -> high `KB`             -> fix the upload path
+  //
+  // WHAT A "UNIT" IS, per call id. Deliberately one array rather than five
+  // differently-named ones: every consumer wants "the natural size of this
+  // call", and the census prints the name of the unit next to it.
+  //   Draw / DrawIndexed / DrawInstanced / DrawIdxInst  -> vertices or indices
+  //   Map / UpdateSub / CopySub / CopyRes               -> unused (see g_bytes)
+  //   *SetCB / *SetSRV / IASetVB / OMSetRT              -> slots bound (NumX)
+  // g_bytes is the payload in BYTES and is only populated where a byte count
+  // is knowable at the call site.
+  //
+  // COST: one non-atomic thread-local add per call, on paths that already pay
+  // two steady_clock reads (~70-80 ns) for ScopedCall. Nothing is added to
+  // GetData, which is ~302,000 calls/frame and has no volume to report.
+  extern std::atomic<uint64_t> g_bytes[CALL_COUNT];
+  extern std::atomic<uint64_t> g_units[CALL_COUNT];
+  inline thread_local uint64_t t_accBytes[CALL_COUNT] = {};
+  inline thread_local uint64_t t_accUnits[CALL_COUNT] = {};
+
+  // Frame-thread only, exactly like the time accumulators: these entry points
+  // are on the templated common context and are also reached from the game's
+  // deferred-context workers, whose volume would not belong to the pole.
+  inline void addBytes(const CallId id, const uint64_t n) {
+    if (t_isFrameThread)
+      t_accBytes[id] += n;
+  }
+
+  inline void addUnits(const CallId id, const uint64_t n) {
+    if (t_isFrameThread)
+      t_accUnits[id] += n;
+  }
+
+  // NV-DXVK [Perf.EntryMap]: Map split by D3D11_MAP, because the four kinds are
+  // four different costs and lumping them hides the only actionable one.
+  // WRITE_DISCARD renames the allocation (that is the dropship COLOR1.y
+  // rename, seen from the producing side); WRITE_NO_OVERWRITE does not; READ
+  // can stall on the GPU. Slot 0 is unused so the D3D11_MAP value (1..5)
+  // indexes directly with no translation table to get wrong.
+  constexpr uint32_t kMapKindSlots = 6;
+  extern std::atomic<uint64_t> g_mapCalls[kMapKindSlots];
+  extern std::atomic<uint64_t> g_mapBytes[kMapKindSlots];
+  extern std::atomic<uint64_t> g_mapImageCalls;   // non-buffer Map, bytes unknowable here
+  inline thread_local uint64_t t_accMapCalls[kMapKindSlots] = {};
+  inline thread_local uint64_t t_accMapBytes[kMapKindSlots] = {};
+  inline thread_local uint64_t t_accMapImageCalls           = 0;
+
+  // NV-DXVK [Perf.EntryMap] 2026-08-19: the same Map census split by BIND FLAG,
+  // and this one decides an architecture question rather than describing a cost.
+  //
+  // THE QUESTION. Moving a per-draw consumer (ExtractTransforms) onto a worker
+  // requires the draw to own its inputs. The cheap way to own them is by
+  // REFERENCE -- record (buffer, offset, mapGen) at draw time, read the bytes
+  // later -- instead of the memcpy captureDrawSnapshot pays today. That is only
+  // sound if the slice the draw read is still the slice holding those bytes
+  // when the deferred reader runs.
+  //
+  // Map(WRITE_DISCARD) RENAMES: the game gets a fresh slice and the old bytes
+  // are whatever the allocator does next. So a by-reference capture is sound
+  // exactly when the buffers the derivation reads are NOT being renamed between
+  // the draw and the read. The flat census already says WRITE_DISCARD runs
+  // ~1227 times a frame against ~1341 draws -- about one rename per draw -- but
+  // that aggregate cannot say WHICH buffers, and the answer is opposite for the
+  // two populations:
+  //   renames are mostly VERTEX/INDEX  -> the cbuffers the derivation reads are
+  //                                       stable, by-reference capture is viable
+  //   renames include CONSTANT_BUFFER  -> a reference captured at draw time
+  //                                       reads the LAST draw's bytes at frame
+  //                                       end. Silently wrong transforms, and
+  //                                       the same failure the m_t31ReadCache
+  //                                       note in HANDOFF sec 0.1 already paid
+  //                                       for once on the sibling buffer.
+  // Three buckets, because a buffer can carry several bind flags and the
+  // interesting question is per-role: index 0 = has CONSTANT_BUFFER, 1 = has
+  // VERTEX or INDEX, 2 = everything else (SRV / UAV / staging).
+  constexpr uint32_t kMapBindSlots = 3;
+  extern std::atomic<uint64_t> g_mapBindCalls[kMapKindSlots][kMapBindSlots];
+  extern std::atomic<uint64_t> g_mapBindBytes[kMapKindSlots][kMapBindSlots];
+  inline thread_local uint64_t t_accMapBindCalls[kMapKindSlots][kMapBindSlots] = {};
+  inline thread_local uint64_t t_accMapBindBytes[kMapKindSlots][kMapBindSlots] = {};
+
+  inline constexpr const char* kMapBindNames[kMapBindSlots] = { "cb", "vbib", "other" };
+
+  // mapType is the raw D3D11_MAP; anything out of range folds into slot 0 so a
+  // bad value shows up as an unnamed bucket instead of corrupting a real one.
+  // bindRole is an index into kMapBindNames, classified at the call site where
+  // the D3D11_BIND_* constants are in scope.
+  inline void noteMapBuffer(const uint32_t mapType, const uint64_t bytes,
+                            const uint32_t bindRole) {
+    if (!t_isFrameThread)
+      return;
+    const uint32_t k = (mapType < kMapKindSlots) ? mapType : 0u;
+    t_accMapCalls[k] += 1;
+    t_accMapBytes[k] += bytes;
+    const uint32_t r = (bindRole < kMapBindSlots) ? bindRole : (kMapBindSlots - 1u);
+    t_accMapBindCalls[k][r] += 1;
+    t_accMapBindBytes[k][r] += bytes;
+  }
+
+  inline void noteMapImage() {
+    if (t_isFrameThread)
+      t_accMapImageCalls += 1;
+  }
+
   // Fold this thread's accumulators into the shared atomics. Called at the top
   // of both drains; the second call is a no-op because the locals are zeroed.
   // Defined below, once the [Perf.Gap] globals it touches have been declared.
@@ -239,6 +354,31 @@ namespace dxvk { namespace vanish_diag {
         g_gapCountByCall[i].fetch_add(t_accGapCount[i], std::memory_order_relaxed);
         t_accGapNs[i] = t_accGapCount[i] = 0;
       }
+      // [Perf.EntryCensus]: same fold, same reason - per-call atomics on a path
+      // this hot are what the 2026-08-06 note above measured at ~27 ms/frame.
+      if (t_accBytes[i] || t_accUnits[i]) {
+        g_bytes[i].fetch_add(t_accBytes[i], std::memory_order_relaxed);
+        g_units[i].fetch_add(t_accUnits[i], std::memory_order_relaxed);
+        t_accBytes[i] = t_accUnits[i] = 0;
+      }
+    }
+    for (uint32_t k = 0; k < kMapKindSlots; ++k) {
+      if (t_accMapCalls[k] || t_accMapBytes[k]) {
+        g_mapCalls[k].fetch_add(t_accMapCalls[k], std::memory_order_relaxed);
+        g_mapBytes[k].fetch_add(t_accMapBytes[k], std::memory_order_relaxed);
+        t_accMapCalls[k] = t_accMapBytes[k] = 0;
+      }
+      for (uint32_t r = 0; r < kMapBindSlots; ++r) {
+        if (t_accMapBindCalls[k][r] || t_accMapBindBytes[k][r]) {
+          g_mapBindCalls[k][r].fetch_add(t_accMapBindCalls[k][r], std::memory_order_relaxed);
+          g_mapBindBytes[k][r].fetch_add(t_accMapBindBytes[k][r], std::memory_order_relaxed);
+          t_accMapBindCalls[k][r] = t_accMapBindBytes[k][r] = 0;
+        }
+      }
+    }
+    if (t_accMapImageCalls) {
+      g_mapImageCalls.fetch_add(t_accMapImageCalls, std::memory_order_relaxed);
+      t_accMapImageCalls = 0;
     }
     if (t_accGapMaxNs != 0) {
       uint64_t prev = g_gapMaxNs.load(std::memory_order_relaxed);
@@ -260,6 +400,94 @@ namespace dxvk { namespace vanish_diag {
     }
     outMaxNs   = g_gapMaxNs.exchange(0, std::memory_order_relaxed);
     outMaxCall = g_gapMaxCall.load(std::memory_order_relaxed);
+  }
+
+  // NV-DXVK [Perf.EntryCensus]: drains the volume axis. MUST be called in the
+  // same emit block as drainTimes and AFTER it - drainTimes runs the flush, and
+  // draining volumes on their own would publish a window of counts against a
+  // window of ns that had already been zeroed.
+  inline void drainVolumes(uint64_t outBytes[CALL_COUNT], uint64_t outUnits[CALL_COUNT]) {
+    flushDiagLocals();
+    for (int i = 0; i < CALL_COUNT; ++i) {
+      outBytes[i] = g_bytes[i].exchange(0, std::memory_order_relaxed);
+      outUnits[i] = g_units[i].exchange(0, std::memory_order_relaxed);
+    }
+  }
+
+  inline void drainMapKinds(uint64_t outCalls[kMapKindSlots],
+                            uint64_t outBytes[kMapKindSlots],
+                            uint64_t& outImageCalls,
+                            uint64_t outBindCalls[kMapKindSlots][kMapBindSlots],
+                            uint64_t outBindBytes[kMapKindSlots][kMapBindSlots]) {
+    flushDiagLocals();
+    for (uint32_t k = 0; k < kMapKindSlots; ++k) {
+      outCalls[k] = g_mapCalls[k].exchange(0, std::memory_order_relaxed);
+      outBytes[k] = g_mapBytes[k].exchange(0, std::memory_order_relaxed);
+      for (uint32_t r = 0; r < kMapBindSlots; ++r) {
+        outBindCalls[k][r] = g_mapBindCalls[k][r].exchange(0, std::memory_order_relaxed);
+        outBindBytes[k][r] = g_mapBindBytes[k][r].exchange(0, std::memory_order_relaxed);
+      }
+    }
+    outImageCalls = g_mapImageCalls.exchange(0, std::memory_order_relaxed);
+  }
+
+  // NV-DXVK [Perf.EntryCensus]: the FAMILY a call id rolls up into. The plan's
+  // fork is per-family, not per-call - "Map traffic" is Map+Unmap+UpdateSub
+  // together, and a binder is only interesting against its siblings.
+  enum Family : int {
+    kFamDraw, kFamMap, kFamCbSet, kFamSrvSet, kFamState,
+    kFamQuery, kFamCopy, kFamCreate, kFamOther, kFamCount
+  };
+
+  inline constexpr const char* kFamilyNames[kFamCount] = {
+    "draws", "maps", "cbSet", "srvSet", "state",
+    "query", "copy", "create", "other"
+  };
+
+  inline constexpr Family familyOf(const int id) {
+    switch (id) {
+      case Draw: case DrawIndexed: case DrawInstanced: case DrawIdxInst:
+      case DrawAuto: case DrawIndirect: case DrawIdxIndirect: case Dispatch:
+        return kFamDraw;
+      case Map: case Unmap: case UpdateSub:
+        return kFamMap;
+      case VSSetCB: case PSSetCB:
+        return kFamCbSet;
+      case VSSetSRV: case PSSetSRV:
+        return kFamSrvSet;
+      case SetPredication:
+      case OMSetRT: case OMSetRTUAV: case OMSetBlend: case OMSetDS:
+      case RSSetState: case RSSetVP: case RSSetSR:
+      case IASetIL: case IASetPT: case IASetVB: case IASetIB:
+      case VSSetShader: case PSSetShader:
+        return kFamState;
+      case QueryBegin: case QueryEnd: case GetData:
+        return kFamQuery;
+      case CopySub: case CopyRes: case ResolveSub:
+      case ClearRTV: case ClearDSV: case Discard:
+        return kFamCopy;
+      case CreateTex2D: case DestroyTex2D: case CreateBuf: case DestroyBuf:
+        return kFamCreate;
+      default:
+        return kFamOther;   // ExecCmdList, FinishCmdList, Flush
+    }
+  }
+
+  // The unit name printed next to `u=` for this call id, or nullptr when the
+  // call has no meaningful volume. Keeping this next to familyOf means a new
+  // call id gets a family and a unit in one edit or neither.
+  inline constexpr const char* unitNameOf(const int id) {
+    switch (id) {
+      case Draw: case DrawInstanced:
+        return "vtx";
+      case DrawIndexed: case DrawIdxInst:
+        return "idx";
+      case VSSetCB: case PSSetCB: case VSSetSRV: case PSSetSRV:
+      case IASetVB: case OMSetRT:
+        return "slots";
+      default:
+        return nullptr;
+    }
   }
 
   // Replaces bump() at the entry points worth timing. Still bumps the original

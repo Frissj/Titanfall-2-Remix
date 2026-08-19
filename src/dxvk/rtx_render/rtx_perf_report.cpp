@@ -289,6 +289,27 @@ namespace dxvk {
           Logger::warn("[Perf.Report] HYGIENE  *** [Perf.GpuPass] reported SHIFTED -- "
                        "every GPU per-pass label below is meaningless ***");
         }
+
+        // [Perf.EntryCensus]: the OBSERVER EFFECT, stated up front for the same
+        // reason matNew is. ScopedCall costs two clock reads on every timed
+        // immediate-context call, and TF2 makes hundreds of thousands of them a
+        // frame, so a large probe figure means the frame-thread rows below are
+        // measuring the measurement. This is a comparability gate, not a bug:
+        // the counts and shares on the census line stay valid, the milliseconds
+        // do not.
+        const Read probe = read(Slot::EntryProbeMs, now);
+        if (probe.seen && wall > 0.0) {
+          const double probePct = probe.v * 100.0 / wall;
+          Logger::warn(str::format(
+            "[Perf.Report] HYGIENE  entryCalls=", num(Slot::EntryCallsPerFrame, now, 0),
+            "/frame  mapKB=", num(Slot::EntryMapKbPerFrame, now, 0),
+            "/frame  ScopedCall probe=", fmtF(probe.v, 2), " ms (",
+            fmtF(probePct, 1), "% of frame)",
+            probePct > 10.0
+              ? "   *** THE INSTRUMENT IS >10% OF THE FRAME: frame-thread ms below"
+                " are inflated; use [Perf.EntryCensus] net/shares ***"
+              : ""));
+        }
       }
 
       // ---- 0. the three timelines
@@ -319,6 +340,19 @@ namespace dxvk {
         { 1, "state-setting calls",       Slot::EntryStateMs,        RowKind::kNested },
         { 1, "-> Remix OnDraw* hook",     Slot::DrawEntryOnDrawMs,   RowKind::kNested },
         { 1, "-> device LockContext",     Slot::DrawEntryLockMs,     RowKind::kNested },
+        // [Perf.EntryCensus]: the families inside "state-setting calls".
+        // Counts and bytes for these are on the census line itself; only the
+        // time comes here, because a count in an Ms column would be rescaled
+        // against the wall like everything else in this table.
+        { 1, "  queries (GetData etc)",   Slot::EntryQueryMs,        RowKind::kNested },
+        { 1, "  Map/Unmap/UpdateSub",     Slot::EntryMapMs,          RowKind::kNested },
+        { 1, "  *SetConstantBuffers",     Slot::EntryCbSetMs,        RowKind::kNested },
+        { 1, "  *SetShaderResources",     Slot::EntrySrvSetMs,       RowKind::kNested },
+        { 1, "  copies/clears",           Slot::EntryCopyMs,         RowKind::kNested },
+        // Not a family: this is the ScopedCall instrument's own cost, spread
+        // across every row above (including the draws). Nested for the same
+        // reason they are -- it is already inside EntryTotalMs.
+        { 1, "  of which: probe cost",    Slot::EntryProbeMs,        RowKind::kNested },
         { 0, "between entry points",      Slot::GapTotalMs,          RowKind::kTotal },
         { 1, "afterQueryEnd",             Slot::GapAfterQueryEndMs,  RowKind::kNested },
         { 1, "post-Present engine code",  Slot::BoundaryPostMs,      RowKind::kAltView },

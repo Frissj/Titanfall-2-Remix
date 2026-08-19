@@ -1870,7 +1870,13 @@ namespace dxvk {
           d.baselineKept = kept;
         }
         const bool deficit = d.baselineKept >= 32 && kept * 10u <= d.baselineKept * 9u;
-        if (deficit && d.lastLoggedFid != fid) {
+        // NV-DXVK [Perf] 2026-08-18: GATED on rtx.logGeomDiag. The baseline is a
+        // running MAX, so once any peak frame lands, every ordinary frame after
+        // it reads as a deficit — measured 7041 lines over 789 frames, i.e. it
+        // fires permanently rather than on the vanish event it was built for.
+        // The counters above still update (baseline tracking is kept intact);
+        // only the per-frame formatting + write is gated.
+        if (deficit && d.lastLoggedFid != fid && RtxOptions::logGeomDiag()) {
           d.lastLoggedFid = fid;
           const RtCamera& cam = m_cameraManager.getMainCamera();
           const Vector3 pos = cam.getPosition();
