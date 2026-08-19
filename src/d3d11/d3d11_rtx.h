@@ -4147,6 +4147,42 @@ namespace dxvk {
       uint32_t rawDrawCount = 0;
     };
     void SubmitDrawTail(SubmitDrawTailCtx& c);
+    // NV-DXVK [XfDefer] §5 -- THE DEFERRED HALF, cut at the SECOND SEAM.
+    //
+    // Everything from `m_lastDrawCaptured = true` onward. That line is the last
+    // write to the verdict the entry point returns, so from the next statement
+    // on, the answer the game gets is FIXED and the work behind it can run
+    // anywhere. Cutting HERE rather than at the first seam is what lets
+    // OnDraw*() keep returning a real bool synchronously -- no verdict cell for
+    // the dxvk-cs thread to block on, and no fail-open direction to pick.
+    //
+    // WHY THAT IS ALMOST FREE, measured rather than assumed: xfPostVerdict on
+    // the 2026-08-19 13:31 capture is 13.8 ms/frame of a ~14.8 ms tail. The
+    // verdict costs ~1 ms; everything expensive is behind it.
+    //
+    // Takes the same ctx, and its preamble re-binds the same aliases so the
+    // 7,441 moved lines stay verbatim. It binds ONLY the aliases the moved body
+    // actually uses -- instanceTransform / zEnable / zWriteEnable /
+    // stencilEnabled / isNdcScreenQuad appear zero times past the seam and this
+    // TU builds with werror, where an unused local is an error.
+    void SubmitDrawDeferred(SubmitDrawTailCtx& c);
+
+    // NV-DXVK [XfDefer] §5.1 -- THE ORDERED CHAIN. Defined in d3d11_rtx.cpp.
+    //
+    // ONE thread, draws in order. Not the dxvk-cs stream (it GAINS what the
+    // frame thread loses, so it is past its crossover before it lands: optimum
+    // T~11.1 and worse beyond) and not a per-draw fan-out (that forces a
+    // per-draw carrier prediction, i.e. a heuristic, i.e. unsound -- R24).
+    // One thread taking draws in order preserves the draw N->N+1 carrier chain
+    // by construction, which is what makes the POST-HOC abort sufficient and
+    // why no prediction is needed. The 2026-08-19 log prices that abort at
+    // 4.83% (xfAbort geo=2052 cb=402 on xfRouted=50840).
+    struct XfChain;
+    std::unique_ptr<XfChain> m_xfChain;
+    // Lazily started on the first routed draw; joined from flushGeometryBatch.
+    void xfChainEnsureStarted();
+    void xfChainSubmit(SubmitDrawTailCtx& c);
+    void xfChainJoin();
     // NV-DXVK [engine-post forward]: if the current draw is the host game's
     // final post-process composite (binds CBufEnginePost), harvest its
     // parameters into Remix's post pipeline (bloom/exposure via setDeferred,

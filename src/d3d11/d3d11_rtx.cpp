@@ -11056,6 +11056,27 @@ namespace dxvk {
     return v[0] != '0';
   }();
 
+  // NV-DXVK [XfDefer] §5: THE CHAIN'S MASTER SWITCH. RTX_XF_CHAIN=1.
+  //
+  // Env var, not an RtxOption, for the same reason as the two above:
+  // rtx_options.h is included nearly everywhere and one new entry is a ~20
+  // minute full rebuild. Default OFF, so an unset environment runs exactly the
+  // code it ran before the chain existed -- xfRouteThisDraw is false, the
+  // dispatch arm calls SubmitDrawDeferred inline, and the worker thread is
+  // never even constructed (XfChain is created lazily on the first routed
+  // draw).
+  //
+  // THIS IS INDEPENDENT OF RTX_D3D11_VERDICT_CELLS and must stay that way. The
+  // chain cuts PAST the verdict, so it needs no cell; the two switches address
+  // different designs and turning both on is not "more deferral", it is two
+  // mechanisms racing for the same draws.
+  static const bool s_xfChainEnabled = []() {
+    const char* v = std::getenv("RTX_XF_CHAIN");
+    if (v == nullptr || v[0] == '\0')
+      return false;
+    return v[0] != '0';
+  }();
+
   void D3D11Rtx::beginDrawVerdict() {
     m_curVerdictBlock.reset();
     m_curVerdictIndex = 0;
@@ -26468,11 +26489,31 @@ namespace dxvk {
     }
     PendingDrawSlot() = default;
     ~PendingDrawSlot() { release(); }
-    // Non-copyable and non-movable: exactly one owner, and it is the stack
-    // frame of the draw that created it. Anything that wants the jobs takes
-    // them by std::move out of the individual members, as the append does.
+    // Non-copyable: exactly one owner of the pins at any moment.
     PendingDrawSlot(const PendingDrawSlot&) = delete;
     PendingDrawSlot& operator=(const PendingDrawSlot&) = delete;
+
+    // MOVABLE, and the flags are the whole implementation. §5's chain moves this
+    // whole slot from SubmitDraw's stack into an XfChain::Slot, and none of the
+    // four payloads nulls its own pin on move -- BatchHashJob / BatchBboxJob
+    // hold raw DxvkBuffer* and MatSnapshot is an aggregate whose CbCap::pinned
+    // is a raw pointer the implicit move copies. So the SOURCE must be told it
+    // no longer owns them, or its destructor releases pins the destination is
+    // still using. Clearing the source flags is that telling.
+    //
+    // The destination release() first: an XfChain slot is reused every lap, and
+    // a draw that aborted or early-returned can leave pins behind in it.
+    PendingDrawSlot(PendingDrawSlot&& o) noexcept { adopt(o); }
+    PendingDrawSlot& operator=(PendingDrawSlot&& o) noexcept {
+      if (this != &o) { release(); adopt(o); }
+      return *this;
+    }
+    void adopt(PendingDrawSlot& o) noexcept {
+      hash    = std::move(o.hash);    hasHash    = o.hasHash;    o.hasHash    = false;
+      bbox    = std::move(o.bbox);    hasBbox    = o.hasBbox;    o.hasBbox    = false;
+      skin    = std::move(o.skin);    hasSkin    = o.hasSkin;    o.hasSkin    = false;
+      matSnap = std::move(o.matSnap); hasMatSnap = o.hasMatSnap; o.hasMatSnap = false;
+    }
   };
 
   // NV-DXVK [BatchSubmitDraw]: one collected RT commit. Move-only: it owns a moved
@@ -26542,6 +26583,298 @@ namespace dxvk {
     // to state that is genuinely per-batch.
   };
 
+
+  // ============================================================
+  // ==================================================================
+  // NV-DXVK [XfDefer] §5.1 -- THE ORDERED CHAIN.
+  //
+  // ONE thread, draws in order, streaming. The host was chosen by arithmetic,
+  // not taste (T = ms of deferred half moved off the frame thread):
+  //
+  //   dxvk-cs stream  bottleneck max(57.66-T, 35.49+T) -- it GAINS what the
+  //                   frame thread loses, so the optimum is T~11.1 and it gets
+  //                   WORSE beyond. Past its crossover before it lands.
+  //   ordered worker  bottleneck max(57.66-T, 35.49) -- keeps improving.
+  //   per-draw fanout forces a per-draw carrier prediction => heuristic =>
+  //                   unsound (R24).
+  //
+  // ONE ORDERED THREAD IS WHAT MAKES THE POST-HOC ABORT SUFFICIENT, and that is
+  // the load-bearing property, not the throughput. Draws processed in order
+  // preserve the N->N+1 carrier chain by construction, so nothing has to PREDICT
+  // whether a draw is safe to defer -- it is run, then asked. That is legal here
+  // for the same reason it is illegal for rasterisation: a derivation can be
+  // redone, a drawn pixel cannot. Measured abort rate 4.83%.
+  //
+  // WHAT THIS DELIBERATELY IS NOT: there is no verdict cell and nothing on the
+  // dxvk-cs thread ever waits. The cut is at the SECOND seam, past the last
+  // write to the entry point's return value, so OnDraw*() answers the game
+  // synchronously exactly as it does today. Unreal's RHI makes the same call --
+  // its one stall primitive runs producer->consumer only, is untimed because
+  // what it waits on is already queued, and ships as a red-flagged CSV stat
+  // (RHITStalls). A consumer blocking on a decision a producer has not made yet
+  // is the shape to avoid, not to bound with a timeout.
+  //
+  // THE FRAME THREAD NEVER BLOCKS ON THIS. If the ring is full the draw runs
+  // inline -- degradation, not a stall. Blocking the pole thread to feed a
+  // scheme whose entire purpose is to unblock the pole thread is self-defeating.
+  // ==================================================================
+  struct D3D11Rtx::XfChain {
+    // §5.3: everything the deferred half operates on, owned per draw. dcs/geo/
+    // posBuffer are MOVED in on the frame thread -- SubmitDraw's stack frame is
+    // gone by the time the worker runs, so pointing at it is a dangling read.
+    // DrawCallState is movable (the arena already std::moves it) and it embeds a
+    // RasterGeometry, so both of the others are movable by construction.
+    struct Slot {
+      DrawCallState   dcs;
+      RasterGeometry  geo;
+      RasterBuffer    posBuffer;
+      PendingDrawSlot pend;
+      // The stage clock is a per-draw VALUE here, not the head's cursor by
+      // pointer. markStg bills the interval since the previous mark, and on the
+      // chain "previous" means this draw's head, on another thread. The
+      // accumulators it feeds are thread_local, so a deferred half bills the
+      // WORKER's buckets -- [Perf.SubmitDraw]'s post-seam stages become the
+      // chain's own timings rather than the frame thread's. That is a reporting
+      // change to be aware of when reading the next log, not a defect.
+      std::chrono::steady_clock::time_point tStg {};
+      // The POD ctx fields the moved body actually reads. instanceTransform,
+      // zEnable, zWriteEnable, stencilEnabled and isNdcScreenQuad are absent on
+      // purpose: they occur zero times past the seam.
+      const D3D11RtxSemantic* posSem = nullptr;
+      const D3D11RtxSemantic* biSem  = nullptr;
+      const D3D11RtxSemantic* bwSem  = nullptr;
+      UINT     count = 0, start = 0;
+      INT      base = 0;
+      bool     indexed = false;
+      bool     sBatchDraw = false;
+      uint32_t drawCallId = 0;
+      uint32_t rawDrawCount = 0;
+    };
+
+    // Power of two so the index wrap is a mask. 4096 slots against ~1,114 draws
+    // per frame is roughly 3.7 frames of runway, which is what lets the chain
+    // lag through a burst without the frame thread ever falling back inline.
+    static constexpr uint64_t kSlots = 4096;
+    static constexpr uint64_t kMask  = kSlots - 1;
+
+    D3D11Rtx* self = nullptr;
+    std::vector<Slot> slots;              // allocated once, reused every lap
+
+    // SPSC. Producer owns `published`, consumer owns `consumed`; each is the
+    // only writer of its own line. alignas(64) keeps them off one cache line --
+    // false sharing between the pole thread and the worker on every draw is
+    // exactly the cost this whole exercise is trying to remove.
+    alignas(64) std::atomic<uint64_t> published { 0 };
+    alignas(64) std::atomic<uint64_t> consumed  { 0 };
+    // Only touched when the worker has decided to sleep, so the producer pays a
+    // mutex round trip when the chain is IDLE and never when it is keeping up.
+    alignas(64) std::atomic<bool>     sleeping  { false };
+    // Same trick on the other side: the worker only takes the lock to wake a
+    // joiner that has actually parked. Notifying on every drain would put a
+    // mutex round trip on the chain for every draw it catches up on.
+    alignas(64) std::atomic<bool>     joinerWaiting { false };
+    std::atomic<bool> quit { false };
+    std::mutex              mu;
+    std::condition_variable cv;      // worker waits here
+    std::condition_variable cvDone;  // joiner waits here
+    std::thread             thread;
+
+    // Instrumentation -- atomic and file-scope-equivalent for §9's reason: a
+    // thread_local tally would have the chain fill its own copy and the report
+    // print the frame thread's, i.e. zero.
+    std::atomic<uint64_t> ranOnChain { 0 };
+    std::atomic<uint64_t> ranInlineFull { 0 };   // ring full -> ran inline
+    std::atomic<uint64_t> depthMax { 0 };
+    std::atomic<uint64_t> joinWaitNs { 0 };
+    std::atomic<uint64_t> joinWaits { 0 };
+
+    explicit XfChain(D3D11Rtx* owner) : self(owner) {
+      slots.resize(kSlots);
+      thread = std::thread([this]() { run(); });
+    }
+
+    ~XfChain() {
+      quit.store(true, std::memory_order_release);
+      { std::lock_guard<std::mutex> lk(mu); }
+      cv.notify_all();
+      if (thread.joinable()) thread.join();
+    }
+
+    // Frame thread. True if the draw was handed off; false means the caller must
+    // run it inline (ring full).
+    bool tryPush(uint64_t& outIndex) {
+      const uint64_t w = published.load(std::memory_order_relaxed);
+      const uint64_t c = consumed.load(std::memory_order_acquire);
+      const uint64_t depth = w - c;
+      if (depth >= kSlots)
+        return false;
+      if (depth > depthMax.load(std::memory_order_relaxed))
+        depthMax.store(depth, std::memory_order_relaxed);
+      outIndex = w;
+      return true;
+    }
+
+    // Frame thread, AFTER the slot at `index` is filled. The release store is
+    // what publishes every preceding write in this slot to the worker.
+    void commit(uint64_t index) {
+      published.store(index + 1, std::memory_order_release);
+      if (sleeping.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lk(mu);
+        cv.notify_one();
+      }
+    }
+
+    void run();
+
+    // Frame thread, at EndFrame. Streaming means this should find the chain
+    // already drained; the wait is the exception, and it is counted so a log can
+    // say whether §5.2's "EndFrame merely JOINS" actually held.
+    void join() {
+      const uint64_t w = published.load(std::memory_order_relaxed);
+      if (consumed.load(std::memory_order_acquire) >= w)
+        return;
+      const auto t0 = std::chrono::steady_clock::now();
+      {
+        std::unique_lock<std::mutex> lk(mu);
+        joinerWaiting.store(true, std::memory_order_release);
+        cvDone.wait(lk, [this, w]() {
+          return consumed.load(std::memory_order_acquire) >= w;
+        });
+        joinerWaiting.store(false, std::memory_order_release);
+      }
+      joinWaitNs.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
+      joinWaits.fetch_add(1, std::memory_order_relaxed);
+    }
+  };
+
+  // The chain's thread body. Spins briefly before parking, because draws arrive
+  // in bursts of ~1,100 with sub-microsecond gaps -- parking between them would
+  // pay a futex wake per draw and hand the pole thread the mutex cost that
+  // `sleeping` exists to avoid.
+  void D3D11Rtx::XfChain::run() {
+    static constexpr uint32_t kSpinBudget = 2048;
+    uint32_t spins = 0;
+    for (;;) {
+      const uint64_t c = consumed.load(std::memory_order_relaxed);
+      const uint64_t w = published.load(std::memory_order_acquire);
+
+      if (c == w) {
+        if (quit.load(std::memory_order_acquire))
+          return;
+        // A joiner may be parked on a queue that is already drained.
+        if (joinerWaiting.load(std::memory_order_acquire)) {
+          std::lock_guard<std::mutex> lk(mu);
+          cvDone.notify_all();
+        }
+        if (++spins < kSpinBudget) {
+          std::this_thread::yield();
+          continue;
+        }
+        spins = 0;
+        std::unique_lock<std::mutex> lk(mu);
+        sleeping.store(true, std::memory_order_release);
+        cv.wait(lk, [this]() {
+          return quit.load(std::memory_order_acquire)
+              || published.load(std::memory_order_acquire)
+                   != consumed.load(std::memory_order_relaxed);
+        });
+        sleeping.store(false, std::memory_order_release);
+        continue;
+      }
+
+      spins = 0;
+      Slot& s = slots[c & kMask];
+
+      // Rebuild the ctx over the SLOT's objects, not SubmitDraw's stack -- that
+      // frame returned long ago. Same field set the seam fills, which is why
+      // both sites must keep answering the routing question identically.
+      SubmitDrawTailCtx ctx { };
+      ctx.dcs              = &s.dcs;
+      ctx.geo              = &s.geo;
+      ctx.posBuffer        = &s.posBuffer;
+      ctx.posSem           = s.posSem;
+      ctx.biSem            = s.biSem;
+      ctx.bwSem            = s.bwSem;
+      ctx.tStg             = &s.tStg;
+      ctx.count            = s.count;
+      ctx.start            = s.start;
+      ctx.base             = s.base;
+      ctx.indexed          = s.indexed;
+      ctx.sBatchDraw       = s.sBatchDraw;
+      ctx.pend             = &s.pend;
+      ctx.routed           = true;   // B3: appends to the staged arena
+      ctx.drawCallIdPreset = true;   // never touches m_drawCallID from here
+      ctx.drawCallId       = s.drawCallId;
+      ctx.rawDrawCount     = s.rawDrawCount;
+
+      // THE DEFERRED SCOPE. This is what makes xfLiveState() hand back the empty
+      // context instead of the live one, and xfMayWriteShared() refuse. RAII
+      // because the moved body has many early returns and one throw would
+      // otherwise leave every later draw on this thread reading live state.
+      struct ScopeGuard {
+        ScopeGuard()  { s_xfDeferExecuting = true;  }
+        ~ScopeGuard() { s_xfDeferExecuting = false; }
+      } guard;
+
+      self->SubmitDrawDeferred(ctx);
+
+      ranOnChain.fetch_add(1, std::memory_order_relaxed);
+      // Release: everything this draw wrote into the staged arena is visible to
+      // the frame thread once it observes the advance. That store IS the
+      // happens-before the B3 merge relies on when it reads `staged` unlocked.
+      consumed.store(c + 1, std::memory_order_release);
+
+      if (c + 1 == published.load(std::memory_order_acquire)
+          && joinerWaiting.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lk(mu);
+        cvDone.notify_all();
+      }
+    }
+  }
+
+  void D3D11Rtx::xfChainEnsureStarted() {
+    if (m_xfChain == nullptr)
+      m_xfChain = std::make_unique<XfChain>(this);
+  }
+
+  // Frame thread. Moves this draw into a slot and publishes it. Returns without
+  // publishing if the ring is full, and the caller then runs the draw inline --
+  // see the header block on why the pole thread must never wait here.
+  void D3D11Rtx::xfChainSubmit(SubmitDrawTailCtx& c) {
+    xfChainEnsureStarted();
+    uint64_t idx = 0;
+    if (!m_xfChain->tryPush(idx)) {
+      m_xfChain->ranInlineFull.fetch_add(1, std::memory_order_relaxed);
+      SubmitDrawDeferred(c);   // graceful degradation, still in draw order
+      return;
+    }
+    XfChain::Slot& s = m_xfChain->slots[idx & XfChain::kMask];
+    // MOVES, not copies. dcs is ~1 KB of vectors and Rc<>s and the arena already
+    // moves it one stage later; geo and posBuffer ride inside the same object
+    // graph. A copy here would hand back more than the deferral saves.
+    s.dcs          = std::move(*c.dcs);
+    s.geo          = std::move(*c.geo);
+    s.posBuffer    = std::move(*c.posBuffer);
+    s.pend         = std::move(*c.pend);
+    s.tStg         = *c.tStg;
+    s.posSem       = c.posSem;
+    s.biSem        = c.biSem;
+    s.bwSem        = c.bwSem;
+    s.count        = c.count;
+    s.start        = c.start;
+    s.base         = c.base;
+    s.indexed      = c.indexed;
+    s.sBatchDraw   = c.sBatchDraw;
+    s.drawCallId   = c.drawCallId;
+    s.rawDrawCount = c.rawDrawCount;
+    m_xfChain->commit(idx);
+  }
+
+  void D3D11Rtx::xfChainJoin() {
+    if (m_xfChain != nullptr)
+      m_xfChain->join();
+  }
   // NV-DXVK [BatchSubmitDraw]: out-of-line dtor so unique_ptr<GeometryBatchArena>
   // is destroyed here, where GeometryBatchArena (and DrawWorkItem/MatSnapshot) are
   // complete types. The arena is empty in steady state (drained every frame by
@@ -26571,7 +26904,6 @@ namespace dxvk {
     }
   }
 
-  // ============================================================
   // NV-DXVK [BatchJoin]: watchdog for flushGeometryBatch's worker join.
   //
   // WHY THIS EXISTS: a live stack sample of the game's frame thread during the
@@ -31254,6 +31586,18 @@ namespace dxvk {
 
   void D3D11Rtx::flushGeometryBatch() {
     pinDeferVerifyFrame();
+    // [XfDefer] §5.2/§5.4: DRAIN THE CHAIN FIRST. This is the happens-before the
+    // B3 merge depends on -- it reads `staged` without a lock, which is only
+    // legal once every chain write is complete and visible. Ordering it here,
+    // above the emptiness test, also means a frame where every captured draw
+    // routed cannot return early with its work still in flight.
+    //
+    // If §5.2 held, this costs nothing: the chain started as the first routed
+    // draw landed and has had the whole draw stream plus ~23.6 ms of engine
+    // code between entry points to keep up, so EndFrame merely JOINS a chain
+    // that is already done. joinWaitNs/joinWaits are there to say whether that
+    // is actually true rather than assumed.
+    xfChainJoin();
     // [XfDefer] B3: `staged` counts toward emptiness. A frame in which every
     // captured draw routed would have an empty `items` and a full `staged`, and
     // the old guard would have returned and silently dropped the whole frame.
@@ -40245,7 +40589,24 @@ namespace dxvk {
     // AND NOTE WHAT IS STILL UNPROVEN: none of B1-B3 has ever executed with a
     // routed draw. They are correct-by-construction and measured only as no-ops,
     // so the first run with this true is a bring-up, not a regression test.
-    const bool xfRouteThisDraw = false;
+    // [XfDefer] §5: THE GATE IS LIVE. Env var rather than an RtxOption because
+    // rtx_options.h is included nearly everywhere and a new entry costs a ~20
+    // minute full rebuild -- same reason RTX_D3D11_SUBMARK and
+    // RTX_D3D11_VERDICT_CELLS are env vars. Default OFF: with it unset this is
+    // the `false` it has always been, and every path below takes the branch it
+    // takes today.
+    //
+    // safeToDefer() IS STILL THE LIMITER. This only asks whether the chain is
+    // ENABLED; xfDeferShouldRoute() is what asks whether THIS draw may go, and
+    // the post-hoc abort is what catches it when the answer was wrong.
+    // Reads the record's CACHED verdict rather than re-calling the gate:
+    // xfDeferShouldRoute(s) already ran at capture and stored deferRouted, and
+    // two sites evaluating the same predicate is how they come to disagree.
+    // No record (or an invalid one) means inline -- the safe direction.
+    const bool xfRouteThisDraw = s_xfChainEnabled
+        && m_drawSnapValid
+        && m_drawSnapCur != nullptr
+        && m_drawSnapCur->deferRouted;
     SubmitDrawTailCtx xfTail { };
     xfTail.dcs               = &dcs;
     xfTail.geo               = &geo;
@@ -40348,27 +40709,23 @@ namespace dxvk {
   // and keeps the stage boundaries measuring exactly what they measured before.
   // ==================================================================
   void D3D11Rtx::SubmitDrawTail(SubmitDrawTailCtx& c) {
+    // [XfDefer] §5: PRUNED BY THE SPLIT, and the pruning is not cosmetic. This
+    // TU builds with werror, so a binding whose only readers moved into
+    // SubmitDrawDeferred is now an ERROR here, not a warning. posBuffer, biSem,
+    // bwSem, sBatchDraw and pend are bound in the deferred half instead --
+    // verified by counting uses on each side of the seam, not by eye.
     DrawCallState&  dcs       = *c.dcs;
     RasterGeometry& geo       = *c.geo;
-    RasterBuffer&   posBuffer = *c.posBuffer;
     const D3D11RtxSemantic* const posSem = c.posSem;
-    const D3D11RtxSemantic* const biSem  = c.biSem;
-    const D3D11RtxSemantic* const bwSem  = c.bwSem;
     const Matrix4* const instanceTransform = c.instanceTransform;
     const UINT count   = c.count;
     const UINT start   = c.start;
     const INT  base    = c.base;
     const bool indexed = c.indexed;
-    const bool sBatchDraw      = c.sBatchDraw;
     const bool zEnable         = c.zEnable;
     const bool zWriteEnable    = c.zWriteEnable;
     const bool stencilEnabled  = c.stencilEnabled;
     const bool isNdcScreenQuad = c.isNdcScreenQuad;
-    // [XfDefer] B1: BY REFERENCE, same trick as dcs/geo/posBuffer above -- the
-    // three capture sites in the moved body keep reading a bare name and stay
-    // verbatim. Points at THIS draw's stack slot in SubmitDraw, never at the
-    // arena, which is the entire content of the fix.
-    PendingDrawSlot& pend = *c.pend;
     // BY REFERENCE, and this one matters. markStg bills the interval since the
     // PREVIOUS stage mark, so the cursor has to be the head's own. A copy would
     // make the first stage below bill from the wrong instant and shift every
@@ -40453,20 +40810,9 @@ namespace dxvk {
       markStg(acc, max);
       }
     };
-
-    auto sdStallMark = [](int seg) {
-      if (!s_sdStallSampleActive) {
-        return;
-      }
-      uint64_t cyc = 0;
-      QueryThreadCycleTime(GetCurrentThread(), &cyc);
-      const auto now = std::chrono::steady_clock::now();
-      s_sdStat.segCyc[seg] += int64_t(cyc - s_sdStallLastCyc);
-      s_sdStat.segWallUs[seg] += std::chrono::duration_cast<std::chrono::microseconds>(
-        now - s_sdStallLastWall).count();
-      s_sdStallLastCyc = cyc;
-      s_sdStallLastWall = now;
-    };
+    // [XfDefer] §5: sdStallMark is NOT reconstructed here -- all five of its
+    // call sites moved into SubmitDrawDeferred, so a copy in this half would be
+    // an unused local and this TU builds with werror.
 
     // ==================================================================
     // NV-DXVK [Perf.SplitXf] 2026-08-12 -- THE OPTIMISATION PLAN Phase 3.
@@ -46149,6 +46495,133 @@ namespace dxvk {
     // VERDICT DEPENDENCY IS BROKEN" in d3d11_rtx.h.
     // ==================================================================
     m_lastDrawCaptured   = true;  // Signal caller to skip D3D11 rasterization
+    // ==================================================================
+    // [XfDefer] §5 -- THE DISPATCH ARM. The verdict above is final, so from
+    // here on the work can run anywhere and the entry point is unaffected.
+    //
+    // c.routed was decided at the FIRST seam by the same named local that
+    // allocated this draw's ID, so the ID order and the chain order are the
+    // one question answered once. An unrouted draw calls straight through and
+    // its stack is identical to before this split.
+    //
+    // xfChainSubmit falls back to running inline when the ring is full, so
+    // this arm cannot block the frame thread -- see the XfChain header block.
+    // ==================================================================
+    if (c.routed)
+      xfChainSubmit(c);
+    else
+      SubmitDrawDeferred(c);
+  }
+
+  // ==================================================================
+  // NV-DXVK [XfDefer] §5 -- THE DEFERRED HALF. MOVED VERBATIM: not one line of
+  // the body below was edited by the extraction, which is what makes the diff
+  // reviewable at 7,441 lines.
+  //
+  // WHY THE CUT IS HERE. The statement just above this function --
+  // `m_lastDrawCaptured = true` -- is the last write to the value OnDraw*()
+  // returns to the game. Everything from this point on is behind a decision
+  // that has already been made, so deferring it needs no promise, no verdict
+  // cell, and nothing on the dxvk-cs thread that waits. Measured: xfPostVerdict
+  // is 13.8 ms/frame of a ~14.8 ms tail, so cutting after the verdict rather
+  // than before it costs about 1 ms and removes the entire failure surface.
+  //
+  // THE PREAMBLE BINDS ONLY WHAT THE BODY USES. instanceTransform, zEnable,
+  // zWriteEnable, stencilEnabled and isNdcScreenQuad occur ZERO times below and
+  // are deliberately absent: this TU builds with werror, where an unused local
+  // is an error rather than a warning. Verified by count, not by eye.
+  //
+  // THE THREE TIMING LAMBDAS ARE RECONSTRUCTED, not shared -- the same call
+  // §1.1 already made for sdStallMark. They are the ONLY things besides the ctx
+  // that crossed this seam (drawCamPos and splitHandled do not), and all three
+  // close over tStg (a ctx field) plus file-scope statics, so both copies bind
+  // the same objects.
+  //
+  // tStg IS THE SLOT'S OWN CURSOR ON THE CHAIN, not the head's. markStg bills
+  // the interval since the previous mark and the accumulators are thread_local,
+  // so on a routed draw the post-seam stages of [Perf.SubmitDraw] become the
+  // CHAIN's timings. That is a reporting change to expect in the next log, not
+  // a defect.
+  // ==================================================================
+  void D3D11Rtx::SubmitDrawDeferred(SubmitDrawTailCtx& c) {
+    DrawCallState&  dcs       = *c.dcs;
+    RasterGeometry& geo       = *c.geo;
+    RasterBuffer&   posBuffer = *c.posBuffer;
+    const D3D11RtxSemantic* const posSem = c.posSem;
+    const D3D11RtxSemantic* const biSem  = c.biSem;
+    const D3D11RtxSemantic* const bwSem  = c.bwSem;
+    const UINT count   = c.count;
+    const UINT start   = c.start;
+    const INT  base    = c.base;
+    const bool indexed = c.indexed;
+    const bool sBatchDraw = c.sBatchDraw;
+    PendingDrawSlot& pend = *c.pend;
+    const uint32_t xfDrawCallId   = c.drawCallId;
+    const uint32_t xfRawDrawCount = c.rawDrawCount;
+    auto& tStg = *c.tStg;
+    auto markStg = [&tStg, this](int64_t& acc, int64_t& max) -> int64_t {
+      // [Perf.MarksCompileOut]: discards the whole body, clock read included.
+      // The (void) casts are not decoration: this TU builds with werror=true,
+      // and at 0 the taken branch touches neither the parameters nor the
+      // captures, which is exactly what unused-parameter / unused-capture
+      // diagnostics fire on. Cheaper than discovering it after a full rebuild.
+      if constexpr (!kRtxPerfMarks) {
+        (void) acc; (void) max; (void) tStg; (void) this;
+        return 0;
+      } else {
+      // Runtime half: RTX_PERF_MARKS=0. Before the clock read, so what remains
+      // when marks are off is this branch and nothing else.
+      if (!s_perfMarksEnabled)
+        return 0;
+      const auto now = std::chrono::steady_clock::now();
+      const int64_t dNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now - tStg).count();
+      acc += dNs;
+      if (dNs > max) max = dNs;
+      tStg = now;
+      // NV-DXVK [Perf.StageDep]: every stage boundary is already here, so the
+      // census hooks in HERE rather than at 21 call sites -- no call-site edits,
+      // and a stage added later is covered the day it is added. `&acc` is the
+      // stage's identity. s_sdepSampled is false whenever the probe is off, so
+      // the cost in that case is one predictable branch.
+      if (s_sdepSampled) {
+        uint64_t sdepNow[kSdepGroupCount];
+        stageDepCarrierGroups(sdepNow);
+        stageDepMark(&acc, sdepNow);
+        // Re-stamp AFTER hashing so the probe's own cost is not billed to the
+        // next stage. Without this the census would inflate exactly the stage
+        // timings the rest of the report is read from.
+        tStg = std::chrono::steady_clock::now();
+      }
+      return dNs;
+      }  // if constexpr (kRtxPerfMarks)
+    };
+
+    auto markSub = [&tStg, &markStg](int64_t& acc, int64_t& max) {
+      // [Perf.MarksCompileOut]: markStg is already a no-op, but return before
+      // even reading the env-var flag so nothing of markSub survives either.
+      if constexpr (!kRtxPerfMarks) {
+        (void) acc; (void) max; (void) tStg; (void) markStg;
+        return;
+      } else {
+      if (!s_submitDrawSubMarkers)
+        return;
+      markStg(acc, max);
+      }
+    };
+
+    auto sdStallMark = [](int seg) {
+      if (!s_sdStallSampleActive) {
+        return;
+      }
+      uint64_t cyc = 0;
+      QueryThreadCycleTime(GetCurrentThread(), &cyc);
+      const auto now = std::chrono::steady_clock::now();
+      s_sdStat.segCyc[seg] += int64_t(cyc - s_sdStallLastCyc);
+      s_sdStat.segWallUs[seg] += std::chrono::duration_cast<std::chrono::microseconds>(
+        now - s_sdStallLastWall).count();
+      s_sdStallLastCyc = cyc;
+      s_sdStallLastWall = now;
+    };
     // Opens the post-verdict measurement. Declared HERE so its scope is exactly
     // the deferrable region, and destructor-based so the region's many early
     // returns are all counted. See the accumulator declarations for why a
