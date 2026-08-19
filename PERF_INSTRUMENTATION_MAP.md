@@ -253,6 +253,24 @@ These answer "is optimisation X worth building" **before** you build it. All def
 | `[Phase0]` / `[Phase0.Summary]` / `[Phase0.MultiMode]` | `rtx.logPhase0Descriptor` | is the per-VS layout bounded and stable enough for GPU-driven injection |
 | `[Phase2]` / `[Phase2.MissVS]` | `rtx.capturePhase2` | per-draw capture-record completeness vs injected draws |
 
+#### 3i-1. `[XfDefer]` step 1/2 — registered 2026-08-19
+
+All on `[Perf.Report]`, all unconditional (they are counters, not clock reads, so
+they do **not** scale with `clkNs` — R21 does not apply).
+
+| field | answers |
+|---|---|
+| `xt_locAgree` / `xt_locDis` | does `DrawSnapshot::cbLoc` (the per-VS location recorded at capture) still equal the live `sVsCbLocCache` entry at the instant the derivation reads it. **`xt_locDis` must be 0 before setting `rtx.xfDeferSeedCbLocFromRecord`** — non-zero means something writes that map between capture and the override and it has to be found, not tolerated |
+| `xt_negAgree` / `xt_negDis` | the same question for the projection neg-cache TTL verdict. Split from the location deliberately: the TTL flips on **elapsed frames**, so folding them would let a TTL boundary read as a location disagreement |
+| `xt_locFromRec` | the population the record-seed actually served. Stays 0 while the flag is off, so `xt_locDis=0` with `xt_locFromRec=0` is the **control**, not a result |
+| `sharedCarrierVs` / `sharedDrawsIn` | the shader-identity partition re-measured against `wroteSharedCarrier()` instead of `wroteCarrier()`. **The go/no-go for routing.** `drawsInCarrierVs`/`drawsSeen` beside it is the CONTROL — it includes `kSdepCbLoc`, which is 88% of all carrier moves and thread-private since the members became `static thread_local`. If `sharedDrawsIn/drawsSeen` collapses against it, HANDOFF_XFDEFER §0.1's "partition is dead" verdict does not survive the step-2 change |
+| `sharedEscape` | draws the shader gate would have PASSED that then moved shared carrier state. **Must be 0.** There is no abort for this axis — on a worker the write has already landed by the time it is detectable |
+
+Acceptance for the step-1 key change itself is on the existing `[Perf.SplitXf]`
+line: `serve%` up and `miss{objStale}` down, with `FAIL`, `FAILcarrier` and
+`REPLAYFAIL` all still 0. `rtx.splitTransformCbLocResolved False` restores the
+old key exactly, so the before/after pair can be taken in one session.
+
 ---
 
 ## 4. GATES

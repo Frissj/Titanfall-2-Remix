@@ -9809,6 +9809,42 @@ namespace dxvk {
   // refuse. Per-window rates, so they clear with the window -- unlike the two
   // sets above, which are cumulative populations.
   static thread_local uint32_t s_xfDrawsInCarrierVs = 0, s_xfDrawsSeen = 0;
+  // ==================================================================
+  // NV-DXVK [XfDefer] 2026-08-19 -- THE SAME PARTITION, MEASURED WITH cbLoc
+  // TAKEN OUT. THIS IS THE NUMBER THAT DECIDES WHETHER ROUTING CAN SHIP.
+  //
+  // HANDOFF_XFDEFER §0.1 records "partition the deferral on shader identity" as
+  // DEAD, on carrierVs=37 of everVs=76 and drawsInCarrierVs/drawsSeen = 89%.
+  // That verdict is CORRECT FOR THE NUMBER IT WAS TAKEN ON and does not survive
+  // the step-2 change, because both counters were fed by wroteCarrier(), which
+  // includes kSdepCbLoc -- 88% of all carrier moves and now thread-private. A
+  // shader tainted only by cbLoc is not tainted at all for this question.
+  //
+  // So this pair re-asks it against wroteSharedCarrier(). Read the two side by
+  // side on [Perf.Report]:
+  //   sharedDrawsIn/drawsSeen still ~89%  -> the partition really is dead, the
+  //       tainted shaders are the bulk of the frame, and routing needs
+  //       record-and-replay for kSdepCam rather than a shader gate.
+  //   sharedDrawsIn/drawsSeen collapses   -> the 89% was cbLoc all along, the
+  //       partition is alive, and rtx.xfDeferRoute is safe to turn on.
+  // Do not re-derive either conclusion from the old pair; it is measuring a
+  // different predicate and will keep saying 89%.
+  //
+  // MEMBERSHIP IS STILL TESTED BEFORE THE INSERT, same rule and same reason as
+  // the pair above: a partition gate decides on the set as learned SO FAR, so a
+  // shader's first shared-carrier draw is one the gate would have let through.
+  // Counting it as already-known would overstate what the partition catches.
+  static thread_local std::unordered_set<uint64_t> s_xfSharedCarrierVsIl;
+  static thread_local uint32_t s_xfDrawsInSharedCarrierVs = 0;
+  // THE CORRECTNESS COUNTER FOR ROUTING, and it is not the same as a
+  // misprediction. It counts draws the shader gate PASSED that then moved a
+  // shared carrier anyway -- i.e. a write a worker would have made to state
+  // another thread reads. It must be 0 over a long window before
+  // rtx.xfDeferRoute is anything but a measurement. Unlike the geo/cb axes
+  // there is no abort for this one: the write has already happened by the time
+  // it is detectable, which is exactly why the gate has to be a learned set and
+  // not a per-draw prediction that is allowed to miss.
+  static thread_local uint32_t s_xfSharedEscape = 0;
   // Billed the same way the eligibility split was: re-using the interval
   // markStg already computed, no extra clock read. This is what replaces
   // xfElig/xfElig3 as the thing worth reading once the deferral is live --
@@ -10013,6 +10049,29 @@ namespace dxvk {
   // known offset and succeeds on the first try.
   static thread_local uint64_t s_perfXtVsLocCacheHits   = 0;
   static thread_local uint64_t s_perfXtVsLocCacheMisses = 0;
+  // NV-DXVK [XfDefer] 2026-08-19 -- STEP 2b's ACCEPTANCE TEST, and it is
+  // deliberately a THREE-way split rather than a pass/fail bool.
+  //
+  //   agree/disagree  counted on every draw where BOTH the record and the live
+  //                   per-VS entry have a location. This is the claim "seeding
+  //                   from the record is a no-op on the frame thread", measured
+  //                   with the behaviour still OFF. disagree must be 0 before
+  //                   rtx.xfDeferSeedCbLocFromRecord is turned on; non-zero
+  //                   means something writes sVsCbLocCache between capture and
+  //                   the override and it has to be found, not tolerated.
+  //   fromRecord      counted only when the seed actually fired, so the two
+  //                   populations can never be confused for one another -- the
+  //                   mistake R20 is about, in its other form.
+  static thread_local uint64_t s_xtLocRecAgree    = 0;
+  static thread_local uint64_t s_xtLocRecDisagree = 0;
+  static thread_local uint64_t s_xtLocFromRecord  = 0;
+  // Same pair for the negative cache. Split from the location because they are
+  // different facts with different lifetimes: a location is written once and
+  // then stable, while the neg stamp flips on ELAPSED FRAMES and is exactly the
+  // input the splitTransformObjKeyMask bit 4194304 block exists for. Folding
+  // them would let a TTL boundary read as a location disagreement.
+  static thread_local uint64_t s_xtNegRecAgree    = 0;
+  static thread_local uint64_t s_xtNegRecDisagree = 0;
   static thread_local int64_t s_perfXtSrcFallbackAcc = 0, s_perfXtSrcFallbackMax = 0;
   // NV-DXVK [SdStall follow-up]: xt_srcFb sub-split. The segment probe proved
   // xform is pure CPU; xt_srcFb (~28us/draw) is its biggest slice. Split into
@@ -16374,6 +16433,11 @@ namespace dxvk {
 
         DrawSnapshot* snap = self->m_drawSnapCur;
         bool elig = false, carrierMoved = false;
+        // [XfDefer] the SHARED half of carrierMoved -- see
+        // DrawSnapshot::wroteSharedCarrier and kSdepSharedMask. Kept as its own
+        // local rather than recomputed at each use so the census, the escape
+        // counter and the report all read one value taken at one instant.
+        bool sharedMoved = false;
         // Axis 1 alone (content pure + layout resolved + not overflowed),
         // BEFORE the carrier gate, and the per-group move mask. Kept as
         // locals so the tally below can attribute the pure-but-not-eligible
@@ -16408,6 +16472,7 @@ namespace dxvk {
           }
           snap->carrierMask = cmask;
           carrierMoved = snap->wroteCarrier();
+          sharedMoved  = snap->wroteSharedCarrier();
           cbSafe = snap->cbSafeToDefer();
           // THE NUMBER THAT DECIDES WHETHER DEFERRAL IS WORTH BUILDING.
           // Evaluated here, after the writes above, because safeToDefer()
@@ -16473,9 +16538,28 @@ namespace dxvk {
             ++s_xfDrawsInCarrierVs;
           ++s_xfDrawsSeen;
 
+          // [XfDefer] THE SAME PARTITION WITH cbLoc EXCLUDED. The pair above
+          // answers a question about a gate nothing will ship; this one answers
+          // it about the gate that would. Same score-then-store order, same
+          // shared denominator (s_xfDrawsSeen), so the two percentages are
+          // directly comparable and the difference IS what cbLoc was costing.
+          const bool xfSharedKnown =
+              s_xfSharedCarrierVsIl.find(s_vkVsIlCur) != s_xfSharedCarrierVsIl.end();
+          if (xfSharedKnown)
+            ++s_xfDrawsInSharedCarrierVs;
+          // THE ESCAPE. The shader gate would have PASSED this draw (it is not
+          // in the tainted set yet) and the derivation then moved shared state.
+          // On a worker that write has already landed by the time this line
+          // runs, so this is not an abort -- it is the count of times the gate
+          // was wrong, and it is the number that has to be 0.
+          else if (sharedMoved)
+            ++s_xfSharedEscape;
+
           s_xfEverVsIl.insert(s_vkVsIlCur);
           if (carrierMoved)
             s_xfCarrierVsIl.insert(s_vkVsIlCur);
+          if (sharedMoved)
+            s_xfSharedCarrierVsIl.insert(s_vkVsIlCur);
 
           const bool actual = s_xtElig3Last;
           if (s_xfPredCur == UINT8_MAX) {
@@ -18935,7 +19019,72 @@ namespace dxvk {
     // resolved once per draw and shared by both consumers, so a full-path draw
     // now does ONE hash lookup where it used to do two (locations + neg-cache
     // were separate maps keyed by the same pointer).
-    if (xtVsLoc != nullptr && xtVsLoc->haveLoc) {
+    // ==================================================================
+    // NV-DXVK [XfDefer] 2026-08-19 -- STEP 2b: THE LOCATION COMES FROM THE
+    // RECORD WHEN THERE IS ONE.
+    //
+    // THE PROBLEM THREAD-LOCAL MEMBERS ALONE DO NOT SOLVE. sVsCbLocCache is
+    // `static thread_local`, so a worker deriving a deferred draw reads ITS
+    // thread's map -- cold on the first sighting of every shader, and warmed by
+    // whatever draws that worker happened to get. The derivation would then
+    // depend on the worker's history, which is the same order dependence the
+    // whole step is removing, moved rather than fixed.
+    //
+    // THE RECORD ALREADY HAS THE ANSWER. captureDrawSnapshot resolves this
+    // exact entry on the FRAME thread, in this draw's own SubmitDraw, and stores
+    // it as DrawSnapshot::cbLoc -- the same lookup, no second map probe. Seeding
+    // from it makes the derivation a pure function of the record on any thread,
+    // which is the property every other converted consumer in this function
+    // already has and the one deferral needs.
+    //
+    // ON THE FRAME THREAD THIS IS A NO-OP, AND THAT IS A MEASURED CLAIM, NOT AN
+    // ASSERTION. Same map, same entry, microseconds apart, and nothing writes
+    // sVsCbLocCache between capture and here (the only writer is the write-back
+    // at the tail of THIS function). xtLocRecDisagree counts the draws where the
+    // record and the live entry differ field for field; read it on [Perf.VsLocCache]
+    // BEFORE turning the behaviour on. Non-zero means something does write that
+    // map in between and the seed must not ship until it is identified.
+    //
+    // DEFAULT OFF for that reason -- the counter is unconditional, the
+    // behaviour is not. R20's rule, applied to a seed instead of a predictor.
+    //
+    // AND IT IS NOT ATTEMPT 3. The two reverted attempts (sentinel seed, then a
+    // frame-scoped hint) both changed what an UNRESOLVED draw holds and so cut
+    // the bootstrap borrow. This changes nothing for an unresolved draw: haveLoc
+    // false in the record falls straight through to the identical live path
+    // below, and the borrow is untouched. It only substitutes one copy of a
+    // resolved location for another copy of the same location.
+    const DrawSnapshot* xtSnapLoc = drawSnap();
+    const bool xtRecLocHave = (xtSnapLoc != nullptr)
+                           && (xtSnapLoc->cbLoc.haveLoc != 0u);
+    if (xtRecLocHave && xtVsLoc != nullptr && xtVsLoc->haveLoc) {
+      // THE ACCEPTANCE TEST. Compared field for field rather than by hashing
+      // the pair, so a disagreement can be printed as a value instead of as a
+      // bit -- the same reason carrierGrp is per group and not a fold.
+      const auto& rl = xtSnapLoc->cbLoc;
+      if (rl.projSlot   != xtVsLoc->projSlot
+       || rl.projOffset != static_cast<uint64_t>(xtVsLoc->projOffset)
+       || rl.projStage  != xtVsLoc->projStage
+       || rl.viewSlot   != xtVsLoc->viewSlot
+       || rl.viewOffset != static_cast<uint64_t>(xtVsLoc->viewOffset)
+       || rl.viewStage  != xtVsLoc->viewStage
+       || (rl.columnMajor != 0u) != xtVsLoc->columnMajor)
+        ++s_xtLocRecDisagree;
+      else
+        ++s_xtLocRecAgree;
+    }
+    if (xtRecLocHave && RtxOptions::xfDeferSeedCbLocFromRecord()) {
+      ++s_perfXtVsLocCacheHits;
+      ++s_xtLocFromRecord;
+      const auto& rl = xtSnapLoc->cbLoc;
+      m_projSlot    = rl.projSlot;
+      m_projOffset  = static_cast<size_t>(rl.projOffset);
+      m_projStage   = rl.projStage;
+      m_columnMajor = (rl.columnMajor != 0u);
+      m_viewSlot    = rl.viewSlot;
+      m_viewOffset  = static_cast<size_t>(rl.viewOffset);
+      m_viewStage   = rl.viewStage;
+    } else if (xtVsLoc != nullptr && xtVsLoc->haveLoc) {
       ++s_perfXtVsLocCacheHits;
       // Override member-var cache with this VS's known-correct location
       // BEFORE the validate path reads them. Subsequent code reads
@@ -18990,8 +19139,26 @@ namespace dxvk {
     // v6.9: same predicate, now read out of the merged per-VS entry via the
     // shared helper -- the replay tier calls vsNegProjActive() on the same
     // entry so the two can never disagree.
-    const bool skipExpensiveProjScan =
+    // NV-DXVK [XfDefer] 2026-08-19 -- STEP 2b, SECOND HALF. This predicate is
+    // the OTHER per-VS route input, and it is the one that cannot be recovered
+    // from any byte: it turns on how many frames ago the entry was stamped. A
+    // worker with a cold map resolves it to false and takes the projection scan
+    // the frame thread would have skipped -- a different ROUTE, not merely a
+    // slower one, which is exactly the p0-vs-p1 divergence the objKey bit
+    // 4194304 block documents. So it is seeded from the record beside the
+    // location, under the same flag, and measured by the same rule.
+    // No haveLoc guard: "no entry at all" records negProj=0 and resolves live to
+    // false, so it agrees by construction and belongs in the denominator.
+    const bool xtNegLive =
       vsNegProjActive(xtVsLoc, m_context->m_device->getCurrentFrameId());
+    if (xtSnapLoc != nullptr) {
+      if ((xtSnapLoc->cbLoc.negProj != 0u) == xtNegLive) ++s_xtNegRecAgree;
+      else                                               ++s_xtNegRecDisagree;
+    }
+    const bool skipExpensiveProjScan =
+      (xtSnapLoc != nullptr && RtxOptions::xfDeferSeedCbLocFromRecord())
+        ? (xtSnapLoc->cbLoc.negProj != 0u)
+        : xtNegLive;
 
     uint32_t projSlot   = skipExpensiveProjScan ? UINT32_MAX : m_projSlot;
     size_t   projOffset = m_projOffset;
@@ -27214,8 +27381,44 @@ namespace dxvk {
                               sizeof(uint64_t), 0xC0A11D0Full);
     out[kMcCarRoute]  = XXH64(&s.carrierGrp[kSdepRoute],
                               sizeof(uint64_t), 0xC0A11D11ull);
-    out[kMcCarCbLoc]  = XXH64(&s.carrierGrp[kSdepCbLoc],
-                              sizeof(uint64_t), 0xC0A11D12ull);
+    // NV-DXVK [XfDefer] 2026-08-19 -- STEP 1: THE RESOLVED LOCATION, NOT THE
+    // ENTRY-STATE FINGERPRINT. Contract and the mechanism are on
+    // DrawSnapshot::cbLoc; the short version is that carrierGrp[kSdepCbLoc]
+    // hashes whatever the PREVIOUS draw left in the six members, and
+    // ExtractTransforms overwrites all of them from sVsCbLocCache before any
+    // read whenever this VS has a location. So for a haveLoc draw the old
+    // component was order-dependent noise in both keys, and it is the recorded
+    // prerequisite for retiring the members from the carrier set.
+    //
+    // THE FALLBACK IS NOT DEFENSIVE, IT IS THE CORRECTNESS HALF. Without a
+    // record the members ARE the input -- a first-sighting VS borrows the
+    // previous draw's location as its search seed -- so the raw fingerprint is
+    // folded back in on exactly those draws. Folded ON TOP rather than
+    // substituted, so a !haveLoc draw can never collide with the haveLoc hash
+    // of the same (empty) CbLocSnap.
+    //
+    // WHY THIS DOES NOT WEAKEN THE "cbLoc IS IN BOTH KEYS" ARGUMENT at the
+    // ObjHead block. That argument is that the derivation WRITES this state, so
+    // an entry serving a draw whose derivation would have populated it must not
+    // be reachable unless the populate is reproduced. It still is: the carrier
+    // replay (o.carProjSlot and friends) is untouched, and the key still
+    // separates entries by resolved location -- by the location itself now,
+    // which is what the replay writes, rather than by the location the previous
+    // draw happened to leave behind.
+    //
+    // SWEEPABLE, because the whole point is that the two readings can be
+    // compared in one session: rtx.splitTransformCbLocResolved False restores
+    // the entry-state fingerprint exactly, so serve%/objStale before and after
+    // are a controlled pair rather than two runs a rebuild apart.
+    if (RtxOptions::splitTransformCbLocResolved()) {
+      uint64_t hCbLoc = XXH64(&s.cbLoc, sizeof(s.cbLoc), 0xC0A11D12ull);
+      if (s.cbLoc.haveLoc == 0u)
+        hCbLoc = XXH64(&s.carrierGrp[kSdepCbLoc], sizeof(uint64_t), hCbLoc);
+      out[kMcCarCbLoc] = hCbLoc;
+    } else {
+      out[kMcCarCbLoc] = XXH64(&s.carrierGrp[kSdepCbLoc],
+                               sizeof(uint64_t), 0xC0A11D12ull);
+    }
     out[kMcCarBone]   = XXH64(&s.carrierGrp[kSdepBone],
                               sizeof(uint64_t), 0xC0A11D13ull);
     out[kMcCarStatic] = XXH64(&s.carrierGrp[kSdepStatic],
@@ -28944,6 +29147,26 @@ namespace dxvk {
   thread_local DrawSnapshot* D3D11Rtx::m_drawSnapCur   = nullptr;
   thread_local bool          D3D11Rtx::m_drawSnapValid = false;
 
+  // NV-DXVK [XfDefer] 2026-08-19 -- STEP 2: the cb-location STAGING REGISTER,
+  // per thread. Contract and the whole argument are on the declarations in
+  // d3d11_rtx.h; the initialisers here are byte-for-byte the ones they carried
+  // as instance members, so a thread that has never derived starts in exactly
+  // the state a fresh D3D11Rtx used to, and the bootstrap borrow behaves the
+  // same on every thread.
+  //
+  // DEFINED BESIDE m_drawSnapCur DELIBERATELY. These two sets are the same
+  // fact -- "what the draw currently being derived on THIS thread is working
+  // from" -- and splitting their definitions is how one of them ends up with a
+  // different reset rule than the other.
+  thread_local uint32_t D3D11Rtx::m_projSlot         = UINT32_MAX;
+  thread_local size_t   D3D11Rtx::m_projOffset       = SIZE_MAX;
+  thread_local int      D3D11Rtx::m_projStage        = -1;
+  thread_local bool     D3D11Rtx::m_columnMajor      = false;
+  thread_local uint32_t D3D11Rtx::m_viewSlot         = UINT32_MAX;
+  thread_local size_t   D3D11Rtx::m_viewOffset       = SIZE_MAX;
+  thread_local int      D3D11Rtx::m_viewStage        = -1;
+  thread_local bool     D3D11Rtx::m_projIsCombinedVP = false;
+
   void D3D11Rtx::captureDrawSnapshot(uint32_t drawIndex, bool indexed,
                                      uint32_t count, uint32_t start,
                                      int32_t base) {
@@ -29836,6 +30059,19 @@ namespace dxvk {
     // constantOffset -- the condition under which the proj-vs-view offset
     // convention divergence documented below stops being harmless.
     uint32_t cbOffNz = 0;
+    // NV-DXVK [XfDefer] 2026-08-19 -- THE RESOLVED CB LOCATION.
+    //
+    // Cleared HERE rather than in the arena-reuse clear list at the top of this
+    // function, because this is the last point before it is written and the
+    // write below is conditional on the map lookup hitting. A draw whose VS has
+    // no entry must record "no entry", not the previous occupant's layout --
+    // the same silent-carry rule the clear list exists for, satisfied by an
+    // unconditional assignment instead of a second list to keep in sync.
+    //
+    // The lookup itself is the SAME ONE the span capture below performs, so
+    // this costs the field copies and no map probe. See DrawSnapshot::cbLoc for
+    // why the key wants this instead of carrierGrp[kSdepCbLoc].
+    s.cbLoc = DrawSnapshot::CbLocSnap { };
     // The location entry this draw's spans came from, kept so the LEARNED
     // manifest can be replayed after the named spans below. Same entry, same
     // lookup -- not a second map probe.
@@ -29864,6 +30100,25 @@ namespace dxvk {
         if (it != sVsCbLocCache.end()) {
           VsCbLocations& L = it->second;
           capLoc = &L;
+          // [XfDefer]: record the whole entry, INCLUDING when haveLoc is false.
+          // An entry that carries only a negative stamp still decides the route
+          // (it is what forces projSlot to UINT32_MAX for the TTL's duration),
+          // so "entry exists, no location" and "no entry at all" are different
+          // states and must key differently.
+          s.cbLoc.projOffset  = static_cast<uint64_t>(L.projOffset);
+          s.cbLoc.viewOffset  = static_cast<uint64_t>(L.viewOffset);
+          s.cbLoc.projSlot    = L.projSlot;
+          s.cbLoc.viewSlot    = L.viewSlot;
+          s.cbLoc.projStage   = L.projStage;
+          s.cbLoc.viewStage   = L.viewStage;
+          s.cbLoc.haveLoc     = L.haveLoc ? 1u : 0u;
+          s.cbLoc.columnMajor = L.columnMajor ? 1u : 0u;
+          // Same predicate, same map entry, same frame id as the site that
+          // decides skipExpensiveProjScan -- factored through vsNegProjActive
+          // so the two cannot drift.
+          s.cbLoc.negProj =
+              vsNegProjActive(&L, m_context->m_device->getCurrentFrameId())
+              ? 1u : 0u;
           // haveLoc distinguishes a real location from an entry that carries
           // only a negative (no-projection) stamp -- see its declaration.
           if (L.haveLoc) {
@@ -34215,13 +34470,34 @@ namespace dxvk {
     // draw holds changes which records exist and which may replay. Retiring
     // this group needs the tier's view of these fields decoupled first; it is
     // not reachable by changing where the seed comes from.
-    // NOTE m_viewStage is cross-draw state this list has always MISSED -- a
-    // genuine hole, deliberately left as-is because adding it would only lower
-    // eligibility further while the group is hashed anyway.
+    // NV-DXVK [XfDefer] 2026-08-19 -- THE TIER IS NOW DECOUPLED, and this
+    // paragraph is history. It no longer keys on these members: the object
+    // validity hash and the view key take the per-VS entry (DrawSnapshot::cbLoc)
+    // instead of the entry-state fingerprint, and every stored entry records and
+    // replays the exit state unconditionally. The members still carry -- the
+    // bootstrap borrow is untouched -- but nothing downstream keys on WHICH
+    // draw left the value, which is what the two reverted attempts broke.
     //
+    // TWO HOLES CLOSED IN THE SAME EDIT. m_viewStage was documented here as
+    // "cross-draw state this list has always MISSED -- a genuine hole,
+    // deliberately left as-is", and m_projIsCombinedVP was missing without even
+    // being noted. Both are now hashed, because an UNHASHED carrier is the one
+    // error direction this probe is not conservative in: it reads clean, and
+    // safeToDefer() then certifies a draw that really does write cross-draw
+    // state. The reason to leave them out was that adding them "would only lower
+    // eligibility", which stopped being a cost when the group became
+    // thread-private -- see D3D11Rtx::m_projSlot.
+    //
+    // ADDING A FIELD HERE MEANS ADDING IT TO XfObjectPart AND TO THE REPLAY.
+    // The hash decides what counts as a move; the replay is what reproduces it
+    // on a serve. A field in one and not the other is a subset write that reads
+    // clean -- REPLAYFAIL is the only thing that would catch it, which is why
+    // both were extended in this edit and not just this list.
     mix(&m_projSlot, 4); mix(&m_projOffset, sizeof(size_t)); mix(&m_projStage, sizeof(int));
     mix(&m_columnMajor, 1);
     mix(&m_viewSlot, 4); mix(&m_viewOffset, sizeof(size_t));
+    mix(&m_viewStage, sizeof(int));
+    mix(&m_projIsCombinedVP, 1);
     seal();   // kSdepCbLoc
 
     // -- THE CLASSIFICATION LATCHES ARE DELIBERATELY *NOT* HASHED. --
@@ -40281,6 +40557,17 @@ namespace dxvk {
         const uint32_t xReplayMask = kXfReplayable
             & (RtxOptions::splitTransformCarrierReplay()
                  ? RtxOptions::splitTransformCarrierReplayMask() : 0u);
+        // NV-DXVK [XfDefer] 2026-08-19 -- WHAT THE STORE GATE MAY FORGIVE.
+        // rtx.splitTransformCbLocReplayAlways takes cbLoc off the mask's
+        // per-group opt-in, because the serve now writes it on EVERY entry
+        // rather than only on entries whose producer moved it -- see the
+        // xCbLocRep block. Store and serve MUST agree about this or a draw is
+        // admitted under one rule and replayed under another, which is why the
+        // widening is computed here, once, beside the mask it widens.
+        const uint32_t xReplayMaskEff = xReplayMask
+            | ((RtxOptions::splitTransformCarrierReplay()
+                && RtxOptions::splitTransformCbLocReplayAlways())
+                 ? (1u << kSdepCbLoc) : 0u);
         // Post-replay carrier fingerprint, for the verify below. Only filled
         // when this draw actually replayed something.
         uint64_t xGrpReplayed[kSdepGroupCount] = { };
@@ -40351,9 +40638,47 @@ namespace dxvk {
           // stale camera write.
           const uint32_t xViewRepOk =
               (vrep.frameStored == xFid) ? kXfViewReplayable : 0u;
+          // NV-DXVK [XfDefer] 2026-08-19 -- STEP 1: cbLoc REPLAYS UNCONDITIONALLY,
+          // AND THIS IS THE CORRECTNESS HALF OF THE KEY CHANGE.
+          //
+          // THE HOLE IT CLOSES, which rtx.splitTransformObjKeyMask' doc records
+          // as a measured defect (FAILcarrier grp{cbLoc} 0 -> 238 -> 337 with
+          // REPLAYFAIL=0 throughout): an entry stored under the ALL-CLEAN rule
+          // -- its producing derivation happened to move no cbLoc, because the
+          // members already held this shader's location on entry -- carries
+          // carGroups=0 and so replays NOTHING. Serve it to a draw that entered
+          // holding a DIFFERENT shader's location and the write never happens.
+          //
+          // WHAT USED TO GUARD IT, ACCIDENTALLY. The validity hash contained
+          // the ENTRY-STATE fingerprint, so the two draws hashed differently
+          // and the serve was refused as stale. That guard is exactly the
+          // order-dependence DrawSnapshot::cbLoc removes, so it has to be
+          // replaced by a real one rather than merely lost -- which is why the
+          // one previous attempt to drop cbLoc from the hash reinstated the
+          // defect, and why this is not the same change.
+          //
+          // WHY REPLAYING ALWAYS IS SOUND, AND STRICTLY STRONGER. The store
+          // gate admits only cbSafeToDefer() draws, and cbSafeToDefer() implies
+          // layoutResolved, which implies this VS had a resolved location.
+          // Every such derivation opens by overwriting the members from that
+          // location, so its EXIT state is a pure function of inputs the key
+          // and the validity hash already cover -- never of the borrowed seed.
+          // Recording that exit state and writing it on every serve therefore
+          // reproduces the skipped write in ALL cases, not just when the
+          // producer happened to change something. carGroups stops being the
+          // question; REPLAYFAIL stays the arbiter, over a larger population.
+          //
+          // THE FIELDS ARE ALREADY WRITTEN UNCONDITIONALLY AT STORE (np.carProjSlot
+          // and friends are plain assignments, not gated on xCarForgiven), so
+          // this needs no new recording -- only carLocValid, which exists so a
+          // field added to the group later cannot silently replay a zero.
+          const bool xCbLocRep = o.carLocValid != 0u
+              && RtxOptions::splitTransformCarrierReplay()
+              && RtxOptions::splitTransformCbLocReplayAlways();
           const uint8_t xRepG = static_cast<uint8_t>(
                 (o.carGroups    & xReplayMask & kXfObjReplayable)
-              | (vrep.carGroups & xReplayMask & xViewRepOk));
+              | (vrep.carGroups & xReplayMask & xViewRepOk)
+              | (xCbLocRep ? (1u << kSdepCbLoc) : 0u));
           if (xRepG != 0u) {
             if (xRepG & (1u << kSdepCbLoc)) {
               m_projSlot     = o.carProjSlot;
@@ -40362,6 +40687,12 @@ namespace dxvk {
               m_columnMajor  = o.carColumnMajor;
               m_viewSlot     = o.carViewSlot;
               m_viewOffset   = o.carViewOffset;
+              // [XfDefer] 2026-08-19: the two fields added to the kSdepCbLoc
+              // hash in the same edit. MEMBERSHIP HERE MIRRORS THAT LIST
+              // EXACTLY -- a field hashed there and missing here is a subset
+              // write that reads clean to carrierMask.
+              m_viewStage        = o.carViewStage;
+              m_projIsCombinedVP = o.carProjCombinedVP;
             }
             // kSdepCam, FROM THE VIEW ENTRY. Same-frame by construction (the
             // view cache is cleared at every frame boundary) and from a draw
@@ -41306,9 +41637,12 @@ namespace dxvk {
           // with the replay tier and the census. This widens what THIS cache
           // accepts; it does not change what the tree considers pure.
           const DrawSnapshot& xs = *m_drawSnapCur;
+          // xReplayMaskEff, NOT xReplayMask: cbLoc is forgiven whenever the
+          // serve replays it unconditionally, and the two must agree. See the
+          // xReplayMaskEff declaration.
           const bool xCarForgiven = xs.wroteCarrier()
-              && xReplayMask != 0u
-              && ((static_cast<uint32_t>(xs.carrierMask) & ~xReplayMask) == 0u);
+              && xReplayMaskEff != 0u
+              && ((static_cast<uint32_t>(xs.carrierMask) & ~xReplayMaskEff) == 0u);
           const bool xStoreOk = s_xtEligLast
               || (xCarForgiven && xs.cbSafeToDefer() && xs.geoBytesStatic());
           if (!xStoreOk) {
@@ -41435,7 +41769,15 @@ namespace dxvk {
                 np.carViewSlot       = m_viewSlot;
                 np.carViewOffset     = m_viewOffset;
                 np.carColumnMajor    = m_columnMajor;
+                // [XfDefer]: the two fields added to the kSdepCbLoc hash in the
+                // same edit. Recorded here so the replay is not a subset write.
+                np.carViewStage      = m_viewStage;
+                np.carProjCombinedVP = m_projIsCombinedVP;
                 np.carGroups         = xCarForgiven ? xs.carrierMask : uint8_t(0);
+                // [XfDefer]: the six above are the derivation's EXIT state for
+                // this shader whether or not it moved them, so they are always
+                // replayable. Set beside them so the two can never drift.
+                np.carLocValid       = 1u;
                 for (uint32_t c = 0; c < kXcCount; ++c) np.comps[c] = objComps[c];
                 xFillSub(np);
                 sObj.insert_or_assign(objKey, np);
@@ -64290,6 +64632,29 @@ namespace dxvk {
                                  // record-and-replay (a) pays.
                                  " drawsInCarrierVs=", s_xfDrawsInCarrierVs,
                                  " drawsSeen=",        s_xfDrawsSeen,
+                                 // [XfDefer] 2026-08-19 -- THE SAME PARTITION,
+                                 // cbLoc EXCLUDED. THIS IS THE GO/NO-GO FOR
+                                 // rtx.xfDeferRoute, and the four fields above
+                                 // are its CONTROL, not its answer: they count
+                                 // wroteCarrier(), which includes kSdepCbLoc --
+                                 // 88% of all carrier moves and thread-private
+                                 // since the members became `static
+                                 // thread_local`. Compare the two ratios:
+                                 //   sharedDrawsIn/drawsSeen ~= drawsInCarrierVs
+                                 //     /drawsSeen -> cbLoc was not the problem,
+                                 //     the partition really is dead, and routing
+                                 //     needs kSdepCam record-and-replay.
+                                 //   sharedDrawsIn/drawsSeen collapses -> the
+                                 //     89% was cbLoc, the partition is alive.
+                                 // sharedEscape MUST BE 0: it counts draws the
+                                 // shader gate passed that then moved shared
+                                 // state. There is no abort for it -- the write
+                                 // has landed by the time it is visible -- so a
+                                 // non-zero value means the gate is unsound, not
+                                 // merely inaccurate.
+                                 " sharedCarrierVs=",  s_xfSharedCarrierVsIl.size(),
+                                 " sharedDrawsIn=",    s_xfDrawsInSharedCarrierVs,
+                                 " sharedEscape=",     s_xfSharedEscape,
                                  // NV-DXVK [GenVal] 2026-08-19. Decides whether
                                  // the split cache's staleness proof can move
                                  // from hashing the draw's input BYTES to
@@ -64407,6 +64772,23 @@ namespace dxvk {
                                  " xs_cb2fast=",     s_perfXsCb2FastAcc,
                                  " xt_vsLocHits=",   s_perfXtVsLocCacheHits,
                                  " xt_vsLocMiss=",   s_perfXtVsLocCacheMisses,
+                                 // NV-DXVK [XfDefer] STEP 2b ACCEPTANCE TEST.
+                                 // READ locDis AND negDis BEFORE SETTING
+                                 // rtx.xfDeferSeedCbLocFromRecord. Both must be
+                                 // 0: they say the record's copy of the per-VS
+                                 // route state is identical to the live entry at
+                                 // the moment the derivation reads it, which is
+                                 // the entire claim that seeding from the record
+                                 // is a no-op on the frame thread. locFromRec is
+                                 // the population the seed actually served, and
+                                 // stays 0 while the flag is off -- so a green
+                                 // locDis with locFromRec=0 is the CONTROL, not
+                                 // a result.
+                                 " xt_locAgree=",    s_xtLocRecAgree,
+                                 " xt_locDis=",      s_xtLocRecDisagree,
+                                 " xt_negAgree=",    s_xtNegRecAgree,
+                                 " xt_negDis=",      s_xtNegRecDisagree,
+                                 " xt_locFromRec=",  s_xtLocFromRecord,
                                  " xt_setup=",       s_perfXtSetupAcc,
                                  " xt_projScan1=",   s_perfXtProjScan1Acc,
                                  " xt_projScan1N=",  s_perfXtProjScan1Fires,
@@ -65982,6 +66364,13 @@ namespace dxvk {
         // NOT -- they are cumulative distinct-shader populations and resetting
         // them would restart the census every 5 s and never converge.
         s_xfDrawsInCarrierVs = 0; s_xfDrawsSeen = 0;
+        // [XfDefer] same split, same rule: the DRAW rate clears with the window
+        // so it stays comparable with drawsSeen; s_xfSharedCarrierVsIl does NOT,
+        // for the reason above -- it is the learned tainted-shader set and the
+        // routing gate reads it, so clearing it would re-open the gate on every
+        // shader every 5 s. sharedEscape is a correctness counter and therefore
+        // MUST clear, or a single early escape would be forgiven by dilution.
+        s_xfDrawsInSharedCarrierVs = 0; s_xfSharedEscape = 0;
         // [GenVal]: same rule -- it is a RATE over the window's lookups, and
         // the ratio genHitStale/(genHitHit+genHitStale) is only meaningful
         // against the same window's serve count. s_genValCur is NOT cleared:
@@ -65991,6 +66380,13 @@ namespace dxvk {
         s_genValStaleHit = 0; s_genValStaleStale = 0;
         s_perfXtVsLocCacheHits                = 0;
         s_perfXtVsLocCacheMisses              = 0;
+        // [XfDefer] step 2b: cleared with their siblings so the window they
+        // describe is the same one xt_vsLocHits describes.
+        s_xtLocRecAgree                       = 0;
+        s_xtLocRecDisagree                    = 0;
+        s_xtNegRecAgree                       = 0;
+        s_xtNegRecDisagree                    = 0;
+        s_xtLocFromRecord                     = 0;
         s_perfRpKeyAcc                        = 0; s_perfRpKeyMax                        = 0;
         s_perfRpSelAcc                        = 0; s_perfRpSelMax                        = 0;
         s_perfRpSelMissAcc                    = 0; s_perfRpSelMissMax                    = 0;
