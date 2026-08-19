@@ -1164,6 +1164,50 @@ namespace dxvk {
     TspSrvScan,             // 128-slot PS SRV dimension scan
     MemoCeilingCbs,         // [MemoCeiling.Slot] per-slot cbuffer hashes
     RecordCbSnapshot,       // split-record raw camera cbuffer snapshot
+    // NV-DXVK [XfDefer] 2026-08-19e -- STEP 4. APPENDED, never inserted, for
+    // the reason SdepGroup gives: kXfLiveSiteNames is positional.
+    //
+    // This one was NOT in the original twelve and never appeared in any xfEsc{}
+    // census, because it did not go through the choke at all -- the
+    // tagTF2SkyShaders detector read m_context->m_state.ps.shaderResources
+    // DIRECTLY. An audit that greps for xfLiveState() cannot find a site that
+    // never called it, which is how it survived four sessions of purity work.
+    // Harmless so far only because rtx.tagTF2SkyShaders is False; turning that
+    // option on would have armed an unchoked live PS read on the chain worker,
+    // deciding sky classification from raced state with nothing to count it.
+    SkyTagSrvScan,          // 128-slot PS SRV scan in the tagTF2SkyShaders path
+    // NV-DXVK [XfDefer] 2026-08-19f. The t30 bone palette's CURRENT mapping.
+    // Served from the seam capture on a routed draw (PendingDrawSlot::bone);
+    // this entry counts the draws where that capture did not fire and the tail
+    // had to refuse rather than fall through to the live mapping.
+    BoneSrcMapping,         // boneBuf->GetMappedSlice() / GetBufferSlice()
+    // NV-DXVK [XfDefer] 2026-08-19f. CaptureSkyProbeCubeFromCb's cb2 read.
+    //
+    // REFUSED, NOT SERVED, and unlike its two neighbours that is a deliberate
+    // trade rather than a free win. It snapshots up to kSnapshotMax = 1 KB of
+    // cb2 at a shader-chosen slot; the record's spans are capped well below
+    // that, so drawCbSpan would miss and refuse anyway, and pinning every VS
+    // cbuffer at the seam would tax EVERY routed draw to serve a sky-only
+    // consumer -- the unconditional-capture mistake B2 already paid for once.
+    //
+    // So this one has a REAL abort cost, proportional to the sky/sub-view
+    // population rather than to once-per-frame. It is bounded, it is correct
+    // (the frame thread re-derives and captures properly), and it is now
+    // MEASURED instead of silent -- watch xfEsc{ skyProbeCb2= }.
+    SkyProbeCb2,            // cb2 snapshot + viewProj/origin decode
+    // NV-DXVK [XfDefer] 2026-08-19f. VB/IB CONTENT read out of a live mapping
+    // in the tail's geometry diagnostics ([ShipSkinDiag], the skyTriWatch
+    // BSP-wall probe, the SkinAABB index walk).
+    //
+    // THE BINDING IS ALREADY PURE at all of these -- they come from
+    // drawVertexBuffer/drawIndexBuffer, which are record-served. That is
+    // exactly why a m_context->m_state audit cannot find them, and exactly the
+    // shape of the bone-palette bug: a pure binding says nothing about whether
+    // GetMappedSlice() still points at this draw's bytes.
+    //
+    // Counted only when the buffer has no immutable CPU copy -- the guard sits
+    // after the GetImmutableData() path, so static geometry never refuses.
+    GeoBufContent,          // VB/IB bytes via GetMappedSlice / mapPtr(0)
     Count
   };
 
@@ -1182,6 +1226,52 @@ namespace dxvk {
     GeomCaptureStableSet,   // m_geomCaptureStableSnapshot insert/clear
     VmHuntConsume,          // m_vmHuntIsSuspect read-and-clear
     HudClassLatch,          // m_lastDrawIsHudClass -- read by a LATER draw's head
+    // NV-DXVK [XfDefer] 2026-08-19f. APPENDED -- kXfSharedSiteNames is
+    // positional, same rule as XfLiveSite.
+    //
+    // m_fullBoneCache is a D3D11Rtx member vector. MergeBoneCacheMirror RESIZES
+    // it, and the skinning path hands out .data() as a raw read pointer without
+    // taking g_boneCacheMirrorMutex -- that mutex serialises two merges against
+    // each other and covers nothing else. A worker doing either while the frame
+    // thread merges is a dangling pointer, not a stale value, which is why this
+    // is a shared-write refusal and not something the abort can clean up after.
+    BoneCacheMirror,        // m_fullBoneCache resize / .data() handout
+    // NV-DXVK [XfDefer] 2026-08-19f -- THE FRAME-SCOPED PUBLISHERS.
+    //
+    // Both are called FROM SubmitDrawDeferred but defined thousands of lines
+    // below it, so no line-range audit of "the tail" could see them. Both
+    // ignore the draw they are handed (CaptureEngineSunFromCb's dcs parameter
+    // is literally unnamed) and publish FRAME state: a global sun/fog, and the
+    // engine light list. Between them they made 22 raw m_context->m_state
+    // reads on the chain worker.
+    //
+    // REFUSED RATHER THAN CONVERTED, and that is the cheaper answer here.
+    // Converting the reads would still leave their shared WRITES racing, and
+    // both already early-out on a frame latch or cadence -- so the refusal can
+    // sit AFTER that early-out, where only the one draw per frame that would
+    // actually do the work pays an abort. Converting would have cost more and
+    // fixed less.
+    EngineSunCapture,       // s_sunCapturedFrame latch + global sun/fog publish
+    EngineLightsDump,       // s_globalLights SRV walk + scene light publish
+    // NV-DXVK [XfDefer] 2026-08-19f -- THE ONE THAT IS NOT A DATA RACE.
+    //
+    // The geometry-capture path calls m_context->EmitCs from inside the tail.
+    // EmitCs appends to the IMMEDIATE CONTEXT'S CS CHUNK, which is
+    // single-producer by construction -- a worker doing it concurrently with
+    // the frame thread does not read a stale value, it CORRUPTS THE COMMAND
+    // STREAM.
+    //
+    // It was reachable: the two xfMayWriteShared calls just above it guard the
+    // capture-set SNAPSHOTS, not the emit, and `doCapture` is computed from
+    // srcHot/provenStable/feedbackWantsCapture with no thread predicate at all.
+    // The commit EmitCs further down is safe for a DIFFERENT reason -- the
+    // batch-arena append returns before reaching it -- which is exactly why
+    // this one was easy to miss.
+    //
+    // rtx.conf says "with batchSubmitDrawStages off the tail's terminal act is
+    // EmitCs, which is order-critical". This is a SECOND EmitCs that batching
+    // does not route away.
+    GeomCaptureEmit,        // m_context->EmitCs for the index/vertex stash
     Count
   };
 
@@ -1638,6 +1728,34 @@ namespace dxvk {
     // tally in d3d11_rtx.cpp is a file-scope array sized from XfLiveSite::Count
     // and cannot name a private nested type.
     const D3D11ContextState& xfLiveState(XfLiveSite site);
+
+    // NV-DXVK [XfDefer] 2026-08-19e -- STEP 4: THE PS-STAGE CONVERSION.
+    //
+    // Same choke contract as xfLiveState, except that a deferred read is SERVED
+    // from the B2 seam capture instead of refused. Full contract, and why it is
+    // a struct rather than an overload returning `.ps`, at the definition.
+    //
+    // Both types are forward-declared and defined in d3d11_rtx.cpp: XfPsSource
+    // points into MatSnapshot and takes a PendingDrawSlot, and both of those are
+    // file-local there. Returning an incomplete type by value is legal so long
+    // as it is complete at the definition and at every call site, which it is --
+    // every caller is a member function in that same file.
+    struct PendingDrawSlot;
+    struct XfPsSource;
+    XfPsSource xfPsSource(XfLiveSite site, const PendingDrawSlot& pend);
+
+    // NV-DXVK [XfDefer] 2026-08-19f -- THE READ-SIDE TWIN OF xfMayWriteShared.
+    //
+    // TRUE when this thread may perform the LIVE read at `site`. False only
+    // inside a deferred scope, where it also counts the escape and marks the
+    // record so the draw is re-derived where the read is legal.
+    //
+    // For sites that cannot be served from a capture and have no record
+    // equivalent -- where the honest answer is "refuse", not "substitute". Use
+    // xfPsSource or a drawXxx accessor when the value CAN be served; this is
+    // for the residue.
+    bool xfMayReadLive(XfLiveSite site);
+
     // TRUE when this thread may perform the shared write at `site`. False only
     // inside a deferred scope, where it also marks the record so the draw is
     // aborted and re-derived where the write is legal. Contract at the
@@ -3946,7 +4064,17 @@ namespace dxvk {
     // SkyMode::PhysicalAtmosphere drops the geometry submission and
     // lets the Hillaire atmospheric LUT pipeline render the sky instead.
     // Returns true if sky was set on dcs.
-    bool SetSkyCategoryFromCb2(DrawCallState& dcs);
+    // NV-DXVK [XfDefer] 2026-08-19f: TAKES THE DRAW'S PENDING SLOT.
+    //
+    // This function is CALLED FROM SubmitDrawDeferred, so on a routed draw its
+    // whole body runs on the chain worker -- a fact its own line range hides,
+    // because it is defined ~7k lines below the tail rather than inside it. Its
+    // 128-slot PS SRV scan therefore needs the B2 seam capture, and xfPsSource
+    // needs the slot to reach it.
+    //
+    // Passed rather than reached through a member: the slot lives on
+    // SubmitDraw's stack (B1), so there is no `this` to find it on.
+    bool SetSkyCategoryFromCb2(DrawCallState& dcs, const PendingDrawSlot& pend);
     // NV-DXVK [ShipHunt v2]: one-shot discovery probe that logs the first
     // appearance of every distinct (VS hash, viewport width) tuple seen
     // in this session.
@@ -4121,7 +4249,39 @@ namespace dxvk {
       // Same value as the seam's xfRouteThisDraw, carried rather than recomputed
       // -- the ID allocation, the dispatch arm and the append must all answer
       // the one question identically.
-      bool routed = false;
+      // WHICH ARENA THE TERMINAL ACT APPENDS TO, and whether the abort gate
+      // applies. An enum rather than two bools because the three states are
+      // mutually exclusive and a `routed && !replay` conjunction is how the
+      // replay path ends up re-aborting forever: the record's escape flags are
+      // sticky, so a re-run that still looks "on the chain" refuses again.
+      //
+      // Inline  -- frame thread, appends to `items`. The pre-chain behaviour.
+      // Chain   -- ordered worker, appends to `staged`. Abort gate ACTIVE.
+      // Replay  -- frame thread at the join, re-running an aborted draw.
+      //            Appends to `replayArena`, gate INACTIVE.
+      //
+      // Replay needs its own arena and cannot reuse either of the others: both
+      // are already populated and ascending in seq, and a replayed draw carries
+      // a MID-RANGE seq. Appending it to the end of either would break exactly
+      // the precondition B3's two-way merge depends on.
+      enum class TailArena : uint8_t { Inline, Chain, Replay };
+      TailArena arena = TailArena::Inline;
+      // [XfDefer] §5.4: SET BY THE TERMINAL ACT, READ BY THE CHAIN.
+      //
+      // Evaluated ONCE, at the arena append, where the abort verdict is already
+      // final -- all four of xfDeferMustAbort's terms are written upstream of
+      // it. The append skips itself when this is true, so an aborted draw never
+      // enters the staged arena and there is nothing to un-append; the join then
+      // re-runs the draw inline. That is what "stage rather than commit" means
+      // in practice, and it is why DrawWorkItem has no `aborted` flag.
+      //
+      // NOTE WHICH TERMS CAN ACTUALLY FIRE UNDER THIS CUT. geoLiveReads and
+      // cbLiveReads describe the DERIVATION, which stays on the frame thread
+      // when the cut is post-verdict -- so only liveStateEscapes and
+      // wroteSharedCarrier are reachable here. The 4.83% abort rate measured on
+      // 2026-08-19 was almost entirely geo+cb and does NOT transfer; expect far
+      // lower, and treat a high rate as a signal that something moved.
+      bool aborted = false;
       // [XfDefer] step 4c: THIS DRAW'S ID.
       //
       // `dcs.drawCallID = m_drawCallID++` used to sit in the tail. On the chain
@@ -4207,7 +4367,14 @@ namespace dxvk {
     // Cheap synchronous computation of the two material fields the game thread reads
     // before EmitCs (sourceIsUnlitUI, blendMode). Called at the SubmitDraw call site
     // so those are valid even when the full FillMaterialData defers to a worker.
-    void hoistSyncMaterialFields(LegacyMaterialData& mat) const;
+    // NV-DXVK [XfDefer] 2026-08-19f: TAKES THE PENDING SLOT. Called from
+    // SubmitDrawDeferred, so on a routed draw it runs on the chain worker --
+    // and unlike its neighbours in that block it is NOT a diagnostic: it
+    // writes mat.sourceIsUnlitUI and the whole mat.blendMode, the two fields
+    // its own comment calls "the two material fields the game thread reads
+    // before EmitCs". Served from the B2 seam capture when there is one.
+    void hoistSyncMaterialFields(LegacyMaterialData& mat,
+                                 const PendingDrawSlot& pend) const;
   };
 
 }
