@@ -1208,6 +1208,16 @@ namespace dxvk {
     // Counted only when the buffer has no immutable CPU copy -- the guard sits
     // after the GetImmutableData() path, so static geometry never refuses.
     GeoBufContent,          // VB/IB bytes via GetMappedSlice / mapPtr(0)
+    // NV-DXVK [XfDefer] 2026-08-19g. drawCbSpan's own refusal, which until now
+    // borrowed the PsCbFieldDump slot.
+    //
+    // THE BORROW COST A SESSION. 19f reused PsCbFieldDump on the grounds that
+    // "the census names WHICH KIND of read escaped, and a cbuffer-content read
+    // is what that entry already means". It is not what the census is for: the
+    // census is the WORK LIST, and psCbDump=28345 sent the next reader to a
+    // kDiagLogs-gated one-shot dump at ~:48613 that cannot fire in a normal run,
+    // instead of to drawCbSpan. Every entry names a SITE, not a category.
+    CbSpanContent,          // drawCbSpan section 2 (staged ring / GetMappedSlice)
     Count
   };
 
@@ -2257,8 +2267,24 @@ namespace dxvk {
       uint32_t texgenMode;
       uint32_t texcoordEncoding;
       bool     enableClipPlane;
-      bool     isSubView;
-      bool     isSubViewSkybox;
+      // NV-DXVK [SubViewFlags] 2026-08-19g -- isSubView and isSubViewSkybox
+      // WERE HERE AND MUST NOT COME BACK.
+      //
+      // They are the only two fields this struct ever held that are not
+      // functions of the object. isSubView is a 4-unit distance test between
+      // THIS DRAW's c_cameraOrigin and g_engineSkyCamOrigin, both of which move;
+      // isSubViewSkybox adds a per-VS latch that flips mid-session when an
+      // accumulating world-AABB crosses 5M. Storing them in the view-INdependent
+      // half let one entry answer for 33 different camera positions, measured as
+      // FAIL=136 fld{subVSky} with subV never firing and o2w agreeing on every
+      // one -- the object transform was fine, only the classification was stale.
+      //
+      // The serve re-derives both through deriveSubViewFlags in d3d11_rtx.cpp,
+      // which the derivation also calls so the rule has one implementation. The
+      // replay tier reached the same conclusion independently in v6.7; its note
+      // ("the sub-view flags are NOT pure functions of the record") is the
+      // clearest statement of why this cannot be fixed by a wider key or a
+      // generation.
       // Frame this entry was last USED, for age eviction. See the cache block:
       // a flat wipe at the cap throws away the stable working set together
       // with the churn, which is a self-inflicted loss on top of the churn

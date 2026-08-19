@@ -1619,6 +1619,133 @@ namespace dxvk {
   std::mutex g_subViewSkyboxByVsMu;
   std::unordered_map<XXH64_hash_t, bool> g_subViewSkyboxByVs;
 
+  // ==================================================================
+  // NV-DXVK [SubViewSkyboxGen] 2026-08-19g -- THE MAP ABOVE IS A LATCH THAT
+  // FLIPS MID-SESSION, AND THE SPLIT-TRANSFORM OBJECT CACHE HAD NO WAY TO KNOW.
+  //
+  // MEASURED, 22:19-22:23 run: FAIL=136 draws, `fld{subVSky}` on 32 of the 34
+  // sampled detail lines, `subV` on ZERO of them. That asymmetry is the whole
+  // diagnosis. isSubView and isSubViewSkybox share the path-13 camera gate
+  // (p13GateWouldPass, ~:23009); isSubViewSkybox alone adds a second term, the
+  // lookup into g_subViewSkyboxByVs (~:23102). Only the second term moved, so
+  // the camera is not the variable -- this map is.
+  //
+  // THE CHAIN. The map is populated by an ACCUMULATING world-AABB scan
+  // (~:53456): a VS is promoted the first time its accumulated diagonal crosses
+  // 5M units, and "dome wins: force true" means it never flips back. So every
+  // sky-dome VS reads false for its first N draws and true forever after.
+  // ExtractTransforms reads the map into transforms.isSubViewSkybox, and
+  // SubmitDrawTail stores THAT into the OBJECT half of the split cache
+  // (np.isSubViewSkybox, ~:43933) -- the view-independent, long-lived half,
+  // whose validity hash covered every geometric input and nothing about this
+  // latch. An entry stored before the flip therefore holds false permanently
+  // while every later derivation returns true, and serving it is a wrong value,
+  // not a stale one.
+  //
+  // The log signature matches exactly: one objKey served across 33 distinct
+  // viewKeys with age climbing 17->24 and restores=12 (one long-lived entry
+  // spanning the flip), then FAIL=0 for 27 consecutive windows once those
+  // entries aged out. chg{t31Ent} on 34/34 is the marker that the entry was
+  // reused across frames where instance data moved -- not the cause; o2w agreed
+  // on every one of them and t31skip=no_srv_bound_at_slot says the t31 block
+  // never ran.
+  //
+  // WHAT THE VISIBLE CONSEQUENCE ACTUALLY IS -- stated carefully, because the
+  // obvious reading overstates it. With verify OFF the served value IS used, so
+  // a dome draw served isSubViewSkybox=false starts the tail wrongly tagged.
+  // But the AABB scan at ~:53585 runs DOWNSTREAM of the serve and re-patches it
+  // to true on any draw that still qualifies, so for the steady-state dome the
+  // wrong cached value is overwritten in the same draw and never reaches
+  // SceneManager. The exposure is the residue: a draw whose entry carries the
+  // stale classification and which does NOT re-qualify for the patch this frame
+  // (tlasE->worldVertSamples == 0, accumulated AABB below 5M this frame,
+  // writesColor, or a normal buffer present). That is a narrower population
+  // than "the sky renders lit", and it is the honest scope of the bug.
+  //
+  // The FAIL itself is a true positive regardless: the cache and the derivation
+  // disagreed on a stored field, which is exactly what the tier exists to catch.
+  //
+  // THE GENERATION. Bumped whenever a draw's final isSubViewSkybox differs from
+  // the value its derivation computed (~:53500), and folded into the object
+  // VALIDITY hash (~:29490). Every entry stored under an older generation then
+  // fails validity and is re-derived. Validity, not the key, on the rule stated
+  // at drawSplitKeys: narrowing the key moves a draw onto a stranger's entry,
+  // narrowing the validity hash can only refuse a serve.
+  //
+  // COST, stated so it is not a surprise: a bump invalidates the WHOLE object
+  // cache for one frame, because the generation is global rather than per-VS.
+  // That is one re-derive spike per flip, and a flip happens once per dome VS
+  // per session -- a handful of frames at level start. The alternative, a
+  // per-VS generation, needs the VS hash at drawSplitKeys time where only the
+  // DrawSnapshot is in scope; not worth the plumbing for an event this rare.
+  //
+  // RELAXED ORDERING IS DELIBERATE. The bump happens on the chain worker (the
+  // patch site is in SubmitDrawDeferred) and the read happens on the frame
+  // thread. Nothing is published THROUGH this value -- it is a pure change
+  // detector -- so all that is required is that the new value be seen
+  // eventually. Worst case a stale entry is served for one more frame, against
+  // a latch that flips once per VS per session.
+  std::atomic<uint32_t> g_subViewSkyboxGen { 0u };
+
+  // ==================================================================
+  // NV-DXVK [SubViewFlags] 2026-08-19g -- THE SUB-VIEW CLASSIFICATION, IN ONE
+  // PLACE, BECAUSE IT IS NOT CACHEABLE AND TWO COPIES OF IT WOULD DRIFT.
+  //
+  // WHY THE FIELDS LEFT XfObjectPart. isSubView and isSubViewSkybox were stored
+  // in the split cache's OBJECT half and served from it. Neither is a function
+  // of the object: isSubView compares THIS DRAW's c_cameraOrigin against
+  // g_engineSkyCamOrigin, and both of those move; isSubViewSkybox adds a lookup
+  // into g_subViewSkyboxByVs, a per-VS latch that flips mid-session. A
+  // view-independent entry cannot hold either one correctly, and the generation
+  // added alongside could only paper over the latch half -- the camera half is
+  // wrong on every frame the camera moves, which is what the verify banner
+  // means by "camera movement is the only thing that tests whether the object
+  // half is really view-independent".
+  //
+  // THE PRECEDENT IS IN THIS FILE. The replay tier hit the identical bug and
+  // fixed it the identical way in v6.7 (~:19042): "the sub-view flags are NOT
+  // pure functions of the record ... a record captured before its VS was
+  // classified replays isSubViewSkybox=false while the full run now reads true.
+  // That is the VS_eda5efc1 failure -- all four matrices byte-identical, svSky
+  // the only mismatch." Its answer was to re-derive on every path-13 replay
+  // rather than trust the record. This is the same answer for the other tier,
+  // and this function is what stops there being three copies of the rule.
+  //
+  // COST. One record-served 12-byte span read plus a mutex-guarded map probe,
+  // and ONLY on a served draw whose entry was stored by path 13 -- the path
+  // that is the sole producer of these flags. Every other served draw pays two
+  // stores of `false`, which is what it would have derived anyway.
+  //
+  // camOValid IS NOT OPTIONAL. A non-finite or unread origin must classify as
+  // "not sub-view", never as "distance happens to compare small against
+  // garbage" -- the caller checks isfinite and passes the verdict in.
+  static inline void deriveSubViewFlags(const float camO[3], bool camOValid,
+                                        XXH64_hash_t vsXxh,
+                                        bool& outSubView,
+                                        bool& outSubViewSkybox) {
+    outSubView       = false;
+    outSubViewSkybox = false;
+    if (!camOValid || g_engineSkyCamOriginValid == 0u)
+      return;
+    // The 4-unit gate, unchanged from the path-13 site it was lifted from.
+    const float dx = camO[0] - g_engineSkyCamOrigin[0];
+    const float dy = camO[1] - g_engineSkyCamOrigin[1];
+    const float dz = camO[2] - g_engineSkyCamOrigin[2];
+    if (dx * dx + dy * dy + dz * dz >= (4.0f * 4.0f))
+      return;
+    outSubView = true;
+    // Secondary refinement, gated on isSubView exactly as before: the per-VS
+    // dome latch. Absent or false both mean "not a dome", which is why find()
+    // and the bool are both tested -- try_emplace(vs,false) is a real verdict
+    // recorded by the scan loop, not a missing one.
+    if (vsXxh == 0)
+      return;
+    std::lock_guard<std::mutex> g(g_subViewSkyboxByVsMu);
+    auto it = g_subViewSkyboxByVs.find(vsXxh);
+    if (it != g_subViewSkyboxByVs.end() && it->second)
+      outSubViewSkybox = true;
+  }
+
   // NV-DXVK [Continuous skyCam derivation]: when the engine's sub-view
   // R_DrawWorldMeshes pass fires (trampoline captures fresh sky+main
   // cam pair from the same w2v), the relationship
@@ -7566,6 +7693,26 @@ namespace dxvk {
     // the first merge treats every region as dirty and copies the whole mirror.
     std::fill(std::begin(m_boneMirrorRegionMergedGen),
               std::end(m_boneMirrorRegionMergedGen), UINT64_MAX);
+
+    // NV-DXVK [XfDefer] 2026-08-19g -- RESERVE THE MIRROR ONCE, SO THE SEAM'S
+    // CAPTURED POINTER IS STABLE BY CONSTRUCTION RATHER THAN BY INSPECTION.
+    //
+    // The seam capture (~:41297) hands the chain worker m_fullBoneCache.data().
+    // That is only sound if the vector never reallocates under it. Both writers
+    // already resize under `size() != kBoneMirrorBytes` against the same fixed
+    // 393216 -- MergeBoneCacheMirror (~:7906) and the UpdateSubresource
+    // interception (~:58818) -- so in practice it grows once and stays put. But
+    // "in practice" is an argument that has to be re-verified by every reader of
+    // this code, and it silently depends on both call sites agreeing on the
+    // constant. Reserving here makes the guarantee unconditional and local:
+    // capacity is final before the first draw, so neither resize can move the
+    // buffer, whatever they are passed.
+    //
+    // reserve(), not resize(): m_hasFullBoneCache is what says the contents are
+    // meaningful, and it must stay false until something has actually written
+    // bones. Growing size() here would make the mirror look populated to the
+    // `!m_fullBoneCache.empty()` guards.
+    m_fullBoneCache.reserve(::dxvk::tf2::kBoneMirrorBytes);
   }
 
   Rc<DxvkSampler> D3D11Rtx::getDefaultSampler() const {
@@ -12778,7 +12925,7 @@ namespace dxvk {
   static const char* const kXfLiveSiteNames[] = {
     "vguiSb", "vbTc", "vbPos", "vbTc2", "psCbDump", "psUvXform",
     "skinVbs", "camOrigDiag", "garbO2w", "tspSrv", "memoCeil", "recCbSnap",
-    "skyTagSrv", "boneSrcMap", "skyProbeCb2", "geoBufContent"
+    "skyTagSrv", "boneSrcMap", "skyProbeCb2", "geoBufContent", "cbSpan"
   };
   static_assert(sizeof(kXfLiveSiteNames) / sizeof(kXfLiveSiteNames[0])
                     == size_t(XfLiveSite::Count),
@@ -23058,8 +23205,6 @@ namespace dxvk {
           // broader set must NOT get the SRGB / Premult overrides,
           // which are intended only for the painted 3D-skybox content.
           // Consumed downstream by SceneManager::createSurfaceMaterial.
-          transforms.isSubView = (p13GateWouldPass != 0u);
-
           // NV-DXVK [SubViewSkybox]: secondary refinement â€” gated on
           // isSubView AND a per-VS persistent classification map
           // populated by the vertex-scan loop in SubmitDraw. The map
@@ -23071,20 +23216,31 @@ namespace dxvk {
           // then patches dcs.transformData.isSubViewSkybox directly
           // for that draw and marks the cache, so subsequent frames
           // are tagged at ExtractTransforms time.
-          if (transforms.isSubView) {
-            const auto vsPtrSvs = drawVertexShaderCom();
+          //
+          // NV-DXVK [SubViewFlags] 2026-08-19g: BOTH FLAGS NOW COME FROM
+          // deriveSubViewFlags, which the split-transform SERVE calls too. They
+          // are no longer cached, so the serve has to recompute them, and two
+          // implementations of a rule this fiddly is R23's defect -- the second
+          // one drifts. The behaviour is unchanged: same 4-unit gate on the same
+          // p13CamOrigin, same map, same isSubView gating on the map probe.
+          //
+          // p13GateWouldPass is left as the DIAGNOSTIC it is documented to be
+          // (~:23000, "computed below purely as a diagnostic") and is no longer
+          // what decides the flag. It is read by an s_xtDiagEnabled-gated log
+          // above this point, so it keeps its own earlier evaluation.
+          {
+            XXH64_hash_t vsXxhSvs = 0;
+            const auto& vsPtrSvs = drawVertexShaderCom();
             if (vsPtrSvs != nullptr && vsPtrSvs->GetCommonShader() != nullptr) {
               const auto& shSvs = vsPtrSvs->GetCommonShader()->GetShader();
-              if (shSvs != nullptr) {
-                const XXH64_hash_t vsXxhSvs =
-                  static_cast<XXH64_hash_t>(shSvs->getHash());
-                std::lock_guard<std::mutex> g(g_subViewSkyboxByVsMu);
-                auto it = g_subViewSkyboxByVs.find(vsXxhSvs);
-                if (it != g_subViewSkyboxByVs.end() && it->second) {
-                  transforms.isSubViewSkybox = true;
-                }
-              }
+              if (shSvs != nullptr)
+                vsXxhSvs = static_cast<XXH64_hash_t>(shSvs->getHash());
             }
+            bool svD = false, svsD = false;
+            deriveSubViewFlags(p13CamOrigin, p13CameraRelative, vsXxhSvs,
+                               svD, svsD);
+            transforms.isSubView       = svD;
+            transforms.isSubViewSkybox = svsD;
           }
         } else {
           Matrix4 invView = inverse(transforms.worldToView);
@@ -26632,6 +26788,19 @@ namespace dxvk {
       const uint8_t* base   = nullptr;
       size_t         len    = 0;
       DxvkBuffer*    pinned = nullptr;
+      // NV-DXVK [XfDefer] 2026-08-19g -- WHICH OF THE THREE SOURCES THIS IS.
+      //
+      // Path 3 (m_fullBoneCache) is now captured here too, and it differs from
+      // paths 1/2 in two ways the tail must not have to re-derive:
+      //   - there is no buffer and therefore no pin (see fromCache below);
+      //   - the tail's boneSrcIsCache flag decides whether the bytes go through
+      //     the write-combined staging copy, and it used to be set by the branch
+      //     that read the cache. With the read moved to the seam that branch no
+      //     longer runs, so the flag has to travel with the bytes.
+      // Getting this wrong sends an already-cached (normal, cached-memory) read
+      // through the WC staging path -- the exact mistake the tail's own comment
+      // at path 3 warns about.
+      bool           fromCache = false;
     };
     BoneSrcCap bone;  bool hasBone = false;
 
@@ -26641,9 +26810,10 @@ namespace dxvk {
         bone.pinned->decRef();
         bone.pinned = nullptr;
       }
-      bone.base = nullptr;
-      bone.len  = 0;
-      hasBone   = false;
+      bone.base      = nullptr;
+      bone.len       = 0;
+      bone.fromCache = false;
+      hasBone        = false;
     }
 
     void release() {
@@ -27797,11 +27967,18 @@ namespace dxvk {
     // has already run by then, so the abort predicate could never have seen it.
     // The same structural blindness that pinned xfAbort{live=} at zero.
     //
-    // Counted against the PsCbFieldDump site rather than a new enum entry: the
-    // census names WHICH KIND of read escaped, and a cbuffer-content read is
-    // what that entry already means.
+    // NV-DXVK [XfDefer] 2026-08-19g: SCORED AS CbSpanContent, was PsCbFieldDump.
+    // The borrowed slot sent 28,345 escapes/window to a kDiagLogs one-shot dump
+    // that cannot run in a normal build. Contract at the enum entry.
+    //
+    // WHAT REACHING HERE MEANS AFTER 19g. The named c_cameraOrigin span is no
+    // longer filtered (~:31678), so the sky consumer -- the only post-seam
+    // caller -- is served from the record and this should read ~0. A non-zero
+    // cbSpan= is therefore a REAL finding: either a new post-seam caller
+    // appeared, or a span the capture genuinely does not hold. Do not read it
+    // as cold-start noise.
     if (s_xfDeferExecuting) {
-      s_xfLiveEscapeBySite[size_t(XfLiveSite::PsCbFieldDump)]
+      s_xfLiveEscapeBySite[size_t(XfLiveSite::CbSpanContent)]
         .fetch_add(1u, std::memory_order_relaxed);
       if (m_drawSnapCur != nullptr && m_drawSnapValid
           && m_drawSnapCur->liveStateEscapes != UINT16_MAX)
@@ -29450,6 +29627,97 @@ namespace dxvk {
                           XXH64(&hk, sizeof(hk), 0x5817E0B1ull));
       } else {
         outObjVal = XXH64(&hk, sizeof(hk), 0x5817E0B1ull);
+      }
+
+      // ==================================================================
+      // NV-DXVK [SubViewSkyboxGen] 2026-08-19g -- THE ONE INPUT TO THE OBJECT
+      // PART THAT IS NOT AN INPUT TO ANYTHING ABOVE.
+      //
+      // Everything hashed above is a geometric or shader input the derivation
+      // READS. isSubViewSkybox is different in kind: the object part stores it
+      // (~:43933) but it is not derived from any of these bytes -- it comes from
+      // g_subViewSkyboxByVs, a per-VS latch that flips once mid-session when an
+      // accumulating world-AABB crosses 5M. So an entry can be byte-for-byte
+      // valid by every measure above and still carry a classification that has
+      // since changed underneath it. That is what the 22:19 run measured:
+      // FAIL=136, `fld{subVSky}` and never `subV`, one entry served across 33
+      // camera positions. Full chain at the g_subViewSkyboxGen declaration.
+      //
+      // Folding the generation in is the invalidation the latch never had. It
+      // goes in the VALIDITY hash and NOT in the key, on the rule stated forty
+      // lines up and paid for once already: narrowing the KEY moves a draw onto
+      // a stranger's entry and shipped 96-193 FAIL/window; narrowing the
+      // VALIDITY hash can only refuse a serve. A refused serve costs a
+      // re-derivation. A wrong serve costs the painted sky its emissive tag.
+      //
+      // REMOVED AGAIN, SAME DAY, AND THE REASON IS WORTH KEEPING. The fold
+      // above shipped for exactly as long as isSubViewSkybox was still a cached
+      // field. Once it left XfObjectPart the fold became dead weight in the
+      // worst way: an XXH64 on every draw plus a WHOLE-CACHE invalidation at
+      // every latch flip, buying nothing, because the serve now reads the latch
+      // live through deriveSubViewFlags and cannot hold a stale classification
+      // at all.
+      //
+      // THE GENERAL RULE IT LEAVES BEHIND. A generation is the right tool when
+      // a cached value has an input the cache cannot see. It is the WRONG tool
+      // when the value should not have been cached -- there it buys a per-draw
+      // cost and a periodic cache wipe to protect a field that could simply be
+      // recomputed. Check which of the two you have before reaching for the
+      // generation; this one was the second.
+      //
+      // g_subViewSkyboxGen itself is kept: it costs one atomic increment per
+      // latch flip (once per VS per session) and stamps the
+      // [SubViewSkyboxClassify] line, so the log still says when a VS was
+      // promoted. It is a diagnostic now, not a correctness mechanism.
+
+      // ==================================================================
+      // NV-DXVK [FanoutCamVal] 2026-08-19g -- THE PATH-6 FANOUT ORIGIN, WHICH
+      // IS AN o2w INPUT AND WAS IN NO COMPONENT.
+      //
+      // THE ONE FAIL LEFT after the sub-view work, and the [Perf.SplitXf.FAIL]
+      // line classified it itself: from{path=6} == o2wPath=6 (not an identity
+      // collision), mask=0->0 (not the mixed-mask hazard), so by its own
+      // decision tree it is the third case -- the validity hash is missing an
+      // input. chg{t31Ent} is a marker, not the cause: t31skip=not_reached says
+      // the t31 block never ran, and path 6 does not read t31 at all.
+      //
+      // WHAT PATH 6 ACTUALLY READS. At ~:23793 its objectToWorld is nothing but
+      // a translation, and the translation IS the camera position:
+      //
+      //     rdefCamOValid = haveCamO && camO != (0,0,0)
+      //     if (!rdefCamOValid && m_hasFanoutCamOrigin)
+      //         camOforZeroCb3 = m_lastFanoutCamOrigin;      <-- HERE
+      //     ...
+      //     objectToWorld = translate(camOforZeroCb3)
+      //
+      // The rdefCamOValid branch is safe and always was: camO is the
+      // RDEF-resolved cb2 span, which is captured, hashed as part of the span
+      // components, and (since the 19g capture change) captured
+      // unconditionally. The FALLBACK branch is the hole.
+      // m_lastFanoutCamOrigin is a D3D11Rtx member written by the engine-hook
+      // fanout sites. It is not a DrawSnapshot input, so no component covers
+      // it, so objVal cannot see it move -- and an entry stored under one
+      // fanout origin serves an o2w that is literally the old camera position
+      // after the player walks. fields{o2w o2v} with every recorded input
+      // identical is exactly that shape.
+      //
+      // WHY THE GATE IS THE PREDICTED PATH. Folding this unconditionally would
+      // invalidate every object entry on every camera move -- serve% to zero,
+      // for a fallback that measured ONE draw in a 90-second run. Path 6 is the
+      // only consumer, so only path-6 draws pay. UINT32_MAX is included because
+      // an unpredicted draw could still derive as path 6; it costs nothing in
+      // steady state, where o2wPath{} reads cold=0.
+      //
+      // ASYMMETRY IS SAFE, AND IS THE POINT. A draw that stored without the
+      // fold and serves with it (or the reverse) simply computes a different
+      // objVal and misses. Same rule as everything else here: narrowing the
+      // VALIDITY hash can only refuse a serve, never redirect one.
+      if (m_hasFanoutCamOrigin
+          && (s_o2wPathPredicted == 6u || s_o2wPathPredicted == UINT32_MAX)) {
+        const float fanoutCamO[3] = { m_lastFanoutCamOrigin.x,
+                                      m_lastFanoutCamOrigin.y,
+                                      m_lastFanoutCamOrigin.z };
+        outObjVal = XXH64(fanoutCamO, sizeof(fanoutCamO), outObjVal);
       }
     }
 
@@ -31671,12 +31939,48 @@ namespace dxvk {
           if (camLocCap0 && camLocCap0->size >= 12
               && camLocCap0->slot < st.vs.constantBuffers.size()) {
             const auto& cbCam = st.vs.constantBuffers[camLocCap0->slot];
-            // capLoc may be null here -- this block is deliberately outside the
-            // sVsCbLocCache guard -- so the counters only apply when there IS
-            // an entry to hold them. No entry means no filtering, which is the
-            // conservative side and matches the pre-existing behaviour.
-            if (cbCam.buffer != nullptr
-                && (capLoc == nullptr || mfWant(capLoc->camUse))) {
+            // ==================================================================
+            // NV-DXVK [XfDefer] 2026-08-19g -- THE mfWant FILTER IS GONE FROM
+            // THIS SPAN, AND IT IS THE FIX FOR xfEsc{ psCbDump=28345 }.
+            //
+            // WHAT WAS ACTUALLY BROKEN. 19f converted SetSkyCategoryFromCb2's
+            // c_cameraOrigin read to drawCbSpan and reported the resulting
+            // 28,345 escapes/window (~85% of a 56.1% abort rate) as "the guard
+            // returns before the live read, so the manifest can never learn the
+            // span". That diagnosis was wrong in a way worth recording: the span
+            // is NOT a manifest span at all. It is a NAMED span, captured right
+            // here, by name, since 2026-08-10 -- and it was being withheld by
+            // mfWant(camUse) on the large majority of draws.
+            //
+            // WHY THE FILTER COULD NEVER GET THIS RIGHT. camUse is fed from
+            // exactly one place (~:17040, s_xtVsLocCur->camUse.notePathDraw(
+            // path, camRead)) and camRead means "ExtractTransforms read the
+            // camera origin on this draw". PathUse::wantedBy then applies the
+            // majority rule, reads[path]*2 >= draws[path]. SetSkyCategoryFromCb2
+            // is a SECOND consumer of the same span, it runs POST-SEAM, and it
+            // credits nothing -- so on every VS whose ExtractTransforms path
+            // does not read camO, the filter measures "nobody wants this",
+            // withholds it, and the sky consumer misses the record forever.
+            // R39 one level up: a filter cannot be taught by a consumer that
+            // has no way to reach it.
+            //
+            // WHY UNCONDITIONAL IS THE RIGHT ANSWER RATHER THAN A BIGGER
+            // MECHANISM. Read PathUse::wantedBy's own cost model: "Capturing
+            // costs one write-combined transaction unconditionally. Not
+            // capturing costs the same transaction as a live read, but only on
+            // the draws that actually read it." That second clause is what
+            // stopped being true when the span acquired a post-seam consumer.
+            // For a routed draw, NOT capturing does not cost a live read -- the
+            // live read is refused, so it costs a REFUSED DRAW and a full
+            // re-derivation at the join. The filter's saving was measured at
+            // ~2,138 withheld draws/window x 12 B; its cost is ~26,231 aborted
+            // draws/window. There is no threshold at which the trade comes back,
+            // so the filter goes rather than gets retuned.
+            //
+            // capLoc is now unused by this block -- deliberately. It was only
+            // ever the filter's argument, and the entry it points at cannot
+            // describe this span's real demand.
+            if (cbCam.buffer != nullptr) {
               const uint32_t rIdxC = s.numCbRanges;
               capture(st.vs.constantBuffers, 0u, camLocCap0->slot,
                       static_cast<uint32_t>(cbCam.constantOffset) * 16u
@@ -41255,11 +41559,36 @@ namespace dxvk {
       // `geo.numBonesPerVertex > 0` block serves. Everything else pays one
       // record-served pointer load and a branch.
       //
-      // TWO PATHS, IN THE SAME ORDER THE TAIL USED THEM, so the bytes a routed
+      // THREE PATHS, IN THE SAME ORDER THE TAIL USES THEM, so the bytes a routed
       // draw gets are the bytes an inline draw would have got: the D3D11
-      // mapped slice first, the host-visible DxvkBuffer mapping second. Path 3
-      // (m_fullBoneCache) is deliberately NOT captured -- it is a member vector
-      // guarded by XfSharedSite::BoneCacheMirror, not a pinnable buffer.
+      // mapped slice first, the host-visible DxvkBuffer mapping second, the
+      // UpdateSubresource mirror third.
+      //
+      // NV-DXVK [XfDefer] 2026-08-19g -- PATH 3 IS CAPTURED NOW, AND THAT IS
+      // WHAT CLOSES boneSrcMap=3306 / boneMirror=3306.
+      //
+      // 19f captured paths 1 and 2 only, on the reasoning that m_fullBoneCache
+      // "is a member vector guarded by XfSharedSite::BoneCacheMirror, not a
+      // pinnable buffer". The census then reported the two counters as
+      // IDENTICAL in every window -- the signature of one population, not two
+      // problems: a draw whose palette lives in the mirror finds no capture
+      // (boneSrcMap++), then asks for the mirror and is refused (boneMirror++).
+      // Both refusals are the same missing capture.
+      //
+      // WHY NO PIN IS NEEDED, AND WHY THAT IS NOT AN EXEMPTION. The reason
+      // paths 1/2 pin is renaming: the frame thread can WRITE_DISCARD the
+      // buffer under the worker. m_fullBoneCache cannot be renamed -- the risk
+      // there is REALLOCATION, and it is measurably absent. Both writers
+      // (MergeBoneCacheMirror ~:7906 and the UpdateSubresource interception
+      // ~:58818) resize only under `size() != N` against the same fixed
+      // kBoneMirrorBytes = 393216, so the vector reaches its final capacity on
+      // the first write and never moves again. The ctor now reserves it
+      // outright, which turns that measured property into an unconditional one.
+      //
+      // Content tearing by a later frame-thread merge is PRE-EXISTING and is
+      // not changed by this: the tail read the same member through the same
+      // pointer before the chain existed. What the capture removes is the
+      // dangling-pointer risk and the refusal.
       if (D3D11ShaderResourceView* boneSrvSeam = drawVsSrv(30u)) {
         if (D3D11Buffer* boneBufSeam = probeSrvCached(boneSrvSeam).buf) {
           const uint8_t* bBase = nullptr;
@@ -41287,10 +41616,40 @@ namespace dxvk {
             if (bdb != nullptr) {
               bdb->incRef();
               bdb->acquire(DxvkAccess::Read);
-              xfPend.bone.pinned = bdb.ptr();
-              xfPend.bone.base   = bBase;
-              xfPend.bone.len    = bLen;
-              xfPend.hasBone     = true;
+              xfPend.bone.pinned    = bdb.ptr();
+              xfPend.bone.base      = bBase;
+              xfPend.bone.len       = bLen;
+              xfPend.bone.fromCache = false;
+              xfPend.hasBone        = true;
+            }
+          }
+
+          // PATH 3, ON THE FRAME THREAD WHERE ALL OF IT IS LEGAL.
+          //
+          // THE MERGE IS THE HALF THAT COULD NOT BE DEFERRED. The tail's own
+          // path-3 block does two shared things -- run MergeBoneCacheMirror
+          // when the mirror generation has moved, and hand out
+          // m_fullBoneCache.data() -- and both were refused on a worker. Doing
+          // them HERE is not a workaround; it is the merge running in the one
+          // place it was always allowed to run, and it is the R38 shape
+          // inverted: the frame thread performs the work instead of a worker
+          // asking permission it can never be granted.
+          //
+          // THE GENERATION CHECK STAYS OUTSIDE THE MUTEX, exactly as the tail
+          // had it: the atomic answers "did any bone byte change?" for the
+          // large majority of skinned draws without taking the lock, and
+          // MergeBoneCacheMirror then narrows to the regions that moved.
+          if (!xfPend.hasBone && m_hasFullBoneCache) {
+            if (::dxvk::tf2::g_boneCacheMirrorGen.load(std::memory_order_acquire)
+                != m_boneMirrorMergedGen) {
+              MergeBoneCacheMirror();
+            }
+            if (!m_fullBoneCache.empty()) {
+              xfPend.bone.pinned    = nullptr;   // nothing to pin; see BoneSrcCap
+              xfPend.bone.base      = m_fullBoneCache.data();
+              xfPend.bone.len       = m_fullBoneCache.size();
+              xfPend.bone.fromCache = true;
+              xfPend.hasBone        = true;
             }
           }
         }
@@ -42804,8 +43163,69 @@ namespace dxvk {
           cand.texcoordEncoding  =
               static_cast<RtSurface::TexcoordEncoding>(o.texcoordEncoding);
           cand.stablePropId      = o.stablePropId;
-          cand.isSubView         = o.isSubView;
-          cand.isSubViewSkybox   = o.isSubViewSkybox;
+          // ==================================================================
+          // NV-DXVK [SubViewFlags] 2026-08-19g -- RE-DERIVED, NOT SERVED. This
+          // was `cand.isSubView = o.isSubView` and the skybox flag beside it,
+          // and those two lines are the whole of FAIL=136 fld{subVSky}.
+          //
+          // Neither flag is a property of the object. isSubView is a distance
+          // test between THIS DRAW's c_cameraOrigin and g_engineSkyCamOrigin --
+          // both of which move -- and isSubViewSkybox adds a per-VS latch that
+          // flips mid-session. Serving them from the view-independent half meant
+          // one entry answered for 33 different camera positions, which is
+          // exactly the case the verify banner says camera movement exists to
+          // catch. Contract and the replay tier's identical precedent are at
+          // deriveSubViewFlags.
+          //
+          // GATED ON storePath == 13 because path 13 is the only producer: the
+          // derivation sets these two nowhere else, so a served entry from any
+          // other path derived false and must serve false. Everything else pays
+          // two stores and a compare.
+          //
+          // THE ORIGIN COMES FROM THE RECORD, at the RDEF-resolved location --
+          // the same span and the same rebase convention the path-13 site reads
+          // (~:23113). Deliberately NOT drawCamOriginForCorrection: that one
+          // names the hardcoded cb2@4 fallback, which the capture comment at
+          // ~:31730 is explicit is a DIFFERENT location by definition, and
+          // classifying off it would gate on bytes the derivation never saw.
+          // This read is free after the 19g capture change -- the cam span is
+          // now unconditionally in the record, so it is a lookup, not a mapping.
+          {
+            bool svS = false, svsS = false;
+            if (o.storePath == 13u) {
+              float        camOS[3] = { 0.0f, 0.0f, 0.0f };
+              bool         camOkS   = false;
+              XXH64_hash_t vsXxhS   = 0;
+              // Reference, not a Com copy -- this is a per-draw path and the
+              // accessor returns a reference to a member nothing here mutates.
+              // Same reason SetSkyCategoryFromCb2 takes it by reference.
+              const auto& vsPtrS = drawVertexShaderCom();
+              if (vsPtrS != nullptr && vsPtrS->GetCommonShader() != nullptr) {
+                const D3D11CommonShader* commonS = vsPtrS->GetCommonShader();
+                const auto& shS = commonS->GetShader();
+                if (shS != nullptr)
+                  vsXxhS = static_cast<XXH64_hash_t>(shS->getHash());
+                auto camLocS = memoCamOriginLoc(commonS);
+                if (camLocS && camLocS->size >= 12
+                    && camLocS->slot
+                         < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+                  const uint8_t* pS = drawCbSpan(
+                      camLocS->slot,
+                      static_cast<uint32_t>(camLocS->offset), 12u,
+                      /*rebase*/ true);
+                  if (pS != nullptr) {
+                    std::memcpy(camOS, pS, sizeof(camOS));
+                    camOkS = std::isfinite(camOS[0])
+                          && std::isfinite(camOS[1])
+                          && std::isfinite(camOS[2]);
+                  }
+                }
+              }
+              deriveSubViewFlags(camOS, camOkS, vsXxhS, svS, svsS);
+            }
+            cand.isSubView       = svS;
+            cand.isSubViewSkybox = svsS;
+          }
           cand.vertexShaderHash  = o.vertexShaderHash;
           cand.pixelShaderHash   = o.pixelShaderHash;
           cand.worldToView       = v.worldToView;
@@ -43148,9 +43568,12 @@ namespace dxvk {
                            &t.clipPlane, sizeof(Vector4)) == 0
                     && oe.texgenMode       == uint32_t(t.texgenMode)
                     && oe.texcoordEncoding == uint32_t(t.texcoordEncoding)
-                    && oe.enableClipPlane  == t.enableClipPlane
-                    && oe.isSubView        == t.isSubView
-                    && oe.isSubViewSkybox  == t.isSubViewSkybox;
+                    && oe.enableClipPlane  == t.enableClipPlane;
+                // NV-DXVK [SubViewFlags] 2026-08-19g: the two sub-view flags
+                // left this comparison with the fields themselves. They were
+                // never a fair term here anyway -- "did the validity hash
+                // invalidate for nothing" is a question about the OBJECT, and a
+                // flag that tracks the camera answers it wrongly by design.
                 const bool spur = o2wSame && otherSame;
                 if (spur) ++xStSpur[xPid]; else ++xStReal[xPid];
                 if (!spur) {
@@ -43797,8 +44220,12 @@ namespace dxvk {
                 np.texgenMode        = static_cast<uint32_t>(t.texgenMode);
                 np.texcoordEncoding  = static_cast<uint32_t>(t.texcoordEncoding);
                 np.enableClipPlane   = t.enableClipPlane;
-                np.isSubView         = t.isSubView;
-                np.isSubViewSkybox   = t.isSubViewSkybox;
+                // NV-DXVK [SubViewFlags] 2026-08-19g: isSubView and
+                // isSubViewSkybox are NOT stored any more -- they left
+                // XfObjectPart entirely. Neither is a function of the object,
+                // and caching them here is what produced FAIL=136 fld{subVSky}.
+                // The serve re-derives them; see deriveSubViewFlags. Do not
+                // re-add them to this list.
                 np.lastFrame         = xFid;
                 np.valHash           = objVal;
             // NV-DXVK [GenVal]: stored beside valHash and from the same draw,
@@ -49028,9 +49455,13 @@ namespace dxvk {
           // Nothing changes for an inline draw: hasBone is only ever set under
           // `sBatchDraw && xfRouteThisDraw`, so paths 1/2 stay exactly as they
           // were on the default path.
+          // NV-DXVK [XfDefer] 2026-08-19g: path 0 now covers path 3 as well, so
+          // it carries the source tag with it. See BoneSrcCap::fromCache.
+          bool boneSrcIsCache = false;
           if (pend.hasBone) {
-            bonePtr    = pend.bone.base;
-            boneBufLen = pend.bone.len;
+            bonePtr        = pend.bone.base;
+            boneBufLen     = pend.bone.len;
+            boneSrcIsCache = pend.bone.fromCache;
           }
 
           // Paths 1 and 2 both ask the buffer for its CURRENT mapping, which is
@@ -49087,8 +49518,17 @@ namespace dxvk {
             // for abort; asking only when a merge is actually due keeps the
             // refusal as rare as the merge is, which the two-level skip above
             // already establishes is "most draws never get here".
-            if (::dxvk::tf2::g_boneCacheMirrorGen.load(std::memory_order_acquire)
-                != m_boneMirrorMergedGen
+            //
+            // NV-DXVK [XfDefer] 2026-08-19g: AND NOW ONLY WHEN THE SEAM DID NOT
+            // ALREADY DO IT. On a routed draw the seam ran this exact
+            // generation check and this exact merge on the frame thread moments
+            // ago (~:41297), so reaching here could only ever produce a refusal
+            // for work already done. Keyed off pend.hasBone rather than
+            // bonePtr, so an INLINE draw's behaviour is bit-identical to
+            // before: hasBone is set only under `sBatchDraw && xfRouteThisDraw`.
+            if (!pend.hasBone
+                && ::dxvk::tf2::g_boneCacheMirrorGen.load(std::memory_order_acquire)
+                     != m_boneMirrorMergedGen
                 && xfMayWriteShared(XfSharedSite::BoneCacheMirror)) {
               MergeBoneCacheMirror();
             }
@@ -49099,7 +49539,12 @@ namespace dxvk {
           // longer answers "did this come from the cached mirror?" â€” and
           // getting that wrong would send an already-cached read through the
           // write-combined staging copy.
-          bool boneSrcIsCache = false;
+          //
+          // NV-DXVK [XfDefer] 2026-08-19g: declared with path 0 above now, since
+          // the seam can be the one that answers it. This branch is the INLINE
+          // path only -- a routed draw either got the mirror at the seam
+          // (fromCache=true) or has no palette at all, and in neither case can
+          // it reach a live handout of .data() here.
           if (!bonePtr && m_hasFullBoneCache && !m_fullBoneCache.empty()
               // [XfDefer] 2026-08-19f: same member, same refusal as the merge
               // above -- .data() outlives this statement and the frame thread
@@ -53316,6 +53761,68 @@ namespace dxvk {
                     (it == g_subViewSkyboxByVs.end()) || (it->second == false);
                   g_subViewSkyboxByVs[vsXxhAabb] = true;
                 }
+                // ==================================================================
+                // NV-DXVK [SubViewSkyboxGen] 2026-08-19g -- THIS PATCH IS THE ONE
+                // THE OBJECT CACHE CANNOT SEE, AND THE BUMP IS WHAT TELLS IT.
+                //
+                // ORDER OF EVENTS, which is the whole problem and is not visible
+                // from either site alone. SubmitDrawTail stores the object part
+                // (np.isSubViewSkybox = t.isSubViewSkybox, ~:43933) and THEN
+                // tail-calls SubmitDrawDeferred, where this line lives. So the
+                // cache has already recorded the derivation's value by the time
+                // this runs, and the patch below can only ever contradict it. A
+                // cache that holds a value the draw did not use is wrong for as
+                // long as that entry survives -- measured at restores=12 and age
+                // 24 on the entry that produced most of the 136 FAILs.
+                //
+                // WHY THE PATCH IS NOT SIMPLY MOVED ABOVE THE STORE, which was the
+                // first thing tried: it cannot be, without moving the accumulating
+                // world-AABB scan with it. This block's inputs are `tlasE`
+                // (e.worldVertMin/Max, accumulated across frames) and
+                // dcs.geometryData.normalBuffer, and tlasE is built in the
+                // DEFERRED half, downstream of the store. Hoisting it is a
+                // restructure of the vertex-scan subsystem, not a reordering.
+                //
+                // SO THE BUMP IS TIED TO THE LATCH TRANSITION, NOT TO THE
+                // PER-DRAW DIVERGENCE. The first version of this tested
+                // `!dcs.transformData.isSubViewSkybox` -- literally "the cache
+                // recorded a value this draw did not use" -- which is the wider
+                // and apparently stricter condition. It is WRONG, and the way it
+                // is wrong is worth recording because the wider condition looked
+                // obviously safer:
+                //
+                //   SetSkyCategoryFromCb2 sets isSubView = true LATE, at ~:56315,
+                //   and its own comment says the scan loop is MEANT to see that
+                //   updated value. For every draw tagged by that route -- the
+                //   dome among them -- isSubView is false when ExtractTransforms
+                //   runs, so the map lookup at ~:23094 is skipped, so
+                //   isSubViewSkybox is false at the store, EVERY FRAME. The
+                //   divergence is therefore steady-state, not transitional, and
+                //   bumping on it would have invalidated the entire object cache
+                //   once per frame forever -- serve% to zero, which is the
+                //   opposite of a fix.
+                //
+                // firstClassify is exactly the latch edge: `(absent || false)`
+                // before the store of true, so it is true once per VS per session
+                // and never again. That is the event the object entries actually
+                // need to be told about, and it is bounded by construction.
+                //
+                // R38 is satisfied: the marker is set by the event that creates
+                // the staleness (the latch flipping), not by the work that
+                // consumes it.
+                //
+                // WHAT THIS DELIBERATELY DOES NOT FIX. The steady-state case
+                // above -- the cache holding false for a draw that renders true
+                // -- is real and remains. It cannot be fixed by invalidation, for
+                // the reason just given, and it is NOT what FAIL measured: the
+                // verify tier compares the served candidate against the fresh
+                // derivation at the STORE point, where both are still pre-patch
+                // and therefore agree. Its fix is to stop caching a field the
+                // tail rewrites -- see the note at the g_subViewSkyboxGen
+                // declaration.
+                if (firstClassify) {
+                  g_subViewSkyboxGen.fetch_add(1u, std::memory_order_relaxed);
+                }
                 dcs.transformData.isSubViewSkybox = true;
                 if (firstClassify) {
                   Logger::info(str::format(
@@ -53323,7 +53830,8 @@ namespace dxvk {
                     vsXxhAabb, std::dec,
                     " worldAabbDiag~", std::sqrt(diagSq),
                     " (samples=", e.worldVertSamples,
-                    ", writesColor=0) â€” promoted; tagging BAKED_ALBEDO_AS_EMISSIVE downstream"));
+                    ", writesColor=0) â€” promoted; tagging BAKED_ALBEDO_AS_EMISSIVE downstream",
+                    " svSkyGen=", g_subViewSkyboxGen.load(std::memory_order_relaxed)));
                 }
               } else {
                 // NV-DXVK [SkyProbe cut]: confirmed NON-dome sub-view draw (writes
@@ -56573,6 +57081,42 @@ namespace dxvk {
     // with rtx.dumpEngineSunCBFields/Values on, every routed draw refuses and
     // the routed population collapses for that run. Those are discovery
     // switches, both default false, and a run with them on is not a perf run.
+    //
+    // ==================================================================
+    // NV-DXVK [XfDefer] 2026-08-19g -- THAT "ONE ABORT PER FRAME" BOUND WAS
+    // WRONG, AND IT MEASURED 3,758. RULE R38.
+    //
+    // The reasoning above assumed the s_sunCapturedFrame latch would be set for
+    // this frame after the first routed draw took its abort. It is not.
+    // s_sunCapturedFrame is stored ONLY on the success paths far below
+    // (~:56916, ~:57140), which the refusal returns above. So the latch never
+    // arms on a routed draw, every subsequent routed draw in the frame retries,
+    // reaches here, and refuses again -- ~57 aborts per frame instead of <=1.
+    // The frame thread's replay does land, but at the JOIN, far too late to arm
+    // anything for the frame that is already over.
+    //
+    // THE FIX IS THE RULE ITSELF: if the intent is "one abort per frame", the
+    // marker has to be set BY THE REFUSAL, not by the work. This latch is that
+    // marker. exchange() makes claiming it atomic -- the first routed draw to
+    // reach this line this frame gets back a different frame id and proceeds to
+    // the refusal; every later one gets back its own id and returns without
+    // asking, so it neither aborts nor re-derives.
+    //
+    // SEPARATE FROM s_sunCapturedFrame ON PURPOSE. That latch means "the
+    // capture succeeded this frame" and gates real work; this one means "a draw
+    // has already paid the abort this frame" and gates only the asking. Folding
+    // them together would let a refusal masquerade as a successful capture and
+    // suppress the frame-thread replay that is the whole recovery.
+    //
+    // Guarded by xfDeferExecutingDeferred() so the inline path -- including the
+    // replay that actually performs the capture -- is untouched.
+    if (xfDeferExecutingDeferred()) {
+      static std::atomic<uint32_t> s_sunDeferFrame { UINT32_MAX };
+      if (s_sunDeferFrame.exchange(sunFrameNow, std::memory_order_relaxed)
+            == sunFrameNow) {
+        return false;   // a draw already took this frame's abort
+      }
+    }
     if (!xfMayWriteShared(XfSharedSite::EngineSunCapture)) {
       return false;
     }
@@ -57572,6 +58116,34 @@ namespace dxvk {
     // dump refuses, so the cost is one abort per dump, not per draw. With
     // rtx.dumpEngineLightsEveryNFrames at its default cadence that is far less
     // than one per frame.
+    //
+    // ==================================================================
+    // NV-DXVK [XfDefer] 2026-08-19g -- SAME R38 DEFECT, SAME MEASUREMENT:
+    // engineLights=3758 per window, identical to the sun.
+    //
+    // And note the irony recorded at the [perf/LightsDumpLatch] comment 20 lines
+    // up: THIS FUNCTION ALREADY HAD THIS EXACT BUG ONCE, in 2026-08-06, where
+    // sLastFrame armed only on success and an early-out therefore ran the whole
+    // preamble on every draw forever. sHopelessFrame was added to fix it. The
+    // 19f refusal then reintroduced the same shape one gate lower down --
+    // sLastFrame still arms only on success, the refusal returns above it, so
+    // every routed draw retries and refuses.
+    //
+    // Fixed the same way sHopelessFrame was: a per-frame latch set by the
+    // condition itself. "A routed draw has already paid the abort this frame"
+    // is a frame-wide fact, exactly like "the mirror is empty this frame", so
+    // once one draw establishes it no other draw need re-establish it.
+    //
+    // Deliberately NOT armed onto sLastFrame: that would burn the whole cadence
+    // window and delay the first real dump by up to N frames -- the same
+    // reasoning sHopelessFrame's comment gives for not touching it either.
+    if (xfDeferExecutingDeferred()) {
+      static std::atomic<uint64_t> s_lightsDeferFrame { UINT64_MAX };
+      if (s_lightsDeferFrame.exchange(curFrame, std::memory_order_relaxed)
+            == curFrame) {
+        return false;   // a draw already took this frame's abort
+      }
+    }
     if (!xfMayWriteShared(XfSharedSite::EngineLightsDump)) {
       return false;
     }
