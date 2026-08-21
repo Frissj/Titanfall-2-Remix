@@ -34,6 +34,9 @@
 #include "rtx_camera_manager.h"
 #include "dxvk_cmdlist.h"
 #include "rtx_opacity_micromap_manager.h"
+// NV-DXVK [ResidentScene]: forward-declares RtInstance only, so this include
+// cannot cycle back on us even though ResidentScene's .cpp includes this file.
+#include "rtx_resident_scene.h"
 
 namespace dxvk 
 {
@@ -318,6 +321,10 @@ private:
   void onTransformChanged(bool objectToWorldChanged = true,
                           const SpatialKeyHint& keyHint = SpatialKeyHint());
   friend class InstanceManager;
+  // NV-DXVK [ResidentScene]: reads and clears m_residentKey to maintain the
+  // back-pointer contract documented on that field. Same access InstanceManager
+  // needs for m_batchRecordKey, and for the same reason.
+  friend class ResidentScene;
 
   // Unique ID of the RtInstance.
   // Sentinel value UINT64_MAX indicates that such RtInstance is a "virtual" instance, and is ignored by some features,
@@ -344,6 +351,25 @@ private:
   // invalidated in the same call, because the destroy path has to come through
   // removeInstance to reach the event handlers at all.
   mutable uint64_t m_batchRecordKey = 0ull;
+
+  // NV-DXVK [ResidentScene]: which resident record, if any, currently holds a
+  // raw pointer to this instance. 0 means none. See rtx_resident_scene.h.
+  //
+  // SAME LIFETIME CONTRACT AS m_batchRecordKey ABOVE, AND FOR THE SAME REASON:
+  // a resident record caches RtInstance* across an UNBOUNDED number of frames
+  // (that is the entire point of residency), so without a back-pointer it is a
+  // dangling-pointer generator -- the failure class this file has already
+  // shipped twice, in the file-static s_zigGunInstance deref and the GC-walk
+  // incRef race. Carrying the key here makes ResidentScene::invalidateFor()
+  // O(1) and TOTAL: an instance cannot be destroyed without coming through
+  // removeInstance, and removeInstance invalidates in the same call.
+  //
+  // DELIBERATELY A SECOND KEY, NOT A REUSE OF m_batchRecordKey. The fanout
+  // record and the resident record answer different questions over different
+  // populations (one batch of placements versus one object across its life),
+  // an instance can legitimately be in both, and sharing the field would make
+  // either invalidation silently clear the other's claim.
+  mutable uint64_t m_residentKey = 0ull;
 
   Flags<CameraType::Enum> m_seenCameraTypes;  // Camera types with which the instance has been originally rendered with
 
@@ -819,6 +845,20 @@ private:
   uint64_t fanoutRecordKey(const DrawCallState& drawCall, const BlasEntry& blas) const;
   // Drop any record referencing this instance. Called from removeInstance.
   void invalidateFanoutRecordFor(const RtInstance* instance);
+
+public:
+  // NV-DXVK [ResidentScene]: the RT-side half of the resident scene. Lives here
+  // because this is the object that owns instance lifetime -- residency is a
+  // statement about when an instance may be reaped, so the record store and the
+  // reaper have to be in the same place or they will disagree.
+  //
+  // Touched ONLY from the RT/CS side. The frame thread's half is
+  // D3D11Rtx::ResidentGateIndex and the two never share a structure; see
+  // rtx_resident_scene.h for why that decomposition removes the need for a lock.
+  ResidentScene& getResidentScene() { return m_residentScene; }
+  const ResidentScene& getResidentScene() const { return m_residentScene; }
+private:
+  ResidentScene m_residentScene;
   // [Perf.PushInst] tallies, dxvk-cs only.
   uint32_t m_piBatches = 0, m_piHit = 0, m_piMissKey = 0, m_piMissInput = 0;
   uint32_t m_piMissInvalid = 0, m_piServedInst = 0, m_piFail = 0;

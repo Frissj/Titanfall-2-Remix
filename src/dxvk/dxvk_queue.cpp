@@ -341,13 +341,31 @@ namespace dxvk {
       //     is timestamping its chunks.
       // Threshold-gated (>250 ms) so it is silent on healthy frames.
       if (fenceUs > 250000) {
+        // NV-DXVK: the identity of the submission was never the hard part -
+        // what it CARRIED was. The cmdList is still alive here (reset() runs
+        // further down, past notifyObjects), so its per-list stat counters are
+        // readable and say whether this fence paid for an acceleration-
+        // structure build storm or a path trace. Read them straight rather
+        // than diffing: DxvkCommandList::reset() clears m_statCounters, so
+        // these are already per-submission, not cumulative.
+        const auto& ctr = entry.submit.cmdList->statCounters();
+
         Logger::warn(str::format(
           "[Perf.FenceSpike] fenceMs=", fenceUs / 1000,
           " cmdList=0x", std::hex,
           reinterpret_cast<uintptr_t>(entry.submit.cmdList.ptr()), std::dec,
           " hadWaitSem=", (entry.submit.waitSync != VK_NULL_HANDLE ? 1 : 0),
           " hadWakeSem=", (entry.submit.wakeSync != VK_NULL_HANDLE ? 1 : 0),
-          " pending=", m_pending.load()));
+          " pending=", m_pending.load(),
+          " | carried: asBuilds=", ctr.getCtr(DxvkStatCounter::CmdAsBuildCalls),
+          " asGeos=", ctr.getCtr(DxvkStatCounter::CmdAsBuildGeos),
+          " asUpdates=", ctr.getCtr(DxvkStatCounter::CmdAsUpdateGeos),
+          " asPrims=", ctr.getCtr(DxvkStatCounter::CmdAsBuildPrims),
+          " ommBuilds=", ctr.getCtr(DxvkStatCounter::CmdOmmBuildCalls),
+          " traceRays=", ctr.getCtr(DxvkStatCounter::CmdTraceRaysCalls),
+          " dispatch=", ctr.getCtr(DxvkStatCounter::CmdDispatchCalls),
+          " draws=", ctr.getCtr(DxvkStatCounter::CmdDrawCalls),
+          " passes=", ctr.getCtr(DxvkStatCounter::CmdRenderPassCount)));
       }
 
       if (status != VK_SUCCESS) {

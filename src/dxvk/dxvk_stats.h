@@ -36,6 +36,18 @@ namespace dxvk {
 
     // NV-DXVK begin: RTX Remix counters
     CmdTraceRaysCalls,                 ///< Number of traceRays calls
+    // NV-DXVK [Perf.FenceSpike]: what a command list actually CARRIES.
+    // A multi-second fence names the submission but not its contents, so a
+    // spike could equally be an acceleration-structure build storm or a path
+    // trace. Counted in the DxvkCommandList wrappers, which are the single
+    // choke point every AS/micromap build goes through, and printed beside
+    // the fence time in dxvk_queue.cpp.
+    CmdAsBuildCalls,                   ///< vkCmdBuildAccelerationStructuresKHR calls
+    CmdAsBuildGeos,                    ///< Acceleration structures across those calls
+    CmdAsBuildPrims,                   ///< Primitives across those builds
+    CmdAsUpdateGeos,                   ///< Of those, the ones built with MODE_UPDATE
+    CmdOmmBuildCalls,                  ///< vkCmdBuildMicromapsEXT calls
+    // NV-DXVK end
     RtxBlasCount,                      ///< Number of unique BLAS's in the scene/geometry cache
     RtxBufferCount,                    ///< Number of unique buffers being tracked for RT rendering
     RtxTextureCount,                   ///< Number of unique textures being tracked for RT rendering

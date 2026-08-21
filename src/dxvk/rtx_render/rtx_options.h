@@ -2458,6 +2458,107 @@ namespace dxvk {
                  "union culled (culled), and how many the solid-angle reject removed (culledSmall).");
     };
 
+    // ==================================================================
+    // THE RESIDENT SCENE. See RESIDENT_SCENE_PLAN.md.
+    //
+    // Engine culling is back ON (rtx.cullOff.enable=False), so a draw STOPS
+    // ARRIVING for anything off-screen, and numFramesToKeepInstances=1 retires
+    // that instance the next frame -- it leaves the RT scene entirely, losing
+    // its shadow, its reflection and its indirect contribution. Residency
+    // decouples an instance's LIFETIME from the draw stream: the scene becomes
+    // a persistent database, and a draw is demoted to a liveness-and-update
+    // signal. Absence of a draw stops meaning death.
+    //
+    // EXPLICITLY NOT ANTI-CULLING. rtx.antiCulling.*,
+    // AntiCulling::isObjectAntiCullingEnabled and
+    // InstanceCategories::IgnoreAntiCulling are out of scope here, and are
+    // neither read nor extended. The IgnoreAntiCulling long-keep clause in
+    // garbageCollection is left exactly as it is; residency adds its own key
+    // and its own clause beside it.
+    //
+    // THE TWO PRIMITIVES ARE ALREADY IN THE TREE AND ARE ONLY BEING JOINED:
+    //   identity  IdentHead (d3d11_rtx.cpp, drawSplitKeys) -- IA buffer
+    //             identity plus the shader pair, camera-invariant by
+    //             construction because these are engine allocations reused for
+    //             the entity's lifetime. Measured at 0 new keys/frame on
+    //             p1/p3/p5 with the camera moving, against 933-959 for the
+    //             byte key, and noProp=0 where stablePropId covered none.
+    //   dirty     D3D11Buffer::GetMapGeneration() -- monotonic, bumped on the
+    //             DiscardSlice() rename AND on Map(WRITE_NO_OVERWRITE) in-place
+    //             writes (where mapPtr and m_contentGen both miss), and pinned
+    //             at 0 forever for IMMUTABLE/STATIC buffers. World geometry is
+    //             therefore provably clean for free.
+    // Neither needs stablePropId, which reads noProp=100% at the site that
+    // would key on it, and neither needs IDA.
+    //
+    // WHERE THE LIST COMES FROM -- the one thing this design cannot do without.
+    // A culled object issues no draw, so Remix has no vertices for it and it
+    // cannot be made resident from nothing: the resident set is the union of
+    // what has been VISIBLE since level load. Left to accumulate that is a
+    // warm-up bug (geometry never faced casts no shadow) and it is
+    // view-HISTORY-dependent, which fails the invariance gate. It is closed by
+    // SEEDING -- driving rtx.cullOff.enable for a few frames at level load to
+    // harvest the whole level, then releasing it -- not by a longer keep. See
+    // seedFrames below and the plan's section 0.0.
+    // ==================================================================
+    struct ResidentScene {
+      friend class ImGUI;
+      friend class RtxOptions;
+
+      RTX_OPTION("rtx.residentScene", bool, enable, false,
+                 "Master switch. Instances reachable from a resident record survive frames in which\n"
+                 "no draw touches them, instead of retiring on numFramesToKeepInstances. Restores the\n"
+                 "RT scene that engine culling (rtx.cullOff.enable=False) removes -- off-screen shadow\n"
+                 "casters, reflection sources and indirect occluders stay present, while the\n"
+                 "draw-submission CPU cost of re-drawing them does not.\n"
+                 "DOES NOTHING UNTIL rtx.residentScene.verify HAS READ FAIL=0 -- see that option.");
+
+      RTX_OPTION("rtx.residentScene", bool, verify, true,
+                 "VERIFY FIRST, SKIP SECOND. Runs the full path AND the residency prediction, scores\n"
+                 "the prediction, and acts on neither the skip nor the extended keep. Same order the\n"
+                 "split-transform cache, the extract memo and pushInstanceRecords all used, and it is\n"
+                 "not optional here: the [PropIdKeepLong attempt reverted] note in\n"
+                 "rtx_instance_manager.cpp records what granting a long keep on an UNSTABLE identity\n"
+                 "did -- dedup missed every frame, fresh instances were created and then all kept\n"
+                 "alive, m_reorderedSurfaces doubled 8500 -> 17155, and every collapse brought down\n"
+                 "twice the stale pixels. Turn this off only once [ResidentScene] reads FAIL=0 across\n"
+                 "a full pitch-and-yaw sweep.");
+
+      RTX_OPTION("rtx.residentScene", uint32_t, keepFrames, 0,
+                 "Frames a resident instance survives untouched. 0 = UNBOUNDED, which is the point:\n"
+                 "residency ends lifetime-by-frame-age rather than lengthening it. A record dies from\n"
+                 "its source buffer being destroyed, from a level change, or from LRU eviction under\n"
+                 "maxRecords -- never from an absent draw. Non-zero values exist only to bisect a\n"
+                 "residency bug against the old behaviour.");
+
+      RTX_OPTION("rtx.residentScene", uint32_t, maxRecords, 65536,
+                 "Hard ceiling on live resident records; the LRU evicts by frameLastSeen past it.\n"
+                 "A ceiling actually being hit in steady state means the KEY is churning, not that\n"
+                 "the scene is large -- raise nothing and go read [ResidentScene] newKeys.");
+
+      RTX_OPTION("rtx.residentScene", bool, foldCbGenerations, true,
+                 "Fold the map generation of every BOUND VS constant buffer into the dirty hash, not\n"
+                 "only the slots the derivation is known to read. A SUPERSET is the safe direction: it\n"
+                 "can report dirty when clean (costing a gate miss) and can never report clean when\n"
+                 "dirty. Off narrows the fold to the vertex and index buffers alone, which is faster\n"
+                 "and UNSOUND for anything whose transform comes from a cbuffer -- bisection only.");
+
+      RTX_OPTION("rtx.residentScene", uint32_t, seedFrames, 0,
+                 "Frames to hold rtx.cullOff.enable ON at level load so the engine submits the whole\n"
+                 "level and residency can harvest it, before releasing it and coasting on the\n"
+                 "resident set. 0 disables seeding, which leaves the resident set to accumulate from\n"
+                 "whatever the player happens to look at -- correct per-object, but view-history\n"
+                 "dependent and therefore NOT invariant under a pitch/yaw sweep. Costs the unculled\n"
+                 "frame time (~58 ms in TF2) for this many frames once, rather than every frame.\n"
+                 "Does NOT cover geometry streamed in after the pass; see the plan's section 0.0.");
+
+      RTX_OPTION("rtx.residentScene", bool, logStats, false,
+                 "One [ResidentScene] line per second: records live/new/evicted, gate hits vs misses,\n"
+                 "why misses missed (key vs generation), and -- while verify is on -- FAIL counts with\n"
+                 "the component that disagreed. FAIL=0 across a pitch-and-yaw sweep is the gate for\n"
+                 "turning verify off.");
+    };
+
     // Resolve Options
     // Todo: Potentially document that after a number of resolver interactions is exhausted the next interaction will be treated as a hit regardless.
     RTX_OPTION_ARGS("rtx", uint8_t, primaryRayMaxInteractions, 32,

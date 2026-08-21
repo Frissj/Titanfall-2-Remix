@@ -136,6 +136,29 @@ namespace dxvk {
       AccRpKeyMs, AccRpSelMs, AccRpSelMissMs, AccRpProofMs,
       AccRpCommitMs, AccXtCapMs, AccRpO2wMs, RpTierTotalMs,
 
+      // ---- the SPLIT-CACHE SERVE PATH (2026-08-20) ----
+      // THE OTHER HALF OF bt_extractXf, and it was the majority half: measured
+      // serve 3.21 us x 72154 against derive 7.85 us x 25144, i.e. 2.57 ms of
+      // the 4.76 ms bucket with not one mark on it. Every existing child of
+      // bt_extractXf is a markXt site INSIDE ExtractTransforms, which a served
+      // draw never enters -- so "bt_extractXf children sum to 96% of the
+      // parent" was true only while the serve rate was 0%.
+      // SvPre/SvKeys/SvLookup are paid by EVERY draw the cache handles,
+      // including the ~26% that then derive anyway: that is tier tax, and it is
+      // per SvAllDraws. The rest are per SvServes. Do not mix the denominators.
+      // MS ONLY. The counts (svAllN / svN) stay on [Perf.SubmitDraw.acc]: a
+      // count published here would be divided by frames and then printed as a
+      // percentage of the wall, which is the trap the state-setting census
+      // block twenty lines up already documents.
+      AccSvPreMs, AccSvKeysMs, AccSvLookupMs, AccSvCarrierMs,
+      AccSvSubViewMs, AccSvComposeMs, AccSvStoreMs, SvTotalMs,
+      // The chain's enqueue -> execute latency, drained off the tStg cursor at
+      // SubmitDrawDeferred's entry. It is LATENCY, NOT WORK: it is reported on
+      // its own and deliberately absent from every stage-leaf sum. Before it
+      // existed the first post-seam mark (`filters`) absorbed all of it and the
+      // xform stage attribution read -11280%.
+      XfDeferWaitMs,
+
       // ---- captureDrawSnapshot, the inside of pfs_guard (2026-08-14) ----
       // THESE ARE LIVE WITH RTX_PERF_MARKS=0, and that is the whole point of
       // them. Every other Acc* slot above comes from markStg, so with marks off

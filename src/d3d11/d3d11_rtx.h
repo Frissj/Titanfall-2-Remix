@@ -3099,6 +3099,266 @@ namespace dxvk {
     // of them were rejected by SubmitDraw's pre-filters".
     uint32_t                             m_rawDrawCount = 0;
 
+    // ======================================================================
+    // THE RESIDENT SCENE -- FRAME-THREAD HALF. See rtx_resident_scene.h for the
+    // RT-side half and RESIDENT_SCENE_PLAN.md for the whole design.
+    //
+    // WHY THE FRAME THREAD OWNS A SEPARATE MAP RATHER THAN CONSULTING THE
+    // RECORD STORE. The verdict ("is this draw unchanged since last frame?")
+    // and the action ("keep its instances alive") happen on different threads
+    // and need different data. Instances are CS/RT-owned; reading one from the
+    // frame thread is the getImageHash / s_zigGunInstance race class, and this
+    // tree has already crashed on it twice. So the frame thread holds only
+    // uint64s it computed itself, the RT side holds the RtInstance*, and the
+    // two are joined by a key travelling through the existing EmitCs stream.
+    // Neither map is ever touched by two threads, so neither needs a lock.
+    // The cbuffer slots the census tracks per model. 8 covers TF2 (numCb reads
+    // ~7 in the split-transform capture) and keeps the per-model entry at a
+    // size where a table of a few thousand is free.
+    static constexpr uint32_t kCensusCbSlots = 8u;
+    // WHICH SLOTS ARE THE CAMERA. cb2 is the projection/view block every
+    // derivation in this file reads the camera out of, and TF2 rewrites it
+    // every frame -- so a per-frame rewrite of THIS slot says nothing about
+    // whether the object moved. Excluded from the dirtyObj verdict for exactly
+    // that reason; see the o2w object-key note in d3d11_rtx.cpp on why keying
+    // on camera-tracking bytes made 97% of churn a key chasing its own tail.
+    // A MASK rather than a single slot so the capture can widen it without a
+    // structural change if cb0/cb1 turn out to be per-frame too.
+    static constexpr uint32_t kCensusCameraSlotMask = (1u << 2);
+    // Cap on the per-slot content hash. The span copy out of write-combined
+    // memory is ~31% of SubmitDraw when unbounded, and this is a diagnostic.
+    static constexpr size_t kCensusCbContentCap = 256u;
+
+    struct ResidentGateEntry {
+      uint64_t srcGenHash    = 0ull;
+      uint32_t frameLastSeen = 0u;
+      // CENSUS FIELDS. The three numbers that decide this key's residency class
+      // -- and the whole point is that they are MEASURED per key rather than
+      // assumed from what a shader "looks like". seen counts every appearance,
+      // dirty counts the appearances where the generation fold had moved.
+      //   dirty == 0 over many seen  ->  Static:    never re-derive, resident forever
+      //   dirty == seen             ->  Dynamic:   re-derives every frame anyway
+      //   in between                ->  Mixed:     the interesting population
+      // Reset every window by censusEmit -- the class question is "is this model
+      // holding still NOW", not "has it ever". everSeen is the lifetime flag and
+      // must NOT be reset, or every window opens with a false first-sight.
+      uint32_t seen  = 0u;
+      bool     everSeen = false;
+      uint32_t dirty = 0u;
+      // SPLIT BY SOURCE, added after the first capture read class{static=1
+      // dynamic=441}: folding every bound cbuffer into one hash made every draw
+      // that binds TF2's per-frame camera constants dirty forever, however
+      // static the object was. dirtyObj excludes the camera slots, so it is the
+      // verdict that actually decides residency -- the camera is not part of
+      // the object-to-world transform.
+      uint32_t dirtyObj = 0u;
+      // Generation says "the buffer was written". Content says "the bytes THIS
+      // DRAW READS differ". For TF2 those are not the same question: the
+      // constants live in shared per-draw scratch buffers that are renamed
+      // every frame regardless of value, so generation is always dirty and
+      // only content can say whether the object actually moved.
+      uint32_t dirtyContent = 0u;
+      uint64_t cbContentHash[kCensusCbSlots] = { };
+      uint64_t vbGen = 0ull;
+      uint64_t ibGen = 0ull;
+      uint64_t cbGen[kCensusCbSlots] = { };
+      uint64_t o2wHash = 0ull;
+      uint32_t o2wDirty = 0u;
+      bool     o2wSeen = false;
+      uint32_t cbMovedMaskAcc = 0u;   // which slots have EVER moved for this model
+      uint32_t cbBoundMaskAcc = 0u;   // which slots this model has ever bound
+      uint64_t modelKey = 0ull;   // identity WITHOUT the draw range or ordinal
+    };
+    std::unordered_map<uint64_t, ResidentGateEntry> m_residentGate;
+
+    // ======================================================================
+    // [SceneCensus] / [VsResidency] -- THE MEASUREMENT THAT SIZES THE PULL
+    // ARCHITECTURE, taken with the conf exactly as it is.
+    //
+    // Four questions, none of which can be answered by reasoning about the
+    // engine, and all four of which change what gets built:
+    //
+    //  1. HOW MUCH GEOMETRY SHARING IS THERE? If 200 barrels share one vertex
+    //     buffer then the bootstrap set is "one instance per MODEL", not "every
+    //     object in the level" -- a few hundred things that saturate in seconds
+    //     instead of the 2-minute streaming settle a full-level seed costs.
+    //     models vs instances below is that ratio, measured.
+    //
+    //  2. WHICH DRAWS ARE ACTUALLY STATIC? Not which ones are called static.
+    //     dirty/seen per key, bucketed, IS the Static/Dynamic/Transient class
+    //     table -- derived rather than declared.
+    //
+    //  3. IS OFF-SCREEN GEOMETRY ALREADY ARRIVING? A depth-only draw (no colour
+    //     RTV bound) is a shadow pass, and shadow passes routinely use a much
+    //     wider frustum than the view. If a real share of the frame is
+    //     depth-only, part of the "culled away" set is already in the draw
+    //     stream under another camera and the gap is smaller than it looks.
+    //
+    //  4. WHICH SHADER CLASSES WOULD RESIDENCY EVEN HELP? Per-VS, because VS is
+    //     the class proxy this tree already uses ([VanishDiag-VsRank],
+    //     [DrawName]). A VS with high draws and clean=100% is pure profit; a VS
+    //     with high draws and clean=0% should never be made resident and should
+    //     be left unculled instead.
+    //
+    // NOT GATED ON AN OPTION, ON PURPOSE. This is the run that decides the
+    // architecture and it has to be takeable on the conf as it stands. It is
+    // gated on GAMEPLAY (a draw-count floor, so menu/loading frames cannot
+    // contribute) and throttled, per this tree's instrumentation rule.
+    // ======================================================================
+    struct CensusModelEntry {
+      uint32_t frameLastSeen  = 0u;
+      uint32_t drawsThisFrame = 0u;
+      uint32_t maxDrawsSeen   = 0u;   // peak fanout for this one geometry
+      uint32_t framesSeen     = 0u;
+    };
+    std::unordered_map<uint64_t, CensusModelEntry> m_censusModels;
+
+    struct CensusVsEntry {
+      uint32_t draws     = 0u;   // draws on this VS this window
+      uint32_t clean     = 0u;   // ... with NOTHING moved, camera cbuffer included
+      uint32_t cleanObj  = 0u;   // ... with nothing moved EXCLUDING the camera slots
+                                 //     -- the verdict residency actually turns on
+      uint32_t dirtyVb   = 0u;   // ... whose vertex buffer was rewritten
+      uint32_t dirtyIb   = 0u;   // ... whose index buffer was rewritten
+      uint32_t dirtyCb   = 0u;   // ... with any cbuffer rewritten
+      uint32_t judged    = 0u;   // draws that got a frame-to-frame verdict at all
+      uint32_t cleanContent = 0u;// ... unchanged by CONTENT, camera slots excluded
+      // The same verdict split by whether the CAMERA moved that frame. If these
+      // two diverge, the content being hashed is camera-relative and the key is
+      // a camera key -- see the note at the increment site.
+      uint32_t judgedCamMoved = 0u,  cleanContentCamMoved = 0u;
+      // The DERIVED objectToWorld verdict -- camera-invariant by construction,
+      // unlike the input-byte content hash which measured the camera.
+      uint32_t o2wJudged = 0u,          o2wClean = 0u;
+      // Arrival vs stash, so "never reached SubmitDrawTail" and "reached it with
+      // an empty stash" stop being the same n=0.
+      //   arrived=0            -> the draw exits SubmitDraw before the tail
+      //   arrived>0 noStash>0  -> it arrives, but censusRecordDraw did not stash
+      uint32_t o2wArrived = 0u,         o2wNoStash = 0u;
+      uint32_t o2wJudgedCamMoved = 0u,  o2wCleanCamMoved = 0u;
+      uint32_t o2wJudgedCamStill = 0u,  o2wCleanCamStill = 0u;
+      uint32_t judgedCamStill = 0u,  cleanContentCamStill = 0u;
+      uint32_t dirtyCbContent = 0u;
+      uint32_t cbContentMovedMask = 0u;
+      uint32_t cbContentReadMask  = 0u;
+      uint32_t cbMovedMask = 0u; // WHICH slots moved (bit i = slot i)
+      uint32_t cbBoundMask = 0u; // which slots were bound at all
+      uint32_t newKeys   = 0u;   // ... that minted a NEVER-SEEN key. Identity churn;
+                                 //     the number that would sink residency.
+      uint32_t gaps      = 0u;   // judged verdicts that spanned an ABSENCE (stride > 1).
+                                 //     A SUBSET of judged, not a separate bucket. Not
+                                 //     churn -- this IS the culled-then-visible object
+                                 //     residency exists for, and the verdict is valid
+                                 //     across the gap: "same as when I last saw it" is
+                                 //     the question, and gap length does not change it.
+      uint32_t sameFrameSkips = 0u; // draws that early-returned: key already judged
+                                    //   this frame. draws == judged + newKeys +
+                                    //   sameFrameSkips must hold; a
+                                    //   shortfall means draws are vanishing
+                                    //   somewhere this census does not model.
+      uint32_t gapFramesSum = 0u;   // sum of gap lengths, for the mean stride
+      uint32_t gapFramesMax = 0u;
+      uint32_t depthOnly = 0u;   // ... with no colour RTV bound (shadow pass)
+      uint32_t models    = 0u;   // distinct geometries touched this window
+      uint32_t instances = 0u;   // distinct full keys touched this window
+    };
+    std::unordered_map<uint64_t, CensusVsEntry> m_censusVs;
+    // Dedup sets for the per-VS distinct counts, cleared with the window.
+    std::unordered_set<uint64_t> m_censusVsModelSeen;
+    std::unordered_set<uint64_t> m_censusVsInstSeen;
+
+    // Per-window frame-wide census accumulators.
+    uint32_t m_cenDraws      = 0;
+    uint32_t m_cenDepthOnly  = 0;
+    uint32_t m_cenColour     = 0;
+    uint32_t m_cenIndexed    = 0;
+    uint32_t m_cenStatic     = 0;   // dirtyObj==0 (camera excluded) and seen>=8
+    uint64_t m_cenSeenSum    = 0;   // raw sums over the model table, to settle the
+    uint64_t m_cenDirtySum   = 0;   //   class{} vs cleanContentPct disagreement
+    uint32_t m_cenSampleN    = 0;
+    // Frame-thread stash: censusRecordDraw runs at the head of SubmitDraw,
+    // censusRecordO2w at the tail of SubmitDrawTail, same thread same draw.
+    uint64_t m_cenCurrentModelKey = 0;
+    uint64_t m_cenCurrentVsHash   = 0;
+    bool     m_cenCurrentCamMoved = false;
+    void censusRecordO2w(const Matrix4& o2w);
+    uint32_t m_cenStaticGen  = 0;   // generation fold, camera slots excluded
+    uint32_t m_cenStaticAll  = 0;   // dirty==0 including the camera slots -- kept
+                                    //   only so the two can be compared: a large
+                                    //   gap IS the camera-fold artefact, measured
+    uint32_t m_cenDynamic    = 0;   // keys with dirty==seen and seen>=8
+    uint32_t m_cenMixed      = 0;
+    uint32_t m_cenYoung      = 0;   // seen<8, not yet classifiable
+    uint32_t m_cenFrames     = 0;   // frames folded into this window
+    uint64_t m_cenVtxTotal   = 0;
+    uint64_t m_cenIdxTotal   = 0;
+    uint32_t m_cenLastLogFrame = 0;
+    uint32_t m_cenLastFrame    = 0;
+    uint32_t m_cenFrameDraws   = 0;   // draws in the frame currently being built
+
+    // The dirty-history table, keyed at MODEL scale rather than draw scale.
+    // Separate from m_residentGate on purpose: that one is keyed per placement
+    // (identity + draw range + per-frame ordinal) because the gate has to make
+    // a per-draw decision, while the class question ("is this geometry static?")
+    // is a property of the geometry and would be answered 200 times over by a
+    // per-placement table -- once per barrel instead of once per barrel MODEL.
+    std::unordered_map<uint64_t, ResidentGateEntry> m_censusGate;
+
+    // Accumulate one draw into the census. Runs UNCONDITIONALLY (gameplay-gated
+    // and throttled at emit), because this is the measurement that decides the
+    // architecture and it must be takeable on the conf as it stands.
+    void censusRecordDraw(bool indexed, UINT count, UINT start, INT base);
+    // Emit and roll the window. Called from the frame boundary detected inside
+    // censusRecordDraw -- the first draw of a new frame is an exact and free
+    // boundary signal, so no Present hook is needed.
+    void censusEmit();
+
+    // THE OCCURRENCE ORDINAL, AND IT IS NOT OPTIONAL -- trap 2 of the plan.
+    // Several draws per frame legitimately share one IA identity (same pooled
+    // buffer, same shader, same range), and resolution is STATEFUL within a
+    // frame: the second draw resolves to different instances than the first
+    // because the first's are already claimed. pushInstanceRecords' verify pass
+    // read FAIL=3367 for exactly this. Keying on IA identity alone would let
+    // draw 2 serve draw 1's record with full confidence, so the ordinal within
+    // the frame is part of the key.
+    struct ResidentOccupancy {
+      uint32_t frame   = 0u;
+      uint32_t counter = 0u;
+    };
+    std::unordered_map<uint64_t, ResidentOccupancy> m_residentOccupancy;
+
+    // Per-window verify tallies, reset when the line is emitted.
+    uint32_t m_rsDraws     = 0;  // draws that reached the gate
+    uint32_t m_rsHit       = 0;  // key known AND generations matched
+    uint32_t m_rsMissKey   = 0;  // key never seen, or not seen last frame
+    uint32_t m_rsMissGen   = 0;  // key known, a source buffer was written
+    uint32_t m_rsNewKeys   = 0;  // keys minted this window -- the churn number
+    uint32_t m_rsNoKey     = 0;  // no usable identity (no VB/IB bound)
+    uint32_t m_rsLastLogFrame = 0;
+
+    // Eviction tallies. CUMULATIVE over the session, deliberately NOT reset
+    // with the per-window counters above -- same reason [Perf.SplitXf]'s
+    // evict{} is cumulative: wipes>0 at ANY point is the finding, and a
+    // per-window counter would let it happen and then read 0 by the time the
+    // line came out. The first version of that sweep freed nothing for weeks
+    // and read as working precisely because it had no counter at all.
+    uint64_t m_rsSweeps = 0;   // times the cap was exceeded
+    uint64_t m_rsAged   = 0;   // entries freed by an age rung
+    uint64_t m_rsWipes  = 0;   // flat clears -- non-zero means the CAP is too small,
+                               //   which is a different finding from key churn
+    uint32_t m_rsRung   = 0;   // which age bound actually did the freeing
+
+    // Returns 0 when the draw has no usable IA identity, which is the "do not
+    // make this resident" answer, not an error: 0 is the no-record sentinel on
+    // RtInstance::m_residentKey and ResidentScene rejects it.
+    uint64_t residentDrawKey(bool indexed, UINT count, UINT start, INT base);
+    // Fold of D3D11Buffer::GetMapGeneration() over every source the derivation
+    // could read. A SUPERSET on purpose -- see rtx.residentScene.foldCbGenerations.
+    uint64_t residentSrcGenFold() const;
+    // Scores the prediction and, once verify is off, decides the skip.
+    void     residentGateEvaluate(bool indexed, UINT count, UINT start, INT base);
+    // ======================================================================
+
     // NV-DXVK: communication channel from ExtractTransforms() back to the
     // caller (SubmitDraw) for the TLAS-coherence filter. ExtractTransforms
     // captures the draw's c_cameraOrigin (cb2 offset 4) into these; SubmitDraw

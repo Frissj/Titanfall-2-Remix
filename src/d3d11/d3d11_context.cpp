@@ -144,6 +144,11 @@ namespace dxvk {
   // NV-DXVK TF2 vanish-zone: per-call counters declared in d3d11_vanish_diag.h.
   namespace vanish_diag {
     std::atomic<uint32_t> g_counts[CALL_COUNT];
+    // NV-DXVK [StallWatch]: frame-thread heartbeat, read by the watchdog in
+    // d3d11_context_imm.cpp. See the store site in d3d11_vanish_diag.h.
+    std::atomic<uint64_t> g_stallHeartbeatNs   { 0ull };
+    std::atomic<uint32_t> g_stallHeartbeatCall { 0u };
+    std::atomic<uint32_t> g_stallThreadId      { 0u };
     // NV-DXVK [perf]: see ScopedCall in d3d11_vanish_diag.h.
     std::atomic<uint64_t> g_timeNs[CALL_COUNT];
     std::atomic<uint64_t> g_timeCalls[CALL_COUNT];

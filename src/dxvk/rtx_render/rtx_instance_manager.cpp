@@ -592,6 +592,13 @@ namespace dxvk {
        m_isCreatedByRenderer
        m_spatialCacheHash
        m_spatialOpPendingFrame  (one value with m_spatialCacheHash - see the size note)
+       m_batchRecordKey    (record back-pointer; a clone is in no batch)
+       m_residentKey       (record back-pointer; a clone is in no resident record.
+                            NOT optional and not merely a "first use runs the full
+                            path" convention - see the 952 -> 960 size note for why
+                            an inherited key invalidates a record the clone was
+                            never in, and why that costs an UNBOUNDED skip window
+                            here where the batch equivalent costs one frame.)
        m_primInstanceOwner
        buildGeometries
        buildRanges
@@ -716,7 +723,27 @@ namespace dxvk {
       // ordinary first-use path: its key is kEmptyHash, so the key test fires on
       // its own merits and the op resolves as a plain insert. If you ever make
       // the copy ctor carry m_spatialCacheHash, carry this with it.
-      static_assert(RtInstanceSize == 952, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+      // 952 -> 960 on 2026-08-20: added uint64_t m_residentKey
+      // ([ResidentScene] — which resident record currently holds a raw pointer
+      // to this instance, 0 for none; the back-pointer that makes
+      // ResidentScene::invalidateFor O(1) and TOTAL).
+      // COPY CTOR: DELIBERATELY NOT COPIED, for the same correctness reason as
+      // m_batchRecordKey above and MORE strongly. A resident record's instance
+      // list is the exact output of one resolution pass, and createInstanceCopy
+      // does not add the clone to it — so the clone is not a member of that
+      // record. If it inherited the key, removeInstance(clone) would invalidate
+      // a record the clone was never in, and the record's own back-pointer
+      // cleanup would never reach the clone because it does not walk it.
+      // WHERE THIS DIFFERS FROM m_batchRecordKey, AND WHY IT MATTERS MORE: a
+      // fanout record is rebuilt every frame its batch is submitted, so a
+      // spurious invalidation costs one frame's skip. A resident record is
+      // designed to survive an UNBOUNDED number of frames without being
+      // rebuilt — that is the entire point of residency — so a spurious
+      // invalidation costs an unbounded skip window, and the instances it was
+      // holding alive fall back to retiring on numFramesToKeepInstances with
+      // nothing reporting why. Left at 0, a clone simply owns no record until
+      // some draw genuinely resolves to it, which is the truth.
+      static_assert(RtInstanceSize == 960, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }
@@ -1606,6 +1633,14 @@ namespace dxvk {
     // behind -- clear() is a level transition, so nothing here is worth keeping,
     // and an empty map cannot serve a pointer into freed memory by any route.
     m_fanoutRecords.clear();
+    // NV-DXVK [ResidentScene]: same reasoning, and residency needs it MORE.
+    // clear() is a level transition, and a resident record is by construction
+    // the one thing in this file designed to outlive an unbounded number of
+    // frames -- so it is the one thing that would otherwise carry pointers to
+    // the previous level's freed instances into the next one. This is also the
+    // point the seed pass (RESIDENT_SCENE_PLAN.md 0.0) is anchored to: the set
+    // must be repopulated from the new level's draws, never inherited.
+    m_residentScene.clear();
     m_viewModelCandidates.clear();
     m_playerModelInstances.clear();
   }
@@ -2990,7 +3025,50 @@ namespace dxvk {
         (pInstance->testCategoryFlags(InstanceCategories::IgnoreAntiCulling) || keepLongForProp)
           ? RtxOptions::numFramesToKeepSubViewInstances()
           : numFramesToKeepInstances;
+
+      // NV-DXVK [ResidentScene]: THE RESIDENCY CLAUSE. A SEPARATE clause beside
+      // the one above, deliberately not folded into it.
+      //
+      // WHY NOT REUSE THE IgnoreAntiCulling GATE. Because this is not
+      // anti-culling and must not become entangled with it. That category is a
+      // per-material/per-content tag applied to TF2 sub-view (3D-skybox)
+      // geometry; residency is a statement about an instance's IDENTITY being
+      // stable and its record being live, which is orthogonal. Folding them
+      // would mean a change to either one silently moves the other's
+      // population, and it would put residency behind an anti-culling switch
+      // that is explicitly out of scope for this work.
+      //
+      // WHY A KEEP OVERRIDE RATHER THAN A LONGER keepN. Because the whole point
+      // is to stop lifetime being a function of frame age at all. keepFrames
+      // defaults to 0 = unbounded: a resident instance is reaped when its
+      // record is invalidated (source buffer destroyed, BLAS torn down, LRU
+      // eviction), never because a draw failed to arrive. Absence of a draw is
+      // what engine culling produces, and treating it as death is exactly the
+      // defect residency exists to remove.
+      //
+      // GATED ON verify: while verification is on, the prediction is SCORED and
+      // NOT ACTED ON, so GC behaves exactly as it does today. That ordering is
+      // not negotiable here -- see the [PropIdKeepLong attempt reverted] note
+      // above for what a long keep on an unstable identity did to
+      // m_reorderedSurfaces.
+      // AND IT DOES NOT OVERRIDE forceGarbageCollection. That path is the
+      // over-the-cap reap (numObjectsToKeep), i.e. the backstop against exactly
+      // the runaway trap 3 describes -- an identity that churns mints a fresh
+      // instance every frame, and if residency also made every one of them
+      // unreapable the count would climb until the LRU noticed, with
+      // m_reorderedSurfaces climbing with it. Residency defers ordinary
+      // lifetime expiry; it does not get to defeat the ceiling.
+      bool residencyHolds = false;
+      if (RtxOptions::ResidentScene::enable()
+          && !RtxOptions::ResidentScene::verify()
+          && !forceGarbageCollection
+          && pInstance->m_residentKey != 0ull) {
+        const ResidentScene::Record* pRec = m_residentScene.find(pInstance->m_residentKey);
+        residencyHolds = (pRec != nullptr) && pRec->valid;
+      }
+
       const bool clauseLifetime = (forceGarbageCollection || enableGarbageCollection) &&
+                                  !residencyHolds &&
                                   (pInstance->m_frameLastUpdated + instanceKeepN <= currentFrame);
       const bool clauseMarked = pInstance->m_isMarkedForGC;
       const bool shouldRemove = clauseLifetime || clauseMarked;
@@ -3275,6 +3353,50 @@ namespace dxvk {
           ? (100u * probeReapRespawn) / probeRemovedThisPass : 0u),
         " kept=", probeKeptThisPass,
         " live=", static_cast<uint32_t>(m_instances.size())));
+    }
+
+    // NV-DXVK [ResidentScene]: LRU / invalidated-record sweep, and the stats
+    // line. Placed AFTER the reap so the record store never holds a pointer to
+    // an instance this pass has already deleted -- removeInstance invalidated
+    // each one on the way out, and this is where the husks are erased.
+    {
+      m_residentScene.onFrameEnd(probeFrame);
+
+      if (RtxOptions::ResidentScene::logStats()) {
+        // EVERY 10 FRAMES, and the counters are reset with each line so each is
+        // a per-window rate rather than a running total. The thing being read
+        // here is a SHAPE over time (does `records` plateau?), and a coarse
+        // throttle hides the frames where it steps.
+        static uint32_t sRsLastLogFrame = 0u;
+        if (probeFrame - sRsLastLogFrame >= 10u) {
+          sRsLastLogFrame = probeFrame;
+          const ResidentScene::Stats& rs = m_residentScene.stats();
+          Logger::warn(str::format(
+            "[ResidentScene] f=", probeFrame,
+            " mode=", (RtxOptions::ResidentScene::enable()
+                        ? (RtxOptions::ResidentScene::verify() ? "verify" : "live")
+                        : "off"),
+            " records=", static_cast<uint32_t>(m_residentScene.size()),
+            " built=", rs.built,
+            " touched=", rs.touched,
+            " touchMiss=", rs.touchMiss,
+            " invalidated=", rs.invalidated,
+            " evicted=", rs.evicted,
+            // CUMULATIVE. Non-zero means maxRecords is too small for the scene,
+            // which is the OPPOSITE finding from key churn and wants raising the
+            // cap rather than abandoning the key.
+            " wiped=", rs.wiped,
+            " instStamped=", rs.instancesStamped,
+            " liveInst=", static_cast<uint32_t>(m_instances.size()),
+            // The two numbers that decide whether this is working. records must
+            // PLATEAU in a stationary scene -- a rising count is trap 3 (an
+            // unstable key minting a fresh record every frame) and is a hard
+            // fail, not a tuning problem. touchMiss must be ~0 once the key is
+            // stable; every miss is a fallback to the full path.
+            " | records must plateau; touchMiss ~0"));
+          m_residentScene.resetStats();
+        }
+      }
     }
 
     // NV-DXVK [InstDriftProbe]: record post-GC size UNCONDITIONALLY so the
@@ -9249,6 +9371,18 @@ namespace dxvk {
     // the next frame's bulk stamp to write through. No-op when the feature is
     // off (m_batchRecordKey stays 0), so it costs one predictable load.
     invalidateFanoutRecordFor(instance);
+
+    // NV-DXVK [ResidentScene]: and drop any RESIDENT record holding this
+    // pointer, for exactly the same reason and in exactly the same place.
+    //
+    // This one matters MORE than the fanout invalidation above, not less: a
+    // fanout record is rebuilt every frame the batch is submitted, so a stale
+    // pointer in it has a short window. A resident record is designed to
+    // survive an UNBOUNDED number of frames without being rebuilt, so a
+    // dangling RtInstance* left here would be written through by the bulk
+    // stamp for as long as the record lives -- which is forever, by design.
+    // No-op when residency is off (m_residentKey stays 0).
+    m_residentScene.invalidateFor(instance);
 
     // Always clean up replacement instance references, even for renderer-created instances
     // to avoid use-after-free bugs in ReplacementInstance.prims

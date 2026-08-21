@@ -10100,6 +10100,65 @@ namespace dxvk {
   static thread_local int64_t  s_xfServeNs = 0, s_xfDeriveNs = 0;
   static thread_local uint32_t s_xfServeN  = 0, s_xfDeriveN  = 0;
   static thread_local bool     s_xtServedLast = false;
+  // NV-DXVK [Perf.ServeSplit] 2026-08-20 -- THE OTHER HALF OF bt_extractXf.
+  //
+  // WHAT THIS CLOSES, and it is not a small hole. bt_extractXf is the interval
+  // between markStg(bt_geoCopy) (:41394, in SubmitDraw) and markStg(bt_extractXf)
+  // (:45525, in SubmitDrawTail). It is NOT "the derivation": ExtractTransforms
+  // is one of two branches inside it, and on a served draw that branch never
+  // runs. Every one of the ~30 named children of this bucket is a markXt site
+  // INSIDE ExtractTransforms, so on a serve not one of them fires.
+  //
+  // Measured 2026-08-20, marks armed: serve 3.21 us x 72154 vs derive 7.85 us
+  // x 25144. That is 2.57 ms/frame of the 4.76 ms bucket -- 54%, the MAJORITY
+  // of the report's own #1 target -- attributed to nothing at all. The plan's
+  // sec 0.2 "Unexplained [U]" (serve went 0% -> 65% and the bucket did not
+  // move) is this: the bucket contains a second population the leaves never
+  // covered, and no bucket TOTAL can separate them.
+  //
+  // WHY A SEPARATE CURSOR (tSv) RATHER THAN markSub. markSub calls markStg,
+  // which ADVANCES tStg -- so a mark placed inside the bt_extractXf span would
+  // subtract from bt_extractXf and break comparability with every prior run.
+  // markXt already solved this for the derivation half by running its own tXt
+  // cursor; tSv is the same contract for the serve half. bt_extractXf itself is
+  // untouched and stays byte-for-byte the number every previous log reported.
+  //
+  // THE THREE ALL-DRAW BUCKETS ARE TIER TAX. sv_pre/sv_keys/sv_lookup are paid
+  // by every draw the split cache handles, including the ~26% that go on to
+  // derive anyway -- for those the cache is pure cost. Counted on svAllN; the
+  // serve-only buckets below are counted on svN. Do not divide one by the other.
+  //
+  // A SKIPPED MARK IS ABSORBED BY THE NEXT ONE THAT FIRES -- markXt's cursor
+  // hazard, documented at rp_sel's v6.9f note. sv_carrier/sv_subView/sv_compose
+  // sit inside `if (haveObj && haveView)` and do not fire on a miss, so the
+  // miss path's time lands in sv_store. That is why the derive branch re-stamps
+  // rather than marking: ExtractTransforms must not be billed here twice.
+  static thread_local int64_t  s_perfSvPreAcc     = 0, s_perfSvPreMax     = 0;
+  static thread_local int64_t  s_perfSvKeysAcc    = 0, s_perfSvKeysMax    = 0;
+  static thread_local int64_t  s_perfSvLookupAcc  = 0, s_perfSvLookupMax  = 0;
+  static thread_local int64_t  s_perfSvCarrierAcc = 0, s_perfSvCarrierMax = 0;
+  static thread_local int64_t  s_perfSvSubViewAcc = 0, s_perfSvSubViewMax = 0;
+  static thread_local int64_t  s_perfSvComposeAcc = 0, s_perfSvComposeMax = 0;
+  static thread_local int64_t  s_perfSvStoreAcc   = 0, s_perfSvStoreMax   = 0;
+  static thread_local uint32_t s_perfSvAllN       = 0, s_perfSvN          = 0;
+  // NV-DXVK [Perf.DeferWait] 2026-08-20 -- WHY `filters` READ 75.33 ms/frame.
+  //
+  // tStg is a CURSOR and it is COPIED ACROSS THE DEFERRAL SEAM (:27383,
+  // `s.tStg = *c.tStg`). SubmitDrawDeferred's first markStg is `filters`
+  // (:47711), so on a routed draw that mark bills the interval from the enqueue
+  // in SubmitDrawTail to whenever the chain got round to executing the slot --
+  // i.e. THE QUEUE WAIT, not the filters. Measured 6.78 s of accumulated wait
+  // in a 5 s window (~270 us/draw), which the report then fed into the xform
+  // stage-leaf sum and printed as `xform named 80.92 vs wall 0.71 (-11280%)`.
+  //
+  // The seam comment at :47601 predicted "the post-seam stages become the
+  // CHAIN's timings ... a reporting change to expect, not a defect". True for
+  // the stages; false for the FIRST one, which absorbs the whole wait on its
+  // own and is not a stage timing at all. Billed here by name instead, and
+  // deliberately NOT added to SdXformLeavesMs -- it is latency, not work, and
+  // adding it back would re-break the residual it was breaking before.
+  static thread_local int64_t  s_perfXfDeferWaitAcc = 0, s_perfXfDeferWaitMax = 0;
+  static thread_local uint32_t s_perfXfDeferWaitN   = 0;
   static thread_local int64_t s_perfBtSkyboxFilterAcc   = 0, s_perfBtSkyboxFilterMax   = 0;
   // [Perf.SubmitDraw] ExtractTransforms() internal subdivision. The function
   // is ~3,800 lines long and bt_extractXf (its total) is the dominant cost
@@ -36751,6 +36810,1017 @@ namespace dxvk {
     return v != nullptr && v[0] == '1';
   }();
 
+  // ==========================================================================
+  // THE RESIDENT SCENE -- FRAME-THREAD HALF. See d3d11_rtx.h for why this is a
+  // separate map from the RT-side record store, and RESIDENT_SCENE_PLAN.md for
+  // the design.
+  // ==========================================================================
+
+  uint64_t D3D11Rtx::residentDrawKey(bool indexed, UINT count, UINT start, INT base) {
+    const auto& ia = m_context->m_state.ia;
+    const auto& vb0 = ia.vertexBuffers[0];
+
+    // NO IDENTITY, NO RESIDENCY. A draw with no vertex buffer bound has nothing
+    // stable to key on, and inventing a key for it would file it under
+    // something no other draw agrees with. Returning 0 routes it down the full
+    // path forever, which is exactly right: 0 is the no-record sentinel that
+    // ResidentScene::build rejects.
+    if (vb0.buffer == nullptr) {
+      return 0ull;
+    }
+
+    // THE OBJECT IDENTITY KEY -- the same inputs drawSplitKeys' IdentHead uses,
+    // and for the same measured reason: these are engine-owned allocations made
+    // at level/entity spawn and reused for the entity's lifetime, so they are
+    // camera- and animation-invariant BY CONSTRUCTION. Measured on this exact
+    // shape: 46-93 new keys/frame against 933-959 for a key over the derivation's
+    // input bytes, and new/frame of 0 on p1/p3/p5 with the camera moving.
+    //
+    // Offsets and stride are in the key because TF2 sub-allocates many meshes
+    // out of one pooled buffer and the pointer alone would merge them. The draw
+    // range is in for the same reason.
+    //
+    // Read straight off m_context->m_state, NOT off a DrawSnapshot: the whole
+    // point of the gate is to run BEFORE captureDrawSnapshot, which is itself
+    // 2.11 ms/frame of what we are trying not to pay.
+    struct KeyHead {
+      uint64_t vbPtr;
+      uint64_t ibPtr;
+      uint64_t vsHash;
+      uint64_t ilPtr;
+      uint32_t vbOffset;
+      uint32_t vbStride;
+      uint32_t ibOffset;
+      uint32_t ibFormat;
+      uint32_t drawStart;
+      uint32_t drawCount;
+      int32_t  drawBase;
+      uint32_t indexed;
+    };
+    static_assert(sizeof(KeyHead) == 64, "KeyHead must have no implicit padding");
+
+    KeyHead k = { };
+    k.vbPtr    = reinterpret_cast<uint64_t>(vb0.buffer.ptr());
+    k.vbOffset = vb0.offset;
+    k.vbStride = vb0.stride;
+    k.ibPtr    = reinterpret_cast<uint64_t>(ia.indexBuffer.buffer.ptr());
+    k.ibOffset = ia.indexBuffer.offset;
+    k.ibFormat = static_cast<uint32_t>(ia.indexBuffer.format);
+    k.ilPtr    = reinterpret_cast<uint64_t>(ia.inputLayout.ptr());
+    k.drawStart = start;
+    k.drawCount = count;
+    k.drawBase  = base;
+    k.indexed   = indexed ? 1u : 0u;
+
+    if (auto* vsP = m_context->m_state.vs.shader.ptr()) {
+      if (auto* csP = vsP->GetCommonShader()) {
+        const auto& shP = csP->GetShader();
+        if (shP != nullptr) {
+          k.vsHash = static_cast<uint64_t>(shP->getHash());
+        }
+      }
+    }
+
+    const uint64_t baseKey = XXH64(&k, sizeof(k), 0ull);
+
+    // AND THE PER-FRAME OCCURRENCE ORDINAL. See ResidentOccupancy in the header:
+    // several draws per frame share one IA identity, resolution is stateful
+    // within the frame, and keying without the ordinal lets draw 2 serve draw
+    // 1's record with full confidence. This is the defect pushInstanceRecords'
+    // verify pass surfaced as FAIL=3367.
+    const uint32_t frameId = m_context->m_device->getCurrentFrameId();
+    ResidentOccupancy& occ = m_residentOccupancy[baseKey];
+    if (occ.frame != frameId) {
+      occ.frame = frameId;
+      occ.counter = 0u;
+    }
+    const uint32_t ordinal = occ.counter++;
+
+    const uint64_t key = XXH64(&ordinal, sizeof(ordinal), baseKey);
+    // Never hand back the sentinel. A one-in-2^64 collision with 0 would
+    // otherwise silently disable residency for that draw forever.
+    return (key == 0ull) ? 1ull : key;
+  }
+
+  uint64_t D3D11Rtx::residentSrcGenFold() const {
+    // THE DIRTY TEST, AND IT IS A PROOF RATHER THAN A HEURISTIC.
+    //
+    // D3D11Buffer::GetMapGeneration() is monotonic and moves on BOTH the
+    // DiscardSlice() rename AND on Map(WRITE_NO_OVERWRITE) in-place writes --
+    // the case where mapPtr and m_contentGen both miss, and the one that made
+    // the dropship COLOR1.y read garbage. So:
+    //
+    //   the transform cannot have changed  <=>  every fold input still matches
+    //
+    // Nothing is read out of the buffers, nothing is derived, no contents are
+    // hashed. And for IMMUTABLE/STATIC buffers the generation is pinned at 0
+    // for the buffer's whole life, which is why world geometry is provably
+    // clean for free.
+    //
+    // A SUPERSET ON PURPOSE. We fold every BOUND VS constant buffer, not only
+    // the slots the derivation is known to read. A superset can report dirty
+    // when clean -- which costs a gate miss and a trip down the full path --
+    // and can NEVER report clean when dirty. That is the same safe direction
+    // every other key in this file takes: widening can refuse a serve, it can
+    // never redirect one onto a stranger's data.
+    const auto& ia = m_context->m_state.ia;
+
+    uint64_t fold = 0ull;
+
+    if (ia.vertexBuffers[0].buffer != nullptr) {
+      const uint64_t g = ia.vertexBuffers[0].buffer->GetMapGeneration();
+      fold = XXH64(&g, sizeof(g), fold);
+    }
+    if (ia.indexBuffer.buffer != nullptr) {
+      const uint64_t g = ia.indexBuffer.buffer->GetMapGeneration();
+      fold = XXH64(&g, sizeof(g), fold);
+    }
+
+    if (RtxOptions::ResidentScene::foldCbGenerations()) {
+      const auto& cbs = m_context->m_state.vs.constantBuffers;
+      for (uint32_t i = 0; i < cbs.size(); ++i) {
+        if (cbs[i].buffer == nullptr) {
+          continue;
+        }
+        // The SLOT is folded alongside the generation so that a rebind moving
+        // the same buffer between slots reads as dirty. It changes which bytes
+        // the derivation sees even though no write happened.
+        const uint64_t g = cbs[i].buffer->GetMapGeneration();
+        const uint64_t slotted = g ^ (static_cast<uint64_t>(i) << 56);
+        fold = XXH64(&slotted, sizeof(slotted), fold);
+      }
+    }
+
+    return fold;
+  }
+
+  void D3D11Rtx::censusRecordDraw(bool indexed, UINT count, UINT start, INT base) {
+    // CLEAR THE STASH FIRST, on every draw, before any early return. A draw
+    // that does not qualify here still reaches SubmitDrawTail, and if it found a
+    // key left over from the PREVIOUS draw it would score that model against
+    // this draw matrix -- a silent cross-draw contamination that would look
+    // exactly like real transform churn.
+    m_cenCurrentModelKey = 0ull;
+
+    const auto& ia  = m_context->m_state.ia;
+    const auto& vb0 = ia.vertexBuffers[0];
+    if (vb0.buffer == nullptr) {
+      return;   // nothing identifiable; also nothing residency could ever hold
+    }
+
+    uint64_t vsHash = 0ull;
+    if (auto* vsP = m_context->m_state.vs.shader.ptr()) {
+      if (auto* csP = vsP->GetCommonShader()) {
+        const auto& shP = csP->GetShader();
+        if (shP != nullptr) {
+          vsHash = static_cast<uint64_t>(shP->getHash());
+        }
+      }
+    }
+
+    // THE MODEL KEY -- identity WITHOUT the draw range and WITHOUT the ordinal.
+    // This is the level at which GEOMETRY is shared: every barrel in the level
+    // draws out of the same vertex buffer with the same shader, and differs
+    // only in its range and its transform. models-vs-instances below is exactly
+    // that ratio, and it is what decides whether the bootstrap set is "one
+    // instance per model" (small, seconds) or "every object" (the 2-minute
+    // streaming settle).
+    struct ModelHead {
+      uint64_t vbPtr, ibPtr, vsHash, ilPtr;
+      uint32_t vbStride, ibFormat;
+    };
+    static_assert(sizeof(ModelHead) == 40, "ModelHead must have no implicit padding");
+    ModelHead mh = { };
+    mh.vbPtr    = reinterpret_cast<uint64_t>(vb0.buffer.ptr());
+    mh.ibPtr    = reinterpret_cast<uint64_t>(ia.indexBuffer.buffer.ptr());
+    mh.vsHash   = vsHash;
+    mh.ilPtr    = reinterpret_cast<uint64_t>(ia.inputLayout.ptr());
+    mh.vbStride = vb0.stride;
+    mh.ibFormat = static_cast<uint32_t>(ia.indexBuffer.format);
+    const uint64_t modelKey = XXH64(&mh, sizeof(mh), 0ull);
+
+    const uint32_t fid = m_context->m_device->getCurrentFrameId();
+
+    // FRAME BOUNDARY, detected here rather than hooked at Present. The census
+    // has no business adding a per-frame callback to a file this size when the
+    // first draw of a new frame is an exact and free boundary signal -- and
+    // emitting from here means the window's numbers are already complete when
+    // the line is written.
+    if (fid != m_cenLastFrame) {
+      // THE GAMEPLAY GATE, APPLIED PER FRAME AND NOT PER WINDOW. The frame that
+      // just ended is judged on ITS OWN draw count: a menu or loading frame
+      // issues a handful of draws with no scene behind it, and if the window
+      // merely accumulated them then ~20 menu frames would creep past any total
+      // threshold and emit a line describing nothing. That is exactly how the
+      // first Phase 0 capture came back reading inst=0 for a thousand frames
+      // and got mistaken for a culling result.
+      //
+      // So a sub-floor frame does not just fail to emit -- it RESETS the
+      // window, because a window straddling the loading/gameplay transition
+      // mixes two populations and its averages describe neither.
+      constexpr uint32_t kCensusGameplayDrawFloor = 100u;
+      if (m_cenFrameDraws > 0u && m_cenFrameDraws < kCensusGameplayDrawFloor) {
+        m_cenDraws = m_cenDepthOnly = m_cenColour = m_cenIndexed = 0u;
+        m_cenVtxTotal = m_cenIdxTotal = 0ull;
+        m_cenFrames = 0u;
+        m_censusVs.clear();
+        m_censusVsModelSeen.clear();
+        m_censusVsInstSeen.clear();
+      } else if (m_cenFrameDraws > 0u) {
+        // COUNT THE FRAME BEFORE EMITTING. Its draws are already folded into
+        // m_cenDraws, so emitting first would divide N frames' worth of draws
+        // by N-1 and report a per-frame count that is quietly ~10% high --
+        // which is well inside the range this line is used to compare against.
+        m_cenFrames += 1;
+        censusEmit();        // internally throttled
+      }
+      m_cenFrameDraws = 0u;
+      m_cenLastFrame = fid;
+    }
+    m_cenFrameDraws += 1;
+
+    // A depth-only draw binds no colour render target. That is the structural
+    // separator this file already uses for the shadow/colour distinction (see
+    // the hasColorRt note in the o2w key), and here it answers question 3: how
+    // much of the frame is a shadow pass, which is geometry potentially arriving
+    // from OUTSIDE the view frustum under a different camera.
+    const bool depthOnly = (m_context->m_state.om.renderTargetViews[0] == nullptr);
+
+    m_cenDraws     += 1;
+    m_cenIndexed   += indexed ? 1u : 0u;
+    m_cenDepthOnly += depthOnly ? 1u : 0u;
+    m_cenColour    += depthOnly ? 0u : 1u;
+    m_cenIdxTotal  += indexed ? count : 0u;
+    m_cenVtxTotal  += indexed ? 0u : count;
+
+    // Per-model fanout: how many draws in ONE frame come out of this geometry.
+    {
+      CensusModelEntry& me = m_censusModels[modelKey];
+      if (me.frameLastSeen != fid) {
+        me.frameLastSeen = fid;
+        me.drawsThisFrame = 0u;
+        me.framesSeen += 1u;
+      }
+      me.drawsThisFrame += 1u;
+      if (me.drawsThisFrame > me.maxDrawsSeen) {
+        me.maxDrawsSeen = me.drawsThisFrame;
+      }
+    }
+
+    // Per-VS, because VS is the class proxy this tree already reads scenes
+    // through ([VanishDiag-VsRank] ranks by it, [DrawName] names it). The
+    // decisive column is clean%: a VS with many draws and clean~100% is what
+    // residency is for, and a VS with many draws and clean~0% should be left
+    // UNCULLED instead -- it re-derives every frame whatever we do.
+    CensusVsEntry& ve = m_censusVs[vsHash];
+    ve.draws     += 1;
+    ve.depthOnly += depthOnly ? 1u : 0u;
+
+    // Distinct-per-window counts. The dedup sets are keyed on the VS folded
+    // together with the model/instance key so two shaders touching the same
+    // buffer are counted once each rather than once in total.
+    if (m_censusVsModelSeen.insert(vsHash ^ (modelKey * 0x9E3779B97F4A7C15ull)).second) {
+      ve.models += 1;
+    }
+    // INSTANCES MUST BE COUNTED HERE, ABOVE THE ONCE-PER-FRAME EARLY RETURN.
+    // It used to sit at the tail of this function, so the second and later
+    // draws of a model within a frame returned before reaching it and every
+    // placement past the first went uncounted -- collapsing instances onto
+    // models and reporting fanout=1 for shaders measured at 24 the run before.
+    // The dirty verdict is per key per FRAME; the distinct-placement count is
+    // per DRAW. Two different questions, and only one of them may early-out.
+    if (m_censusVsInstSeen.insert(vsHash ^ (modelKey * 0xC2B2AE3D27D4EB4Full)
+                                         ^ (static_cast<uint64_t>(start) << 20)
+                                         ^ (static_cast<uint64_t>(count) << 40)
+                                         ^ static_cast<uint64_t>(static_cast<uint32_t>(base))).second) {
+      ve.instances += 1;
+    }
+
+    // ------------------------------------------------------------------
+    // THE DIRTY HISTORY, SPLIT BY SOURCE. Keyed at the model level so one entry
+    // describes one geometry rather than one placement -- a barrel drawn 200
+    // times is not 200 independent decisions.
+    //
+    // WHY THE SPLIT EXISTS. The first version folded vb + ib + EVERY bound VS
+    // cbuffer into one hash, on the reasoning that a superset can produce a
+    // false dirty but never a false clean. That is true and it is still the
+    // rule -- but it destroyed the SIGNAL: the measured result was
+    // class{static=1 dynamic=441} with every fanout=1 shader reading
+    // cleanPct=0, because TF2 rewrites its per-frame camera/time constants
+    // every frame and any draw binding that buffer is then dirty forever,
+    // however static the object is.
+    //
+    // That is the trap this file already documents at the o2w object key:
+    // "the bytes track the camera while the matrix they produce does not...
+    // ~97% of all churn was a key chasing something its own value did not do."
+    // Same failure, different mechanism.
+    //
+    // So attribute rather than guess. Per source, and per cbuffer SLOT, because
+    // "a cbuffer moved" and "cb2 (the camera) moved while cb3 (the object) did
+    // not" are completely different findings and only the second one says the
+    // object is genuinely static.
+    // ------------------------------------------------------------------
+    const auto& cbs = m_context->m_state.vs.constantBuffers;
+    const uint64_t vbGen = vb0.buffer->GetMapGeneration();
+    const uint64_t ibGen = (ia.indexBuffer.buffer != nullptr)
+                         ? ia.indexBuffer.buffer->GetMapGeneration() : 0ull;
+
+    ResidentGateEntry& ce = m_censusGate[modelKey];
+
+    // ONCE PER KEY PER FRAME, AND THE FIRST VERSION GOT THIS WRONG.
+    //
+    // It evaluated the dirty test on EVERY sighting. For a model with fanout
+    // 24, that is 24 sightings inside one frame, and between two draws of the
+    // same frame the engine has usually not re-mapped anything -- so 23 of the
+    // 24 comparisons read "clean" for a reason that has nothing to do with
+    // whether the object is static across frames. That is precisely why the
+    // high-fanout shaders read cleanPct 92-95 while every fanout=1 shader read
+    // 0: the number was measuring within-frame remapping, not frame-to-frame
+    // stability, and the two populations differ only in how many times they
+    // sample it.
+    //
+    // Residency asks a strictly frame-to-frame question, so evaluate exactly
+    // once per key per frame and compare against the previous frame.
+    if (ce.frameLastSeen == fid && ce.everSeen) {
+      ve.sameFrameSkips += 1;
+      return;   // already judged this key this frame; the draw is still counted above
+    }
+    // CONTIGUITY IS NOT REQUIRED, AND REQUIRING IT WAS A REAL MISTAKE.
+    //
+    // The first version judged only keys seen LAST frame, reasoning that a
+    // longer gap would report accumulated change as one frame.s worth. Measured
+    // consequence: judged=0 on every shader that submits on ALTERNATE frames
+    // (gapMean=2, gapMax=2 -- 0x29566a60, 0x2966cb89, 0x29a262d2, ~900
+    // draws/window), while the shaders judged perfectly were the ones drawing
+    // every model exactly once every frame. The filter kept the population that
+    // was never in trouble and discarded the one residency EXISTS for: an
+    // object not submitted every frame is precisely what numFramesToKeepInstances=1
+    // retires.
+    //
+    // It was also wrong on its own terms. Residency does not ask "did this
+    // change in one frame", it asks "is this the same as when I last saw it".
+    // Change accumulated across the gap is exactly the thing that matters -- if
+    // it moved while away, the record is stale and must be rebuilt. Gap length
+    // is a DIMENSION of the answer, not a precondition for asking, so it is
+    // reported (gapMean/gapMax) rather than used as a gate. No threshold.
+    // everSeen, NOT seen==0. seen is now reset every window (see censusEmit),
+    // so keying firstSight on it would make the first sighting of every window
+    // a false "never seen before": newKeys would read in the hundreds on a
+    // provably stable key, and one verdict per model per window would be lost.
+    const bool firstSight  = !ce.everSeen;
+
+    const bool vbMoved = !firstSight && (ce.vbGen != vbGen);
+    const bool ibMoved = !firstSight && (ce.ibGen != ibGen);
+
+    // Per-slot, so the log can name WHICH cbuffer is doing the dirtying.
+    uint32_t cbMovedMask = 0u;
+    uint32_t cbBoundMask = 0u;
+    uint32_t cbContentMovedMask = 0u;
+    uint32_t cbContentReadMask  = 0u;
+    for (uint32_t i = 0; i < kCensusCbSlots && i < cbs.size(); ++i) {
+      const uint64_t g = (cbs[i].buffer != nullptr) ? cbs[i].buffer->GetMapGeneration() : 0ull;
+      if (cbs[i].buffer != nullptr) {
+        cbBoundMask |= (1u << i);
+      }
+      if (!firstSight && ce.cbGen[i] != g) {
+        cbMovedMask |= (1u << i);
+      }
+      ce.cbGen[i] = g;
+
+      // ------------------------------------------------------------------
+      // CONTENT, NOT JUST GENERATION -- the question the first capture forced.
+      //
+      // cbMoved read 0xe on essentially every shader: slots 1, 2 and 3 remap
+      // EVERY frame while slot 0 never does. That is not 441 objects moving,
+      // it is TF2 writing its per-draw constants into shared dynamic buffers
+      // that get renamed each frame whether or not the values changed. Map
+      // generation answers "was this buffer written", and for a shared
+      // per-draw scratch buffer the answer is always yes -- so it cannot
+      // decide whether THIS object moved. That is the "one pooled buffer
+      // backing many objects -> false dirty" case flagged as the fallback
+      // condition in RESIDENT_SCENE_PLAN.md 1.2, now measured.
+      //
+      // So hash the bytes -- but only the ones THIS DRAW READS. constantOffset
+      // and constantBound give the draw's own window into the shared buffer,
+      // which is what makes this per-object rather than per-buffer.
+      //
+      // Capped, because the point is a diagnostic and not a new hot path: the
+      // span copy out of write-combined memory is already ~31% of SubmitDraw
+      // when it is done unbounded.
+      // ------------------------------------------------------------------
+      if (cbs[i].buffer != nullptr) {
+        size_t stagedLen = 0;
+        const uint8_t* staged = stagedCbBytes(cbs[i].buffer.ptr(), stagedLen);
+        if (staged != nullptr) {
+          const size_t off = static_cast<size_t>(cbs[i].constantOffset) * 16u;
+          size_t len = static_cast<size_t>(cbs[i].constantBound) * 16u;
+          if (len == 0u || len > kCensusCbContentCap) {
+            len = kCensusCbContentCap;
+          }
+          if (off < stagedLen) {
+            len = std::min<size_t>(len, stagedLen - off);
+            const uint64_t h = XXH64(staged + off, len, 0ull);
+            cbContentReadMask |= (1u << i);
+            if (!firstSight && ce.cbContentHash[i] != h) {
+              cbContentMovedMask |= (1u << i);
+            }
+            ce.cbContentHash[i] = h;
+          }
+        }
+      }
+    }
+
+    ce.vbGen = vbGen;
+    ce.ibGen = ibGen;
+
+    const bool anyMoved = vbMoved || ibMoved || (cbMovedMask != 0u);
+    // THE GEOMETRY-ONLY VERDICT, and it is the one that actually decides
+    // residency. An object whose vertex/index data and whose OBJECT cbuffers
+    // are unchanged is static even if the camera constants were rewritten --
+    // the camera is not part of the object-to-world transform, which is the
+    // entire lesson of the o2w key note referenced above.
+    const bool objMoved = vbMoved || ibMoved
+                        || ((cbMovedMask & ~kCensusCameraSlotMask) != 0u);
+
+    // THE VERDICT THAT NOW DECIDES EVERYTHING. Geometry unchanged AND the
+    // CONTENT of every non-camera constant window unchanged. If this reads high
+    // where objMoved reads 0% clean, the objects are static and it was only the
+    // buffers being rewritten with identical bytes -- which means the gate must
+    // compare content, not generations, and the architecture proceeds.
+    // If it ALSO reads ~0%, the transforms genuinely differ every frame and the
+    // next question is whether they differ by a jitter epsilon or by real
+    // motion (rtx_types.h documents TF2 producing "slightly different matrices
+    // each frame for the same static prop"), which is a different fix again.
+    const bool contentMoved = vbMoved || ibMoved
+                            || ((cbContentMovedMask & ~kCensusCameraSlotMask) != 0u);
+
+    ce.dirty        += anyMoved ? 1u : 0u;
+    ce.dirtyObj     += objMoved ? 1u : 0u;
+    ce.dirtyContent += contentMoved ? 1u : 0u;
+    ce.cbMovedMaskAcc |= cbMovedMask;
+    ce.cbBoundMaskAcc |= cbBoundMask;
+    ce.modelKey = modelKey;
+
+    // THE STRIDE SINCE THIS KEY WAS LAST JUDGED. 1 = submitted every frame.
+    // 2+ = it went away and came back, which is the residency case rather than
+    // an error, and is now recorded ON THE JUDGED PATH because the verdict is
+    // valid across any gap -- see the contiguity note above for why requiring
+    // gapLen==1 silently discarded ~900 draws/window of exactly the population
+    // this feature exists to serve.
+    const uint32_t gapLen = (ce.everSeen && fid > ce.frameLastSeen)
+                          ? (fid - ce.frameLastSeen) : 0u;
+
+    if (firstSight) {
+      ve.newKeys += 1;                      // identity churn -- the dangerous one
+    } else {
+      ve.judged += 1;
+      ve.gapFramesSum += gapLen;
+      if (gapLen > ve.gapFramesMax) { ve.gapFramesMax = gapLen; }
+      if (gapLen > 1u) { ve.gaps += 1; }    // verdict spanned an absence
+      if (!anyMoved)      { ve.clean += 1; }
+      if (!objMoved)      { ve.cleanObj += 1; }
+      if (!contentMoved)  { ve.cleanContent += 1; }
+      // SPLIT THE VERDICT BY CAMERA MOTION -- the discriminator the last capture
+      // demands, and it costs nothing because slot 2 IS the camera and its
+      // content-moved bit is already computed above.
+      //
+      // raw dirtyPct swung 100 -> 6 across two adjacent windows with no code
+      // change: the camera came to rest. If cleanContentPct is ~90 when the
+      // camera is still and ~0 when it moves, then the bytes being hashed are
+      // CAMERA-RELATIVE and this content key is a camera key -- the exact
+      // failure documented at the o2w object key ("the bytes track the camera
+      // while the matrix they produce does not"), hit for the third time.
+      //
+      // If instead both columns read ~90, camera motion is incidental and the
+      // content key is sound. Only these two numbers separate those.
+      const bool camMoved = (cbContentMovedMask & kCensusCameraSlotMask) != 0u;
+      // Stashed for censusRecordO2w, which runs at the end of SubmitDrawTail on
+      // this same thread once objectToWorld is final. Only ONE draw per key per
+      // frame reaches here (the early return above), so the o2w verdict inherits
+      // the same once-per-frame cadence as the content verdict and the two
+      // columns describe the same population.
+      m_cenCurrentModelKey = modelKey;
+      m_cenCurrentVsHash   = vsHash;
+      m_cenCurrentCamMoved = camMoved;
+      if (camMoved) {
+        ve.judgedCamMoved += 1;
+        if (!contentMoved) { ve.cleanContentCamMoved += 1; }
+      } else {
+        ve.judgedCamStill += 1;
+        if (!contentMoved) { ve.cleanContentCamStill += 1; }
+      }
+      if (vbMoved)        { ve.dirtyVb += 1; }
+      if (ibMoved)        { ve.dirtyIb += 1; }
+      if (cbMovedMask != 0u)        { ve.dirtyCb += 1; }
+      if (cbContentMovedMask != 0u) { ve.dirtyCbContent += 1; }
+      ve.cbMovedMask        |= cbMovedMask;
+      ve.cbBoundMask        |= cbBoundMask;
+      ve.cbContentMovedMask |= cbContentMovedMask;
+      ve.cbContentReadMask  |= cbContentReadMask;
+    }
+    ce.seen += 1;
+    ce.everSeen = true;
+    ce.frameLastSeen = fid;
+  }
+
+  void D3D11Rtx::censusEmit() {
+    const uint32_t fid = m_context->m_device->getCurrentFrameId();
+
+    // The gameplay floor is applied PER FRAME at the boundary in
+    // censusRecordDraw, not here -- see the comment there for why a window
+    // total cannot do that job. By the time we are called the window contains
+    // only gameplay frames.
+    if (m_cenFrames == 0u || m_cenDraws == 0u) {
+      return;
+    }
+    if (fid - m_cenLastLogFrame < 10u) {
+      return;
+    }
+    m_cenLastLogFrame = fid;
+
+    // Re-bucket the whole model table each window rather than incrementally:
+    // a key's CLASS can change (a prop that was static starts animating), and
+    // an incremental counter would keep it in the bucket it entered under. The
+    // table is model-scale (hundreds), not draw-scale, so the walk is cheap.
+    m_cenStatic = m_cenDynamic = m_cenMixed = m_cenYoung = 0u;
+    m_cenStaticAll = 0u;
+    m_cenStaticGen = 0u;
+    m_cenSeenSum = m_cenDirtySum = 0ull;
+    m_cenSampleN = 0u;
+    uint32_t modelsLiveThisWindow = 0u;
+    uint64_t fanoutSum = 0ull, fanoutMax = 0ull;
+
+    // PER-WINDOW, NOT PER-LIFETIME. THIS WAS WRONG IN EVERY EARLIER CAPTURE.
+    //
+    // seen/dirty were cumulative over the model's whole life, so "static" meant
+    // "was NEVER dirty since the session began". Across a few thousand frames
+    // essentially everything eventually moves once -- and gapMax=21 shows some
+    // verdicts legitimately span 21 frames of real change -- so the bucket
+    // decayed toward zero as the session ran. It read static=41 in one capture
+    // and static=0 in the next with no change to the scene, which is the
+    // signature of an instrument measuring elapsed time rather than the scene.
+    //
+    // A window is the right scope: residency asks "is this model holding still
+    // NOW", not "has it held still forever". The counters are therefore reset
+    // below, and kClassifyMinSeen drops to 4 because a 10-frame window cannot
+    // supply 8 sightings for a model drawn once per frame.
+    constexpr uint32_t kClassifyMinSeen = 4u;
+    for (auto& [k, ce] : m_censusGate) {
+      if (ce.seen < kClassifyMinSeen)          { m_cenYoung += 1; continue; }
+      // CLASSIFY ON dirtyObj, NOT dirty. The first capture classified on the
+      // all-sources fold and read static=1 / dynamic=441, because TF2 rewrites
+      // its per-frame camera constants every frame and every draw binding them
+      // looked dynamic. The camera is not part of object-to-world; a model is
+      // static when its GEOMETRY and its OBJECT constants hold still.
+      // CLASSIFY ON CONTENT. Generation says "the buffer was written", which
+      // for TF2 shared per-draw scratch buffers is always true and classified
+      // 441 models as dynamic in the first capture. Content says "the bytes
+      // this draw reads differ", which is the actual question.
+      if (ce.dirtyContent == 0u)                 { m_cenStatic += 1; }
+      else if (ce.dirtyContent + 2u >= ce.seen)  { m_cenDynamic += 1; }
+      else                                       { m_cenMixed += 1; }
+      // The other two verdicts on the SAME models, so the size of each
+      // instrument artefact is a measured number rather than an argument:
+      //   staticAll  generation fold including the camera slots (capture 1)
+      //   staticGen  generation fold excluding them            (capture 2)
+      //   static     content fold excluding them               (this capture)
+      if (ce.dirty == 0u)    { m_cenStaticAll += 1; }
+      if (ce.dirtyObj == 0u) { m_cenStaticGen += 1; }
+
+      // RAW SUMS, because class{} and the per-VS cleanContentPct DISAGREE and
+      // both are derived from the same comparison. Per-VS says ~90% of judged
+      // draws are content-clean; class{} says mixed=0 in ~150 of 160 windows,
+      // which requires seen ~= dirtyContent on essentially every model. Those
+      // cannot both be true.
+      //
+      // seenSum / dirtySum settle it without another round of inference:
+      //   dirtySum/seenSum ~= 10%  -> the per-VS number is right and the
+      //                               BUCKET THRESHOLDS are wrong (the
+      //                               dirtyContent+2>=seen test, or the window
+      //                               reset landing in the wrong place).
+      //   dirtySum/seenSum ~= 90%  -> the buckets are right and the per-VS
+      //                               tally is counting a different population
+      //                               than it claims to.
+      // Printed raw, not as a verdict, so the arithmetic can be checked.
+      m_cenSeenSum  += ce.seen;
+      m_cenDirtySum += ce.dirtyContent;
+      if (m_cenSampleN < 4u) {
+        // Four actual models, so a distribution can be seen rather than a mean.
+        // A mean of 9/1 and a mean of 9/9-with-outliers look identical summed.
+        Logger::warn(str::format(
+          "[CensusModel] f=", fid,
+          " key=0x", std::hex, k, std::dec,
+          " seen=", ce.seen,
+          " dirtyContent=", ce.dirtyContent,
+          " dirtyObj=", ce.dirtyObj,
+          " dirtyGen=", ce.dirty));
+        m_cenSampleN += 1u;
+      }
+
+      // Roll the window. The generation and content HASHES are deliberately
+      // kept -- they are the comparison baseline and resetting them would make
+      // the first sighting of every window a false "first sight", inflating
+      // newKeys and losing one verdict per model per window. Only the tallies
+      // are cleared.
+      ce.seen = 0u;
+      ce.dirty = 0u;
+      ce.dirtyObj = 0u;
+      ce.dirtyContent = 0u;
+    }
+    for (const auto& [k, me] : m_censusModels) {
+      if (fid - me.frameLastSeen <= 10u) {
+        modelsLiveThisWindow += 1;
+        fanoutSum += me.maxDrawsSeen;
+        if (me.maxDrawsSeen > fanoutMax) { fanoutMax = me.maxDrawsSeen; }
+      }
+    }
+
+    Logger::warn(str::format(
+      "[SceneCensus] f=", fid,
+      // PER FRAME, not per window: the accumulators run for ~10 frames so the
+      // raw totals would read 10x a frame count and invite exactly the
+      // comparison error this line exists to prevent. frames= is printed so
+      // the division can be checked rather than trusted.
+      " frames=", m_cenFrames,
+      " drawsPerFrame=", (m_cenFrames > 0 ? m_cenDraws / m_cenFrames : m_cenDraws),
+      " drawsWindow=", m_cenDraws,
+      // Geometry volume, so a draw-count fall can be told apart from a real
+      // work fall: 538 draws carrying twice the indices is not a win.
+      " idxPerFrame=", (m_cenFrames > 0 ? m_cenIdxTotal / m_cenFrames : m_cenIdxTotal),
+      " vtxPerFrame=", (m_cenFrames > 0 ? m_cenVtxTotal / m_cenFrames : m_cenVtxTotal),
+      // Q3: how much of the frame is a shadow pass. A large depthOnly share
+      // means part of the off-screen set is ALREADY in the draw stream under a
+      // wider camera, and the residency gap is smaller than it looks.
+      " rtv{colour=", m_cenColour, " depthOnly=", m_cenDepthOnly,
+      " depthPct=", (m_cenDraws > 0 ? (100u * m_cenDepthOnly) / m_cenDraws : 0u), "}",
+      // Q1: the sharing ratio. modelsLive is the size of the bootstrap set if
+      // geometry is cached per MODEL; fanoutAvg is how many placements one
+      // cached geometry serves. High fanout = seeding is cheap and a
+      // placement list is worth building. fanout ~1 = every draw is its own
+      // geometry, the model/placement split buys nothing, and a full seed is
+      // the only way to populate.
+      " share{modelsLive=", modelsLiveThisWindow,
+      " fanoutAvg=", (modelsLiveThisWindow > 0
+                       ? static_cast<uint32_t>(fanoutSum / modelsLiveThisWindow) : 0u),
+      " fanoutMax=", static_cast<uint32_t>(fanoutMax), "}",
+      // Q2: the class table, MEASURED. static = never re-derived once settled,
+      // and is the population residency exists for. dynamic = re-derives every
+      // frame regardless, so residency cannot help it and it should be left
+      // uncalled instead. young = not yet seen enough times to classify.
+      // THE DISCRIMINATOR. dirtySum/seenSum is the same ratio cleanContentPct
+      // reports, computed over the model table instead of the per-VS tallies.
+      // If they disagree the bucket thresholds are wrong, not the scene.
+      " raw{seenSum=", m_cenSeenSum, " dirtySum=", m_cenDirtySum,
+      " dirtyPct=", (m_cenSeenSum > 0 ? (100ull * m_cenDirtySum) / m_cenSeenSum : 0ull), "}",
+      " class{static=", m_cenStatic,
+      // staticAll counts the same models with the camera slots INCLUDED in the
+      // dirty test. static >> staticAll is the direct measurement of how much
+      // of the first capture class{static=1 dynamic=441} was the camera rather
+      // than the objects.
+      " staticGen=", m_cenStaticGen,
+      " staticAll=", m_cenStaticAll,
+      " dynamic=", m_cenDynamic,
+      " mixed=", m_cenMixed,
+      " young=", m_cenYoung,
+      " tableSize=", static_cast<uint32_t>(m_censusGate.size()), "}",
+      " | static high + fanout high => residency + placement list wins"));
+
+    // Q4: per-VS, ranked by draws. The class proxy this tree already reads
+    // scenes through -- cross-reference against [VanishDiag-VsRank] and
+    // [DrawName] to put a name to each line.
+    {
+      std::vector<std::pair<uint32_t, uint64_t>> rank;
+      rank.reserve(m_censusVs.size());
+      for (const auto& [vs, ve] : m_censusVs) {
+        rank.emplace_back(ve.draws, vs);
+      }
+      std::sort(rank.begin(), rank.end(),
+                [](const auto& a, const auto& b) { return a.first > b.first; });
+      const size_t topN = std::min<size_t>(rank.size(), 12u);
+      for (size_t i = 0; i < topN; ++i) {
+        const CensusVsEntry& ve = m_censusVs[rank[i].second];
+        Logger::warn(str::format(
+          "[VsResidency] f=", fid,
+          " vs=0x", std::hex, rank[i].second, std::dec,
+          " draws=", ve.draws,
+          " models=", ve.models,
+          " instances=", ve.instances,
+          // The decisive column. clean% is the share of this VS's draws whose
+          // source buffers had not been written since the previous sighting.
+          // ~100 => pure residency profit. ~0 => never make this resident;
+          // leave it unculled in the engine instead, it re-derives regardless.
+          // ALL PERCENTAGES DIVIDE BY judged, NOT draws. Only the first draw of
+          // each key each frame gets a frame-to-frame verdict now, so dividing
+          // by draws would scale every rate down by the fanout and make a
+          // high-fanout shader look worse than a fanout=1 one for no reason.
+          " judged=", ve.judged,
+          " cleanPct=", (ve.judged > 0 ? (100u * ve.clean) / ve.judged : 0u),
+          // THE COLUMN THAT DECIDES RESIDENCY. cleanObj excludes the camera
+          // cbuffer slots: an object whose geometry and whose OBJECT constants
+          // are unchanged is static even though TF2 rewrote the per-frame
+          // camera block, because the camera is not part of object-to-world.
+          // cleanObjPct high while cleanPct is 0 means the first fold was
+          // measuring the camera, not the object.
+          " cleanObjPct=", (ve.judged > 0 ? (100u * ve.cleanObj) / ve.judged : 0u),
+          // THE DECIDING NUMBER. Content-based, camera slots excluded.
+          // high here + cleanObjPct 0  => buffers rewritten with IDENTICAL
+          //   bytes; the objects are static and the gate must compare content.
+          // 0 here as well                => the transforms genuinely differ every
+          //   frame; next question is jitter-epsilon vs real motion.
+          " cleanContentPct=", (ve.judged > 0 ? (100u * ve.cleanContent) / ve.judged : 0u),
+          // THE COLUMN PAIR THAT NOW DECIDES EVERYTHING. camStill high +
+          // camMoved low => the content key tracks the CAMERA, not the object,
+          // and hashing input bytes cannot work however the slots are masked.
+          // Both high => the key is sound and the earlier readings were not
+          // simply taken standing still.
+          " camStill{n=", ve.judgedCamStill,
+          " cleanPct=", (ve.judgedCamStill > 0 ? (100u * ve.cleanContentCamStill) / ve.judgedCamStill : 0u), "}",
+          " camMoved{n=", ve.judgedCamMoved,
+          " cleanPct=", (ve.judgedCamMoved > 0 ? (100u * ve.cleanContentCamMoved) / ve.judgedCamMoved : 0u), "}",
+          // THE DERIVED-TRANSFORM VERDICT. objectToWorld is camera-invariant by
+          // construction, so unlike cleanContentPct this cannot be measuring the
+          // camera. o2wStill vs o2wMoved is the whole question:
+          //   both high  => residency survives camera motion. Gate goes
+          //                 downstream of ExtractTransforms and slice 5 proceeds.
+          //   still high, moved low => the DERIVED matrix also tracks the camera,
+          //                 which would mean the transform genuinely re-poses and
+          //                 no cross-frame cache can hold it.
+          //   both low   => TF2 jitter (rtx_types.h: "slightly different matrices
+          //                 each frame for the same static prop"). Then and only
+          //                 then is a near/far epsilon the right fix.
+          " o2w{arrived=", ve.o2wArrived, " noStash=", ve.o2wNoStash,
+          " n=", ve.o2wJudged,
+          " cleanPct=", (ve.o2wJudged > 0 ? (100u * ve.o2wClean) / ve.o2wJudged : 0u),
+          " still=", (ve.o2wJudgedCamStill > 0 ? (100u * ve.o2wCleanCamStill) / ve.o2wJudgedCamStill : 0u),
+          " moved=", (ve.o2wJudgedCamMoved > 0 ? (100u * ve.o2wCleanCamMoved) / ve.o2wJudgedCamMoved : 0u),
+          " nStill=", ve.o2wJudgedCamStill, " nMoved=", ve.o2wJudgedCamMoved, "}",
+          // WHICH SOURCE IS DOING THE DIRTYING. dirtyVb high = a genuinely
+          // streamed/rewritten vertex buffer, and no key can cache that.
+          // dirtyCb high with dirtyVb 0 = only constants moved, so look at
+          // cbMoved to see whether it is the camera slot or the object slot.
+          " dirty{vb=", ve.dirtyVb, " ib=", ve.dirtyIb,
+          " cbGen=", ve.dirtyCb, " cbContent=", ve.dirtyCbContent, "}",
+          " cbMoved=0x", std::hex, ve.cbMovedMask,
+          " cbContentMoved=0x", ve.cbContentMovedMask,
+          " cbContentRead=0x", ve.cbContentReadMask,
+          " cbBound=0x", ve.cbBoundMask, std::dec,
+          " newKeys=", ve.newKeys,
+          " gaps=", ve.gaps,
+          // MEAN STRIDE over judged draws: 1 = submitted every frame,
+          // 2 = alternate frames. gaps counts how many verdicts spanned an
+          // absence -- those are the residency cases, not failures.
+          " gapMean=", (ve.judged > 0 ? ve.gapFramesSum / ve.judged : 0u),
+          " gapMax=", ve.gapFramesMax,
+          " sameFrameSkips=", ve.sameFrameSkips,
+          // ACCOUNTING IDENTITY, printed so it can be checked and not assumed:
+          // draws must equal judged + newKeys + sameFrameSkips. If it
+          // does not, draws are being lost on a path this census does not model
+          // and every rate above it is computed over the wrong denominator.
+          " accounted=", (ve.judged + ve.newKeys + ve.sameFrameSkips),
+          " depthOnly=", ve.depthOnly,
+          " fanout=", (ve.models > 0 ? ve.instances / ve.models : 0u)));
+      }
+    }
+
+    m_cenDraws = m_cenDepthOnly = m_cenColour = m_cenIndexed = 0u;
+    m_cenFrames = 0u;
+    m_cenVtxTotal = m_cenIdxTotal = 0ull;
+    m_censusVs.clear();
+    m_censusVsModelSeen.clear();
+    m_censusVsInstSeen.clear();
+
+    // PRUNE, on the same [Perf.SplitXf] evict{} age-rung ladder as everything
+    // else here. Both tables are keyed on engine buffer pointers, and the
+    // engine frees and reallocates buffers over a session, so left alone they
+    // grow for as long as the process runs.
+    //
+    // The cap is deliberately generous relative to the record cap: these are
+    // MODEL-scale tables (hundreds of geometries, not thousands of placements)
+    // and their whole value is the long history in `seen`/`dirty`. Evicting an
+    // entry resets its class back to `young` and loses the classification, so
+    // the ladder should only ever bite on genuine pointer churn.
+    // kCensusCap lives INSIDE the lambda as a static. As a plain constexpr in
+    // the enclosing scope MSVC rejects it under /WX with C3493 ("cannot be
+    // implicitly captured because no default capture mode has been specified"),
+    // and that error poisons the lambda's type, so both call sites below then
+    // fail with a misleading C2064 about a term not being callable. One cause,
+    // three errors -- do not chase the C2064s.
+    const auto pruneLadder = [fid](auto& table) {
+      static constexpr size_t   kCensusCap = 32768u;
+      static constexpr uint32_t kAgeRungs[] = { 300u, 60u, 8u, 2u };
+      if (table.size() <= kCensusCap) {
+        return;
+      }
+      for (uint32_t r = 0; r < std::size(kAgeRungs) && table.size() > kCensusCap; ++r) {
+        for (auto it = table.begin(); it != table.end(); ) {
+          if (fid > it->second.frameLastSeen && fid - it->second.frameLastSeen > kAgeRungs[r]) {
+            it = table.erase(it);
+          } else {
+            ++it;
+          }
+        }
+      }
+      // No flat wipe here, unlike the gate. Wiping the census would silently
+      // reset every class back to `young` and the next line would read as if
+      // the scene had just loaded -- a diagnostic that lies is worse than one
+      // that admits it is over its cap. tableSize= on the line above is how
+      // that shows.
+    };
+    pruneLadder(m_censusGate);
+    pruneLadder(m_censusModels);
+  }
+
+  void D3D11Rtx::residentGateEvaluate(bool indexed, UINT count, UINT start, INT base) {
+    // ------------------------------------------------------------------
+    // [SceneCensus] / [VsResidency] RUN UNCONDITIONALLY. See the block comment
+    // on the census members in d3d11_rtx.h for why: this is the measurement
+    // that decides what gets built, and it has to be takeable on the conf
+    // exactly as it stands rather than behind a switch nobody has flipped.
+    //
+    // GAMEPLAY-GATED, NOT WALL-CLOCK-GATED. A menu or loading frame issues a
+    // handful of draws with no scene behind them, and folding those into the
+    // census is how the first Phase 0 capture came back reading inst=0 for
+    // 1000 frames and got mistaken for a culling result. The floor below is
+    // the same idea applied at the only place the frame thread can see it.
+    // ------------------------------------------------------------------
+    censusRecordDraw(indexed, count, start, base);
+
+    if (!RtxOptions::ResidentScene::enable()) {
+      return;
+    }
+
+    // THE READOUT. Emitted from the frame thread rather than beside
+    // [ResidentScene] in garbageCollection because these are the FRAME-THREAD
+    // tallies -- the gate verdict and the key churn -- and the two halves must
+    // be readable independently. If the RT-side line shows records plateauing
+    // while this one shows newKeys in the hundreds, the key is churning and the
+    // record store is merely hiding it behind eviction.
+    {
+      const uint32_t fid = m_context->m_device->getCurrentFrameId();
+      if (RtxOptions::ResidentScene::logStats()
+          && m_rsDraws > 0
+          && fid - m_rsLastLogFrame >= 10u) {
+        m_rsLastLogFrame = fid;
+        Logger::warn(str::format(
+          "[ResidentGate] f=", fid,
+          " draws=", m_rsDraws,
+          " hit=", m_rsHit,
+          " missKey=", m_rsMissKey,
+          " missGen=", m_rsMissGen,
+          " newKeys=", m_rsNewKeys,
+          " noKey=", m_rsNoKey,
+          " gateSize=", static_cast<uint32_t>(m_residentGate.size()),
+          " hitPct=", (m_rsDraws > 0 ? (100u * m_rsHit) / m_rsDraws : 0u),
+          // CUMULATIVE, and printed even at zero. A sweep policy with no
+          // counter is how [Perf.SplitXf]'s first eviction pass read as working
+          // while freeing nothing. sweeps=0 means the cap was never reached;
+          // aged>0 with wipes=0 is the healthy state; wipes>0 means the cap is
+          // too small for the scene -- raise maxRecords, do NOT read it as key
+          // churn. rung names the age bound that actually did the freeing.
+          " evict{sweeps=", m_rsSweeps, " aged=", m_rsAged,
+          " wipes=", m_rsWipes, " rung=", m_rsRung, "}",
+          // READ IT AS: newKeys ~0 in a stationary scene means the IA key is
+          // stable and residency is safe to arm. newKeys in the hundreds means
+          // the key itself churns (the engine rotates the buffers under it) and
+          // arming a long keep on it is trap 3 -- the [PropIdKeepLong attempt
+          // reverted] case, which made things WORSE. missGen high with newKeys
+          // ~0 is the good failure: identity is stable, the content genuinely
+          // moves, and those draws simply are not residency candidates.
+          " | newKeys ~0 = key stable; newKeys high = DO NOT ARM"));
+        m_rsDraws = m_rsHit = m_rsMissKey = m_rsMissGen = 0u;
+        m_rsNewKeys = m_rsNoKey = 0u;
+      }
+
+      // PRUNE, AND IT IS NOT OPTIONAL. Both maps are keyed on engine buffer
+      // pointers, and the engine frees and reallocates buffers over a session,
+      // so left alone they grow for as long as the process runs.
+      //
+      // THE POLICY IS THE SPLIT-TRANSFORM CACHE'S AGE-RUNG LADDER, COPIED
+      // DELIBERATELY RATHER THAN REINVENTED (see [Perf.SplitXf] evict{} around
+      // the kAgeRungs block in this same file). Its correction note is exactly
+      // the mistake the first version of THIS sweep made: a single absolute age
+      // bound cannot fire when the fill rate is high, because by the time the
+      // cap is reached the oldest entry is younger than the bound and the test
+      // matches nothing. That sweep freed zero and fell through to a flat wipe
+      // every ~25 frames while reading as a working policy, because it had no
+      // counter.
+      //
+      // So: ASK, DO NOT ASSUME. Walk a ladder of age bounds and stop at the
+      // first that gets under the cap -- keeping as much history as the cap can
+      // afford instead of as much as a guess predicted.
+      //
+      // WHY AGE SEPARATES THE WORKING SET FROM THE CHURN HERE, same argument as
+      // there: frameLastSeen is stamped on EVERY draw that reaches the gate, so
+      // a prop drawn every frame is permanently age 0-1 and survives every rung,
+      // while a key minted once and never seen again ages without bound. Any
+      // rung separates the two populations; the ladder only decides how much of
+      // the recently-but-not-currently-used middle survives -- and that middle
+      // is precisely the culled-then-visible object this whole feature exists
+      // for, so it wants the most room the cap allows.
+      //
+      // ONLY WHEN OVER THE CAP. Not on a fixed period: the walk is O(map), and
+      // the map is the thing we are trying not to pay for.
+      const size_t kGateCap = RtxOptions::ResidentScene::maxRecords();
+      if (kGateCap != 0u && m_residentGate.size() > kGateCap) {
+        m_rsSweeps += 1;
+        static constexpr uint32_t kAgeRungs[] = { 300u, 60u, 8u, 2u };
+        for (uint32_t r = 0; r < std::size(kAgeRungs) && m_residentGate.size() > kGateCap; ++r) {
+          const uint32_t maxAge = kAgeRungs[r];
+          for (auto it = m_residentGate.begin(); it != m_residentGate.end(); ) {
+            if (fid > it->second.frameLastSeen && fid - it->second.frameLastSeen > maxAge) {
+              it = m_residentGate.erase(it);
+              m_rsAged += 1;
+            } else {
+              ++it;
+            }
+          }
+          m_rsRung = maxAge;
+        }
+        // Still over after the tightest rung means the cap's worth of keys were
+        // ALL touched within 2 frames -- a working set that genuinely exceeds
+        // the cap, not churn. A wipe is then the honest answer: refill costs a
+        // frame of gate misses, and silently keeping an unbounded map would
+        // trade a frame-time bug for a memory one. If m_rsWipes reads non-zero
+        // the cap is too small for the scene, which is a DIFFERENT finding from
+        // key churn and wants raising maxRecords rather than abandoning the key.
+        if (m_residentGate.size() > kGateCap) {
+          m_residentGate.clear();
+          m_rsWipes += 1;
+          m_rsRung = 0u;
+        }
+      }
+
+      // The occupancy map is swept on the same trigger and the same ladder. It
+      // is keyed on the BASE key (identity without the ordinal), so it is
+      // strictly smaller than the gate map and cannot be the thing that blows
+      // the cap -- but it is keyed on the same engine pointers and leaks the
+      // same way, so it cannot simply be left alone either.
+      if (kGateCap != 0u && m_residentOccupancy.size() > kGateCap) {
+        for (auto it = m_residentOccupancy.begin(); it != m_residentOccupancy.end(); ) {
+          if (fid > it->second.frame && fid - it->second.frame > 2u) {
+            it = m_residentOccupancy.erase(it);
+          } else {
+            ++it;
+          }
+        }
+      }
+    }
+
+    m_rsDraws += 1;
+
+    const uint64_t key = residentDrawKey(indexed, count, start, base);
+    if (key == 0ull) {
+      m_rsNoKey += 1;
+      return;
+    }
+
+    const uint64_t gens = residentSrcGenFold();
+    const uint32_t frameId = m_context->m_device->getCurrentFrameId();
+
+    const auto it = m_residentGate.find(key);
+    if (it == m_residentGate.end()) {
+      m_rsNewKeys += 1;
+      m_rsMissKey += 1;
+      ResidentGateEntry& e = m_residentGate[key];
+      e.srcGenHash = gens;
+      e.frameLastSeen = frameId;
+      return;
+    }
+
+    ResidentGateEntry& e = it->second;
+
+    // A key we have seen before but NOT last frame is a miss, deliberately.
+    // The record it would serve has not been refreshed since, and a resident
+    // record that a draw should have updated and did not is the s2s "two views"
+    // failure -- alive but stale, with no FAIL to catch it. Requiring
+    // contiguity makes that state unreachable through the gate.
+    const bool contiguous = (e.frameLastSeen + 1u == frameId) || (e.frameLastSeen == frameId);
+    const bool gensMatch  = (e.srcGenHash == gens);
+
+    if (!contiguous) {
+      m_rsMissKey += 1;
+    } else if (!gensMatch) {
+      m_rsMissGen += 1;
+    } else {
+      m_rsHit += 1;
+    }
+
+    e.srcGenHash = gens;
+    e.frameLastSeen = frameId;
+
+    // VERIFY FIRST, SKIP SECOND. While rtx.residentScene.verify is on the
+    // verdict above is SCORED AND DISCARDED: the draw goes down the full path
+    // regardless, GC keeps its ordinary lifetime clause, and this feature can
+    // change nothing on screen. Nothing is skipped until [ResidentScene] reads
+    // a stable record count and touchMiss ~0 across a pitch-and-yaw sweep.
+    //
+    // The skip itself (emitting a TouchRecord{key} instead of a full
+    // DrawCallState, and bulk-stamping on the CS side) is the next slice; see
+    // RESIDENT_SCENE_PLAN.md section 4, slice 6. Deliberately NOT wired here
+    // while the key is unproven -- that ordering is what the
+    // [PropIdKeepLong attempt reverted] note exists to enforce.
+  }
+
   void D3D11Rtx::SubmitDraw(bool indexed,
                              UINT count,
                              UINT start,
@@ -36765,6 +37835,17 @@ namespace dxvk {
     // not dxvk::tf2 -- tf2 closes above line 665. g_engineHookCaptureCount IS
     // in dxvk::tf2, which is why nearby code qualifies that one and not these.)
     latchEngineCameraForDraws();
+
+    // NV-DXVK [ResidentScene]: the gate, and it runs HERE -- first thing, off
+    // live m_context->m_state, before captureDrawSnapshot and before any
+    // derivation. That position is the whole point: the cost this is meant to
+    // remove is everything downstream of it, so a gate that needed the snapshot
+    // would already have paid the 2.11 ms/frame it exists to avoid.
+    //
+    // No-op unless rtx.residentScene.enable, and SCORES ONLY while
+    // rtx.residentScene.verify is on (the default), so with the feature off or
+    // unverified this is one predictable branch and nothing on screen can move.
+    residentGateEvaluate(indexed, count, start, base);
 
     // [Perf.SubmitDraw] per-stage timing â€” see comment near static thread_local accumulators
     // above for stage definitions. markStg bumps both the running accumulator AND the per-draw
@@ -42395,6 +43476,46 @@ namespace dxvk {
         ++sKSFrameDraws;
         ++sKS.draws;
 
+        // NV-DXVK [Perf.ServeSplit]: the serve half's own cursor. Contract, and
+        // why it is not markSub, on the accumulators' declaration. Same
+        // compile-out / env-var pair as markXt, in the same order, so a
+        // marks-off build carries one predictable branch and no clock read.
+        // Conditional init, same shape XfPostVerdictTimer uses: with marks off
+        // this block must cost one predictable branch and no clock read, and a
+        // cursor that stamps unconditionally would spend ~41 ns on every one of
+        // the ~1,330 split draws a frame for a number nobody is reading.
+        auto tSv = (kRtxPerfMarks && s_perfMarksEnabled)
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point { };
+        auto markSv = [&tSv](int64_t& acc, int64_t& max) {
+          if constexpr (!kRtxPerfMarks) {
+            (void) acc; (void) max; (void) tSv;
+            return;
+          } else {
+          if (!s_perfMarksEnabled)
+            return;
+          const auto now = std::chrono::steady_clock::now();
+          const int64_t dNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now - tSv).count();
+          acc += dNs;
+          if (dNs > max) max = dNs;
+          tSv = now;
+          }
+        };
+        // Re-stamp WITHOUT billing. Used at the derive branch so the whole of
+        // ExtractTransforms -- which has its own tXt cursor and its own 30
+        // children -- cannot land in a serve bucket as well.
+        auto dropSv = [&tSv]() {
+          if constexpr (!kRtxPerfMarks) {
+            (void) tSv;
+            return;
+          } else {
+          if (!s_perfMarksEnabled)
+            return;
+          tSv = std::chrono::steady_clock::now();
+          }
+        };
+        ++s_perfSvAllN;
+
         // THE VIEW CACHE IS PER FRAME. worldToView is the camera, and the
         // camera is the one thing that genuinely changes every frame -- that
         // is the whole reason the fused key dies. Ten entries a frame is the
@@ -42719,9 +43840,14 @@ namespace dxvk {
         // point where this used to be read.
         const bool xVerify = RtxOptions::splitTransformVerify();
         const bool xAblate = xVerify;
+        markSv(s_perfSvPreAcc, s_perfSvPreMax);   // [sv_pre] frame roll, view eviction, lambdas
         drawSplitKeys(*m_drawSnapCur, objKey, objVal, viewKey,
                       xAblate ? objVar : nullptr,
                       objComps, &objDrop);
+        // [sv_keys] drawMemoComponents + the block hashing + both path
+        // predictions. Paid on EVERY split draw -- this is the tier's entry
+        // fee, and the first candidate for the 3.21 us a serve costs.
+        markSv(s_perfSvKeysAcc, s_perfSvKeysMax);
 
         const auto itObj  = sObj.find(objKey);
         const auto itView = sView.find(viewKey);
@@ -42932,6 +44058,10 @@ namespace dxvk {
         // when this draw actually replayed something.
         uint64_t xGrpReplayed[kSdepGroupCount] = { };
         uint8_t  xReplayedGroups = 0;
+
+        // [sv_lookup] both map finds, the three gates (xPathOk / xViewStale /
+        // xVPathOk) and every census between them. Also all-draw tier tax.
+        markSv(s_perfSvLookupAcc, s_perfSvLookupMax);
 
         DrawCallTransforms cand;
         if (haveObj && haveView) {
@@ -43154,6 +44284,11 @@ namespace dxvk {
             if (xVerify)
               stageDepCarrierGroups(xGrpReplayed);
           }
+          // [sv_carrier] the cross-draw member RESTORE -- kSdepCbLoc plus the
+          // ~14 kSdepCam writes and their s_camRep mirror. This is the part of
+          // a serve that is not a compose at all: it is replaying side effects
+          // the skipped derivation would have had. Serve-only.
+          markSv(s_perfSvCarrierAcc, s_perfSvCarrierMax);
           const XfViewPart&   v = itView->second;
           cand.objectToWorld     = o.objectToWorld;
           cand.textureTransform  = o.textureTransform;
@@ -43226,6 +44361,11 @@ namespace dxvk {
             cand.isSubView       = svS;
             cand.isSubViewSkybox = svsS;
           }
+          // [sv_subView] the 19g re-derivation: memoCamOriginLoc + a named-span
+          // locate + 12-byte read + three isfinite, on every path-13 serve.
+          // Prices fix 5 of HANDOFF_XFDEFER 19g -- it bought FAIL 134 -> 0 and
+          // this is what it cost. Serve-only.
+          markSv(s_perfSvSubViewAcc, s_perfSvSubViewMax);
           cand.vertexShaderHash  = o.vertexShaderHash;
           cand.pixelShaderHash   = o.pixelShaderHash;
           cand.worldToView       = v.worldToView;
@@ -43240,6 +44380,12 @@ namespace dxvk {
           // fresh matrix product, so this runs here too -- otherwise verify
           // would report a FAIL that is the missing sanitise, not the split.
           cand.sanitize();
+          // [sv_compose] THE COMPOSE ITSELF -- ~12 field copies, one
+          // isIdentityExact, one Matrix4 product and sanitize. This is the only
+          // bucket the plan's sec 0.2 candidate ("the compose path costs what
+          // the derivation did") can live in. If it reads small, that candidate
+          // is dead and the serve cost is the four buckets around it.
+          markSv(s_perfSvComposeAcc, s_perfSvComposeMax);
         } else {
           if (!haveObj && !haveView) ++xMissBoth;
           else if (!haveObj)         ++xMissObj;
@@ -43260,11 +44406,21 @@ namespace dxvk {
           // [Perf.ServeCost]: this draw's bt_extractXf interval is a COMPOSE,
           // not a derivation. See the accumulators' declaration.
           s_xtServedLast = true;
+          // [Perf.ServeSplit]: the denominator for the serve-only buckets.
+          // Incremented HERE and not at the compose, because the compose also
+          // runs under verify -- where the serve is then thrown away.
+          ++s_perfSvN;
         } else {
           const auto tXf0 = (haveObj && haveView)
               ? std::chrono::steady_clock::now()
               : std::chrono::steady_clock::time_point { };
+          // [Perf.ServeSplit]: re-stamp, bill nothing. ExtractTransforms owns
+          // its own cursor and its own children; without this its whole span
+          // would land in sv_store and the serve buckets would read as the
+          // derivation they exist to be compared against.
+          dropSv();
           dcs.transformData = ExtractTransforms();
+          dropSv();
           s_xtServedLast = false;  // [Perf.ServeCost]: full derivation
           // NV-DXVK [LateTag]: the path AS THE CACHE SEES IT. Stamped here
           // because everything below -- the serve decision, storePath, the
@@ -44262,6 +45418,18 @@ namespace dxvk {
             }
           }
         }
+        // [sv_store] everything after the serve/derive decision that is still
+        // inside the split block: the store/overwrite, storePath and carrier
+        // recording, the ablation census and the FAIL bookkeeping. On a MISS
+        // the three serve-only marks above never fire, so a miss's post-lookup
+        // time lands here too -- read it against s_perfSvAllN - s_perfSvN, not
+        // svN.
+        //
+        // LAST STATEMENT IN `if (splitOn)`, and it has to be: tSv/markSv are
+        // declared in that block, and the `if (RtxOptions::splitTransformCache())`
+        // reporting block below is its SIBLING, not its child -- which is
+        // exactly where this mark was first (wrongly) put.
+        markSv(s_perfSvStoreAcc, s_perfSvStoreMax);
       }
 
       if (RtxOptions::splitTransformCache()) {
@@ -47568,10 +48736,106 @@ namespace dxvk {
     // xfChainSubmit falls back to running inline when the ring is full, so
     // this arm cannot block the frame thread -- see the XfChain header block.
     // ==================================================================
+    // NV-DXVK [CensusO2w]: THE DERIVED-TRANSFORM DIRTY TEST, taken here because
+    // this is the last point at which objectToWorld is final for EVERY path
+    // (paths 9-12 assign it well after ExtractTransforms) and we are still on
+    // the frame thread, so the model key stashed by censusRecordDraw is ours.
+    //
+    // WHY THE CONTENT HASH OF THE INPUT BYTES COULD NOT ANSWER THIS. Measured:
+    // the camera drifted 0.3 world units over 40 frames and content dirt went
+    // from 6% to 100%; the instant Main= froze in [Cam.snapshot] it collapsed
+    // back. Sub-unit camera jitter cannot correlate with real object motion, so
+    // the object constants are CAMERA-RELATIVE and hashing them produces a
+    // camera key however the slots are masked. Third time this tree has hit
+    // that wall -- see the o2w object-key note ("the bytes track the camera
+    // while the matrix they produce does not").
+    //
+    // objectToWorld is camera-invariant BY CONSTRUCTION, which is the whole
+    // point: if THIS reads clean while the camera moves, residency survives
+    // camera motion and the gate simply lives downstream of the derivation
+    // instead of upstream of it.
+    censusRecordO2w(dcs.transformData.objectToWorld);
+
     if (c.arena == SubmitDrawTailCtx::TailArena::Chain)
       xfChainSubmit(c);
     else
       SubmitDrawDeferred(c);
+  }
+
+  void D3D11Rtx::censusRecordO2w(const Matrix4& o2w) {
+    // ARRIVAL COUNT FIRST, KEYED OFF LIVE STATE, NOT OFF THE STASH.
+    //
+    // [VsResidency] reads judged=450 / o2w{n=0} for 0x29a8a769 while an
+    // otherwise identical shader reads judged=1335 / o2w{n=1335} -- exactly
+    // equal. So either those draws never arrive here, or they arrive and the
+    // stash is empty. Those are completely different bugs and the o2w counters
+    // cannot tell them apart, because both produce n=0.
+    //
+    // Reading the VS out of live state rather than m_cenCurrentVsHash is the
+    // point: the stash may be stale or clear, and a counter that depends on the
+    // thing under suspicion cannot measure it.
+    {
+      uint64_t vsNow = 0ull;
+      if (auto* vsP = m_context->m_state.vs.shader.ptr()) {
+        if (auto* csP = vsP->GetCommonShader()) {
+          const auto& shP = csP->GetShader();
+          if (shP != nullptr) {
+            vsNow = static_cast<uint64_t>(shP->getHash());
+          }
+        }
+      }
+      if (vsNow != 0ull) {
+        CensusVsEntry& veArr = m_censusVs[vsNow];
+        veArr.o2wArrived += 1;
+        if (m_cenCurrentModelKey == 0ull) {
+          veArr.o2wNoStash += 1;
+        }
+      }
+    }
+
+    const uint64_t key = m_cenCurrentModelKey;
+    if (key == 0ull) {
+      return;   // this draw never reached the census (no IA identity)
+    }
+    // Consume it: one o2w verdict per draw, and a stale key must never be
+    // scored against the next draw's matrix.
+    m_cenCurrentModelKey = 0ull;
+
+    const auto it = m_censusGate.find(key);
+    if (it == m_censusGate.end()) {
+      return;
+    }
+    ResidentGateEntry& ce = it->second;
+
+    // EXACT BYTES, no epsilon. rtx_types.h documents TF2 producing "slightly
+    // different matrices each frame for the same static prop", so an exact
+    // compare may well read dirty on a prop that is visually static -- and that
+    // is the RIGHT first measurement. A near/far epsilon is the fix for jitter
+    // ONLY once jitter is shown to be what is happening; leading with a
+    // tolerance would hide the difference between "jittering" and "moving",
+    // which are the two answers this is being asked to separate.
+    const uint64_t h = XXH64(&o2w, sizeof(Matrix4), 0ull);
+
+    CensusVsEntry& ve = m_censusVs[m_cenCurrentVsHash];
+    if (ce.o2wSeen) {
+      ve.o2wJudged += 1;
+      const bool moved = (ce.o2wHash != h);
+      if (!moved) {
+        ve.o2wClean += 1;
+      }
+      // Split by camera state, the same way the content test is, so the two
+      // are directly comparable on one line.
+      if (m_cenCurrentCamMoved) {
+        ve.o2wJudgedCamMoved += 1;
+        if (!moved) { ve.o2wCleanCamMoved += 1; }
+      } else {
+        ve.o2wJudgedCamStill += 1;
+        if (!moved) { ve.o2wCleanCamStill += 1; }
+      }
+      if (moved) { ce.o2wDirty += 1; }
+    }
+    ce.o2wHash = h;
+    ce.o2wSeen = true;
   }
 
   // ==================================================================
@@ -47625,6 +48889,37 @@ namespace dxvk {
     // or not that use survives, rather than a judgement about which gate is on.
     (void) posBuffer;
     auto& tStg = *c.tStg;
+    // NV-DXVK [Perf.DeferWait] 2026-08-20 -- DRAIN THE QUEUE WAIT BEFORE ANY
+    // STAGE SEES IT. Contract on the accumulator's declaration. tStg arrives
+    // holding the value the head half left at the seam (:27383 copies it into
+    // the slot), so without this the first markStg below -- `filters` -- bills
+    // the entire enqueue-to-execute latency as stage time. That is the whole of
+    // `filters=75.33 ms/frame` and of `xform named 80.92 vs wall 0.71`.
+    //
+    // Done inline rather than through markStg because markStg does not exist
+    // yet at this point and, more to the point, this is deliberately NOT a
+    // stage: nothing downstream should be able to add it to a stage sum.
+    // GATED ON xfDeferExecutingDeferred(), and the gate is the whole
+    // correctness of this. On the INLINE path SubmitDrawTail falls straight
+    // into this function, so the interval since its last mark (bt_skybox) is
+    // the tail's own trailing work -- real work, which `filters` has always
+    // billed and must keep billing. Only a slot that actually came off the
+    // queue has a wait to drain. Draining unconditionally would fix the
+    // deferred path by silently stealing ~a stage's worth of the inline one,
+    // which is the same class of error as the bug being fixed.
+    if constexpr (kRtxPerfMarks) {
+      if (s_perfMarksEnabled && xfDeferExecutingDeferred()) {
+        const auto nowDw = std::chrono::steady_clock::now();
+        const int64_t dw = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            nowDw - tStg).count();
+        if (dw > 0) {
+          s_perfXfDeferWaitAcc += dw;
+          if (dw > s_perfXfDeferWaitMax) s_perfXfDeferWaitMax = dw;
+        }
+        ++s_perfXfDeferWaitN;
+        tStg = nowDw;
+      }
+    }
     auto markStg = [&tStg, this](int64_t& acc, int64_t& max) -> int64_t {
       // [Perf.MarksCompileOut]: discards the whole body, clock read included.
       // The (void) casts are not decoration: this TU builds with werror=true,
@@ -59959,6 +61254,23 @@ namespace dxvk {
     // for comparison against [Perf.Busy], which measures this thread alone.
     vanish_diag::t_isFrameThread = true;
 
+    // NV-DXVK [StallWatch]: publish this thread's id and start the watchdog.
+    // Done HERE because this is the one place that already knows which thread
+    // owns the frame, and because the watchdog needs a thread id it can open a
+    // handle on -- the heartbeat store in the ScopedCall constructor cannot do
+    // it without dragging windows.h into that header.
+    //
+    // WHY A SEPARATE THREAD IS THE ONLY THING THAT CAN SEE THIS. The freezes
+    // read afterGetData=12028ms in [Perf.Gap] with [Perf.SyncSite] bursts=0
+    // through every one of them: the game is not spinning inside D3D11, it has
+    // LEFT and not come back. Nothing inside this DLL runs during that window,
+    // so no amount of instrumentation on our own entry points can say where it
+    // went. An outside observer sampling the stalled thread can.
+    if (vanish_diag::g_stallThreadId.load(std::memory_order_relaxed) == 0u) {
+      vanish_diag::g_stallThreadId.store(::GetCurrentThreadId(), std::memory_order_relaxed);
+      vanish_diag::stallWatchStart();
+    }
+
     // NV-DXVK [BatchSubmitDraw]: drain the per-frame collect arena FIRST, before any of
     // EndFrame's own EmitCs work (engine-camera update, tail injectRTX). This guarantees
     // every geometry commit collected this frame is emitted â€” in original draw order â€”
@@ -67590,6 +68902,25 @@ namespace dxvk {
           pubNs(perfreport::Slot::RpTierTotalMs,
                 s_perfRpKeyAcc + s_perfRpSelAcc + s_perfRpSelMissAcc
               + s_perfRpProofAcc + s_perfRpCommitAcc + s_perfXtCapAcc);
+          // NV-DXVK [Perf.ServeSplit] 2026-08-20: the serve half of
+          // bt_extractXf. SvTotalMs is the sum of the seven, so the report can
+          // print bt_extractXf - SvTotal and have what is left be the
+          // derivation half without anyone doing it by hand -- which is how the
+          // 25.5% hole in this same bucket went unnoticed for a week.
+          pubNs(perfreport::Slot::AccSvPreMs,     s_perfSvPreAcc);
+          pubNs(perfreport::Slot::AccSvKeysMs,    s_perfSvKeysAcc);
+          pubNs(perfreport::Slot::AccSvLookupMs,  s_perfSvLookupAcc);
+          pubNs(perfreport::Slot::AccSvCarrierMs, s_perfSvCarrierAcc);
+          pubNs(perfreport::Slot::AccSvSubViewMs, s_perfSvSubViewAcc);
+          pubNs(perfreport::Slot::AccSvComposeMs, s_perfSvComposeAcc);
+          pubNs(perfreport::Slot::AccSvStoreMs,   s_perfSvStoreAcc);
+          pubNs(perfreport::Slot::SvTotalMs,
+                s_perfSvPreAcc + s_perfSvKeysAcc + s_perfSvLookupAcc
+              + s_perfSvCarrierAcc + s_perfSvSubViewAcc + s_perfSvComposeAcc
+              + s_perfSvStoreAcc);
+          // [Perf.DeferWait]: latency, not work. Published so it is visible;
+          // NOT added to SdXformLeavesMs, which is the bug it fixes.
+          pubNs(perfreport::Slot::XfDeferWaitMs,  s_perfXfDeferWaitAcc);
         }
 
         Logger::info(str::format("[Perf.SubmitDraw.acc] units=ns"
@@ -67854,6 +69185,31 @@ namespace dxvk {
                                  " xfServeN=",       s_xfServeN,
                                  " xfDerive=",       s_xfDeriveNs,
                                  " xfDeriveN=",      s_xfDeriveN,
+                                 // NV-DXVK [Perf.ServeSplit] 2026-08-20: the
+                                 // INSIDE of xfServe. Until these existed the
+                                 // serve half of bt_extractXf had not one mark
+                                 // on it -- every named child of the bucket is
+                                 // a markXt site inside ExtractTransforms, and
+                                 // a served draw never enters that function.
+                                 // sv_pre/sv_keys/sv_lookup are per svAllN
+                                 // (all split draws, tier tax); the rest are
+                                 // per svN.
+                                 " sv_pre=",         s_perfSvPreAcc,
+                                 " sv_keys=",        s_perfSvKeysAcc,
+                                 " sv_lookup=",      s_perfSvLookupAcc,
+                                 " sv_carrier=",     s_perfSvCarrierAcc,
+                                 " sv_subView=",     s_perfSvSubViewAcc,
+                                 " sv_compose=",     s_perfSvComposeAcc,
+                                 " sv_store=",       s_perfSvStoreAcc,
+                                 " svAllN=",         s_perfSvAllN,
+                                 " svN=",            s_perfSvN,
+                                 // [Perf.DeferWait]: the chain's enqueue ->
+                                 // execute latency, drained off tStg at the
+                                 // deferred half's entry so it stops being
+                                 // billed to `filters`. NOT a stage.
+                                 " xfDeferWait=",    s_perfXfDeferWaitAcc,
+                                 " xfDeferWaitN=",   s_perfXfDeferWaitN,
+                                 " xfDeferWaitMax=", s_perfXfDeferWaitMax,
                                  // v6.9d REPLAY-PATH BUCKETS. Until these
                                  // existed every xt_* marker sat after the
                                  // replay early-return, so bt_extractXf's
@@ -69512,6 +70868,19 @@ namespace dxvk {
         // a cut of the same window's bt_extractXf.
         s_xfServeNs = 0; s_xfDeriveNs = 0;
         s_xfServeN  = 0; s_xfDeriveN  = 0;
+        // [Perf.ServeSplit] / [Perf.DeferWait] -- same window as everything
+        // above. A bucket left out here reads as a monotonic climb, which is
+        // how a leak looks and is not what these measure.
+        s_perfSvPreAcc     = 0; s_perfSvPreMax     = 0;
+        s_perfSvKeysAcc    = 0; s_perfSvKeysMax    = 0;
+        s_perfSvLookupAcc  = 0; s_perfSvLookupMax  = 0;
+        s_perfSvCarrierAcc = 0; s_perfSvCarrierMax = 0;
+        s_perfSvSubViewAcc = 0; s_perfSvSubViewMax = 0;
+        s_perfSvComposeAcc = 0; s_perfSvComposeMax = 0;
+        s_perfSvStoreAcc   = 0; s_perfSvStoreMax   = 0;
+        s_perfSvAllN       = 0; s_perfSvN          = 0;
+        s_perfXfDeferWaitAcc = 0; s_perfXfDeferWaitMax = 0;
+        s_perfXfDeferWaitN   = 0;
         // [XfDefer]: same rule again. The counters are a RATE over the window's
         // draws, so they must clear with the window that produced them --
         // carrying them would make a settled scene's miss rate look better and

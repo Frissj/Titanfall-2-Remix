@@ -80,6 +80,28 @@ namespace dxvk {
 
     const TextureTableStats& getTextureTableStats() const { return m_texTableStats; }
 
+    // NV-DXVK [BindlessTail]: the measurement the device-loss chain was missing.
+    //
+    // The buffer table's per-frame length was never recorded anywhere -- the
+    // only bindless counter in the log ([MatChurn] blSlots) is the TEXTURE
+    // table, which in TF2 only ever grows, so it cannot see the shrink that
+    // opens the undefined window. These are per table, so `Buffers` shrinking
+    // while `Textures` grows is visible as such.
+    //
+    //   live       real descriptors written this frame.
+    //   peakLive   high-water of `live` since startup.
+    //   reDummied  slots that held a live descriptor last cycle and are past
+    //              this frame's count, so they were overwritten with the dummy.
+    //              NON-ZERO IS THE SHRINK: before this fix those slots kept
+    //              serving stale descriptors to any out-of-range index.
+    struct TableStats {
+      uint32_t live = 0;
+      uint32_t peakLive = 0;
+      uint32_t reDummied = 0;
+    };
+
+    const TableStats& getTableStats(Table type) const { return m_tableStats[type]; }
+
   private:
 
     struct BindlessTable {
@@ -91,6 +113,32 @@ namespace dxvk {
 
       VkDescriptorSetLayout layout = VK_NULL_HANDLE;
       VkDescriptorSet bindlessDescSet = VK_NULL_HANDLE;
+
+      // NV-DXVK [BindlessTail]: this set is declared for kMaxBindlessResources
+      // slots, allocated ONCE, and never cleared -- but each frame only wrote
+      // engineObjects.size() of them. Every slot past that was undefined
+      // memory, and the binding carries VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT,
+      // which makes reading one undefined behaviour rather than an error: the
+      // hardware follows whatever 64-bit address the slot happens to hold.
+      // That is a GPU page fault, not a wrong pixel.
+      //
+      // Nothing bounds the index on the way in -- BUFFER_ARRAY() is a raw
+      // geometries[NonUniformResourceIndex(idx)][elem] -- and the index comes
+      // from Surface data reached through a TLAS instance's customIndex, both
+      // of which live in grow-only buffers. So when the scene shrinks, an
+      // index from the larger era stays readable and lands in the tail.
+      //
+      //   fullyInitialized  every slot has been written at least once, so no
+      //                     slot is undefined any more. Set by the one-time
+      //                     whole-table dummy fill on the first update.
+      //   liveSlots         slots this set last wrote with real descriptors.
+      //                     Slots between a shrunk count and this still hold
+      //                     the PREVIOUS cycle's live descriptors, which point
+      //                     at buffers no longer tracked (trackResource runs
+      //                     only for written slots) and therefore free to be
+      //                     destroyed -- so they are re-dummied on shrink.
+      bool fullyInitialized = false;
+      uint32_t liveSlots = 0;
 
       void createLayout(const VkDescriptorType type);
       void updateDescriptors(VkWriteDescriptorSet set);
@@ -124,6 +172,9 @@ namespace dxvk {
     std::vector<uint64_t> m_prevTexSlotView;
 
     TextureTableStats m_texTableStats;
+
+    // NV-DXVK [BindlessTail]: see getTableStats.
+    TableStats m_tableStats[Table::Count];
 
 
     uint32_t currentIdx() const {

@@ -845,14 +845,41 @@ namespace dxvk {
     void vkCmdBuildMicromapsEXT(
         uint32_t                      infoCount,
         const VkMicromapBuildInfoEXT* pInfos) {
+        m_statCounters.addCtr(DxvkStatCounter::CmdOmmBuildCalls, 1);
         m_vkd->vkCmdBuildMicromapsEXT(m_execBuffer, infoCount, pInfos);
     }
 
+    // NV-DXVK [Perf.FenceSpike]: every acceleration-structure build in the
+    // tree funnels through here (rtx_accel_manager's BLAS block and both
+    // single-build sites), so this is the one place that can price a fence
+    // spike as "AS build" rather than "path trace" without a GPU timestamp.
+    // The primitive sum is the load-bearing half: build COUNT stays flat while
+    // a level-load storm multiplies the primitives behind it.
     void vkCmdBuildAccelerationStructuresKHR(
         uint32_t                                    infoCount,
         const VkAccelerationStructureBuildGeometryInfoKHR* pInfos,
         const VkAccelerationStructureBuildRangeInfoKHR* const* ppBuildRangeInfos)
     {
+        m_statCounters.addCtr(DxvkStatCounter::CmdAsBuildCalls, 1);
+        m_statCounters.addCtr(DxvkStatCounter::CmdAsBuildGeos, infoCount);
+
+        for (uint32_t i = 0; i < infoCount; i++) {
+          if (pInfos[i].mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR)
+            m_statCounters.addCtr(DxvkStatCounter::CmdAsUpdateGeos, 1);
+
+          // ppBuildRangeInfos[i] is an array of pInfos[i].geometryCount ranges.
+          // Both the outer and inner pointer are allowed to be null on a
+          // malformed call; a counter must never be the thing that faults.
+          if (ppBuildRangeInfos == nullptr || ppBuildRangeInfos[i] == nullptr)
+            continue;
+
+          uint64_t prims = 0;
+          for (uint32_t g = 0; g < pInfos[i].geometryCount; g++)
+            prims += ppBuildRangeInfos[i][g].primitiveCount;
+
+          m_statCounters.addCtr(DxvkStatCounter::CmdAsBuildPrims, prims);
+        }
+
         m_vkd->vkCmdBuildAccelerationStructuresKHR(m_execBuffer, infoCount, pInfos, ppBuildRangeInfos);
     }
 

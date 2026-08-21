@@ -51,6 +51,15 @@ namespace dxvk { namespace vanish_diag {
   // Defined in d3d11_context.cpp.
   extern std::atomic<uint32_t> g_counts[CALL_COUNT];
 
+  // NV-DXVK [StallWatch]: the frame thread heartbeat, written by ScopedCall on
+  // a clock read it already takes. Read by the watchdog thread in
+  // d3d11_context_imm.cpp. See the store site for why this exists.
+  extern std::atomic<uint64_t> g_stallHeartbeatNs;
+  extern std::atomic<uint32_t> g_stallHeartbeatCall;
+  extern std::atomic<uint32_t> g_stallThreadId;
+  // Called once from the D3D11 device; starts the watchdog on first use.
+  void stallWatchStart();
+
   inline void bump(CallId id) {
     g_counts[id].fetch_add(1, std::memory_order_relaxed);
   }
@@ -536,6 +545,30 @@ namespace dxvk { namespace vanish_diag {
       // going below it needs a cheaper clock (rdtsc) or sampling, not a
       // reordering.
       const auto tEnter = std::chrono::steady_clock::now();
+
+      // NV-DXVK [StallWatch] HEARTBEAT. One relaxed store on a clock read this
+      // constructor already took, on the frame thread only.
+      //
+      // WHY IT LIVES HERE AND NOT IN A NEW HOOK: this is the one point every
+      // D3D11 entry point already passes through with a timestamp in hand, so
+      // the heartbeat is free. Anywhere else would need its own clock read, and
+      // this header's own comment above explains what an extra read costs at
+      // TF2's call rate.
+      //
+      // WHAT IT IS FOR: [Perf.Gap] reports afterGetData=12028ms AFTER the fact,
+      // and [Perf.SyncSite] reads bursts=0 through every freeze -- so the game
+      // is NOT spinning inside D3D11, it has left and not come back. Nothing
+      // inside this DLL can see where it went, because by definition it is not
+      // calling us. A watchdog thread reading this heartbeat can catch the
+      // thread WHILE it is away and sample where it actually is.
+      g_stallHeartbeatNs.store(
+        uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+          tEnter.time_since_epoch()).count()),
+        std::memory_order_relaxed);
+      g_stallHeartbeatCall.store(uint32_t(i), std::memory_order_relaxed);
+      // NOTE: the thread id is published where t_isFrameThread is SET, not here.
+      // This header deliberately does not include windows.h (see the
+      // t_isFrameThread comment above) and GetCurrentThreadId would drag it in.
 
       // [Perf.Gap]: close the interval opened by the previous call's exit. Only
       // at depth 0 - a nested entry point would otherwise report the enclosing

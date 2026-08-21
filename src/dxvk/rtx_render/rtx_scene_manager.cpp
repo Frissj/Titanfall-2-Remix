@@ -5729,6 +5729,15 @@ namespace dxvk {
     const BindlessResourceManager::TextureTableStats& bl =
       m_bindlessResourceManager.getTextureTableStats();
 
+    // NV-DXVK [BindlessTail]: per-table lengths. The buffer table is the one
+    // the shader indexes with Surface.positionBufferIndex / indexBufferIndex,
+    // so its shrink is what opens the undefined-slot window; the texture one
+    // is carried alongside only so the two can be told apart in the same line.
+    const BindlessResourceManager::TableStats& bufTable =
+      m_bindlessResourceManager.getTableStats(BindlessResourceManager::Table::Buffers);
+    const BindlessResourceManager::TableStats& texTable =
+      m_bindlessResourceManager.getTableStats(BindlessResourceManager::Table::Textures);
+
     // NV-DXVK [Perf.Report]: THE hygiene gate (map section 6). matNew nonzero in
     // steady state means material identities are being minted for a scene that is
     // not changing, and every timing number in the report is then incomparable to
@@ -5782,7 +5791,24 @@ namespace dxvk {
       " blChg=", bl.changed,
       " blDrop=", bl.dropped,
       " blRecov=", bl.recovered,
-      " blGrew=", bl.grew));
+      " blGrew=", bl.grew,
+      // NV-DXVK [BindlessTail]: the BUFFER table, which is the one the
+      // device-loss chain runs through and the one nothing was measuring.
+      // blSlots above is the TEXTURE table, and in TF2 that only ever grows
+      // (blDrop=0 every frame of the 23:57 device loss), so it cannot see the
+      // shrink that leaves stale descriptors behind a shrinking count.
+      //
+      // Read it as: bufReDummied > 0 on a frame means the buffer table SHRANK,
+      // and every slot in that window was, before this fix, still serving the
+      // previous cycle's descriptor to any out-of-range index. Join those
+      // frames against [ReapJoin] live= and [TlasRealloc] to see the scene
+      // collapse that produced them.
+      " | bufSlots=", bufTable.live,
+      " bufPeak=", bufTable.peakLive,
+      " bufReDummied=", bufTable.reDummied,
+      " texTableSlots=", texTable.live,
+      " texTablePeak=", texTable.peakLive,
+      " texReDummied=", texTable.reDummied));
 
     m_prevChurn = cur;
   }

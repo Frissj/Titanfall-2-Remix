@@ -459,6 +459,48 @@ namespace dxvk {
       };
       emitRows(kRpRows, sizeof(kRpRows) / sizeof(kRpRows[0]), now, wall);
 
+      // NV-DXVK [Perf.ServeSplit] 2026-08-20 -- THE SERVE HALF OF bt_extractXf.
+      //
+      // READ THIS BEFORE THE NAMED-LEAF TABLE BELOW. Every child of
+      // bt_extractXf in that table is a markXt site INSIDE ExtractTransforms,
+      // and the split cache's whole purpose is NOT to call ExtractTransforms.
+      // So on a served draw the parent bills and not one child does. The
+      // "children sum to 96% of the parent" the source comments quote was
+      // measured when the serve rate was 0%; at a 74% serve rate the same
+      // arithmetic leaves the majority of the bucket dark.
+      //
+      // HOW TO READ IT: SERVE TOTAL against bt_extractXf in the table below.
+      // The remainder is the derivation half, and only THAT remainder is what
+      // the markXt children are a breakdown of.
+      //   sv_pre/keys/lookup   TIER TAX -- every split draw pays these, hit or
+      //                        miss. For the ~26% that miss, the cache is pure
+      //                        added cost and this is how much.
+      //   sv_carrier           replaying the skipped derivation's SIDE EFFECTS
+      //                        (cbLoc + the ~14 cam member writes). Not a
+      //                        compose; work the cache cannot avoid, only move.
+      //   sv_compose           the actual compose. If this is small, then
+      //                        THE_OPTIMISATION_PLAN sec 0.2's candidate --
+      //                        "the compose costs what the derivation did" --
+      //                        is refuted and the serve cost is the keys and
+      //                        the lookup, which are a different fix entirely.
+      Logger::warn("[Perf.Report]   -- split-cache SERVE path (bt_extractXf's other half; NO markXt child covers it) --");
+      static const Row kSvRows[] = {
+        { 1, "sv_pre     (all split draws)", Slot::AccSvPreMs,     RowKind::kTotal },
+        { 1, "sv_keys    (all, tier tax)",   Slot::AccSvKeysMs,    RowKind::kTotal },
+        { 1, "sv_lookup  (all, tier tax)",   Slot::AccSvLookupMs,  RowKind::kTotal },
+        { 1, "sv_carrier (serve: restores)", Slot::AccSvCarrierMs, RowKind::kTotal },
+        { 1, "sv_subView (serve: re-derive)",Slot::AccSvSubViewMs, RowKind::kTotal },
+        { 1, "sv_compose (serve: the compose)", Slot::AccSvComposeMs, RowKind::kTotal },
+        { 1, "sv_store   (store + miss tail)", Slot::AccSvStoreMs, RowKind::kTotal },
+        { 0, "SERVE TOTAL (vs bt_extractXf)", Slot::SvTotalMs,     RowKind::kTotal },
+        // SUMMED OVER DRAWS, SO IT CAN EXCEED THE FRAME and that is not a bug:
+        // ~1,330 draws each wait concurrently in the same queue. It is here to
+        // be watched, not added -- it belongs to no stage and no total.
+        { 0, "chain enqueue->exec WAIT (sum over draws; latency, not work)",
+                                             Slot::XfDeferWaitMs,  RowKind::kTotal },
+      };
+      emitRows(kSvRows, sizeof(kSvRows) / sizeof(kSvRows[0]), now, wall);
+
       Logger::warn("[Perf.Report]   -- named leaves ([Perf.SubmitDraw.acc]; parent+children = bucket) --");
       static const Row kAccRows[] = {
         { 1, "bt_extractXf",   Slot::AccExtractXfMs,    RowKind::kTotal },

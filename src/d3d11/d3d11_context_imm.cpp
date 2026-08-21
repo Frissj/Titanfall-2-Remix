@@ -5,6 +5,8 @@
 #include "d3d11_vanish_diag.h"
 
 #include <atomic>
+#include <thread>
+#include <cstring>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -270,6 +272,214 @@ namespace dxvk {
       return out;
     }
 
+    // ======================================================================
+    // NV-DXVK [StallWatch] -- WHERE THE FRAME THREAD GOES DURING A FREEZE.
+    //
+    // THE PROBLEM THIS EXISTS FOR. Multi-second freezes, recurring, sometimes
+    // needing a game restart. What the existing instruments say:
+    //   [Perf.Gap]      maxAfter=GetData, afterGetData=12028.5ms over 5 gaps
+    //   [Perf.SyncSite] bursts=0 polls=0 through EVERY freeze window
+    //   [Perf.Block]    gpuIdleMs=12026 -- the GPU is idle the whole time
+    //   [Perf.Busy]     blockedMs=429 of 453 wall -- blocked, not spinning
+    //   scene           instances=2095 blas=207 -- fully populated, not a load
+    //
+    // Read together those say the game is NOT spinning inside D3D11 waiting for
+    // a query: it returned from GetData, left, and did not come back for twelve
+    // seconds, with the GPU idle throughout. Every probe in this DLL runs on OUR
+    // entry points, so during that window none of them run at all -- the stall
+    // is precisely the interval in which we are blind. No amount of additional
+    // logging on the D3D11 side can see it.
+    //
+    // So: an outside observer. A watchdog thread reads a heartbeat the frame
+    // thread stamps on every entry point (vanish_diag::ScopedCall, on a clock
+    // read it already takes) and, when the heartbeat goes stale, samples the
+    // stalled thread WHILE it is still away.
+    //
+    // WHY A CONSERVATIVE STACK SCAN AND NOT StackWalk64. dbghelp is not linked
+    // here, and pulling it in to call it from a suspended-thread context is the
+    // wrong risk: dbghelp takes its own locks and the thread we suspended may
+    // hold them. Instead we read the thread's RSP window and keep the values
+    // that land inside a known module's image -- the same technique the earlier
+    // nvoglv64 hang analysis used, and it is enough to name the module.
+    //
+    // SUSPENSION SAFETY, and this is the part to not get wrong:
+    //   - module bases/sizes are resolved BEFORE the suspend and cached, so no
+    //     GetModuleHandleA (loader lock) runs while a thread is suspended;
+    //   - while suspended we do nothing but GetThreadContext and a memcpy of
+    //     the stack window, guarded by VirtualQuery (a syscall, no loader lock);
+    //   - the thread is resumed BEFORE any formatting or logging, so Logger's
+    //     mutex and file I/O can never be entered with the game halted.
+    // Getting that order wrong turns a diagnostic into the hang it is chasing.
+    // ======================================================================
+    struct StallMod { const char* name; uint64_t base; uint64_t size; };
+
+    void StallWatchThread() {
+      using namespace dxvk::vanish_diag;
+
+      // Resolved ONCE, off the suspend path. See the safety note above.
+      static const char* kModNames[] = {
+        "engine.dll", "client.dll", "materialsystem_dx11.dll", "shaderapidx11.dll",
+        "studiorender.dll", "server.dll", "d3d11.dll", "tier0.dll",
+        "nvoglv64.dll", "ntdll.dll", "kernel32.dll", "KernelBase.dll",
+      };
+      static const char* kModShort[] = {
+        "eng", "cli", "mat", "shaderapi", "studio", "server", "d3d11", "tier0",
+        "nvogl", "ntdll", "kernel32", "kernelbase",
+      };
+      constexpr int kModCount = int(sizeof(kModNames) / sizeof(kModNames[0]));
+
+      StallMod mods[kModCount] = {};
+      bool modsResolved = false;
+
+      const HANDLE hThread = ::OpenThread(
+        THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+        FALSE, g_stallThreadId.load(std::memory_order_relaxed));
+      if (hThread == nullptr) {
+        Logger::warn("[StallWatch] OpenThread failed - watchdog not running");
+        return;
+      }
+
+      uint64_t lastReportedNs = 0;
+
+      for (;;) {
+        ::Sleep(250);
+
+        const uint64_t beatNs = g_stallHeartbeatNs.load(std::memory_order_relaxed);
+        if (beatNs == 0ull) {
+          continue;   // frame thread has not entered D3D11 yet
+        }
+
+        const uint64_t nowNs = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count());
+        if (nowNs <= beatNs) {
+          continue;
+        }
+        const uint64_t staleMs = (nowNs - beatNs) / 1000000ull;
+
+        // 1000 ms: far above any legitimate frame (worst steady-state here is
+        // ~58 ms) and far below the freezes being chased (12-18 s), so it
+        // cannot fire on a slow frame and cannot miss a stall.
+        if (staleMs < 1000ull) {
+          continue;
+        }
+        // One report per stall, not one per poll: re-arm only after the
+        // heartbeat has moved again.
+        if (beatNs == lastReportedNs) {
+          continue;
+        }
+        lastReportedNs = beatNs;
+
+        if (!modsResolved) {
+          for (int m = 0; m < kModCount; ++m) {
+            mods[m].name = kModShort[m];
+            mods[m].base = reinterpret_cast<uint64_t>(::GetModuleHandleA(kModNames[m]));
+            mods[m].size = SyncDiagModuleSize(mods[m].base);
+          }
+          modsResolved = true;
+        }
+
+        // ---- suspended window: context + stack copy ONLY ----
+        constexpr size_t kStackWords = 512;   // 4 KB of stack
+        uint64_t stackBuf[kStackWords] = {};
+        size_t   stackWords = 0;
+        uint64_t rip = 0, rsp = 0;
+        bool     gotCtx = false;
+
+        if (::SuspendThread(hThread) != DWORD(-1)) {
+          // alignas: x64 CONTEXT contains XMM state and requires 16-byte
+          // alignment; GetThreadContext fails with a misaligned buffer.
+          alignas(16) CONTEXT ctx = {};
+          ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+          if (::GetThreadContext(hThread, &ctx)) {
+            gotCtx = true;
+            rip = ctx.Rip;
+            rsp = ctx.Rsp;
+
+            MEMORY_BASIC_INFORMATION mbi = {};
+            if (rsp != 0 && ::VirtualQuery(reinterpret_cast<LPCVOID>(rsp), &mbi, sizeof(mbi)) != 0
+                && mbi.State == MEM_COMMIT) {
+              const uint64_t regionEnd =
+                reinterpret_cast<uint64_t>(mbi.BaseAddress) + uint64_t(mbi.RegionSize);
+              size_t avail = size_t((regionEnd - rsp) / sizeof(uint64_t));
+              stackWords = (avail < kStackWords) ? avail : kStackWords;
+              if (stackWords != 0) {
+                std::memcpy(stackBuf, reinterpret_cast<const void*>(rsp),
+                            stackWords * sizeof(uint64_t));
+              }
+            }
+          }
+          ::ResumeThread(hThread);
+        }
+        // ---- thread is running again; formatting and I/O are safe ----
+
+        if (!gotCtx) {
+          Logger::warn(str::format("[StallWatch] stall ", staleMs,
+                                   "ms but GetThreadContext failed"));
+          continue;
+        }
+
+        const auto nameAddr = [&](uint64_t addr, uint64_t& rvaOut) -> const char* {
+          const char* best = nullptr;
+          uint64_t bestBase = 0;
+          for (int m = 0; m < kModCount; ++m) {
+            if (mods[m].base && mods[m].size
+                && addr >= mods[m].base && addr < mods[m].base + mods[m].size
+                && mods[m].base > bestBase) {
+              bestBase = mods[m].base; best = mods[m].name; rvaOut = addr - mods[m].base;
+            }
+          }
+          return best;
+        };
+
+        uint64_t ripRva = rip;
+        const char* ripMod = nameAddr(rip, ripRva);
+
+        // Candidate return addresses: stack words that land in a known image.
+        // Deduped and capped -- a stack window holds many copies of the same
+        // frame and the point is to name the WAIT, not to reconstruct a trace.
+        std::string frames;
+        uint64_t seen[16] = {};
+        int nSeen = 0;
+        for (size_t i = 0; i < stackWords && nSeen < 16; ++i) {
+          uint64_t rva = 0;
+          const char* mod = nameAddr(stackBuf[i], rva);
+          if (mod == nullptr) {
+            continue;
+          }
+          bool dup = false;
+          for (int k = 0; k < nSeen; ++k) {
+            if (seen[k] == stackBuf[i]) { dup = true; break; }
+          }
+          if (dup) {
+            continue;
+          }
+          seen[nSeen++] = stackBuf[i];
+          char buf[64];
+          std::snprintf(buf, sizeof(buf), "%s+0x%llx", mod,
+                        static_cast<unsigned long long>(rva));
+          if (!frames.empty()) frames += " | ";
+          frames += buf;
+        }
+
+        Logger::warn(str::format(
+          "[StallWatch] STALL staleMs=", staleMs,
+          " lastEntry=", (g_stallHeartbeatCall.load(std::memory_order_relaxed) < CALL_COUNT
+                          ? kNames[g_stallHeartbeatCall.load(std::memory_order_relaxed)]
+                          : "?"),
+          " rip=", (ripMod ? ripMod : "?"), "+0x", std::hex, ripRva, std::dec,
+          " stackWords=", uint32_t(stackWords),
+          " | ", frames,
+          // READ IT AS: rip names WHAT the thread is doing. A kernel wait shows
+          // rip in ntdll (NtWaitForSingleObject / NtDelayExecution) and the
+          // frames name WHO is waiting -- eng/mat/studio is the game's own code,
+          // nvogl is the display driver, d3d11 is us. lastEntry= is the last
+          // D3D11 call before it left, which is the join back to [Perf.Gap].
+          " | rip=who is waiting, frames=who asked"));
+      }
+      // hThread deliberately not closed: the loop never exits while the process
+      // lives, and a handle leak on a never-returning thread is not a leak.
+    }
+
     // NV-DXVK [Perf.QEndSite]: name the engine call sites that call End() on a
     // query, because the frame is spent immediately after them.
     //
@@ -348,6 +558,20 @@ namespace dxvk {
           " type=", queryType, " hits=", hits,
           " stack: ", line));
       }
+    }
+  }
+
+  namespace vanish_diag {
+    // NV-DXVK [StallWatch]: start once, detached. The watchdog never returns
+    // while the process lives, so it must not be joined or scoped.
+    void stallWatchStart() {
+      static std::atomic<bool> s_started { false };
+      bool expected = false;
+      if (!s_started.compare_exchange_strong(expected, true)) {
+        return;
+      }
+      std::thread(StallWatchThread).detach();
+      Logger::warn("[StallWatch] watchdog armed - reports frame-thread stalls >1000ms");
     }
   }
 

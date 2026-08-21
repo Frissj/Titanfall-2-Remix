@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <unordered_set>
 #include <deque>
+#include <vector>    // NV-DXVK [Perf.DeviceLost]: crash-dump shader/marker arrays
 
 // NV-DXVK start: callstack logging support
 #include <sstream>
@@ -328,6 +329,186 @@ namespace dxvk {
   }
   // NV-DXVK end
 
+  // NV-DXVK [Perf.DeviceLost] (2026-08-21): decode the dump we just wrote.
+  //
+  // The tree has been writing .nv-gpudmp files on every VK_ERROR_DEVICE_LOST
+  // for months and nobody ever read one, so a device loss only ever showed up
+  // in the log as "Command submission failed: -4" -- which says nothing about
+  // whether the GPU timed out, faulted, or on what. The decoder half of the
+  // Aftermath API is already vendored and already included by this file, so
+  // the answer costs one decode of a buffer we are holding anyway.
+  //
+  // What the fields mean, and why each is here:
+  //   state=PageFault/DmaFault  the GPU dereferenced a bad address. This is a
+  //                             DIFFERENT failure from state=Timeout, and it
+  //                             rules out "the work was merely slow" -- which
+  //                             a long [Perf.FenceSpike] on its own cannot.
+  //   va=                       the faulting address. A page-aligned VA in a
+  //                             plausible range reads as a real allocation that
+  //                             was freed/unmapped while still referenced. A
+  //                             high or unaligned VA is not an address at all;
+  //                             it was assembled from data, so the corruption
+  //                             is upstream in whatever supplied it.
+  //   zone=                     dxvk_scoped_annotation.cpp already feeds every
+  //                             ScopedGpuProfileZone name to vkCmdSetCheckpointNV,
+  //                             so the markers carry pass names ("Primary Rays",
+  //                             "Reflection PSR"). The last one NOT Finished is
+  //                             the pass the GPU died inside.
+  //   shader=                   the pipeline that was resident at the fault.
+  //
+  // Offline equivalent for dumps already on disk, same fields:
+  //   py scripts-common/aftermath_decode.py --latest <game dir>
+  static void logDecodedCrashDump(const void* pGpuCrashDump, const uint32_t gpuCrashDumpSize) {
+    auto deviceStatusName = [](GFSDK_Aftermath_Device_Status s) -> const char* {
+      switch (s) {
+      case GFSDK_Aftermath_Device_Status_Active:      return "Active";
+      case GFSDK_Aftermath_Device_Status_Timeout:     return "Timeout";
+      case GFSDK_Aftermath_Device_Status_OutOfMemory: return "OutOfMemory";
+      case GFSDK_Aftermath_Device_Status_PageFault:   return "PageFault";
+      case GFSDK_Aftermath_Device_Status_Stopped:     return "Stopped";
+      case GFSDK_Aftermath_Device_Status_Reset:       return "Reset";
+      case GFSDK_Aftermath_Device_Status_DmaFault:    return "DmaFault";
+      default:                                        return "Unknown";
+      }
+    };
+
+    auto contextStatusName = [](GFSDK_Aftermath_Context_Status s) -> const char* {
+      switch (s) {
+      case GFSDK_Aftermath_Context_Status_NotStarted: return "NotStarted";
+      case GFSDK_Aftermath_Context_Status_Executing:  return "Executing";
+      case GFSDK_Aftermath_Context_Status_Finished:   return "Finished";
+      case GFSDK_Aftermath_Context_Status_Invalid:    return "Invalid";
+      default:                                        return "?";
+      }
+    };
+
+    GFSDK_Aftermath_GpuCrashDump_Decoder decoder = nullptr;
+
+    if (!GFSDK_Aftermath_SUCCEED(GFSDK_Aftermath_GpuCrashDump_CreateDecoder(
+          GFSDK_Aftermath_Version_API, pGpuCrashDump, gpuCrashDumpSize, &decoder))) {
+      Logger::warn("[Perf.DeviceLost] could not create a decoder for the dump");
+      return;
+    }
+
+    GFSDK_Aftermath_GpuCrashDump_DeviceInfo deviceInfo = {};
+    if (GFSDK_Aftermath_SUCCEED(GFSDK_Aftermath_GpuCrashDump_GetDeviceInfo(decoder, &deviceInfo))) {
+      Logger::err(str::format(
+        "[Perf.DeviceLost] state=", deviceStatusName(deviceInfo.status),
+        " adapterReset=", deviceInfo.adapterReset ? 1 : 0,
+        " engineReset=", deviceInfo.engineReset ? 1 : 0));
+    }
+
+    // Absent on a timeout, which is itself the finding -- so say so either way
+    // rather than staying silent and leaving "did it fault?" unanswered.
+    GFSDK_Aftermath_GpuCrashDump_PageFaultInfo faultInfo = {};
+    if (GFSDK_Aftermath_SUCCEED(GFSDK_Aftermath_GpuCrashDump_GetPageFaultInfo(decoder, &faultInfo))) {
+      const uint64_t va = faultInfo.faultingGpuVA;
+      // Page-aligned and inside the range the driver hands out = a real
+      // allocation. Anything else was never an address to begin with.
+      const bool implausible = (va >= (1ull << 48)) || ((va & 0xFFFull) != 0);
+
+      Logger::err(str::format(
+        "[Perf.DeviceLost] pageFault va=0x", std::hex, va, std::dec,
+        " faultType=", uint32_t(faultInfo.faultType),
+        " accessType=", uint32_t(faultInfo.accessType),
+        " engine=", uint32_t(faultInfo.engine),
+        " client=", uint32_t(faultInfo.client),
+        implausible ? "  <- implausible VA: assembled from data, not a freed allocation"
+                    : "  <- plausible VA: a real allocation, unmapped while still referenced"));
+
+      if (faultInfo.bHasResourceInfo) {
+        Logger::err(str::format(
+          "[Perf.DeviceLost] faultRes va=0x", std::hex, faultInfo.resourceInfo.gpuVa, std::dec,
+          " size=", faultInfo.resourceInfo.size,
+          " dim=", faultInfo.resourceInfo.width, "x", faultInfo.resourceInfo.height,
+          "x", faultInfo.resourceInfo.depth,
+          " mips=", faultInfo.resourceInfo.mipLevels,
+          " fmt=", faultInfo.resourceInfo.format,
+          " isBuffer=", faultInfo.resourceInfo.bIsBufferHeap ? 1 : 0,
+          " wasDestroyed=", faultInfo.resourceInfo.bWasDestroyed ? 1 : 0));
+      }
+    } else {
+      Logger::err("[Perf.DeviceLost] pageFault none - not an address fault (timeout / hang / reset)");
+    }
+
+    uint32_t shaderCount = 0;
+    if (GFSDK_Aftermath_SUCCEED(GFSDK_Aftermath_GpuCrashDump_GetActiveShadersInfoCount(decoder, &shaderCount))
+     && shaderCount > 0) {
+      std::vector<GFSDK_Aftermath_GpuCrashDump_ShaderInfo> shaders(shaderCount);
+      if (GFSDK_Aftermath_SUCCEED(GFSDK_Aftermath_GpuCrashDump_GetActiveShadersInfo(
+            decoder, shaderCount, shaders.data()))) {
+        for (const auto& shader : shaders) {
+          Logger::err(str::format(
+            "[Perf.DeviceLost] shader type=", uint32_t(shader.shaderType),
+            " hash=0x", std::hex, shader.shaderHash,
+            " instance=0x", shader.shaderInstance, std::dec,
+            " internal=", shader.isInternal ? 1 : 0));
+        }
+      }
+    }
+
+    uint32_t markerCount = 0;
+    if (GFSDK_Aftermath_SUCCEED(GFSDK_Aftermath_GpuCrashDump_GetEventMarkersInfoCount(decoder, &markerCount))
+     && markerCount > 0) {
+      std::vector<GFSDK_Aftermath_GpuCrashDump_EventMarkerInfo> markers(markerCount);
+      if (GFSDK_Aftermath_SUCCEED(GFSDK_Aftermath_GpuCrashDump_GetEventMarkersInfo(
+            decoder, markerCount, markers.data()))) {
+        for (const auto& marker : markers) {
+          // markerData is the pointer we handed vkCmdSetCheckpointNV, i.e. a
+          // ScopedGpuProfileZone string literal in this module.
+          //
+          // markerDataSize is 0 for those: the size argument only exists on
+          // the GFSDK_Aftermath_SetEventMarker path, and a size-0 marker means
+          // "a user pointer, length unknown". Treating 0 as the length would
+          // blank out exactly the zone name we came here for, so fall back to
+          // scanning for a NUL.
+          //
+          // That scan has no length to trust, and this runs on a crash path
+          // where a second fault costs us the whole report - so clamp it to
+          // what VirtualQuery says is actually committed and readable, and
+          // stop at the first non-printable byte in case a dynamic-name zone
+          // passed a buffer that no longer holds a string.
+          std::string name;
+          const char* data = static_cast<const char*>(marker.markerData);
+
+          if (data != nullptr) {
+            size_t limit = marker.markerDataSize != 0
+              ? std::min<size_t>(marker.markerDataSize, 128u)
+              : 128u;
+
+            MEMORY_BASIC_INFORMATION mbi = {};
+            const bool readable =
+              VirtualQuery(data, &mbi, sizeof(mbi)) == sizeof(mbi)
+              && mbi.State == MEM_COMMIT
+              && !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD));
+
+            if (readable) {
+              const auto regionEnd =
+                reinterpret_cast<const char*>(mbi.BaseAddress) + mbi.RegionSize;
+              limit = std::min<size_t>(limit, size_t(regionEnd - data));
+
+              for (size_t i = 0; i < limit; i++) {
+                const char c = data[i];
+                if (c == '\0' || c < 0x20 || c > 0x7E)
+                  break;
+                name.push_back(c);
+              }
+            }
+          }
+
+          Logger::err(str::format(
+            "[Perf.DeviceLost] marker status=", contextStatusName(marker.contextStatus),
+            " ctx=0x", std::hex, marker.contextId, std::dec,
+            " zone=\"", name, "\""));
+        }
+      }
+    } else {
+      Logger::err("[Perf.DeviceLost] marker none - no GPU zone breadcrumbs in the dump");
+    }
+
+    GFSDK_Aftermath_GpuCrashDump_DestroyDecoder(decoder);
+  }
+
   void aftermathCrashCallback(const void* pGpuCrashDump, const uint32_t gpuCrashDumpSize, void* pUserData) {
     std::string exeName = env::getExeNameNoSuffix();
 
@@ -351,6 +532,10 @@ namespace dxvk {
     } else {
       Logger::warn(str::format("Aftermath was trying to write a GPU dump, but it failed, proposed filename: ", dumpFilename));
     }
+
+    // Decode after the write, never before: if the decoder trips on a
+    // malformed dump the file is already safely on disk for the offline tool.
+    logDecodedCrashDump(pGpuCrashDump, gpuCrashDumpSize);
   }
 
   void aftermathShaderDebugInfoCallback(const void* pShaderDebugInfo, const uint32_t shaderDebugInfoSize, void* pUserData) {

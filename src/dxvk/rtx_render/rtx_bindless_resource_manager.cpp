@@ -158,10 +158,58 @@ namespace dxvk {
       m_prevTexSlotView = std::move(curTexSlotView);
     }
 
+    // NV-DXVK [BindlessTail]: leave no undefined slot in the table.
+    //
+    // The write above covers [0, liveCount). The binding is declared for
+    // kMaxBindlessResources slots with VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT
+    // and the set is allocated once and never cleared, so before this every
+    // slot past liveCount was either uninitialised descriptor memory or a
+    // stale live descriptor from an earlier, larger frame. Reading one is
+    // undefined behaviour, and on NVIDIA that means the hardware follows the
+    // arbitrary 64-bit address it finds -- a DMA page fault that takes the
+    // device down, not a wrong pixel. Nothing bounds the index on the way in
+    // (BUFFER_ARRAY is a raw geometries[NonUniformResourceIndex(idx)][elem]),
+    // and the index reaches the shader through grow-only buffers, so an index
+    // from a larger era stays readable after the scene shrinks.
+    //
+    // Two distinct windows, closed two different ways:
+    //   - never-written slots: one whole-table dummy fill, once per set. This
+    //     is the expensive branch and it runs exactly once per table per
+    //     frame-in-flight, at startup.
+    //   - slots that WERE live and are now past the count: re-dummied on the
+    //     frames where the count drops. Those hold descriptors whose buffers
+    //     are no longer tracked (trackResource runs only for written slots),
+    //     so they can point at freed and unmapped memory.
+    //
+    // This does not fix a stale index -- it makes the read defined, so an
+    // out-of-range index samples the dummy and gets counted instead of
+    // killing the device.
+    Table tableType = Table::Count;
+    switch (Type) {
+    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:  tableType = Table::Textures; break;
+    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER: tableType = Table::Buffers;  break;
+    case VK_DESCRIPTOR_TYPE_SAMPLER:        tableType = Table::Samplers; break;
+    default:
+      return;
+    }
+
+    BindlessTable* const table = m_tables[tableType][currentIdx()].get();
+
+    // createLayout declares every table -- samplers included -- for
+    // kMaxBindlessResources, so that is the count that has to be defined.
+    // (kMaxBindlessSamplers exists in the header but is referenced nowhere.)
+    const uint32_t liveCount = uint32_t(numDescriptors);
+    const uint32_t writeCount = table->fullyInitialized
+      ? std::max(liveCount, table->liveSlots)   // only re-cover a shrink
+      : kMaxBindlessResources;                  // one-time: define everything
+
+    // resize() fills the tail with the dummy; [0, liveCount) is already built.
+    descriptorInfos.resize(writeCount, dummyDescriptor);
+
     VkWriteDescriptorSet descWrites;
     memset(&descWrites, 0, sizeof(descWrites));
     descWrites.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    descWrites.descriptorCount = numDescriptors;
+    descWrites.descriptorCount = writeCount;
     descWrites.descriptorType = Type;
 
     if constexpr (std::is_same_v<T, VkDescriptorImageInfo>) {
@@ -170,18 +218,24 @@ namespace dxvk {
       descWrites.pBufferInfo = &descriptorInfos[0];
     }
 
-    switch (Type) {
-    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
-      m_tables[Table::Textures][currentIdx()]->updateDescriptors(descWrites);
-      break;
-    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
-      m_tables[Table::Buffers][currentIdx()]->updateDescriptors(descWrites);
-      break;
-    case VK_DESCRIPTOR_TYPE_SAMPLER:
-      m_tables[Table::Samplers][currentIdx()]->updateDescriptors(descWrites);
-      break;
-    default:
-      break;
+    table->updateDescriptors(descWrites);
+
+    // Only claim the table is initialised once a write actually landed --
+    // updateDescriptors returns without writing if the set allocation failed.
+    const bool wrote = (table->bindlessDescSet != VK_NULL_HANDLE);
+    const uint32_t reDummied = (writeCount > liveCount) ? (writeCount - liveCount) : 0u;
+
+    if (wrote) {
+      const bool wasFirstWrite = !table->fullyInitialized;
+      table->fullyInitialized = true;
+      table->liveSlots = liveCount;
+
+      TableStats& stats = m_tableStats[tableType];
+      stats.live = liveCount;
+      stats.peakLive = std::max(stats.peakLive, liveCount);
+      // The one-time fill covers the whole table and would report a
+      // meaningless ~64k "shrink"; only a real shrink is interesting.
+      stats.reDummied = wasFirstWrite ? 0u : reDummied;
     }
   }
 

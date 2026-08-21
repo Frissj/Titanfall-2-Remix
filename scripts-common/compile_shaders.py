@@ -334,6 +334,37 @@ def createSlangTask(inputFile, variantSpec):
     # Force scalar block layout in shaders - buffers are required to be aligned as such by Neural Radiance Cache
     command1 += f'-fvk-use-scalar-layout '
 
+    # NV-DXVK [Perf.DeviceLost]: source debug info, PER SHADER, opt-in.
+    #
+    # Aftermath can resolve a crashed shader's instruction offset to a source
+    # line, but only if the SPIR-V carries debug info. Without it a dump
+    # resolves to "gbuffer_psr_raygen @ 0x4b730" and stops there.
+    #
+    # This is NOT a global switch on purpose. Measured on
+    # smooth_normals.comp.slang with this slangc (2025.10.4): 19,444 bytes ->
+    # 115,216, i.e. 5.9x, and slang emits the same payload for -g1/-g2/-g3, so
+    # there is no cheaper level to pick. The 216 built .spv total 145 MB today;
+    # at 5.9x that is ~856 MB compiled into d3d11.dll, which is already 162 MB.
+    # Whole-build debug info is not affordable here.
+    #
+    # Per shader it is free: the gbuffer PSR raygen is ~51 KB, so ~300 KB with
+    # debug info. Add the variant names you are chasing, rebuild, and only
+    # those grow. Names are variant names, matching the .spv filenames in
+    # _Comp64Release/src/dxvk/rtx_shaders (not the .slang source name).
+    #
+    # NOTE this only pays off once a crash dump actually contains an "Active
+    # Warps" section -- that is what carries the instruction offset to map. A
+    # DMA page fault that resets the engine leaves no warps and no offset, and
+    # then debug info changes nothing. Check with:
+    #   py scripts-common/aftermath_decode.py --latest <game dir>
+    SHADER_SOURCE_DEBUG_INFO = {
+        # 'gbuffer_psr_raygen',
+        # 'gbuffer_raygen',
+    }
+
+    if variantName in SHADER_SOURCE_DEBUG_INFO:
+        command1 += f'-g2 '
+
     if generateSlangRepro:
       reproFile = os.path.join(args.output, variantName + ".slangRepro")
       command1 += f'-dump-repro {reproFile}'
