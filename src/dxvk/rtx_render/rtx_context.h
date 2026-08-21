@@ -123,6 +123,12 @@ namespace dxvk {
     void commitGeometryToRT(const DrawParameters& params, DrawCallState& drawCallState, ShardedDrawInfo* shardInfo = nullptr);
     void commitExternalGeometryToRT(ExternalDrawState&& state);
 
+    // NV-DXVK [ResidentScene] slice 6: the skip lives INSIDE commitGeometryToRT,
+    // immediately ahead of submitDrawState. See the comment there for why the
+    // decision belongs on this thread rather than on the one that made the
+    // prediction -- in short, the record's existence is the evidence, and only
+    // this side can see it.
+
     static void blitImageHelper(Rc<DxvkContext> ctx, const Rc<DxvkImage>& srcImage, const Rc<DxvkImage>& dstImage, VkFilter filter);
 
     virtual void flushCommandList() override;

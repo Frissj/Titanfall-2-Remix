@@ -3165,6 +3165,14 @@ namespace dxvk {
       uint64_t o2wHash = 0ull;
       uint32_t o2wDirty = 0u;
       bool     o2wSeen = false;
+      // NV-DXVK [ResidentScene] slice 5: the MATERIAL half of the gate's dirty
+      // test. Geometry and transform are not the whole of what a record holds --
+      // an instance also carries a surface material, and a draw whose vertex
+      // buffers and object-to-world are both unchanged can still be asking for a
+      // different texture or a different blend mode. Skipping that draw would
+      // hold the old material resident with nothing to catch it, which is trap
+      // 4's shape exactly: alive, and not refreshed. See residentMaterialFold().
+      uint64_t matHash = 0ull;
       uint32_t cbMovedMaskAcc = 0u;   // which slots have EVER moved for this model
       uint32_t cbBoundMaskAcc = 0u;   // which slots this model has ever bound
       uint64_t modelKey = 0ull;   // identity WITHOUT the draw range or ordinal
@@ -3348,15 +3356,65 @@ namespace dxvk {
                                //   which is a different finding from key churn
     uint32_t m_rsRung   = 0;   // which age bound actually did the freeing
 
+    // NV-DXVK [ResidentScene] slice 5: draws that got a key at SubmitDraw entry
+    // and never reached the judge at the end of SubmitDrawTail. THE PLAN'S OPEN
+    // QUESTION, MEASURED FROM THE GATE ITSELF rather than from the census: four
+    // shaders (0x29a8a769, 0x2966cb89, 0x28674497, 0x29dbd7a3, ~965 draws, ~22%
+    // of the frame) report o2w{n=0} because they are filtered before the
+    // transform is finalized. A draw class the gate never sees is a draw class
+    // residency does not cover, and a gate that silently never fires for a fifth
+    // of the frame looks identical to one that fires and hits.
+    uint32_t m_rsNoTail    = 0;
+    uint32_t m_rsMissO2w   = 0;  // key and geometry clean, derived transform moved
+    uint32_t m_rsMissMat   = 0;  // key, geometry and transform clean, material moved
+
+    // THE GATE'S PER-DRAW STASH. The verdict needs both halves and they become
+    // available at different points: the key and the two cheap folds come off
+    // live D3D11 state at SubmitDraw entry, while objectToWorld only exists
+    // after ExtractTransforms. Carrying them forward is what lets the judge sit
+    // where the transform is final without re-reading state that may have moved.
+    //
+    // CLEARED AT ENTRY ON EVERY DRAW, before anything can return early. A key
+    // left over from the previous draw would be judged against this draw's
+    // matrix, which is a silent cross-draw contamination that reads exactly like
+    // real transform churn -- the same trap censusRecordDraw's stash note names.
+    uint64_t m_rsDrawKey  = 0ull;
+    uint64_t m_rsDrawGens = 0ull;
+    uint64_t m_rsDrawMat  = 0ull;
+    uint64_t m_rsDrawSrcVb = 0ull;
+    uint64_t m_rsDrawSrcIb = 0ull;
+
+    // NV-DXVK [ResidentScene] slice 8: seed-pass state, frame thread only.
+    // m_rsSeenSceneEpoch is the g_sceneEpoch value a seed was last ARMED for; a
+    // mismatch arms m_rsSeedFramesLeft, which forces engine culling off for that
+    // many frames so the whole level is submitted once and can be harvested.
+    // Starts at a value the epoch counter never takes, so the first gameplay
+    // frame arms without needing a separate "have we ever seeded" flag.
+    uint32_t m_rsSeenSceneEpoch = UINT32_MAX;
+    uint32_t m_rsSeedFramesLeft = 0u;
+
     // Returns 0 when the draw has no usable IA identity, which is the "do not
     // make this resident" answer, not an error: 0 is the no-record sentinel on
     // RtInstance::m_residentKey and ResidentScene rejects it.
     uint64_t residentDrawKey(bool indexed, UINT count, UINT start, INT base);
-    // Fold of D3D11Buffer::GetMapGeneration() over every source the derivation
-    // could read. A SUPERSET on purpose -- see rtx.residentScene.foldCbGenerations.
-    uint64_t residentSrcGenFold() const;
-    // Scores the prediction and, once verify is off, decides the skip.
-    void     residentGateEvaluate(bool indexed, UINT count, UINT start, INT base);
+    // Fold of D3D11Buffer::GetMapGeneration() over the vertex and index buffers.
+    // THE GEOMETRY HALF ONLY -- see the body for why the constant buffers are
+    // not in it and what replaced them.
+    uint64_t residentGeomGenFold() const;
+    // Fold over the pixel-shader state a material is derived from. The MATERIAL
+    // half; see the body.
+    uint64_t residentMaterialFold() const;
+    // Entry half: mint the key, take the cheap folds, stash them. Decides nothing.
+    void     residentGateBegin(bool indexed, UINT count, UINT start, INT base);
+    // Tail half: the verdict, against the now-final object-to-world transform.
+    // Writes residentKey / residentGenHash / residentPredictHit into the draw
+    // state, which is per-DRAW storage that already travels every route to the
+    // CS thread -- a member of this object would be per-OBJECT, and a tail
+    // running behind the frame thread would read a later draw's verdict, which
+    // is the [XfDefer] B1 defect exactly.
+    void     residentGateJudge(DrawCallState& drawCallState);
+    // Slice 8: arm/step the seed pass. Frame thread, once per frame.
+    void     residentSeedUpdate();
     // ======================================================================
 
     // NV-DXVK: communication channel from ExtractTransforms() back to the
@@ -4552,6 +4610,14 @@ namespace dxvk {
       // the precondition B3's two-way merge depends on.
       enum class TailArena : uint8_t { Inline, Chain, Replay };
       TailArena arena = TailArena::Inline;
+      // NV-DXVK [ResidentScene]: the gate's verdict does NOT live here, and that
+      // is deliberate. It is written into the DrawCallState by residentGateJudge
+      // instead, because the ordered chain rebuilds this ctx field by field from
+      // its own slot (see XfChain's loop) while it MOVES the DrawCallState
+      // wholesale -- so a verdict on the ctx would have to be added to the slot,
+      // to the seam that fills it and to the rebuild, and a future field added
+      // to only two of the three would go missing silently. The draw state is
+      // already the thing that travels, and the verdict is about the draw.
       // [XfDefer] §5.4: SET BY THE TERMINAL ACT, READ BY THE CHAIN.
       //
       // Evaluated ONCE, at the arena append, where the abort verdict is already

@@ -3378,22 +3378,55 @@ namespace dxvk {
                         : "off"),
             " records=", static_cast<uint32_t>(m_residentScene.size()),
             " built=", rs.built,
+            // touched= is the number of draws the skip was ACTUALLY TAKEN on.
+            // Read it against [ResidentGate] hit= from the frame thread: a large
+            // gap means the gate is predicting hits for draws that have no
+            // record to serve, and missUnk below says how many.
             " touched=", rs.touched,
             " touchMiss=", rs.touchMiss,
+            " missUnk=", rs.touchMissUnknown,
+            " missInval=", rs.touchMissInvalid,
+            // Refused because the record's instances carry per-frame work the
+            // gate cannot speak for: billboards, ray portals, decals, or opacity
+            // micromaps being on. Permanent for those draws, not a fault -- but
+            // if this reads close to hit= then residency is being refused almost
+            // everywhere and the reason is one of those four, not the key.
+            " missUnsafe=", rs.touchMissUnsafe,
             " invalidated=", rs.invalidated,
             " evicted=", rs.evicted,
             // CUMULATIVE. Non-zero means maxRecords is too small for the scene,
             // which is the OPPOSITE finding from key churn and wants raising the
             // cap rather than abandoning the key.
             " wiped=", rs.wiped,
+            // CUMULATIVE. Records retired because the engine freed the buffers
+            // they were built from -- the signal that stops a destroyed object
+            // ghosting in the ray-traced scene. Reading zero for a whole session
+            // in a game with entities means the signal is not arriving, which is
+            // a defect and not a quiet scene.
+            " srcDied=", rs.sourceDestroyed,
             " instStamped=", rs.instancesStamped,
             " liveInst=", static_cast<uint32_t>(m_instances.size()),
+            // THE VERIFY VERDICT, and it is the gate for arming this feature.
+            // predicted is how many draws the frame-thread gate said it could
+            // serve from a record; FAIL is how many of those the record would
+            // have got WRONG -- the full path resolved to a different instance
+            // list than the record names, so the touch would have kept the
+            // wrong objects alive and let the right ones retire.
+            //
+            // FAIL must read 0, not "low", across a full pitch-and-yaw sweep
+            // before rtx.residentScene.verify goes off. failNoRec breaking out
+            // separately matters: that one says the frame thread's gate index
+            // and the record store disagree about what exists, which no amount
+            // of tightening the dirty test would fix.
+            " | predicted=", rs.predicted,
+            " FAIL=", rs.fail,
+            " failNoRec=", rs.failNoRecord,
             // The two numbers that decide whether this is working. records must
             // PLATEAU in a stationary scene -- a rising count is trap 3 (an
             // unstable key minting a fresh record every frame) and is a hard
             // fail, not a tuning problem. touchMiss must be ~0 once the key is
             // stable; every miss is a fallback to the full path.
-            " | records must plateau; touchMiss ~0"));
+            " | records must plateau; missInval ~0; FAIL=0 before verify goes off"));
           m_residentScene.resetStats();
         }
       }
@@ -3772,10 +3805,49 @@ namespace dxvk {
     const uint64_t key = instance->m_batchRecordKey;
     if (key == 0ull)
       return;
-    const auto it = m_fanoutRecords.find(key);
-    if (it != m_fanoutRecords.end())
-      it->second.valid = false;
+
+    // Clear this instance's own back-pointer first and unconditionally: even if
+    // the record is already gone it must not keep naming it, and zeroing it up
+    // front is what makes the loop below skip this (dying) entry for free.
     instance->m_batchRecordKey = 0ull;
+
+    const auto it = m_fanoutRecords.find(key);
+    if (it == m_fanoutRecords.end())
+      return;
+
+    it->second.valid = false;
+
+    // NV-DXVK [FanoutUAF, 2026-08-21]: drop the pointers NOW, not later.
+    //
+    // Marking the record invalid was not enough. The dying instance's pointer
+    // stayed in `instances`, and TWO places walk that vector and dereference
+    // every element with no validity check:
+    //
+    //   - the aged-record sweep in onFrameEnd, which cleared back-pointers
+    //     before erasing the record;
+    //   - the rebuild in processSceneObjectFanout, which clears back-pointers
+    //     from the previous contents before overwriting them.
+    //
+    // Either one dereferences an instance destroyed since the record was built.
+    // That is the AV at InstanceManager::onFrameEnd (rtx_instance_manager.cpp
+    // :3465) on dxvk-cs, reading freed instance memory -- the CS thread died
+    // there and the frame thread then blocked in QueryEnd, which is what the
+    // freeze looked like from outside.
+    //
+    // Doing it here is safe in a way that doing it later is not: removeInstance
+    // calls this BEFORE destroying the instance, so every pointer in the vector
+    // is still live at this moment. If a sibling was already destroyed in the
+    // same GC pass, its own removeInstance ran this first and emptied the
+    // vector, so we return early on key == 0 and never touch it.
+    //
+    // Clearing the vector loses nothing: an invalid record is never served --
+    // processSceneObjectFanout tests `!valid` before it looks at `instances` --
+    // and the rebuild reassigns the whole list.
+    for (RtInstance* other : it->second.instances) {
+      if (other->m_batchRecordKey == key)
+        other->m_batchRecordKey = 0ull;
+    }
+    it->second.instances.clear();
   }
 
   void InstanceManager::processSceneObjectFanout(
@@ -7776,8 +7848,9 @@ namespace dxvk {
           if (fastReject == kFastReasonCount) {
             // COMMIT the fast update: only the genuinely per-frame writes.
             // NV-DXVK [Phase2b]: on a worker the surface buffer binding is
-            // deferred to the CS record step — the per-frame m_bufferCache tape
-            // those indices point into is only built there (see the spec Sec 3.4).
+            // deferred to the CS record step — the bake that decides which
+            // bindless slots this geometry holds only runs there (see the spec
+            // Sec 3.4).
             if (inShardedInstancePhase()) {
               t_shardPhase.currentOps->bindBuffers = true;
             } else {
@@ -7880,9 +7953,10 @@ namespace dxvk {
         // The "every skipped read is a key input" argument does not reach this
         // call, and it must stay outside the guard.
         // NV-DXVK [Phase2b]: NOT skipped — DEFERRED to the CS record step, which
-        // rebinds after this frame's m_bufferCache tape exists. The 2026-08-07
-        // freeze was a skip with NO later rebind; the deferred rebind still
-        // happens every frame, before prepareSceneData consumes the surface.
+        // rebinds after this frame's bake has settled which slots the geometry
+        // holds. The 2026-08-07 freeze was a skip with NO later rebind; the
+        // deferred rebind still happens every frame, before prepareSceneData
+        // consumes the surface.
         if (inShardedInstancePhase()) {
           t_shardPhase.currentOps->bindBuffers = true;
         } else {

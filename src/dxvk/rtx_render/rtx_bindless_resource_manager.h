@@ -94,6 +94,14 @@ namespace dxvk {
     //              this frame's count, so they were overwritten with the dummy.
     //              NON-ZERO IS THE SHRINK: before this fix those slots kept
     //              serving stale descriptors to any out-of-range index.
+    //
+    // NV-DXVK [stable buffer identity]: the BUFFER table's `live` no longer
+    // collapses and rebuilds every frame, so its reDummied should now read 0.
+    // Freeing a buffer slot leaves a HOLE rather than shortening the table, and
+    // a hole takes the dummy through the ordinary per-slot write above, not
+    // through the tail. The tail stays because it is the thing that makes an
+    // out-of-range or freed index a defined read of a dummy buffer instead of a
+    // device loss, and that is worth having whatever the table length does.
     struct TableStats {
       uint32_t live = 0;
       uint32_t peakLive = 0;

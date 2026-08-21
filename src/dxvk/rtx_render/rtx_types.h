@@ -1382,6 +1382,36 @@ struct DrawCallState {
   // this thread (non-matsys draw) — callers must then fall back to hashes.
   uint64_t engineMaterialPtr = 0;
 
+  // NV-DXVK [ResidentScene]: the frame thread's record key for this draw, and
+  // the dirty fold it was judged against. See RESIDENT_SCENE_PLAN.md.
+  //
+  // WHY THE KEY TRAVELS ON THE DRAW. The gate's two halves live on different
+  // threads by necessity: the frame thread owns the D3D11 state the key is made
+  // of and must decide before any of the work it exists to skip, while only the
+  // CS side may touch an RtInstance. The key is the entire join between them --
+  // eight bytes through the channel the draw already uses, so no map is ever
+  // reached by two threads and there is nothing to lock.
+  //
+  // 0 means "this draw has no usable identity", which is the do-not-make-
+  // resident answer rather than an error: 0 is also the no-record sentinel on
+  // RtInstance::m_residentKey and ResidentScene::build rejects it.
+  uint64_t residentKey = 0ull;
+  uint64_t residentGenHash = 0ull;
+  // The engine buffers this draw was made of, as raw addresses. The record keeps
+  // them so that ~D3D11Buffer freeing one can retire it -- a resident instance
+  // is exempt from lifetime expiry, so without a death signal a destroyed object
+  // would stay in the ray-traced scene indefinitely. Addresses rather than
+  // references on purpose: holding a reference would keep alive the very object
+  // whose destruction is the signal.
+  uint64_t residentSrcVertexBuffer = 0ull;
+  uint64_t residentSrcIndexBuffer = 0ull;
+  // The frame thread's verdict, carried for SCORING ONLY. While
+  // rtx.residentScene.verify is on the draw runs the full path regardless and
+  // this says "the gate would have skipped me" -- which is what makes the FAIL
+  // count in [ResidentScene] a measurement of the prediction rather than of the
+  // consequence of having acted on it.
+  bool residentPredictHit = false;
+
   void setupCategoriesForTexture();
   void setupCategoriesForGeometry();
   void setupCategoriesForHeuristics(uint32_t prevFrameSeenCamerasCount,

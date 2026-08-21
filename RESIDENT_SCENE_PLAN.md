@@ -4,6 +4,30 @@
 engine culling is back ON, `cullOff.enable=False`, 57.99 → 19.97 ms, 17.2 → 50.1 fps,
 drawsIn 1338 → 538, scene healthy at inst≈1670 / uniqueBlas≈217).
 
+> **IMPLEMENTED 2026-08-21. Slices 1-8 are in the tree, unbuilt and unrun.**
+>
+> This document keeps its original text. Where the implementation contradicted
+> it, the claim is left standing with a correction block underneath, the same way
+> §1.2 already handles its own two reversals — a plan that quietly rewrites its
+> refuted parts teaches the next reader nothing about which kinds of claim in it
+> are load-bearing and which were guesses.
+>
+> **What changed most, and it is the shape of the whole thing:** the gate reaches
+> its verdict on the frame thread, but the SKIP IS TAKEN ON THE CS THREAD, at the
+> top of `RtxContext::commitGeometryToRT` immediately ahead of `submitDrawState`.
+> §2.1's flow diagram assumes the frame thread collapses the payload. It cannot:
+> the evidence that makes a skip safe is whether a resident record actually
+> exists, and only the CS side can see that. See the correction under §2.1.
+>
+> **Two death signals this document did not have, both of which would have made
+> residency do nothing or do harm:** the BLAS outliving the instance (§2.3), and
+> the per-frame work that hangs off an instance rather than off its geometry,
+> transform or material (§2.2). Both are now closed and both are new traps (§3).
+>
+> **And a prerequisite this document does not mention at all:** buffer identity
+> had to become stable first, or every gate hit minted a stale bindless index.
+> See §0.2, added.
+
 **NO ANTI-CULLING.** `rtx.antiCulling.*`, `AntiCulling::isObjectAntiCullingEnabled`
 and `InstanceCategories::IgnoreAntiCulling` are OUT OF SCOPE and must not be read,
 written, or extended by anything here. The existing long-keep gate at
@@ -28,6 +52,12 @@ engine cull   object never reaches D3D11             saves CPU  (entry point + e
 residency     object survives not being drawn        keeps RT correctness                    THIS
 sceneCull     object resident but masked out of TLAS saves GPU  (BVH + traversal)            EXISTS, inert
 ```
+
+**Status 2026-08-21.** Residency is BUILT and arms behind two switches, in this
+order and no other: `rtx.residentScene.enable=True` with `verify=True` scores the
+prediction and acts on nothing; `verify=False` takes the skip and the extended
+keep. sceneCull is still inert and still waiting on residency to put the
+off-screen set back before its `solidAngleMin` sweep means anything.
 
 The claim: every object present as if culling were off, paying neither cost.
 
@@ -73,6 +103,31 @@ is a reason to delay slices 1-6:
    convenience, and it applies only to the Dynamic class — never to world or static
    props, which cannot move. Deferred to slice 9; see §6.
 
+> **IMPLEMENTED 2026-08-21, and the trigger is a scene EPOCH rather than a
+> level-load hook.** `SceneManager::clear()` is the one point every scene reset
+> funnels through — a level change reaches it via the camera-cut delayed clear,
+> a replacement reload reaches it directly — so it publishes `g_sceneEpoch`, and
+> the frame thread arms the seed when the epoch differs from the one it last
+> seeded. An epoch rather than a flag because a clear that happens while the
+> frame thread is not looking cannot then be missed, and two clears in quick
+> succession arm the seed exactly once.
+>
+> Two details this section did not anticipate:
+>
+> **It has to be gameplay-gated.** The first epoch is the process starting, not a
+> level arriving. A seed spent on menu and loading frames harvests nothing and
+> then does not re-arm until the next clear, which is worse than not seeding.
+> Same floor the census and the scene-clear probes already use.
+>
+> **It flips the cullOff MASTER switch only.** The individual patch groups keep
+> whatever the conf says, so the seed frames reproduce exactly the configuration
+> `rtx.cullOff.enable=True` was measured at 57.99 ms on. Forcing every group on
+> would be a wider configuration nobody has run — `pvs` in particular is
+> documented as much more expensive — and the seed is not the place to find that
+> out. The A/B override still wins: `abMode==2` means the user is deliberately
+> restoring engine culling to compare, and a seed that ignored it would silently
+> invalidate the comparison.
+
 ## 0.1 What it is worth
 
 Not the 8.20 ms of frame-thread slack. That measures *additional* headroom on top
@@ -90,6 +145,65 @@ test has to compare CONTENT and not just a generation counter. Take the second
 term as "most of 17 us on ~90% of draws", not "all of it on all of them". Today's
 19.97 ms is not a banked baseline — it is a loan against missing geometry, and
 `[ReapJoin] respawn=0 starved=1..22/frame` is the interest being paid.
+
+> **CORRECTED 2026-08-21 BY THE IMPLEMENTATION: the second term is not the
+> 17 us/draw on the frame thread.** That was the right number for a gate that
+> collapses the payload on the frame thread, and the skip does not live there.
+>
+> Where the money is, from this tree's own measurements on one window:
+>
+> ```
+> [Perf.Busy]     wallMs 73.6                the frame
+> [Perf.CsSplit]  dxvk-cs exec 73.3          99.6% -- dxvk-cs IS the frame
+> [Perf.CsCmd]    commitGeometryToRT 53.1 ms/f over ~1100 calls
+> [CommitRT]      submitMs 50 of perFrameMs 52
+> ```
+>
+> So the term to remove is `submitDrawState`, ~50 of `commitGeometryToRT`'s ~52,
+> and that is exactly what a hit removes. The ~2 ms above it — camera
+> classification, sky handling, transform fixups — still runs, deliberately
+> (§2.1). The frame thread keeps its ~17 us/draw.
+>
+> **That is not a loss, it is the correct order.** dxvk-cs is 99.6% of wall time;
+> the frame thread has 8.20 ms of slack that §0.1 opens by dismissing. Cutting CS
+> first and measuring what becomes the ceiling afterwards is the same
+> "verify first, skip second" discipline this document applies everywhere else.
+> If the frame thread does become the ceiling, moving the gate earlier is a
+> separate change with its own evidence — and it will need one, because a gate
+> that runs before `captureDrawSnapshot` has to be able to un-skip a draw whose
+> transform turns out to have moved.
+
+## 0.2 THE PREREQUISITE THIS PLAN DOES NOT MENTION, AND IT BLOCKED EVERYTHING
+
+**Added 2026-08-21.** Bindless BUFFER identity was not stable, and every gate hit
+was by construction a buffer that had not been re-tracked that frame.
+
+`m_bufferCache` was an append-only tape cleared at `SceneManager::onFrameEnd`
+every frame and refilled only by geometry PROCESSED THIS FRAME. A slot index was
+therefore a position in one frame's tape and meant nothing in the next one. An
+instance kept alive and not redrawn — which is the entire population this
+document exists to create — re-uploaded its surface every frame carrying indices
+from an older and possibly longer tape. Measured before the fix: 1032 stale
+surface uploads over 70 frames, worst case 691 slots past the end of the tape.
+Past the end is an undefined descriptor in an array declared with
+`VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT`, which the hardware follows as an
+arbitrary address; inside the tape but from an earlier generation it is simply
+the wrong buffer.
+
+So residency would have made the device-loss chain WORSE in exact proportion to
+how well it worked: the gate's hit rate and the stale-index count are the same
+number counted twice.
+
+The table is now a `BufferSlotTable` with stable slots, freed on evidence rather
+than on frame age — `retire()` says the owner let go, and `reclaim()` frees only
+after the surface upload has reported no reference for longer than the pipeline
+depth. That last part is what makes it correct HERE specifically: recycling a
+slot on frame age would eventually hand a live wrong buffer to an instance that
+outlived the guess, and residency's whole premise is that an instance's age is
+not a bound on its life.
+
+`[StaleTape] staleSurfaces = 0` across a level load and a stationary capture is
+the gate for this, and it is a prerequisite for reading anything else here.
 
 ---
 
@@ -157,6 +271,34 @@ shape. Third time in this tree.
 |---|---|---|---|
 | geometry — BLAS, vertex/index data | `GetMapGeneration()` | ~free, a few atomic loads | never moves |
 | transform | **hash of the DERIVED `objectToWorld`** | must run after ExtractTransforms | **100% clean under camera motion** |
+| material | fold over PS + its SRVs, samplers, blend/depth/raster state | ~16 cache lines, engine pointers | ADDED 2026-08-21, unmeasured |
+
+> **A THIRD TEST, ADDED BY THE IMPLEMENTATION, AND IT IS NOT OPTIONAL.** This
+> section reasons entirely about geometry and transform, and a record does not
+> hold either of those — it holds RtInstances, and an instance carries a surface
+> MATERIAL as well. A draw whose vertex buffers and object-to-world are both
+> unchanged can still be asking for a different texture or a different blend
+> mode, and a two-test gate would skip it and leave the old material resident
+> with nothing to catch it. That is trap 4's shape exactly: alive, and not
+> refreshed.
+>
+> What identifies a material here is whatever `FillMaterialData` reads: the pixel
+> shader, the resources it samples, the samplers, and the blend / depth-stencil /
+> rasterizer state objects. All engine objects created once and reused for the
+> material's lifetime — so unlike the constant buffers they do NOT churn per
+> frame, and they are the same kind of input as the IA pointers §1.1's key is
+> made of, stable for the same reason.
+>
+> **The whole 128-slot shader-resource array, not the handful of slots TF2 is
+> known to use.** This is the place the superset argument actually holds: it can
+> only make the gate refuse a serve it could have made, where narrowing to "the
+> slots the material path looks at" is a guess about another module's behaviour
+> and being wrong there means serving a stale material. Sixteen contiguous cache
+> lines against the ~48 us of CS-side commit a hit removes.
+>
+> `[ResidentGate] missMat` is what says whether that was the wrong trade: high
+> means the game rebinds material state per draw and the fold wants narrowing to
+> what `FillMaterialData` actually reads — a measurement, not a guess.
 
 > **CORRECTED AGAIN 2026-08-20, and this is the version that survived.** The row
 > above used to say "content hash of the draw's own cbuffer window, 90%

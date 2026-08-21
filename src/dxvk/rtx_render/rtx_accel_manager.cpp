@@ -7834,6 +7834,115 @@ namespace dxvk {
     assert(dataOffset == surfacesGPUSize);
     assert(surfacesGPUData.size() == surfacesGPUSize);
 
+    // NV-DXVK [StaleTape, 2026-08-21]: do the surfaces we are about to upload
+    // still index buffers that exist? This is the acceptance gate for stable
+    // buffer identity, and it is also where the buffer table learns which of its
+    // slots are still referenced.
+    //
+    // WHAT IT USED TO CATCH. m_bufferCache was an append-only TAPE, cleared whole
+    // at SceneManager::onFrameEnd every frame and rebuilt by updateBufferCache,
+    // which runs only for geometry PROCESSED THIS FRAME. A buffer index was a
+    // position in one frame's tape and meant nothing in the next one, so an
+    // instance kept alive but not redrawn -- [ReapJoin] starved=, 227/frame in
+    // the run that died -- re-uploaded its surface every frame carrying indices
+    // from an older and possibly LONGER tape. Tape lengths swung 822 to 1508
+    // ([MatChurn] bufSlots=/bufPeak=), so an index past the end was not
+    // hypothetical: 1032 stale uploads over 70 frames, worst 691 slots past the
+    // end. Past the end of the bindless array's written region is an undefined
+    // descriptor (declared for kMaxBindlessResources with
+    // VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT), which the hardware follows as
+    // an arbitrary address -- the DMA page fault.
+    //
+    // WHAT IT CATCHES NOW. Slots are stable and are freed only on evidence, so
+    // this should read zero. Two ways it can fail, counted apart because they
+    // mean different things:
+    //   oob   an index past the end of the table. Nothing hands these out any
+    //         more, so a non-zero count means a surface is carrying an index
+    //         from before a SceneManager::clear() renumbered everything.
+    //   dead  an index inside the table pointing at a slot that was reclaimed.
+    //         This is the one to watch: it means the reclaim sweep freed a slot
+    //         while a live surface still referenced it, so the quiet-frame
+    //         evidence was not sufficient. Left alone it becomes a live WRONG
+    //         buffer as soon as the slot is handed to something else, which is
+    //         silently wrong geometry with nothing else to catch it.
+    //
+    // No shader change and no GPU readback, which matters because the GPU-side
+    // OOB probe answered a DIFFERENT question and read zero for a whole session:
+    // [Coverage] OOBWhy counts an out-of-range SURFACE index, and this failure
+    // produces none -- the surface index is perfectly valid, it is the BUFFER
+    // index inside the surface that is stale.
+    {
+      SceneManager& sceneManager = m_device->getCommon()->getSceneManager();
+      const std::vector<RaytraceBuffer>& bufferTable = sceneManager.getBufferTable();
+      const uint32_t tableCount = static_cast<uint32_t>(bufferTable.size());
+      const uint32_t frameId = m_device->getCurrentFrameId();
+
+      uint32_t staleSurfaces = 0;
+      uint32_t maxBufferIndex = 0;
+      uint32_t oobIndices = 0;
+      uint32_t deadIndices = 0;
+
+      for (uint32_t i = 0; i < m_reorderedSurfaces.size(); ++i) {
+        const RtSurface& s = m_reorderedSurfaces[i]->surface;
+
+        // kSurfaceInvalidBufferIndex is the "not bound" sentinel and is never
+        // dereferenced by the shader, so it must not count as stale.
+        //
+        // The VGUI trio is included even though it is bound on a handful of
+        // surfaces: those slices come from the game's own dynamic SRVs, so they
+        // are the ones that actually churn, and a slot nobody reports a
+        // reference for is a slot the sweep will reclaim.
+        const uint32_t indices[] = {
+          s.positionBufferIndex, s.previousPositionBufferIndex, s.normalBufferIndex,
+          s.texcoordBufferIndex, s.color0BufferIndex, s.indexBufferIndex,
+          static_cast<uint32_t>(s.vguiFontBoundsBufferIndex),
+          static_cast<uint32_t>(s.vguiImgBoundsBufferIndex),
+          static_cast<uint32_t>(s.vguiStylesBufferIndex),
+        };
+
+        bool stale = false;
+        for (const uint32_t idx : indices) {
+          if (idx == kSurfaceInvalidBufferIndex) {
+            continue;
+          }
+          maxBufferIndex = std::max(maxBufferIndex, idx);
+
+          if (idx >= tableCount) {
+            ++oobIndices;
+            stale = true;
+            continue;
+          }
+          if (!bufferTable[idx].defined()) {
+            ++deadIndices;
+            stale = true;
+            continue;
+          }
+
+          // THE REFERENCE OBSERVATION. Every live surface is rewritten here every
+          // frame, so this is the complete set of slots in use, and a slot that
+          // stops appearing has genuinely stopped being read -- which is what
+          // lets the reclaim sweep recycle it without guessing at instance
+          // lifetimes.
+          sceneManager.markBufferSlotReferenced(idx, frameId);
+        }
+        staleSurfaces += stale ? 1u : 0u;
+      }
+
+      // Silent when clean. A non-zero count is the defect, so it must not be
+      // throttled away on the frame it first appears.
+      if (staleSurfaces != 0) {
+        Logger::warn(str::format(
+          "[StaleTape] f=", frameId,
+          " staleSurfaces=", staleSurfaces,
+          "/", m_reorderedSurfaces.size(),
+          " oob=", oobIndices,
+          " dead=", deadIndices,
+          " maxBufferIndex=", maxBufferIndex,
+          " tableCount=", tableCount,
+          "  <- surfaces uploaded with buffer indices that name no live buffer"));
+      }
+    }
+
     ctx->writeToBuffer(m_surfaceBuffer, 0, surfacesGPUData.size(), surfacesGPUData.data());
 
     // Allocate and initialize the surface mapping buffer

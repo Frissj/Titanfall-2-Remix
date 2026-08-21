@@ -5457,6 +5457,50 @@ namespace dxvk {
         }
       }
 
+      // NV-DXVK [ResidentScene] slice 6: THE SKIP.
+      //
+      // WHY IT IS HERE AND NOT ON THE FRAME THREAD, which is where the verdict
+      // was reached. Two reasons, and the second is the one that decided it.
+      //
+      // 1. THIS IS WHERE THE MONEY IS. dxvk-cs is 99.6% of the frame, and of
+      //    commitGeometryToRT's ~52 ms/frame, submitDrawState is ~50 -- the
+      //    geometry decision, the BLAS input, the material resolution and the
+      //    instance resolve. Everything above this line is camera
+      //    classification, sky handling and transform fixups, and it is ~2 ms.
+      //    Cutting exactly here takes the 50 and keeps the 2.
+      //
+      // 2. THE RECORD'S EXISTENCE IS THE EVIDENCE, AND ONLY THIS THREAD HAS IT.
+      //    A record is built only by a draw that actually RESOLVED TO
+      //    INSTANCES. So a draw that commits for a side effect and produces
+      //    none -- a sky pass, a fog registration, a terrain bake -- has no
+      //    record, cannot be served, and falls through to the full path. The
+      //    frame thread cannot make that distinction: it would have to be told,
+      //    and telling it means a second shared map between the two threads,
+      //    which is the one thing this design does not have. Deciding where the
+      //    evidence already is costs nothing and removes the whole class of
+      //    "the draw existed for something other than its geometry".
+      //
+      // So the touch is not a hopeful stamp: it either finds a valid, non-empty
+      // record and keeps exactly those instances alive, or it reports a miss and
+      // this draw commits in full, which is the behaviour without residency.
+      // There is no third outcome and nothing is silently dropped.
+      //
+      // VERIFY FIRST, SKIP SECOND. While rtx.residentScene.verify is on the
+      // prediction is carried, scored in processDrawCallState and DISCARDED --
+      // the draw commits in full and this feature can change nothing on screen.
+      // Nothing is skipped until [ResidentScene] reads FAIL=0 with the record
+      // count plateaued across a pitch-and-yaw sweep. That ordering is what the
+      // [PropIdKeepLong attempt reverted] note exists to enforce: a long keep on
+      // an unstable identity made things measurably WORSE, not merely no better.
+      if (drawCallState.residentPredictHit
+          && drawCallState.residentKey != 0ull
+          && RtxOptions::ResidentScene::enable()
+          && !RtxOptions::ResidentScene::verify()
+          && getSceneManager().touchResidentRecord(drawCallState.residentKey,
+                                                   m_device->getCurrentFrameId())) {
+        return;
+      }
+
       const auto tCommitSub0 = std::chrono::steady_clock::now();
       getSceneManager().submitDrawState(this, drawCallState, overrideMaterialData);
       s_commitSubmitNs += std::chrono::duration_cast<std::chrono::nanoseconds>(

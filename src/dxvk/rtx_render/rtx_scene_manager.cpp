@@ -293,6 +293,13 @@ namespace dxvk {
         " engineHookCaptureCount=", tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed)));
     }
 
+    // NV-DXVK [ResidentScene] slice 8: the scene this was built from is gone, so
+    // whatever residency had harvested describes a level that is no longer
+    // loaded. Publishing it here, at the single point every reset funnels
+    // through, is what lets the frame thread arm the seed pass without needing
+    // to recognise a level change itself. See g_sceneEpoch.
+    g_sceneEpoch.fetch_add(1u, std::memory_order_relaxed);
+
     auto& textureManager = m_device->getCommon()->getTextureManager();
 
     // Only clear once after the scene disappears, to avoid adding a WFI on every frame through clear().
@@ -358,8 +365,44 @@ namespace dxvk {
       tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
 
     const size_t oldestFrame = m_device->getCurrentFrameId() - RtxOptions::numFramesToKeepGeometryData();
+
+    // NV-DXVK [ResidentScene]: THE GEOMETRY HAS TO OUTLIVE THE INSTANCE, and
+    // without this clause it does not.
+    //
+    // rtx.numFramesToKeepBLAS is 1, so a BlasEntry is destroyed the frame after
+    // its last draw. onSceneObjectDestroyed then marks every linked instance for
+    // collection, and m_isMarkedForGC is a clause residency deliberately does
+    // NOT override -- an instance must never outlive its geometry. So an
+    // off-screen object would have its instances faithfully exempted from
+    // lifetime expiry by the residency clause in InstanceManager::
+    // garbageCollection, and then reaped one frame later anyway through the
+    // geometry. Residency would measure as working and do nothing.
+    //
+    // Asking the record store per BLAS rather than stamping frameLastTouched
+    // from the touch: a touch only happens when a DRAW arrives, and the whole
+    // population this feature exists for is the one whose draws do not.
+    //
+    // Costs a walk of the linked instances, and only for entries that have
+    // already aged past the bound -- i.e. the ones about to be destroyed.
+    const bool residencyKeepsGeometry =
+      RtxOptions::ResidentScene::enable() && !RtxOptions::ResidentScene::verify();
+    const ResidentScene& residentScene = m_instanceManager.getResidentScene();
+
     auto blasEntryGarbageCollection = [&](auto& iter, auto& entries) -> void {
       if (iter->second.frameLastTouched < oldestFrame) {
+        if (residencyKeepsGeometry) {
+          bool heldResident = false;
+          for (const RtInstance* instance : iter->second.getLinkedInstances()) {
+            if (residentScene.holdsInstance(instance)) {
+              heldResident = true;
+              break;
+            }
+          }
+          if (heldResident) {
+            ++iter;
+            return;
+          }
+        }
         // NV-DXVK [BlasDestroyed]: log every BLAS destruction during
         // gameplay, with vsHash + linkedInstance count + frame-since-
         // touch. Rate-limited to bound output. Sub-view-mountain BLASes
@@ -652,6 +695,25 @@ namespace dxvk {
     m_accelManager.garbageCollection();
     m_lightManager.garbageCollection(getCamera());
     m_rayPortalManager.garbageCollection();
+
+    // NV-DXVK [stable buffer identity]: free the bindless slots of retired
+    // buffers that nothing reads through any more.
+    //
+    // AFTER the instance reap above, deliberately. An entry destroyed by the
+    // BLAS pass marks its linked instances and m_instanceManager.
+    // garbageCollection() removes them in this same call, so by this point an
+    // instance cannot be the thing keeping one of those slots alive.
+    //
+    // kMaxFramesInFlight is the wait, and it is a pipeline fact rather than a
+    // guess about lifetimes. uploadSurfaceData rewrites the whole surface buffer
+    // and marks every index a live surface carries EVERY frame, so a slot that
+    // has gone unmarked for longer than the pipeline depth is one that no
+    // already-submitted frame can still read through either. Recycling on age
+    // instead would eventually hand a live wrong buffer to a surface that
+    // outlived the guess -- silently wrong geometry, with no FAIL to catch it.
+    // How many it freed is reported through [MatChurn] bufFreed, which reads the
+    // table's own monotonic counter rather than this call's return.
+    m_bufferCache.reclaim(m_device->getCurrentFrameId(), kMaxFramesInFlight);
   }
 
   void SceneManager::onDestroy() {
@@ -867,10 +929,11 @@ namespace dxvk {
   //          the interleave dispatch. Records through ctx and consumes the
   //          gpuCapture rebind's outputs — CANNOT move (plan Sec 0.1).
   //          Derived: bake - alloc.
-  //   tape   updateBufferCache -> nine m_bufferCache.track() calls handing out
-  //          bindless indices. MOVABLE to the ordered tail (single-threaded
-  //          there, so no lock needed and indices stay deterministic) — but
-  //          gated on auditing SparseUniqueCache::track first.
+  //   tape   updateBufferCache -> the bindless slot bind and retire. MOVABLE to
+  //          the ordered tail (single-threaded there, so no lock needed and
+  //          indices stay deterministic). Named `tape` for the append-only table
+  //          it used to walk; slots are stable now, so the common case is nine
+  //          slice compares rather than nine appends.
   //   rest   geom - bake - tape: the decision, the probes, the flag bookkeeping.
   //
   // MEASUREMENT FLOOR: geom is ~4 us/draw (5-6 ms over ~1350 draws), so these
@@ -1659,12 +1722,17 @@ namespace dxvk {
 
     // Update buffers in the cache
     {
-      // NV-DXVK [Perf.GeoSplit]: `tape` — the nine m_bufferCache.track() calls.
+      // NV-DXVK [Perf.GeoSplit]: `tape` — the bindless slot bind and retire.
       // Runs on EVERY call including kUpdateInstance (this site is outside the
       // switch), so it is per-DRAW cost, not per-bake, which is exactly why it
       // is a candidate for the ordered tail.
+      //
+      // `inOutGeometry` is still the PRE-bake geometry here: everything above
+      // writes to `output`, the copy, and the finalise at the end of this
+      // function is what overwrites it. That is what lets updateBufferCache see
+      // both sides and work out which buffers the geometry let go of.
       GeoSplitZone gsz(geoSplitOn, &s_geoTapeNs, &s_geoTapeN);
-      updateBufferCache(output);
+      updateBufferCache(inOutGeometry, output);
     }
 
     // NV-DXVK [TrimCache]: s2s mangle/black race probe — the CACHE-WRITE side.
@@ -1741,11 +1809,20 @@ namespace dxvk {
     m_instanceManager.onFrameEnd();
     m_previousFrameSceneAvailable = raytracedThisFrame && RtxOptions::enablePreviousTLAS();
 
-    // NV-DXVK [Phase2b]: capture the tape's final size before the clear — the
-    // flush-side pre-pass reads it (drain-ordered, no race) as the overflow
-    // predictor, since at flush time the live tape is always freshly empty.
+    // NV-DXVK [Phase2b]: publish the buffer table's size for the flush-side
+    // pre-pass, which reads it (drain-ordered, no race) as the overflow
+    // predictor because the live count is written on this thread, after the
+    // flush.
+    //
+    // NV-DXVK [stable buffer identity]: THE CLEAR THAT USED TO BE HERE IS GONE,
+    // and that is the whole point of the change. Clearing the table every frame
+    // is what made a slot index mean nothing outside the frame that produced it,
+    // and it is what a surface that was uploaded without being re-derived then
+    // read through. Slots are now released by retire() plus the reclaim sweep in
+    // garbageCollection(), on evidence that nothing references them. The only
+    // remaining whole-table clear is in SceneManager::clear(), where the scene
+    // genuinely goes away.
     m_bufferCacheLastFrameCount = m_bufferCache.getTotalCount();
-    m_bufferCache.clear();
     m_externalGpuInstancingTransforms.clear();
     if (raytracedThisFrame){
       std::lock_guard lock { m_drawCallMeta.mutex };
@@ -2993,62 +3070,125 @@ namespace dxvk {
     }
   }
 
-  void SceneManager::updateBufferCache(RaytraceGeometry& newGeoData) {
+  namespace {
+    // The buffers a RaytraceGeometry can hold a bindless slot for, each paired
+    // with the field that holds the slot.
+    //
+    // ONE list, walked by both the bind and the retire, because the two used to
+    // be separate hand-written runs of if/else and a buffer added to the geometry
+    // has to reach both of them. Miss the bind and the surface reads a stale
+    // slot; miss the retire and the slot is never reclaimed. Order is the order
+    // the tape used to append in, kept so slot numbers in an old log still read
+    // sensibly against a new one.
+    struct GeoBufferSlot {
+      RaytraceBuffer RaytraceGeometry::* buffer;
+      uint32_t RaytraceGeometry::* index;
+    };
+
+    constexpr GeoBufferSlot kGeoBufferSlots[] = {
+      { &RaytraceGeometry::indexBuffer,            &RaytraceGeometry::indexBufferIndex },
+      { &RaytraceGeometry::normalBuffer,           &RaytraceGeometry::normalBufferIndex },
+      { &RaytraceGeometry::color0Buffer,           &RaytraceGeometry::color0BufferIndex },
+      { &RaytraceGeometry::texcoordBuffer,         &RaytraceGeometry::texcoordBufferIndex },
+      { &RaytraceGeometry::positionBuffer,         &RaytraceGeometry::positionBufferIndex },
+      { &RaytraceGeometry::previousPositionBuffer, &RaytraceGeometry::previousPositionBufferIndex },
+      // NV-DXVK: TF2 worldspace VGUI auxiliary structured buffers. These are the
+      // game's own SRVs rather than buffers Remix allocated, and they are
+      // re-cloned from the draw on every call, so if the game renames one the
+      // geometry silently starts holding a different slice. That is the reason
+      // the retire below cannot assume only a destroyed geometry orphans slots.
+      { &RaytraceGeometry::vguiFontBoundsBuffer,   &RaytraceGeometry::vguiFontBoundsBufferIndex },
+      { &RaytraceGeometry::vguiImgBoundsBuffer,    &RaytraceGeometry::vguiImgBoundsBufferIndex },
+      { &RaytraceGeometry::vguiStylesBuffer,       &RaytraceGeometry::vguiStylesBufferIndex },
+    };
+
+    constexpr size_t kGeoBufferSlotCount = sizeof(kGeoBufferSlots) / sizeof(kGeoBufferSlots[0]);
+  }
+
+  void SceneManager::updateBufferCache(const RaytraceGeometry& oldGeoData, RaytraceGeometry& newGeoData) {
     ScopedCpuProfileZone();
-    if (newGeoData.indexBuffer.defined()) {
-      newGeoData.indexBufferIndex = m_bufferCache.track(newGeoData.indexBuffer);
-    } else {
-      newGeoData.indexBufferIndex = kSurfaceInvalidBufferIndex;
+
+    const uint32_t frameId = m_device->getCurrentFrameId();
+
+    // BIND. newGeoData was copied from oldGeoData before the bake, so every index
+    // field already holds the slot the previous bake handed it. Slots are stable
+    // now, so a field whose buffer did not move needs no work at all -- the index
+    // it is already carrying still names the same buffer. The tape had to
+    // re-track every field of every draw every frame only because its indices did
+    // not survive the frame boundary; nine slice compares replace nine appends.
+    //
+    // retain() asks the table whether the slot still holds this exact buffer
+    // rather than comparing against oldGeoData, and re-asserts ownership when it
+    // does. The re-assertion matters for the buffers several geometries share
+    // (the VGUI structured buffers), where one geometry being destroyed retires a
+    // slot another one still holds.
+    for (const GeoBufferSlot& slot : kGeoBufferSlots) {
+      const RaytraceBuffer& buffer = newGeoData.*(slot.buffer);
+      uint32_t& index = newGeoData.*(slot.index);
+
+      if (!buffer.defined()) {
+        index = kSurfaceInvalidBufferIndex;
+        continue;
+      }
+
+      if (index != kSurfaceInvalidBufferIndex && m_bufferCache.retain(index, buffer, frameId)) {
+        continue;
+      }
+
+      index = m_bufferCache.track(buffer, frameId);
     }
 
-    if (newGeoData.normalBuffer.defined()) {
-      newGeoData.normalBufferIndex = m_bufferCache.track(newGeoData.normalBuffer);
-    } else {
-      newGeoData.normalBufferIndex = kSurfaceInvalidBufferIndex;
+    // RETIRE. A bake can replace the buffers this geometry holds: a vertex count
+    // change reallocates both history buffers, and the VGUI structured buffers
+    // are re-cloned from the draw on every call, so they follow the game's own
+    // SRV. Whatever the geometry no longer references has to be handed back, or
+    // the table grows without bound -- and it is the LIVE geometry that does
+    // this, so retiring only on destruction would not be enough.
+    //
+    // Compare against the WHOLE new set, not field by field. The two history
+    // buffers exchange roles on every vertex update -- position takes what was
+    // previous-position and vice versa -- so a field-by-field comparison would
+    // report both as changed and retire a buffer the geometry still holds.
+    //
+    // The cheap test first: when every field is unchanged there is nothing to
+    // retire, and that is the overwhelmingly common case (a draw that resolved to
+    // kUpdateInstance touches no buffer at all).
+    bool anyBufferMoved = false;
+    for (const GeoBufferSlot& slot : kGeoBufferSlots) {
+      if (!(oldGeoData.*(slot.buffer)).matches(newGeoData.*(slot.buffer))) {
+        anyBufferMoved = true;
+        break;
+      }
     }
 
-    if (newGeoData.color0Buffer.defined()) {
-      newGeoData.color0BufferIndex = m_bufferCache.track(newGeoData.color0Buffer);
-    } else {
-      newGeoData.color0BufferIndex = kSurfaceInvalidBufferIndex;
+    if (!anyBufferMoved) {
+      return;
     }
 
-    if (newGeoData.texcoordBuffer.defined()) {
-      newGeoData.texcoordBufferIndex = m_bufferCache.track(newGeoData.texcoordBuffer);
-    } else {
-      newGeoData.texcoordBufferIndex = kSurfaceInvalidBufferIndex;
-    }
+    for (size_t i = 0; i < kGeoBufferSlotCount; ++i) {
+      const RaytraceBuffer& released = oldGeoData.*(kGeoBufferSlots[i].buffer);
+      if (!released.defined()) {
+        continue;
+      }
 
-    if (newGeoData.positionBuffer.defined()) {
-      newGeoData.positionBufferIndex = m_bufferCache.track(newGeoData.positionBuffer);
-    } else {
-      newGeoData.positionBufferIndex = kSurfaceInvalidBufferIndex;
-    }
+      bool stillHeld = false;
+      for (size_t j = 0; j < kGeoBufferSlotCount && !stillHeld; ++j) {
+        const RaytraceBuffer& kept = newGeoData.*(kGeoBufferSlots[j].buffer);
+        stillHeld = kept.defined() && kept.matches(released);
+      }
 
-    if (newGeoData.previousPositionBuffer.defined()) {
-      newGeoData.previousPositionBufferIndex = m_bufferCache.track(newGeoData.previousPositionBuffer);
-    } else {
-      newGeoData.previousPositionBufferIndex = kSurfaceInvalidBufferIndex;
+      if (!stillHeld) {
+        m_bufferCache.retire(released);
+      }
     }
+  }
 
-    // NV-DXVK: TF2 worldspace VGUI auxiliary structured buffers. m_bufferCache
-    // dedups by DxvkBufferSlice so a single font atlas / styles table that
-    // gets reused across many VGUI panel draws only consumes one bindless
-    // slot per type.
-    if (newGeoData.vguiFontBoundsBuffer.defined()) {
-      newGeoData.vguiFontBoundsBufferIndex = m_bufferCache.track(newGeoData.vguiFontBoundsBuffer);
-    } else {
-      newGeoData.vguiFontBoundsBufferIndex = kSurfaceInvalidBufferIndex;
-    }
-    if (newGeoData.vguiImgBoundsBuffer.defined()) {
-      newGeoData.vguiImgBoundsBufferIndex = m_bufferCache.track(newGeoData.vguiImgBoundsBuffer);
-    } else {
-      newGeoData.vguiImgBoundsBufferIndex = kSurfaceInvalidBufferIndex;
-    }
-    if (newGeoData.vguiStylesBuffer.defined()) {
-      newGeoData.vguiStylesBufferIndex = m_bufferCache.track(newGeoData.vguiStylesBuffer);
-    } else {
-      newGeoData.vguiStylesBufferIndex = kSurfaceInvalidBufferIndex;
+  void SceneManager::retireGeometryBufferSlots(const RaytraceGeometry& geoData) {
+    for (const GeoBufferSlot& slot : kGeoBufferSlots) {
+      const RaytraceBuffer& buffer = geoData.*(slot.buffer);
+      if (buffer.defined()) {
+        m_bufferCache.retire(buffer);
+      }
     }
   }
 
@@ -3083,7 +3223,18 @@ namespace dxvk {
     return result;
   }
   
+  bool SceneManager::touchResidentRecord(uint64_t key, uint32_t frameId) {
+    return m_instanceManager.getResidentScene().touch(key, frameId);
+  }
+
   void SceneManager::onSceneObjectDestroyed(const BlasEntry& blas) {
+    // The geometry goes away with the entry, so every bindless slot it holds is
+    // orphaned here. Retire, do not free: a surface uploaded in an earlier frame
+    // can still carry one of these indices and the GPU can still be reading it.
+    // The reclaim sweep frees the slot once the surface upload stops reporting a
+    // reference to it.
+    retireGeometryBufferSlots(blas.modifiedGeometryData);
+
     for (RtInstance* instance : blas.getLinkedInstances()) {
       instance->markForGarbageCollection();
       instance->markAsUnlinkedFromBlasEntryForGarbageCollection();
@@ -4010,6 +4161,39 @@ namespace dxvk {
       drawCallState.getGeometryData().vertexCount,
       instance != nullptr ? meshtrace::Stage::InstanceMade : meshtrace::Stage::InstanceNull);
 
+    // NV-DXVK [ResidentScene] slice 6, CS half: PUBLISH WHAT THIS DRAW RESOLVED
+    // TO, so a later frame's gate hit has something to keep alive.
+    //
+    // HERE AND NOWHERE ELSE. sFanoutInstances is the complete produced list on
+    // all three routes above -- the sharded consume, the fanout split and the
+    // single-instance case all leave it final at this point -- and this is the
+    // first line after which that is true. Anything earlier would record a
+    // partial list, and a record with a hole in it stamps some of an object's
+    // instances and lets the rest retire, which is the failure with no FAIL to
+    // catch it.
+    //
+    // SCORE BEFORE BUILD. score() compares the record as it stands against what
+    // the full path just produced, so it has to run while the record still
+    // describes the PREVIOUS resolution. build() overwrites it.
+    if (RtxOptions::ResidentScene::enable() && drawCallState.residentKey != 0ull) {
+      ResidentScene& residentScene = m_instanceManager.getResidentScene();
+      if (RtxOptions::ResidentScene::verify() && drawCallState.residentPredictHit) {
+        residentScene.score(drawCallState.residentKey, sFanoutInstances);
+      }
+      // An empty list is not a record. A draw that produced no instance has
+      // nothing to keep alive, and filing it would make the gate serve an empty
+      // touch forever -- which reads as a hit and does nothing, the worst of
+      // both. build() rejects it below; this test only saves the call.
+      if (!sFanoutInstances.empty()) {
+        residentScene.build(drawCallState.residentKey,
+                            drawCallState.residentGenHash,
+                            drawCallState.residentSrcVertexBuffer,
+                            drawCallState.residentSrcIndexBuffer,
+                            m_device->getCurrentFrameId(),
+                            sFanoutInstances);
+      }
+    }
+
     // Check if a light should be created for this Material
     // NV-DXVK [fanout split]: once per DRAW, not once per instance. createEffectLight
     // derives the light position from the draw call's own geometry centroid and
@@ -4142,10 +4326,10 @@ namespace dxvk {
     // ---- ORDERED PRE-PASS (Step 1), arena order --------------------------
     const bool shardingAdmissible =
       !RtxOptions::enableInstanceDebuggingTools()
-      // Conservative overflow admission: the tape is rebuilt on the CS record
-      // step, so at flush time only last frame's final size predicts the cliff.
-      // Within 1/8th of the limit, route everything legacy — the legacy path
-      // keeps its exact per-draw overflow check.
+      // Conservative overflow admission: the buffer table's slot count is
+      // written on the CS record step, so at flush time only last frame's final
+      // size predicts the cliff. Within 1/8th of the limit, route everything
+      // legacy — the legacy path keeps its exact per-draw overflow check.
       && (m_bufferCacheLastFrameCount + (m_bufferCacheLastFrameCount >> 3)) < kBufferCacheLimit;
 
     for (ShardedDrawBatchItem& item : batch) {
@@ -5708,6 +5892,10 @@ namespace dxvk {
     cur.texInserts      = textureManager.getCacheInsertCount();
     cur.texFrees        = textureManager.getCacheFreeCount();
     cur.texClears       = textureManager.getCacheClearCount();
+    cur.bufInserts      = m_bufferCache.getInsertCount();
+    cur.bufRetires      = m_bufferCache.getRetireCount();
+    cur.bufFrees        = m_bufferCache.getFreeCount();
+    cur.bufRevives      = m_bufferCache.getReviveCount();
     cur.imgStamps       = g_newGameImageHashStamps.load(std::memory_order_relaxed);
     cur.mtQueued        = RtxTextureManager::getManagedQueuedCount();
     cur.mtDemoteReq     = RtxTextureManager::getManagedDemoteRequestCount();
@@ -5803,9 +5991,28 @@ namespace dxvk {
       // previous cycle's descriptor to any out-of-range index. Join those
       // frames against [ReapJoin] live= and [TlasRealloc] to see the scene
       // collapse that produced them.
+      //
+      // NV-DXVK [stable buffer identity]: bufReDummied should now be rare rather
+      // than hundreds a frame. The table no longer collapses and rebuilds every
+      // frame, so it only shrinks when the reclaim sweep actually hands slots
+      // back, which is what bufFreed counts.
       " | bufSlots=", bufTable.live,
       " bufPeak=", bufTable.peakLive,
       " bufReDummied=", bufTable.reDummied,
+      // NV-DXVK [stable buffer identity]: the identity side of the same table.
+      // bufLive is how many slots hold a buffer, bufRetired how many of those
+      // their owner has released and the sweep has not yet been able to free.
+      // The four deltas are per-window; in a settled scene bufNew is the one
+      // that must be flat, because a slot that keeps being reissued is exactly
+      // the instability this replaced.
+      " | bufLive=", m_bufferCache.getActiveCount(),
+      " bufTotal=", m_bufferCache.getTotalCount(),
+      " bufRetired=", m_bufferCache.getRetiredCount(),
+      " bufSpare=", m_bufferCache.getFreeSlotCount(),
+      " bufNew=", d(cur.bufInserts, p.bufInserts),
+      " bufRetire=", d(cur.bufRetires, p.bufRetires),
+      " bufFreed=", d(cur.bufFrees, p.bufFrees),
+      " bufRevived=", d(cur.bufRevives, p.bufRevives),
       " texTableSlots=", texTable.live,
       " texTablePeak=", texTable.peakLive,
       " texReDummied=", texTable.reDummied));

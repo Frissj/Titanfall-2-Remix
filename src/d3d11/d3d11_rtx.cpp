@@ -5841,6 +5841,13 @@ namespace dxvk {
   // = auto/distance); sub_18026B070 reads the value through the parent pointer at
   // +0x38, i.e. `*(int*)(*(void**)(obj+0x38) + 92)`, so we write it the same way
   // rather than assuming obj is its own parent. +88 is the float mirror.
+  // NV-DXVK [ResidentScene] slice 8: non-zero while the seed pass is holding
+  // engine culling off so residency can harvest the level. Written by
+  // D3D11Rtx::residentSeedUpdate and read by cullOffUpdate, both of which run on
+  // the frame thread from the same EndFrame block in that order -- which is the
+  // whole of the synchronisation, and why this is a plain integer.
+  static uint32_t g_residentSeedActive = 0u;
+
   static bool g_cullOffRLodForced = false;
   static int  g_cullOffSavedRLod  = -1;
   static void cullOffSetStudioLod(bool force) {
@@ -6516,7 +6523,21 @@ namespace dxvk {
     // 1 = restore only the area-layer sites. See g_cullOffAbMode for why this
     // is a patch toggle rather than a diff against rtx.cullOff.pvs.
     const uint32_t abMode = dxvk::tf2::g_cullOffAbMode.load(std::memory_order_relaxed);
-    const bool master = RtxOptions::CullOff::enable() && abMode != 2u;
+    // NV-DXVK [ResidentScene] slice 8: THE SEED PASS DRIVES THIS, and it is the
+    // only correct use of the cullOff patches once residency exists.
+    //
+    // Residency can only hold what has been drawn, so the resident set has to be
+    // populated from somewhere; defeating engine culling for a few frames at
+    // load submits the whole level once and residency harvests it. The 58 ms/
+    // frame that made cullOff unusable as a steady state is affordable for a
+    // handful of frames, and paying it once is what turns residency from
+    // view-history dependent into invariant. See residentSeedUpdate.
+    //
+    // The A/B override still wins: abMode 2 means the user is deliberately
+    // restoring engine culling to compare, and a seed that ignored that would
+    // silently invalidate the comparison.
+    const bool seeding = g_residentSeedActive != 0u;
+    const bool master = (RtxOptions::CullOff::enable() || seeding) && abMode != 2u;
     const bool areaGroupOn = (abMode == 0u);
 
     // Fast path: nothing wanted and nothing applied => do NOTHING. This runs
@@ -36902,27 +36923,36 @@ namespace dxvk {
     return (key == 0ull) ? 1ull : key;
   }
 
-  uint64_t D3D11Rtx::residentSrcGenFold() const {
-    // THE DIRTY TEST, AND IT IS A PROOF RATHER THAN A HEURISTIC.
+  uint64_t D3D11Rtx::residentGeomGenFold() const {
+    // THE GEOMETRY HALF OF THE DIRTY TEST, AND IT IS A PROOF RATHER THAN A
+    // HEURISTIC.
     //
     // D3D11Buffer::GetMapGeneration() is monotonic and moves on BOTH the
     // DiscardSlice() rename AND on Map(WRITE_NO_OVERWRITE) in-place writes --
     // the case where mapPtr and m_contentGen both miss, and the one that made
     // the dropship COLOR1.y read garbage. So:
     //
-    //   the transform cannot have changed  <=>  every fold input still matches
+    //   the vertex data cannot have changed  <=>  both fold inputs still match
     //
     // Nothing is read out of the buffers, nothing is derived, no contents are
-    // hashed. And for IMMUTABLE/STATIC buffers the generation is pinned at 0
-    // for the buffer's whole life, which is why world geometry is provably
-    // clean for free.
+    // hashed. And for IMMUTABLE/STATIC buffers the generation is pinned at 0 for
+    // the buffer's whole life, which is why world geometry is provably clean for
+    // free. Measured on the dominant shaders: vb=0 ib=0 over 975 judged draws --
+    // the geometry genuinely never moves.
     //
-    // A SUPERSET ON PURPOSE. We fold every BOUND VS constant buffer, not only
-    // the slots the derivation is known to read. A superset can report dirty
-    // when clean -- which costs a gate miss and a trip down the full path --
-    // and can NEVER report clean when dirty. That is the same safe direction
-    // every other key in this file takes: widening can refuse a serve, it can
-    // never redirect one onto a stranger's data.
+    // THE CONSTANT BUFFERS ARE DELIBERATELY NOT IN HERE, AND THAT IS THE
+    // CORRECTION THIS WHOLE DESIGN TURNS ON. An earlier version folded the
+    // generation of every bound VS constant buffer on the stated reasoning that
+    // a superset is the safe direction -- it can refuse a serve but never
+    // redirect one. Sound, and useless: TF2 writes per-draw constants into
+    // shared dynamic scratch buffers that are RENAMED EVERY FRAME whether or not
+    // any value changed, so cbGen read dirty on 975 of 975 draws. A gate on that
+    // fold hits ~0% of the time and the obvious-looking conclusion would have
+    // been "residency does not work for this game". It does; the sensor did not.
+    //
+    // What replaced it is residentGateJudge's comparison of the DERIVED
+    // objectToWorld -- see there for why hashing the constants' own bytes cannot
+    // work either.
     const auto& ia = m_context->m_state.ia;
 
     uint64_t fold = 0ull;
@@ -36936,20 +36966,70 @@ namespace dxvk {
       fold = XXH64(&g, sizeof(g), fold);
     }
 
-    if (RtxOptions::ResidentScene::foldCbGenerations()) {
-      const auto& cbs = m_context->m_state.vs.constantBuffers;
-      for (uint32_t i = 0; i < cbs.size(); ++i) {
-        if (cbs[i].buffer == nullptr) {
-          continue;
-        }
-        // The SLOT is folded alongside the generation so that a rebind moving
-        // the same buffer between slots reads as dirty. It changes which bytes
-        // the derivation sees even though no write happened.
-        const uint64_t g = cbs[i].buffer->GetMapGeneration();
-        const uint64_t slotted = g ^ (static_cast<uint64_t>(i) << 56);
-        fold = XXH64(&slotted, sizeof(slotted), fold);
+    return fold;
+  }
+
+  uint64_t D3D11Rtx::residentMaterialFold() const {
+    // THE MATERIAL HALF, AND IT IS NOT OPTIONAL.
+    //
+    // A resident record holds RtInstances, and an RtInstance carries a surface
+    // MATERIAL as well as geometry and a transform. Geometry generations and the
+    // derived transform between them say nothing about which texture is bound or
+    // what blend mode is set, so a draw that changes only its material would pass
+    // a gate built from those two and be skipped -- leaving the old material
+    // resident with nothing to catch it. That is trap 4's shape: alive, and not
+    // refreshed.
+    //
+    // WHAT IDENTIFIES A MATERIAL HERE is whatever FillMaterialData reads: the
+    // pixel shader, the resources it samples, the samplers it samples them with,
+    // and the blend / depth-stencil / rasterizer state objects (the same three
+    // the [markFm] BlendCache/DepthCache work decodes). All of them are engine
+    // objects created once and reused for the material's lifetime, so unlike the
+    // constant buffers above they do NOT churn per frame -- they are the same
+    // kind of input as the IA pointers the identity key is made of, and stable
+    // for the same reason.
+    //
+    // THE WHOLE SHADER-RESOURCE ARRAY, not the handful of slots TF2 is known to
+    // use. This is the superset argument in the place where it actually holds:
+    // widening can only make the gate refuse a serve it could have made, while
+    // narrowing to "the slots the material path looks at" would be a guess about
+    // another module's behaviour, and being wrong there means serving a stale
+    // material. The array is 128 contiguous pointers -- sixteen cache lines,
+    // read sequentially -- against the ~48 us of CS-side commit a hit removes.
+    uint64_t fold = 0ull;
+
+    const auto& ps = m_context->m_state.ps;
+
+    const uint64_t psPtr = reinterpret_cast<uint64_t>(ps.shader.ptr());
+    fold = XXH64(&psPtr, sizeof(psPtr), fold);
+
+    for (uint32_t i = 0; i < ps.shaderResources.views.size(); ++i) {
+      const uint64_t v = reinterpret_cast<uint64_t>(ps.shaderResources.views[i].ptr());
+      if (v == 0ull) {
+        continue;
       }
+      // The SLOT rides with the pointer so that moving the same view between
+      // slots reads as dirty: it changes which resource the shader samples for a
+      // given register even though nothing was created or destroyed.
+      const uint64_t slotted = v ^ (static_cast<uint64_t>(i) << 56);
+      fold = XXH64(&slotted, sizeof(slotted), fold);
     }
+
+    for (uint32_t i = 0; i < ps.samplers.size(); ++i) {
+      const uint64_t s = reinterpret_cast<uint64_t>(ps.samplers[i]);
+      if (s == 0ull) {
+        continue;
+      }
+      const uint64_t slotted = s ^ (static_cast<uint64_t>(i) << 48);
+      fold = XXH64(&slotted, sizeof(slotted), fold);
+    }
+
+    const uint64_t stateObjects[3] = {
+      reinterpret_cast<uint64_t>(m_context->m_state.om.cbState),
+      reinterpret_cast<uint64_t>(m_context->m_state.om.dsState),
+      reinterpret_cast<uint64_t>(m_context->m_state.rs.state),
+    };
+    fold = XXH64(stateObjects, sizeof(stateObjects), fold);
 
     return fold;
   }
@@ -37630,7 +37710,7 @@ namespace dxvk {
     pruneLadder(m_censusModels);
   }
 
-  void D3D11Rtx::residentGateEvaluate(bool indexed, UINT count, UINT start, INT base) {
+  void D3D11Rtx::residentGateBegin(bool indexed, UINT count, UINT start, INT base) {
     // ------------------------------------------------------------------
     // [SceneCensus] / [VsResidency] RUN UNCONDITIONALLY. See the block comment
     // on the census members in d3d11_rtx.h for why: this is the measurement
@@ -37644,6 +37724,21 @@ namespace dxvk {
     // the same idea applied at the only place the frame thread can see it.
     // ------------------------------------------------------------------
     censusRecordDraw(indexed, count, start, base);
+
+    // CLEAR THE STASH FIRST, on every draw, before any early return -- and
+    // account for what was in it. A key still sitting here belongs to the
+    // PREVIOUS draw and means that draw never reached the judge at the end of
+    // SubmitDrawTail, because the judge consumes it. That is the plan's open
+    // question answered from the gate itself rather than from a separate probe:
+    // four shaders report o2w{n=0} for ~965 draws a frame, and a gate that
+    // silently never fires for a fifth of the frame is indistinguishable from
+    // one that fires and hits unless the shortfall is counted.
+    if (m_rsDrawKey != 0ull) {
+      m_rsNoTail += 1;
+    }
+    m_rsDrawKey  = 0ull;
+    m_rsDrawGens = 0ull;
+    m_rsDrawMat  = 0ull;
 
     if (!RtxOptions::ResidentScene::enable()) {
       return;
@@ -37667,8 +37762,24 @@ namespace dxvk {
           " hit=", m_rsHit,
           " missKey=", m_rsMissKey,
           " missGen=", m_rsMissGen,
+          // The two tests the corrected design added, split out because they
+          // prescribe opposite responses -- see residentGateJudge.
+          " missO2w=", m_rsMissO2w,
+          " missMat=", m_rsMissMat,
           " newKeys=", m_rsNewKeys,
           " noKey=", m_rsNoKey,
+          // Draws that got a key and never reached the judge. This is the
+          // plan's own open question, measured: ~965 draws a frame across four
+          // shaders are filtered before objectToWorld is final, and a gate that
+          // never fires for that fifth of the frame reads identically to one
+          // that fires and hits. noTail high means residency does not cover
+          // those draws at all, whatever hitPct says about the rest.
+          " noTail=", m_rsNoTail,
+          // How many hits were ACTED ON is the RT side's to report, not this
+          // one's: the skip is taken there, on evidence this thread cannot see.
+          // Read [ResidentScene] touched= against hit= here -- a large gap means
+          // the gate is predicting hits for draws that have no record to serve.
+          " seedLeft=", m_rsSeedFramesLeft,
           " gateSize=", static_cast<uint32_t>(m_residentGate.size()),
           " hitPct=", (m_rsDraws > 0 ? (100u * m_rsHit) / m_rsDraws : 0u),
           // CUMULATIVE, and printed even at zero. A sweep policy with no
@@ -37689,6 +37800,7 @@ namespace dxvk {
           " | newKeys ~0 = key stable; newKeys high = DO NOT ARM"));
         m_rsDraws = m_rsHit = m_rsMissKey = m_rsMissGen = 0u;
         m_rsNewKeys = m_rsNoKey = 0u;
+        m_rsMissO2w = m_rsMissMat = m_rsNoTail = 0u;
       }
 
       // PRUNE, AND IT IS NOT OPTIONAL. Both maps are keyed on engine buffer
@@ -37768,21 +37880,102 @@ namespace dxvk {
 
     m_rsDraws += 1;
 
+    // MINT THE KEY AND TAKE THE TWO CHEAP FOLDS, THEN STOP. No verdict is
+    // reached here, because the third input does not exist yet: objectToWorld is
+    // produced by ExtractTransforms, well downstream of this point. The judge
+    // sits at the end of SubmitDrawTail where it IS final, and this half exists
+    // to read the D3D11 state while it is unambiguously this draw's.
     const uint64_t key = residentDrawKey(indexed, count, start, base);
     if (key == 0ull) {
       m_rsNoKey += 1;
       return;
     }
 
-    const uint64_t gens = residentSrcGenFold();
+    m_rsDrawKey  = key;
+    m_rsDrawGens = residentGeomGenFold();
+    m_rsDrawMat  = residentMaterialFold();
+
+    // The buffers this draw is made of, for the record's death signal. Read here
+    // rather than at the judge because this is where the IA state is
+    // unambiguously this draw's, and stored as plain addresses -- a reference
+    // would keep alive the very object whose destruction is the signal.
+    const auto& ia = m_context->m_state.ia;
+    m_rsDrawSrcVb = reinterpret_cast<uint64_t>(ia.vertexBuffers[0].buffer.ptr());
+    m_rsDrawSrcIb = reinterpret_cast<uint64_t>(ia.indexBuffer.buffer.ptr());
+  }
+
+  void D3D11Rtx::residentGateJudge(DrawCallState& drawCallState) {
+    // THE VERDICT, AND IT LIVES HERE BECAUSE OF WHAT THE THIRD TEST HAD TO
+    // BECOME.
+    //
+    // The gate needs to answer "is this draw asking for anything different from
+    // last frame". Geometry and material are answered upstream off engine
+    // objects that do not churn. The transform was supposed to be answered the
+    // same way, and could not be, twice over:
+    //
+    //   generations   TF2 writes per-draw constants into shared dynamic scratch
+    //                 that is renamed every frame regardless of value, so the
+    //                 generation reads dirty on 100% of draws. See
+    //                 residentGeomGenFold.
+    //   input bytes   hashing the draw's own constant window read clean on ~90%
+    //                 of draws STANDING STILL and collapsed to 0% the moment the
+    //                 camera drifted 0.3 world units, then recovered the instant
+    //                 it froze. TF2's object constants are CAMERA-RELATIVE, so
+    //                 hashing them is a camera key however the slots are masked
+    //                 -- the third time this tree has hit that exact wall.
+    //
+    // The DERIVED objectToWorld is camera-invariant by construction, which is
+    // the whole point: it reads clean=100% with the camera moving for an entire
+    // capture. It only exists after the derivation, so the gate lives downstream
+    // of the derivation rather than upstream of it, and does not save it. That
+    // is affordable because the derivation is already ~76% cache-served
+    // (xfServeN=80829 against xfDeriveN=25229) -- and it is not where the money
+    // is anyway: dxvk-cs is 99.6% of the frame, and what a hit removes is that
+    // draw's entire CS-side commit.
+    //
+    // EXACT BYTES, NO EPSILON, and this is deliberate rather than unexamined.
+    // rtx_types.h documents TF2 producing "slightly different matrices each
+    // frame for the same static prop", so a tolerance is the obvious-looking
+    // addition. It must not be the FIRST thing added: an epsilon blurs
+    // "jittering" and "moving", which are precisely the two answers this test
+    // exists to separate, and the measurement says none is needed -- an exact
+    // compare already reads 100% clean. If a tolerance is ever justified it will
+    // be by a capture showing otherwise, not by anticipation.
+    drawCallState.residentKey             = 0ull;
+    drawCallState.residentGenHash         = 0ull;
+    drawCallState.residentSrcVertexBuffer = 0ull;
+    drawCallState.residentSrcIndexBuffer  = 0ull;
+    drawCallState.residentPredictHit      = false;
+
+    const uint64_t key = m_rsDrawKey;
+    if (key == 0ull) {
+      return;   // no identity, or the entry half is disabled
+    }
+    // CONSUME IT. One verdict per draw, and a stale key must never be judged
+    // against the next draw's matrix. This is also what makes m_rsNoTail mean
+    // "never reached here" at the next draw's entry.
+    m_rsDrawKey = 0ull;
+
+    // The key and the fold travel with the draw either way: on a hit the commit
+    // collapses to a touch of this key, and on a miss the full path carries it
+    // so the CS side can (re)build the record it will serve next frame. A draw
+    // whose record is never built is a draw the gate can never hit.
+    drawCallState.residentKey             = key;
+    drawCallState.residentGenHash         = m_rsDrawGens;
+    drawCallState.residentSrcVertexBuffer = m_rsDrawSrcVb;
+    drawCallState.residentSrcIndexBuffer  = m_rsDrawSrcIb;
+
     const uint32_t frameId = m_context->m_device->getCurrentFrameId();
+    const uint64_t o2w = XXH64(&drawCallState.transformData.objectToWorld, sizeof(Matrix4), 0ull);
 
     const auto it = m_residentGate.find(key);
     if (it == m_residentGate.end()) {
       m_rsNewKeys += 1;
       m_rsMissKey += 1;
       ResidentGateEntry& e = m_residentGate[key];
-      e.srcGenHash = gens;
+      e.srcGenHash    = m_rsDrawGens;
+      e.matHash       = m_rsDrawMat;
+      e.o2wHash       = o2w;
       e.frameLastSeen = frameId;
       return;
     }
@@ -37795,30 +37988,101 @@ namespace dxvk {
     // failure -- alive but stale, with no FAIL to catch it. Requiring
     // contiguity makes that state unreachable through the gate.
     const bool contiguous = (e.frameLastSeen + 1u == frameId) || (e.frameLastSeen == frameId);
-    const bool gensMatch  = (e.srcGenHash == gens);
+    const bool gensMatch  = (e.srcGenHash == m_rsDrawGens);
+    const bool matMatch   = (e.matHash == m_rsDrawMat);
+    const bool o2wMatch   = (e.o2wHash == o2w);
 
+    // Counted apart because they prescribe different responses. missGen high
+    // with newKeys ~0 is the GOOD failure: identity is stable and the geometry
+    // genuinely moves, so those draws simply are not residency candidates.
+    // missO2w high on world geometry means the derivation is not reproducing
+    // itself and is a bug to find, not a class to exclude. missMat high means
+    // the game rebinds material state per draw and the fold needs narrowing to
+    // what FillMaterialData actually reads -- a measurement, not a guess.
     if (!contiguous) {
       m_rsMissKey += 1;
     } else if (!gensMatch) {
       m_rsMissGen += 1;
+    } else if (!o2wMatch) {
+      m_rsMissO2w += 1;
+    } else if (!matMatch) {
+      m_rsMissMat += 1;
     } else {
       m_rsHit += 1;
+      drawCallState.residentPredictHit = true;
     }
 
-    e.srcGenHash = gens;
+    e.srcGenHash    = m_rsDrawGens;
+    e.matHash       = m_rsDrawMat;
+    e.o2wHash       = o2w;
     e.frameLastSeen = frameId;
+  }
 
-    // VERIFY FIRST, SKIP SECOND. While rtx.residentScene.verify is on the
-    // verdict above is SCORED AND DISCARDED: the draw goes down the full path
-    // regardless, GC keeps its ordinary lifetime clause, and this feature can
-    // change nothing on screen. Nothing is skipped until [ResidentScene] reads
-    // a stable record count and touchMiss ~0 across a pitch-and-yaw sweep.
+  void D3D11Rtx::residentSeedUpdate() {
+    // SLICE 8 -- THE SEED PASS, AND WHY RESIDENCY IS NOT CORRECT WITHOUT IT.
     //
-    // The skip itself (emitting a TouchRecord{key} instead of a full
-    // DrawCallState, and bulk-stamping on the CS side) is the next slice; see
-    // RESIDENT_SCENE_PLAN.md section 4, slice 6. Deliberately NOT wired here
-    // while the key is unproven -- that ordering is what the
-    // [PropIdKeepLong attempt reverted] note exists to enforce.
+    // Residency can only hold objects that have been DRAWN at least once: a
+    // culled object issues no draw, so there are no vertices, no material and no
+    // transform to make resident. Left to fill on its own the resident set is
+    // therefore "the union of everything the player has happened to look at",
+    // which is not a scene but a warm-up bug -- geometry you have never faced
+    // casts no shadow and appears in no reflection until you turn towards it
+    // once. It also fails the plan's own acceptance test, which is INVARIANCE
+    // rather than an average: fix the camera, sweep pitch and yaw, and the
+    // resident count must stay flat instead of growing.
+    //
+    // So the fix is to defeat engine culling ONCE, at load, and harvest the
+    // whole level: ~58 ms/frame for a handful of frames instead of every frame
+    // for the session. That is the only correct use of the cullOff patches now
+    // that residency exists -- as a population pass, not a steady state.
+    //
+    // TWO GAPS IT DOES NOT CLOSE, both real and neither a reason to withhold it:
+    // geometry streamed in after the pass has still never been drawn, and an
+    // entity that moves while culled holds the pose it had when last seen. The
+    // first wants a re-seed trigger; the second is the one place an engine-side
+    // hook is genuinely load-bearing, and the plan defers it until it is visible
+    // on screen.
+    const uint32_t seedFrames = RtxOptions::ResidentScene::seedFrames();
+
+    // GAMEPLAY-GATED, and not as a nicety. The first scene epoch is the process
+    // starting, not a level arriving: menu and loading frames issue a handful of
+    // draws with no world behind them, so a seed spent there would harvest
+    // nothing and then not re-arm until the next clear. This is the same
+    // gameplay floor the census and the scene-clear probes use, applied at the
+    // only place the frame thread can see it.
+    //
+    // Tracking the epoch we SEEDED rather than the epoch we SAW is what makes
+    // both cases work from one test: at startup the two differ because nothing
+    // has been seeded yet, and afterwards they differ exactly when a clear has
+    // bumped the epoch.
+    const bool inGameplay =
+      tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
+    const uint32_t epoch = g_sceneEpoch.load(std::memory_order_relaxed);
+
+    if (inGameplay && epoch != m_rsSeenSceneEpoch
+        && seedFrames != 0u && RtxOptions::ResidentScene::enable()) {
+      m_rsSeenSceneEpoch = epoch;
+      m_rsSeedFramesLeft = seedFrames;
+      Logger::warn(str::format(
+        "[ResidentSeed] armed for ", seedFrames,
+        " frames on scene epoch ", epoch,
+        " -- engine culling forced off while the level is harvested"));
+    }
+
+    if (m_rsSeedFramesLeft != 0u) {
+      m_rsSeedFramesLeft -= 1;
+      if (m_rsSeedFramesLeft == 0u) {
+        Logger::warn("[ResidentSeed] complete -- engine culling released, "
+                     "coasting on the resident set");
+      }
+    }
+
+    // Published for cullOffUpdate, which runs immediately after this in the same
+    // EndFrame block. The seed flips ONLY the master switch: the individual
+    // patch groups keep whatever the conf says, so the seed frames reproduce
+    // exactly the configuration rtx.cullOff.enable=True was measured on rather
+    // than a wider one nobody has run.
+    g_residentSeedActive = m_rsSeedFramesLeft;
   }
 
   void D3D11Rtx::SubmitDraw(bool indexed,
@@ -37836,16 +38100,18 @@ namespace dxvk {
     // in dxvk::tf2, which is why nearby code qualifies that one and not these.)
     latchEngineCameraForDraws();
 
-    // NV-DXVK [ResidentScene]: the gate, and it runs HERE -- first thing, off
-    // live m_context->m_state, before captureDrawSnapshot and before any
-    // derivation. That position is the whole point: the cost this is meant to
-    // remove is everything downstream of it, so a gate that needed the snapshot
-    // would already have paid the 2.11 ms/frame it exists to avoid.
+    // NV-DXVK [ResidentScene]: the gate's ENTRY half, and it runs HERE -- first
+    // thing, off live m_context->m_state, before captureDrawSnapshot and before
+    // any derivation. It mints the identity key and takes the geometry and
+    // material folds while the D3D11 state is unambiguously this draw's, then
+    // stops: the third input, the derived objectToWorld, does not exist until
+    // ExtractTransforms has run, so residentGateJudge finishes the verdict at
+    // the end of SubmitDrawTail.
     //
     // No-op unless rtx.residentScene.enable, and SCORES ONLY while
     // rtx.residentScene.verify is on (the default), so with the feature off or
     // unverified this is one predictable branch and nothing on screen can move.
-    residentGateEvaluate(indexed, count, start, base);
+    residentGateBegin(indexed, count, start, base);
 
     // [Perf.SubmitDraw] per-stage timing â€” see comment near static thread_local accumulators
     // above for stage definitions. markStg bumps both the running accumulator AND the per-draw
@@ -48755,6 +49021,27 @@ namespace dxvk {
     // camera motion and the gate simply lives downstream of the derivation
     // instead of upstream of it.
     censusRecordO2w(dcs.transformData.objectToWorld);
+
+    // NV-DXVK [ResidentScene]: the gate's TAIL half. Same instant, same reason
+    // the census hook is here -- objectToWorld is final for EVERY path at this
+    // point (paths 9-12 assign it well after ExtractTransforms) and the draw is
+    // still ours.
+    //
+    // THE VERDICT IS RECORDED, NOT ACTED ON HERE, and not acted on by this
+    // thread at all. It is written into the draw state and travels with it to
+    // RtxContext::commitGeometryToRT, which decides the skip against evidence
+    // this side does not have: whether a resident record for the key actually
+    // exists. See the comment at that site. Two consequences fall out of that
+    // placement and both matter -- a draw that filters out downstream of here
+    // never reaches the decision, and a draw that commits for a side effect
+    // rather than for geometry has no record and so can never be skipped.
+    //
+    // The draw state is the carrier because it is the one object every route to
+    // the CS thread already moves. Keeping the verdict on this object instead
+    // would be per-OBJECT storage for a per-DRAW fact, which is the [XfDefer] B1
+    // defect exactly: a tail running behind the frame thread reads a later
+    // draw's value.
+    residentGateJudge(dcs);
 
     if (c.arena == SubmitDrawTailCtx::TailArena::Chain)
       xfChainSubmit(c);
@@ -63630,6 +63917,13 @@ namespace dxvk {
           // rtx.cullOff.enable=True parsed correctly (it appears in the startup
           // option dump), culling silently stayed on, and nothing in the log said
           // why. If this is ever re-gated, log the suppression — never no-op quietly.
+          // NV-DXVK [ResidentScene] slice 8: step the seed pass BEFORE
+          // cullOffUpdate reconciles the patches, so an armed seed takes effect
+          // on the frame it was armed rather than the frame after. Both run on
+          // the frame thread from this one place, which is the whole of the
+          // synchronisation between them.
+          residentSeedUpdate();
+
           cullOffUpdate();
 
           // NV-DXVK [WorldVis]: opt-in diagnostic hook that measures the engine's

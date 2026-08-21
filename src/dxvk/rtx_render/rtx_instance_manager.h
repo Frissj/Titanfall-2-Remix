@@ -183,6 +183,10 @@ public:
   // Returns true if a new camera type was registered
   bool registerCamera(CameraType::Enum cameraType, uint32_t frameIndex);
   bool isCameraRegistered(CameraType::Enum cameraType) const;
+  // The whole set at once, for ResidentScene::build to capture and
+  // ResidentScene::touch to replay -- setFrameLastUpdated() clears it on the
+  // first stamp of a frame, so a keep-alive that does not put it back loses it.
+  uint32_t getSeenCameraMask() const { return m_seenCameraTypes.raw(); }
   void setCustomIndexBit(uint32_t oneBitMask, bool value);
   bool getCustomIndexBit(uint32_t oneBitMask) const;
   bool isHidden() const { return m_isHidden; }
@@ -679,9 +683,9 @@ public:
 
   // NV-DXVK [Phase2b]: CS-record-step half of processInstanceBuffers. Rebinds the
   // instance's surface buffer indices from the (post-bake, post-updateBufferCache)
-  // BlasEntry — the per-frame m_bufferCache tape is CS-domain under Phase2b, so
-  // this write cannot happen on the flush side. Same body as the non-hoisted
-  // processInstanceBuffers path.
+  // BlasEntry — this frame's bake is what decides which slots the geometry holds,
+  // and it happens on the CS thread, so this write cannot happen on the flush
+  // side. Same body as the non-hoisted processInstanceBuffers path.
   void bindInstanceBuffersFromBlas(const BlasEntry& blas, RtInstance& instance) const;
 
   // NV-DXVK [Phase2b]: CS-record-step half of the updateInstance billboard stage

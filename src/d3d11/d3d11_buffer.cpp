@@ -4,6 +4,7 @@
 #include "d3d11_vanish_diag.h"
 
 #include "../dxvk/dxvk_data.h"
+#include "../dxvk/rtx_render/rtx_resident_scene.h"
 
 #ifndef RTX_D3D11_CACHED_DYNAMIC_INDEX_BUFFERS
 // NV-DXVK [perf/CachedDynamicIB] 2026-08-06: allocate DYNAMIC INDEX buffers in
@@ -239,6 +240,19 @@ namespace dxvk {
     // late in process shutdown, after the vanish_diag g_counts static array
     // has been destroyed, leading to UB. CreateBuf alone answers the
     // realloc-loop question.
+
+    // NV-DXVK [ResidentScene]: THE DEATH SIGNAL. The engine freeing an object's
+    // vertex or index buffer is that object ceasing to exist, and this is the
+    // one point at which DXVK observes it directly. A resident instance is
+    // exempt from lifetime expiry, so without this a destroyed object would stay
+    // in the ray-traced scene until its record happened to be evicted.
+    //
+    // SAFE IN A DESTRUCTOR, which the note above is a standing warning about:
+    // the callee holds its state in a deliberately leaked allocation for exactly
+    // that reason, and returns on a single relaxed atomic load when residency
+    // has never built a record — which is every run with the feature off, and
+    // matters because this runs for every buffer the engine frees.
+    dxvk::noteResidentSourceBufferDestroyed(reinterpret_cast<uint64_t>(this));
   }
   
   

@@ -88,8 +88,31 @@ public:
   uint64_t getBindingEpoch() const { return m_bindingEpoch; }
 
 protected:
-  BufferRefTable<RaytraceBuffer> m_bufferCache;
-  BufferRefTable<Rc<DxvkSampler>> m_materialSamplerCache;
+  // Bindless buffer identity is the SLICE and nothing else: the underlying
+  // buffer object plus the byte range, which is all a VkDescriptorBufferInfo
+  // carries. Stride and vertex format are held per surface (RtSurface::
+  // positionStride and its siblings), so two views of one range with different
+  // strides are correctly one bindless slot. This is the same rule
+  // BufferRefTable::DefaultMatcher applied, kept deliberately so that moving to
+  // stable slots does not also change what counts as one buffer.
+  struct RaytraceBufferHashFn {
+    size_t operator() (const RaytraceBuffer& buffer) const {
+      const uint64_t identity[3] = {
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(buffer.buffer().ptr())),
+        static_cast<uint64_t>(buffer.offset()),
+        static_cast<uint64_t>(buffer.length()),
+      };
+      return static_cast<size_t>(XXH3_64bits(identity, sizeof(identity)));
+    }
+  };
+
+  struct RaytraceBufferKeyEqual {
+    bool operator() (const RaytraceBuffer& lhs, const RaytraceBuffer& rhs) const {
+      return lhs.matches(rhs);
+    }
+  };
+
+  BufferSlotTable<RaytraceBuffer, RaytraceBufferHashFn, RaytraceBufferKeyEqual> m_bufferCache;
 
   struct SurfaceMaterialHashFn {
     size_t operator() (const RtSurfaceMaterial& mat) const {
@@ -274,6 +297,28 @@ public:
 
   const std::vector<Rc<DxvkSampler>>& getSamplerTable() const { return m_samplerCache.getObjectTable(); }
   const std::vector<RaytraceBuffer>& getBufferTable() const { return m_bufferCache.getObjectTable(); }
+
+  // NV-DXVK [ResidentScene] slice 6: keep alive without reprocessing.
+  //
+  // The key names one draw the frame-thread gate proved unchanged. Returns true
+  // when a valid, non-empty record was found and its instances were stamped --
+  // and ONLY then may the caller skip the draw. False means there is nothing to
+  // keep alive, the caller must commit in full, and the miss is reported through
+  // [ResidentScene] touchMiss rather than swallowed.
+  bool touchResidentRecord(uint64_t key, uint32_t frameId);
+
+  // One live surface about to be uploaded carries this bindless buffer slot.
+  //
+  // Called from AccelManager::uploadSurfaceData, which rewrites every live
+  // surface every frame and so sees the complete set of referenced slots. This
+  // is the evidence the reclaim sweep in garbageCollection() waits on before
+  // recycling a retired slot: it observes a reference instead of inferring one
+  // from an instance's age, which is what makes recycling safe for an instance
+  // that is kept alive without being redrawn.
+  void markBufferSlotReferenced(uint32_t bufferIndex, uint32_t frameId) {
+    m_bufferCache.markReferenced(bufferIndex, frameId);
+  }
+
   const std::vector<RtInstance*>& getInstanceTable() const { return m_instanceManager.getInstanceTable(); }
   
   const InstanceManager& getInstanceManager() const { return m_instanceManager; }
@@ -478,8 +523,15 @@ private:
                                                  const DrawCallState& drawCallState,
                                                  uint32_t* out_indexInCache = nullptr);
 
-  // Updates ref counts for new buffers
-  void updateBufferCache(RaytraceGeometry& newGeoData);
+  // Binds newGeoData's buffers to bindless slots and retires the slots that
+  // oldGeoData held and newGeoData no longer does. oldGeoData is the cached
+  // geometry as it stood before this bake, so the two together say exactly which
+  // buffers the geometry let go of.
+  void updateBufferCache(const RaytraceGeometry& oldGeoData, RaytraceGeometry& newGeoData);
+
+  // Retires every bindless slot this geometry holds. Used when the geometry
+  // itself is going away with its BlasEntry.
+  void retireGeometryBufferSlots(const RaytraceGeometry& geoData);
 
   // NV-DXVK: auto-dump every unique texture we see (albedo + normal + rough
   // + metallic + emissive + AO + lightmaps + detail + cloudMask) to
@@ -657,6 +709,15 @@ private:
     uint64_t texInserts = 0;   // new bindless texture slots
     uint64_t texFrees = 0;
     uint64_t texClears = 0;
+    // NV-DXVK [stable buffer identity]: the same four events on the BUFFER
+    // table. In a settled scene all four are flat, which is the statement that
+    // buffer identity is stable. bufNew climbing frame after frame in a still
+    // scene means the same real buffer is being handed a new slot repeatedly,
+    // and it is the number that would have exposed the tape immediately.
+    uint64_t bufInserts = 0;   // new bindless buffer slots
+    uint64_t bufRetires = 0;   // slots whose owner let go of the buffer
+    uint64_t bufFrees = 0;     // retired slots the reclaim sweep handed back
+    uint64_t bufRevives = 0;   // retired slots claimed again before being freed
     uint64_t imgStamps = 0;    // new game DxvkImages entering the material path
     uint64_t mtQueued = 0;
     uint64_t mtDemoteReq = 0;
@@ -672,10 +733,10 @@ private:
   // material from scratch because m_preCreationSurfaceMaterialMap (cleared every
   // frame) had no entry. The ratio is the per-frame dedup rate; the INSERT count
   // into m_surfaceMaterialCache is the part that should be zero in a steady scene.
-  // NV-DXVK [Phase2b]: last frame's final m_bufferCache tape size, captured in
-  // onFrameEnd before the clear. The pre-pass admission gate reads it — the
-  // live count is useless there (the tape is rebuilt on the CS record step,
-  // after the flush).
+  // NV-DXVK [Phase2b]: last frame's final m_bufferCache slot count, captured in
+  // onFrameEnd. The pre-pass admission gate on the game thread reads it to
+  // predict the overflow cliff, and it reads this snapshot rather than the live
+  // count because the count is written on the CS thread, after the flush.
   uint32_t m_bufferCacheLastFrameCount = 0;
 
   // NV-DXVK [Phase2b]: atomics — createSurfaceMaterial's memo-hit path now runs

@@ -2536,13 +2536,6 @@ namespace dxvk {
                  "A ceiling actually being hit in steady state means the KEY is churning, not that\n"
                  "the scene is large -- raise nothing and go read [ResidentScene] newKeys.");
 
-      RTX_OPTION("rtx.residentScene", bool, foldCbGenerations, true,
-                 "Fold the map generation of every BOUND VS constant buffer into the dirty hash, not\n"
-                 "only the slots the derivation is known to read. A SUPERSET is the safe direction: it\n"
-                 "can report dirty when clean (costing a gate miss) and can never report clean when\n"
-                 "dirty. Off narrows the fold to the vertex and index buffers alone, which is faster\n"
-                 "and UNSOUND for anything whose transform comes from a cbuffer -- bisection only.");
-
       RTX_OPTION("rtx.residentScene", uint32_t, seedFrames, 0,
                  "Frames to hold rtx.cullOff.enable ON at level load so the engine submits the whole\n"
                  "level and residency can harvest it, before releasing it and coasting on the\n"
