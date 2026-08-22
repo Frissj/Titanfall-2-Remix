@@ -1,4 +1,4 @@
-﻿#include "d3d11_rtx.h"
+#include "d3d11_rtx.h"
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -2673,6 +2673,1174 @@ namespace dxvk {
   // ============================================================
   std::atomic<uint32_t> g_remixFrameId { 0 };   // published from EndFrame
 
+  // ============================================================
+  // NV-DXVK [Join] -- SLICE A OF THE ENUMERATION-DRIVEN RESIDENT SCENE.
+  //
+  // WHAT THIS IS FOR. Residency today can only hold an object that was DRAWN,
+  // because a draw is its only evidence the object exists -- and the entire
+  // defect is that an engine-culled object produces no draw. The proposed fix is
+  // to take the object list from the engine UPSTREAM of culling and use that as
+  // the liveness signal instead. Every slice of that plan rests on one
+  // unverified assumption:
+  //
+  //     a D3D11 draw can be attributed to an entry in the render list.
+  //
+  // If it cannot, nothing downstream works, and this probe exists so that we
+  // find out in one capture rather than four slices later. IT MEASURES AND
+  // CHANGES NOTHING -- no patching, no skipping, no keep-alive.
+  //
+  // THE MECHANISM. client.dll dispatches renderables through the per-renderable
+  // draw gate sub_180371590 (CULLING_BIBLE 3A.1) and calls DrawModel only when
+  // that gate returns nonzero, so between gate call N and gate call N+1 every
+  // draw belongs to renderable N. gateWrapper is already hooked at all three
+  // of that gate's call sites for [GateAll], so the latch costs one store there.
+  //
+  // THE LATCH IS THREAD-LOCAL ON PURPOSE, AND THAT IS THE PRIMARY MEASUREMENT.
+  // The dispatch and the D3D11 draw are only known to be ordered if they run on
+  // the same thread. materialsystem_dx11 has a QUEUED render context (3A.2) and
+  // the ship's own draw path was found to be deferred -- which is why [MatBind]
+  // had to hook the matsys Bind at REPLAY time to name it rather than at record
+  // time. So if DrawModel merely records into that queue and the real draw is
+  // replayed later on another thread, the latch reads null at every draw and
+  // latched= reads 0. That is not a fault in the probe, it is the answer: the
+  // gate is the wrong attribution site, and slice A fails HERE, cheaply.
+  //
+  // COST. Two thread-local stores per renderable and one increment per draw,
+  // all of it behind rtx.residentScene.logStats.
+  // ============================================================
+
+  // matsys sub_1800872D0, resolved at install. The ring's WRAP SENTINEL: when
+  // an allocation will not fit before the end of the buffer, sub_1800877E0
+  // writes this helper at the current head, resets the head to 0, and the
+  // dispatcher runs it like any other record. It never passes through the
+  // hooked allocator, so the join can only ever miss on it. Declared here
+  // rather than beside the hook because noteReplay is what has to recognise it.
+  static std::atomic<const void*> g_qWrapSentinel { nullptr };
+
+  namespace joinprobe {
+    // Set by gateWrapper before the original gate runs; read by SubmitDraw.
+    thread_local void*    t_rend        = nullptr;
+    thread_local uint32_t t_rendSeq     = 0u;      // which renderable this frame
+    thread_local uint32_t t_drawsSince  = 0u;      // draws since the latch was set
+
+    // THE SECOND LATCH, AND IT IS THE POINT OF THE WHOLE RECORD/REPLAY JOIN.
+    //
+    // t_rend above lives on the thread that dispatches renderables. The first
+    // capture proved that is NOT the thread that issues the D3D11 draw
+    // (gate=37464, draw=47940, latched=0 on every frame), because matsys records
+    // the draw into a queued render context and replays it elsewhere.
+    //
+    // IDA settled what the queue carries: a record holds mesh, buffers, ranges
+    // and a tint blob, and NOTHING that names the object -- matsys is a
+    // primitive layer and does not know entities exist. So the renderable
+    // cannot be recovered at replay by reading the engine's data.
+    //
+    // What CAN be recovered is the record's own ADDRESS. The recording thread
+    // knows where the record lands, the draining thread computes that same
+    // address to find the record it is about to run, and on the recording
+    // thread t_rend is still valid. So the address is the join key, carried in
+    // a side table -- no engine memory is written and no ordering is assumed.
+    // queuedDrawInstallHook has the derivation of the address on both sides.
+    //
+    // ORDERING IS THE REASON THIS IS NOT AN ORDINAL. sub_180087960 selects its
+    // queue from thread-local storage (TEB TLS slot -> index at +4136 -> the
+    // descriptor array at qword_181BBA040), so there is one queue PER RECORDING
+    // THREAD. "the Nth record is the Nth replay" would hold with one worker and
+    // break with two, which is the worst way for a probe to be wrong.
+    thread_local void*    t_rendReplay  = nullptr;
+
+    // The render handle of whatever is latched, carried across the thread hop
+    // with the renderable so the draw thread can name an object without
+    // dereferencing one. 0xFFFF means "not a studio renderable", which is the
+    // same sentinel [GateAll] uses.
+    thread_local uint32_t t_rendHandle       = 0xFFFFu;   // dispatch thread
+    thread_local uint32_t t_rendReplayHandle = 0xFFFFu;   // draw thread
+    // Records allocated inside the current DrawModel span, on the dispatch
+    // thread. Only ever compared against zero.
+    thread_local uint32_t t_spanRecs         = 0u;
+
+    // The span stack. Depth 16 is far past what the two known levels need; it
+    // exists so an unexpected third level degrades into an unattributed span
+    // rather than into a buffer overrun.
+    static constexpr uint32_t kSpanMax = 16u;
+    thread_local void*    t_spanStack[kSpanMax]    = {};
+    thread_local uint32_t t_spanHandles[kSpanMax]  = {};
+    thread_local uint32_t t_spanRecStack[kSpanMax] = {};
+    thread_local uint32_t t_spanTop                = 0u;
+
+    // The producer of the record currently being dispatched, on the draw
+    // thread. Set by noteReplay, read by noteDraw.
+    thread_local void*    t_producer = nullptr;
+
+    // The handle for the draw about to be counted, whichever side latched it.
+    inline uint32_t currentHandle() {
+      return t_rend != nullptr ? t_rendHandle : t_rendReplayHandle;
+    }
+
+    // The effective renderable for a draw: the direct latch when the draw is
+    // issued on the dispatching thread, otherwise the one the replay resolved.
+    inline void* currentRenderable() {
+      return t_rend != nullptr ? t_rend : t_rendReplay;
+    }
+
+    // RAW SAMPLES, AND THEY COME FIRST. An aggregate cannot separate "the latch
+    // is stale" from "the latch is correct" -- both read as a high latched
+    // count. The raw line shows the actual interleaving of gate calls and draws
+    // for the head of one frame, which is the only form in which a threading or
+    // ordering fault is visible at all.
+    static constexpr uint32_t kRawMax = 40u;
+
+    // Behind a first-use accessor rather than as plain namespace-scope objects,
+    // for the reason the logger's own denylist gives: an engine detour or a
+    // static initialiser in another translation unit can reach this before this
+    // one's dynamic initialisation has run, and a half-constructed set or mutex
+    // there is a startup crash rather than a missing log line.
+    struct State {
+      std::mutex mu;
+      // THE LISTED SET, ACCUMULATED AS A UNION OVER THE WHOLE FRAME rather than
+      // replaced per call. sub_1801A8350 runs once per view, and TF2 renders
+      // sub-views (the 3D-skybox fan, shadow views) as well as the main one, so
+      // the last call's list is one view's population and not the scene's.
+      // Replacing would under-report by exactly the sub-view content the s2s
+      // work already showed is easy to lose.
+      std::unordered_set<void*> listed;
+      // Renderables that passed the gate and then actually produced >= 1 draw.
+      std::unordered_set<void*> drawn;
+      // Renderables that produced a draw while NOT in this frame's listed union.
+      // MUST BE 0. Non-zero means the list is not an upper bound on what draws,
+      // so it cannot serve as the population and the enumeration has to move
+      // upstream of sub_1801A8350.
+      uint32_t drawnNotListed  = 0u;
+      uint32_t listCalls       = 0u;   // views enumerated this frame
+      uint32_t gateCalls       = 0u;   // renderables dispatched this frame
+      uint32_t gatePass        = 0u;   // ...of which the gate let through
+      uint32_t draws           = 0u;   // SubmitDraw calls this frame
+      uint32_t drawsLatched    = 0u;   // ...that had a renderable latched
+      uint32_t drawTid         = 0u;   // the thread SubmitDraw runs on
+      uint32_t gateTid         = 0u;   // the thread the gate runs on
+      uint32_t rawN            = 0u;
+      char     raw[kRawMax][80] = {};
+
+      // THE RECORD/REPLAY JOIN COUNTERS. The table they describe is NOT a
+      // member here -- see shards() below for why it cannot take this lock.
+      // ATOMIC because the record side now runs on every engine worker thread
+      // that queues a matsys command, and these must be counted without any of
+      // them serialising against each other or against the draw thread.
+      std::atomic<uint32_t> recCalls    { 0u };  // queue records written this frame
+      std::atomic<uint32_t> recWithRend { 0u };  // ...that had a renderable latched
+      std::atomic<uint32_t> recTid      { 0u };  // the LAST thread to record, of many
+      std::atomic<uint32_t> replayCalls { 0u };  // records dispatched this frame
+      std::atomic<uint32_t> replayHit   { 0u };  // ...that found their record
+      std::atomic<uint32_t> replayMiss  { 0u };  // ...that did not
+      std::atomic<uint32_t> replayTid   { 0u };  // the thread that dispatches
+      // MUST BOTH BE ZERO. A hit consumes its entry, so a record address that
+      // is written over while still occupied (recReuse), or swept out having
+      // never been dispatched (recUnconsumed), is the join being handed a key
+      // that does not survive to its own use.
+      std::atomic<uint32_t> recReuse      { 0u };
+      std::atomic<uint32_t> recUnconsumed { 0u };
+      // The WRAP SENTINEL, dispatched but never allocated through
+      // sub_180087960: sub_1800877E0 writes it directly when the ring runs out
+      // of room at the end of the buffer. It is a structural miss on every
+      // wrap, so it is counted apart from miss= rather than inflating it.
+      std::atomic<uint32_t> replaySentinel { 0u };
+      // The largest gap, in frames, between a record being allocated and being
+      // dispatched. This is the produce-to-consume latency measured instead of
+      // assumed, and it is what says whether the sweep window below is long
+      // enough. If it ever approaches that window, widen the window.
+      std::atomic<uint32_t> maxAge { 0u };
+      // DrawModel spans this frame, and how many of them queued anything. The
+      // pair is what turns "gate passes 90, only 2 draw" from a puzzle into a
+      // fact: spans near 90 means DrawModel runs and mostly does nothing, spans
+      // near 2 means the gate count belongs to the pre-pass that never draws.
+      std::atomic<uint32_t> spans        { 0u };
+      std::atomic<uint32_t> spansWithRec { 0u };
+
+      // DRAWS RANKED BY WHO QUEUED THEM. This is the population map §7.2 has
+      // been estimating: every dispatched record carries the return address of
+      // its sub_180087960 call, so a draw can be billed to the code that
+      // produced it whether or not any object identity exists for it yet.
+      //
+      // Held under s.mu with the rest of the per-draw counters -- noteDraw
+      // already takes that lock, so ranking costs a linear scan of a table this
+      // small and no new contention. Resolved to module+RVA only at log time,
+      // for the reason [JoinStack] gives: GetModuleFileNameA per draw would
+      // cost more than the thing being measured.
+      static constexpr uint32_t kProducers = 48u;
+      struct Producer {
+        void*    site  = nullptr;
+        uint32_t draws = 0u;
+        // ...of which the record was queued while a DrawModel span was open.
+        // PER PRODUCER, because the aggregate cannot say WHICH producer the
+        // span is missing. latched=19 against a studiorender+client share of
+        // ~22% says the spans miss most of the movers; this says which site to
+        // bracket to stop missing them.
+        uint32_t inSpan = 0u;
+      };
+      Producer producers[kProducers] = {};
+      uint32_t nProducers            = 0u;
+      // Draws whose producer did not fit the table. Non-zero means the ranking
+      // is truncated and must not be read as complete.
+      uint32_t producerOverflow      = 0u;
+      // Draws that arrived with no producer at all: a miss, the wrap sentinel,
+      // or a record queued before the hook installed.
+      uint32_t producerUnknown       = 0u;
+    };
+
+    inline State& state() {
+      static State s;
+      return s;
+    }
+
+    inline bool enabled() {
+      return RtxOptions::ResidentScene::logStats();
+    }
+
+    // THE JOIN TABLE. Key is the address of the queue record; value is the
+    // renderable that was latched on the recording thread when that record was
+    // allocated, plus the frame it was allocated on.
+    //
+    // THE FRAME STAMP IS A LEAK CATCHER, AND NOT MUCH ELSE. An earlier version
+    // of this comment said the queue buffer was DOUBLE-BUFFERED and sized the
+    // eviction window at two frames on that basis. sub_1800877E0 says
+    // otherwise: the queue is a SINGLE power-of-two ring -- (size-1) is used as
+    // the mask in its own free-space arithmetic -- which on overflow writes a
+    // wrap sentinel and resets the write head to 0, and which BLOCKS the
+    // producer (_mm_pause / JT_HelpWithJobTypes) rather than overwrite a record
+    // the consumer has not reached.
+    //
+    // That last property is what makes the address safe as a key: a record
+    // cannot be recycled before it is drained, so an entry can be consumed on
+    // use and nothing has to be aged against a guess about buffering depth.
+    // What remains for the stamp is records that are never drained at all -- a
+    // queue reset, or anything written before the hooks went in. maxAge below
+    // measures the real produce-to-consume latency so this window stays a
+    // number someone checked rather than a number someone assumed.
+    struct RecordEntry {
+      void*    rend   = nullptr;
+      uint32_t frame  = 0u;
+      uint32_t handle = 0xFFFFu;
+      // WHO QUEUED THIS RECORD -- the return address of the sub_180087960
+      // call, which the entry detour makes available for free.
+      //
+      // THIS IS THE COVERAGE LEVER, and the renderable is not. Hooking draw
+      // paths one at a time bought 2% then 3.5%; the join meanwhile finds 98%
+      // of dispatched records, and every one of them was queued by somebody who
+      // knew what it was. A producer address is not object identity, but it
+      // partitions ~100% of the frame by what produced it, which is what says
+      // where an identity is worth building and how much of the frame each one
+      // would be worth.
+      void*    producer = nullptr;
+    };
+
+    // SHARDED, AND THAT IS NOT PREMATURE. The record side used to be one call
+    // site carrying 1-2 records per frame, where a single mutex cost nothing.
+    // It is now the ENTRY of the matsys queue allocator, which every engine
+    // worker calls for every queued command -- thousands per frame across
+    // several threads. One lock there would serialise the engine's own worker
+    // pool against itself, and a probe that changes the thread interleaving it
+    // is measuring reports on a game that only exists while it is watching.
+    static constexpr uint32_t kShards   = 64u;
+    static constexpr size_t   kShardMax = 4096u;   // entries per shard
+
+    struct Shard {
+      std::mutex mu;
+      std::unordered_map<uint64_t, RecordEntry> map;
+    };
+
+    // Behind a first-use accessor for the same reason State is: an engine
+    // detour can reach this before this translation unit's dynamic
+    // initialisation has run.
+    inline Shard* shards() {
+      static Shard s[kShards];
+      return s;
+    }
+
+    // Records are 8-byte aligned queue offsets, so the low three bits are
+    // always zero -- hashing on them would leave 56 of the 64 shards empty.
+    inline Shard& shard(uint64_t key) {
+      return shards()[(key >> 3) & (kShards - 1u)];
+    }
+
+    // ============================================================
+    // THE PRODUCER CHAIN CENSUS. [Join.who] names 17 call sites and says how
+    // much of the frame each one is worth; it says nothing about what they ARE.
+    // This walks the stack ONCE per distinct producer and stops, so each site
+    // arrives with the chain that reached it -- which is what turns
+    // "engine.dll+0x1b42e2 is 37% of the frame" into a subsystem with a name,
+    // and therefore into a decision about whether it can move.
+    //
+    // THE WALK IS VALID HERE, AND THAT IS NOT OBVIOUS given how much of this
+    // file cannot walk a stack. qAllocWrapper is reached by a JMP from the
+    // allocator's own entry, so our island never appears as a frame and every
+    // frame above it is engine code with real .pdata. The trampoline-blocked
+    // chains documented elsewhere in this file are blocked because a CALL into
+    // an island put an unwindable frame in the middle; this one has none.
+    //
+    // ONE WALK PER PRODUCER, NOT PER RECORD. The membership scan happens first,
+    // so ~630 records a frame cost a locked scan of a table of at most 48, and
+    // only a genuinely new producer pays for RtlCaptureStackBackTrace. Total
+    // cost for the whole census is on the order of seventeen walks.
+    // ============================================================
+    static constexpr uint32_t kChainDepth  = 20u;
+    static constexpr uint32_t kChainFrames = 4u;
+    // 512, NOT 48, AND THE FIRST ATTEMPT AT 48 IS THE REASON. The record side
+    // cannot tell which producers will carry draws -- that is only known on the
+    // draw thread -- so it must capture every producer and let the report
+    // filter. Sized at 48 it filled in four frames with state and setup
+    // commands and missed almost every site [Join.who] ranks, including the one
+    // worth 36% of the frame. The table is the cheap half of this probe: 512
+    // entries is ~87 KB and the walks are still one per distinct producer.
+    static constexpr uint32_t kChainMax    = 512u;
+
+    struct ChainState {
+      std::mutex mu;
+      struct Entry {
+        void*  site = nullptr;
+        USHORT n    = 0;
+        void*  f[kChainDepth] = {};
+      };
+      Entry    e[kChainMax];
+      uint32_t n = 0u;
+      std::atomic<uint32_t> framesLeft { 0u };
+      std::atomic<bool>     armed      { false };
+      bool                  done       = false;
+    };
+
+    inline ChainState& chains() {
+      static ChainState c;
+      return c;
+    }
+
+    // Called from noteRecord, on whichever thread queued the record.
+    inline void noteProducerChain(void* producer) {
+      ChainState& c = chains();
+      // Unlocked fast-out, as with the draw census: one atomic load per record
+      // once the census is over, which is for the life of the process.
+      if (c.framesLeft.load(std::memory_order_relaxed) == 0u || producer == nullptr)
+        return;
+
+      std::lock_guard<std::mutex> g(c.mu);
+      for (uint32_t i = 0; i < c.n; ++i)
+        if (c.e[i].site == producer)
+          return;
+      if (c.n >= kChainMax)
+        return;
+      void* frames[kChainDepth];
+      const USHORT n = RtlCaptureStackBackTrace(0, static_cast<DWORD>(kChainDepth), frames, nullptr);
+      if (n == 0)
+        return;
+      ChainState::Entry& e = c.e[c.n++];
+      e.site = producer;
+      e.n    = (n < kChainDepth) ? n : static_cast<USHORT>(kChainDepth);
+      std::memcpy(e.f, frames, sizeof(void*) * static_cast<size_t>(e.n));
+    }
+
+    // Called from gateWrapper. Closes out the previous renderable -- crediting
+    // it with a draw if it produced one -- and opens the next.
+    inline void latch(void* rend, char verdict) {
+      if (!enabled())
+        return;
+      const uint32_t tid = static_cast<uint32_t>(GetCurrentThreadId());
+      void* const    prev      = t_rend;
+      const uint32_t prevDraws = t_drawsSince;
+      State& s = state();
+
+      std::lock_guard<std::mutex> g(s.mu);
+      s.gateCalls += 1u;
+      s.gateTid = tid;
+      if (verdict != 0)
+        s.gatePass += 1u;
+      // NOT CREDITED HERE ANY MORE. Crediting a renderable with having drawn
+      // used to happen on this thread, on the assumption that the draws
+      // followed the gate inline. They do not -- they are replayed on another
+      // thread -- so t_drawsSince is always 0 here and the credit never fired.
+      // It moved to noteDraw, which is the only place that knows a draw
+      // actually happened, and which works whichever thread issues it.
+      (void) prev; (void) prevDraws;
+      if (s.rawN < kRawMax) {
+        std::snprintf(s.raw[s.rawN], sizeof(s.raw[0]),
+                      "gate#%u tid=%u v=%d prevDraws=%u",
+                      s.gateCalls, tid, int(verdict), prevDraws);
+        s.rawN += 1u;
+      }
+      // THE GATE NO LONGER LATCHES, AND THE FIRST CAPTURE IS WHY. Latching here
+      // set t_rend and nothing ever cleared it, so every queue allocation the
+      // thread made after the last gate call of the frame -- and on into the
+      // next frame -- inherited the last renderable. The measurement said so
+      // plainly and looked like success while doing it: withRend was EXACTLY
+      // equal to rec on all 44 captured frames, 100.0% every time, while the
+      // set of renderables those records were attributed to was FOUR pointers
+      // across the whole run against 36..210 gate calls per frame, one of them
+      // covering 1573 of 1800 sampled draws.
+      //
+      // The binary says the same thing from the other side. Of the gate's three
+      // call sites, client.dll+0x36E83E is a visibility PRE-PASS: it gates a
+      // batch back to back, counts the survivors into esi and stores them in a
+      // stack array, and draws none of them. A hundred gate calls with no queue
+      // traffic between them leave exactly one survivor latched, which is the
+      // handful of pointers the capture found.
+      //
+      // The span is now taken where the renderable actually draws -- around the
+      // IClientRenderable vtable +0x48 call at client.dll+0x36E36A and
+      // +0x36E9F9 -- by drawEnter/drawLeave. Records allocated outside those
+      // calls now correctly carry NO renderable, which is what turns
+      // withRend/n from a stuck 100% into the ratio §7 is asking for.
+      (void) rend;
+      t_rendSeq    = s.gateCalls;
+      t_drawsSince = 0u;
+    }
+
+    // Called from the draw-span islands, around IClientRenderable::DrawModel,
+    // on the thread that dispatches renderables -- which the first capture
+    // proved is also the thread that records into the matsys queue
+    // (lastTid == gateTid == 41584).
+    //
+    // THE HANDLE IS READ HERE AND NOWHERE ELSE, on purpose. It is the same
+    // render-handle expression [GateAll] uses, and this is a thread that
+    // already reads engine object memory under that guard. Carrying the handle
+    // through the join means the draw thread never has to touch a renderable to
+    // name one, which keeps the crash surface where it already was.
+    // NESTED, BECAUSE THE SPANS NEST. The two client DrawModel sites are one
+    // level; the model-render draw (client.dll sub_18026B070, already wrapped
+    // by lodWrapper) is another, and for a studio model the second runs inside
+    // the first. A flat latch would have the inner drawLeave clear the outer
+    // span, and every record the outer one queued afterwards would silently
+    // lose its renderable -- the same class of error as the gate latch that
+    // nothing cleared, just inverted. The innermost open span wins, which is
+    // also the more precise attribution.
+    inline void drawEnter(void* rend) {
+      if (t_spanTop < kSpanMax) {
+        t_spanStack[t_spanTop]     = t_rend;
+        t_spanHandles[t_spanTop]   = t_rendHandle;
+        t_spanRecStack[t_spanTop]  = t_spanRecs;
+      }
+      t_spanTop   += 1u;
+      t_rend       = rend;
+      t_rendHandle = 0xFFFFu;
+      t_spanRecs   = 0u;
+      if (!enabled() || rend == nullptr)
+        return;
+      const uint8_t* const r = reinterpret_cast<const uint8_t*>(rend);
+      if (studioMemReadable(r, 8) && studioMemReadable(r + 1733, 4) && r[1733] != 0)
+        t_rendHandle = *reinterpret_cast<const uint16_t*>(r + 1734);
+    }
+
+    inline void drawLeave() {
+      // COUNTED AT LEAVE, not at enter, because the question is not how often
+      // DrawModel runs -- it is how often DrawModel runs and produces nothing.
+      // spans vs spansWithRec separates "the gate count is dominated by the
+      // pre-pass that never draws" from "DrawModel runs ~90 times a frame and
+      // queues nothing", which the last capture could not tell apart.
+      if (enabled() && t_rend != nullptr) {
+        State& s = state();
+        s.spans.fetch_add(1u, std::memory_order_relaxed);
+        if (t_spanRecs != 0u)
+          s.spansWithRec.fetch_add(1u, std::memory_order_relaxed);
+      }
+      // Guarded against an unmatched leave, which would otherwise wrap the
+      // depth to 0xFFFFFFFF and read off the end of the stack. It should not
+      // happen -- every island pairs its own calls -- but a probe that turns a
+      // missing call into an out-of-bounds read is not worth its own findings.
+      if (t_spanTop != 0u)
+        t_spanTop -= 1u;
+      if (t_spanTop < kSpanMax) {
+        t_rend       = t_spanStack[t_spanTop];
+        t_rendHandle = t_spanHandles[t_spanTop];
+        t_spanRecs   = t_spanRecStack[t_spanTop];
+      } else {
+        t_rend       = nullptr;
+        t_rendHandle = 0xFFFFu;
+        t_spanRecs   = 0u;
+      }
+    }
+
+    // Called from SubmitDraw.
+    inline void noteDraw() {
+      if (!enabled())
+        return;
+      const uint32_t tid = static_cast<uint32_t>(GetCurrentThreadId());
+      t_drawsSince += 1u;
+      void* const rend = currentRenderable();
+      State& s = state();
+
+      std::lock_guard<std::mutex> g(s.mu);
+      s.draws += 1u;
+      s.drawTid = tid;
+
+      // Bill this draw to whoever queued the record being dispatched.
+      if (t_producer == nullptr) {
+        s.producerUnknown += 1u;
+      } else {
+        uint32_t i = 0;
+        for (; i < s.nProducers; ++i) {
+          if (s.producers[i].site == t_producer) {
+            s.producers[i].draws += 1u;
+            if (rend != nullptr)
+              s.producers[i].inSpan += 1u;
+            break;
+          }
+        }
+        if (i == s.nProducers) {
+          if (s.nProducers < State::kProducers) {
+            s.producers[s.nProducers].site   = t_producer;
+            s.producers[s.nProducers].draws  = 1u;
+            s.producers[s.nProducers].inSpan = (rend != nullptr) ? 1u : 0u;
+            s.nProducers += 1u;
+          } else {
+            s.producerOverflow += 1u;
+          }
+        }
+      }
+      if (rend != nullptr) {
+        s.drawsLatched += 1u;
+        // THE CREDIT, and this is the only place that can give it: a draw has
+        // demonstrably happened and the renderable it belongs to is in hand.
+        // Counted on the FIRST draw of each renderable only -- drawnNotListed
+        // is a count of objects, and billing it per draw would multiply one
+        // absent object by however many submeshes it happens to have.
+        if (s.drawn.insert(rend).second && s.listed.find(rend) == s.listed.end())
+          s.drawnNotListed += 1u;
+      }
+      // ATTRIBUTED DRAWS ONLY. The ring used to take the first forty draws of
+      // the frame and that is now forty lines of nothing: the head of the frame
+      // is world geometry, and the last capture spent all 520 of its sampled
+      // slots on rend=0x0 via=- while the nine draws that carried a renderable
+      // never appeared once. Nine a frame fits a forty-slot ring several times
+      // over, so the ring now takes those and skips the rest.
+      if (rend != nullptr && s.rawN < kRawMax) {
+        std::snprintf(s.raw[s.rawN], sizeof(s.raw[0]),
+                      "draw#%u tid=%u rend=0x%llx h=0x%x via=%c since=%u",
+                      s.draws, tid,
+                      static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(rend)),
+                      currentHandle(),
+                      (t_rend != nullptr ? 'D' : (t_rendReplay != nullptr ? 'R' : '-')),
+                      t_drawsSince);
+        s.rawN += 1u;
+      }
+    }
+
+    // Called from the matsys queue-allocator wrapper, on the RECORDING thread,
+    // with the address the replay functor will be handed for this record.
+    //
+    // t_rend is read here rather than passed in because that is the measurement:
+    // if recording happens on the dispatching thread it is populated, and if it
+    // does not, recWithRend reads 0 and says so. A null is stored rather than
+    // skipped so a stale entry from an earlier frame at the same address cannot
+    // be served to a later draw -- the queue buffer is reused, and a table that
+    // only ever adds would answer confidently with last frame's object.
+    inline void noteRecord(uint64_t replayKey, void* producer) {
+      if (!enabled())
+        return;
+      void* const rend = t_rend;
+      State& s = state();
+      s.recCalls.fetch_add(1u, std::memory_order_relaxed);
+      s.recTid.store(static_cast<uint32_t>(GetCurrentThreadId()), std::memory_order_relaxed);
+      if (rend != nullptr)
+        s.recWithRend.fetch_add(1u, std::memory_order_relaxed);
+
+      // SCOPED, so the chain census below does not run a stack walk while
+      // holding a lock the other recording threads are hashing into.
+      Shard& sh = shard(replayKey);
+      {
+        std::lock_guard<std::mutex> g(sh.mu);
+        if (sh.map.size() < kShardMax || sh.map.count(replayKey) != 0u) {
+          RecordEntry& e = sh.map[replayKey];
+          // ALREADY OCCUPIED MEANS THE PREVIOUS RECORD AT THIS ADDRESS WAS
+          // NEVER DRAINED. Since a hit consumes its entry, a live entry here is
+          // a record the dispatcher never ran before the queue wrapped back
+          // onto it. Expected to be zero; a rising count means the join is
+          // being asked to key on addresses that are recycled faster than they
+          // are consumed, which no amount of latching would fix.
+          if (e.rend != nullptr || e.frame != 0u)
+            s.recReuse.fetch_add(1u, std::memory_order_relaxed);
+          e.rend     = rend;
+          e.frame    = g_remixFrameId.load(std::memory_order_relaxed);
+          e.handle   = t_rendHandle;
+          e.producer = producer;
+        }
+      }
+      if (rend != nullptr)
+        t_spanRecs += 1u;
+      noteProducerChain(producer);
+    }
+
+    // Called from the queue dispatcher island, on the DRAW thread, before the
+    // record's own helper runs. Returns the renderable to hold for the draws
+    // that helper issues.
+    inline void* noteReplay(uint64_t replayKey, const void* helper) {
+      if (!enabled())
+        return nullptr;
+      State& s = state();
+      s.replayCalls.fetch_add(1u, std::memory_order_relaxed);
+      s.replayTid.store(static_cast<uint32_t>(GetCurrentThreadId()), std::memory_order_relaxed);
+
+      // The wrap sentinel is dispatched like any other record but was never
+      // allocated through the hooked allocator, so it can only ever miss.
+      // Counting it as one would leave a constant floor under miss= that looks
+      // like a defect and is not.
+      if (helper != nullptr && helper == g_qWrapSentinel.load(std::memory_order_relaxed)) {
+        s.replaySentinel.fetch_add(1u, std::memory_order_relaxed);
+        t_rendReplayHandle = 0xFFFFu;
+        t_producer         = nullptr;
+        return nullptr;
+      }
+
+      Shard& sh = shard(replayKey);
+      std::lock_guard<std::mutex> g(sh.mu);
+      const auto it = sh.map.find(replayKey);
+      if (it == sh.map.end()) {
+        s.replayMiss.fetch_add(1u, std::memory_order_relaxed);
+        t_rendReplayHandle = 0xFFFFu;
+        t_producer         = nullptr;
+        return nullptr;
+      }
+      t_rendReplayHandle = it->second.handle;
+      s.replayHit.fetch_add(1u, std::memory_order_relaxed);
+      t_producer = it->second.producer;
+      // CONSUMED, NOT AGED, and this is what removes the frame+1 entirely
+      // rather than tolerating it. A queue record is written once and drained
+      // once -- the dispatcher steps its read cursor past each one -- so an
+      // entry that has been handed to a dispatch is finished. Erasing it here
+      // means the table never holds a consumed record, so nothing can be served
+      // across a frame boundary, no eviction window has to be tuned to the
+      // queue's double buffering, and the "hit served from an earlier frame"
+      // count that read lag == hit on 41 of 44 frames has nothing left to
+      // count. What that number was measuring was never staleness in the
+      // answer: the record address key is exact and the renderable it names is
+      // the right object whatever the frame counter did in between. It was the
+      // phase between the Remix frame counter and the game's produce/drain
+      // pipeline, which is not ours to remove.
+      const uint32_t fid = g_remixFrameId.load(std::memory_order_relaxed);
+      if (fid >= it->second.frame) {
+        const uint32_t age = fid - it->second.frame;
+        uint32_t seen = s.maxAge.load(std::memory_order_relaxed);
+        while (age > seen
+               && !s.maxAge.compare_exchange_weak(seen, age, std::memory_order_relaxed))
+          ;
+      }
+      void* const rend = it->second.rend;
+      sh.map.erase(it);
+      return rend;
+    }
+
+    // Called from renderListWrapper once per enumerated view, with the list the
+    // job just produced. Union, never replace -- see State::listed.
+    inline void noteList(void** list, uint64_t count) {
+      if (!enabled())
+        return;
+      State& s = state();
+      std::lock_guard<std::mutex> g(s.mu);
+      s.listCalls += 1u;
+      for (uint64_t i = 0; i < count; ++i) {
+        if (list[i] != nullptr)
+          s.listed.insert(list[i]);
+      }
+    }
+  }
+
+  // ============================================================
+  // NV-DXVK [JoinStack] -- WHERE THE DRAWS ACTUALLY COME FROM.
+  //
+  // WHY THIS EXISTS, AND WHY IT SHOULD HAVE BEEN FIRST. The A2 hooks proved
+  // their own mechanism and then measured rec=1-2 records per frame against
+  // 391-576 draws: sub_18006FCB0 carries ~0.3% of the frame, so it is a queued
+  // draw path but not THE one. That was found by reading IDA and reasoning from
+  // a comment naming sub_180072E70 -> sub_18001E400 -> sub_18001C390 as "the"
+  // draw path. Static analysis can show that a path exists; it cannot show how
+  // often it runs, and volume was the whole question.
+  //
+  // This probe answers it from the only direction that cannot be wrong about
+  // volume: stand at the draw and look up.
+  //
+  // A BOUNDED CENSUS, NOT A SAMPLER. Every draw is captured, for a fixed small
+  // number of gameplay frames, and then it stops for the life of the process.
+  // A 1-in-N sampler would have been cheaper per frame and would have given a
+  // draw count per path that is an estimate; the ranking is the entire output
+  // here, and an estimate of the ranking is what already cost this session one
+  // wrong path. Eight frames at ~500 draws and ~2 us per capture is ~1 ms/frame
+  // for eight frames, paid once.
+  //
+  // RESOLUTION IS DEFERRED TO REPORT TIME. GetModuleHandleExA plus
+  // GetModuleFileNameA per frame per draw would dwarf the capture itself, so
+  // captures store raw addresses and only the ranked survivors are resolved.
+  // Module attribution copies [VanishDiag-Stack-Auto]'s resolved form rather
+  // than a name list, for the reason recorded there: the one path a hardcoded
+  // list cannot name is the one you are looking for.
+  // ============================================================
+  namespace joinstack {
+    static constexpr uint32_t kDepth     = 24u;   // frames per capture
+    static constexpr uint32_t kMaxChains = 256u;  // distinct call chains held
+    static constexpr uint32_t kFrames    = 8u;    // gameplay frames to census
+
+    struct Chain {
+      uint64_t key   = 0ull;
+      uint32_t count = 0u;
+      USHORT   n     = 0;
+      void*    f[kDepth] = {};
+    };
+
+    struct State {
+      std::mutex mu;
+      Chain    chains[kMaxChains];
+      uint32_t nChains    = 0u;
+      // ATOMIC because noteDraw reads it WITHOUT the lock, on every draw, to
+      // get out before paying for anything. That fast-out is the whole reason
+      // this probe is affordable to leave in the build, and a plain uint32_t
+      // read concurrently with the frame thread's write is a data race whatever
+      // the generated code happens to do.
+      std::atomic<uint32_t> framesLeft { 0u };
+      uint32_t totalDraws = 0u;
+      // Draws whose chain did not fit the table. NOT silent: a truncated
+      // ranking reads as "these are the paths" when it means "these were
+      // first", which is exactly the failure [VanishDiag-Stack-Auto] documents.
+      uint32_t droppedDraws = 0u;
+      // ATOMIC because the [Join] install site reads it every frame, off this
+      // lock, to decide whether the census has finished -- see censusDone().
+      std::atomic<bool> done { false };
+    };
+
+    inline State& state() {
+      static State s;
+      return s;
+    }
+
+    // THE [Join] DISPATCHER ISLAND MUST NOT BE INSTALLED UNTIL THIS IS TRUE.
+    // That island is jumped to, not called, so it has no unwind information,
+    // and once it sits between the draw and sub_180087E30 every chain this
+    // census captures is correct up to the island and garbage above it. The
+    // walk does not fault -- RtlVirtualUnwind treats an unknown PC as a leaf
+    // and pops whatever is at RSP, which here is the dispatcher's shadow space
+    // -- and that is exactly the danger: it produces a plausible ranking of
+    // paths that do not exist. Running the census first and installing after
+    // costs eight gameplay frames and keeps both probes honest.
+    inline bool censusDone() {
+      return state().done.load(std::memory_order_relaxed);
+    }
+
+    // Called from SubmitDraw, on whichever thread issues the draw.
+    inline void noteDraw() {
+      State& s = state();
+      // Unlocked fast-out, and it is what makes this affordable to leave in the
+      // build: one atomic load per draw when the census is not running. The
+      // window between this and the re-test under the lock can admit one extra
+      // draw at a frame boundary, against a census of several thousand.
+      if (s.framesLeft == 0u)
+        return;
+
+      void* frames[kDepth];
+      const USHORT n = RtlCaptureStackBackTrace(0, static_cast<DWORD>(kDepth), frames, nullptr);
+      if (n == 0)
+        return;
+      const uint64_t key = XXH64(frames, sizeof(void*) * static_cast<size_t>(n), 0ull);
+
+      std::lock_guard<std::mutex> g(s.mu);
+      if (s.framesLeft == 0u)
+        return;
+      s.totalDraws += 1u;
+      for (uint32_t i = 0; i < s.nChains; ++i) {
+        if (s.chains[i].key == key) {
+          s.chains[i].count += 1u;
+          return;
+        }
+      }
+      if (s.nChains >= kMaxChains) {
+        s.droppedDraws += 1u;
+        return;
+      }
+      Chain& c = s.chains[s.nChains++];
+      c.key = key;
+      c.count = 1u;
+      c.n = n;
+      std::memcpy(c.f, frames, sizeof(void*) * static_cast<size_t>(n));
+    }
+
+    // One captured chain, resolved to module+RVA so the offsets paste straight
+    // into IDA. Deferred here rather than done at capture time -- see the
+    // header comment.
+    inline std::string resolve(void* const* f, USHORT n) {
+      std::string out;
+      out.reserve(1024);
+      for (USHORT k = 0; k < n; ++k) {
+        char buf[96];
+        HMODULE hMod = nullptr;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                               | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCSTR>(f[k]), &hMod)
+            && hMod != nullptr) {
+          char path[MAX_PATH] = {};
+          const DWORD got = GetModuleFileNameA(hMod, path, MAX_PATH);
+          const char* leaf = "?";
+          if (got > 0) {
+            leaf = path;
+            if (const char* slash = std::strrchr(path, '\\'))
+              leaf = slash + 1;
+          }
+          std::snprintf(buf, sizeof(buf), "%s+0x%llx", leaf,
+                        static_cast<unsigned long long>(
+                          reinterpret_cast<uint64_t>(f[k]) - reinterpret_cast<uint64_t>(hMod)));
+        } else {
+          std::snprintf(buf, sizeof(buf), "?@0x%llx",
+                        static_cast<unsigned long long>(reinterpret_cast<uint64_t>(f[k])));
+        }
+        if (!out.empty()) out += " | ";
+        out += buf;
+      }
+      return out;
+    }
+
+    // Frame thread, once per frame, from joinProbeEndFrame.
+    inline void endFrame(bool inGameplay, uint32_t fid) {
+      State& s = state();
+      std::lock_guard<std::mutex> g(s.mu);
+
+      if (s.done)
+        return;
+
+      if (s.framesLeft == 0u) {
+        // ARM. Gameplay-gated on the same floor everything else here uses: a
+        // census spent on menu and loading frames would rank the paths of a
+        // scene with no world in it, and then never re-arm.
+        if (inGameplay && RtxOptions::ResidentScene::logStats()) {
+          s.framesLeft = kFrames;
+          Logger::warn(str::format(
+            "[JoinStack] armed for ", kFrames, " frames at f=", fid,
+            " -- every draw captured, then this stops for the process"));
+        }
+        return;
+      }
+
+      s.framesLeft -= 1u;
+      if (s.framesLeft != 0u)
+        return;
+
+      s.done = true;
+
+      // RANK BY DRAWS CARRIED. This is the output: which submission path
+      // actually moves the frame. Reading these in any other order is what
+      // produced the sub_18006FCB0 detour -- a real path that carries 0.3%.
+      uint32_t order[kMaxChains];
+      for (uint32_t i = 0; i < s.nChains; ++i)
+        order[i] = i;
+      std::sort(order, order + s.nChains,
+                [&s](uint32_t a, uint32_t b) { return s.chains[a].count > s.chains[b].count; });
+
+      Logger::warn(str::format(
+        "[JoinStack] census complete f=", fid,
+        " draws=", s.totalDraws,
+        " distinctChains=", s.nChains,
+        " dropped=", s.droppedDraws,
+        (s.droppedDraws > 0u
+           ? "  <-- TABLE FULL, ranking is TRUNCATED and must not be read as complete"
+           : "")));
+
+      const uint32_t show = s.nChains < 12u ? s.nChains : 12u;
+      for (uint32_t r = 0; r < show; ++r) {
+        const Chain& c = s.chains[order[r]];
+        Logger::warn(str::format(
+          "[JoinStack] #", r,
+          " draws=", c.count,
+          " pct=", (s.totalDraws > 0u ? (100u * c.count) / s.totalDraws : 0u),
+          " frames=", c.n,
+          " stack: ", resolve(c.f, c.n).c_str()));
+      }
+    }
+  }
+
+  // NV-DXVK [Join] slice A: the frame readout. Frame thread, once per frame,
+  // from the same EndFrame block that steps the residency seed.
+  //
+  // HOW TO READ IT, IN THIS ORDER. Each line can veto the ones under it:
+  //
+  //   tid{gate=,draw=,same=}   THE FIRST NUMBER, and it can end slice A on its
+  //       own. same=0 means the renderable dispatch and the D3D11 draw are on
+  //       different threads, so ordering between them is not defined and the
+  //       gate cannot attribute anything. The response is not to fix the probe:
+  //       it is to move attribution to the matsys REPLAY site, which is where
+  //       [MatBind] already had to go for the deferred ship draw.
+  //   latched= / noLatch=      with same=1, latched=0 means the gate runs on
+  //       the draw thread but the draws do not happen inside its span -- the
+  //       within-thread deferred case, same conclusion as above.
+  //       A LARGE noLatch IS NOT A FAULT. World geometry and static props never
+  //       pass through the client renderable list, so those draws have no latch
+  //       by construction, and this number is how much of the frame one list can
+  //       ever account for. It sizes the static-prop and world slices; it does
+  //       not condemn this one.
+  //   drawnNotListed=          MUST BE 0. A renderable that drew while absent
+  //       from the frame's listed union means the list is not an upper bound on
+  //       what draws, so it cannot serve as the population and the enumeration
+  //       has to move upstream of sub_1801A8350.
+  //   listed=                  the acceptance gate, and it is INVARIANCE rather
+  //       than a target number: hold the camera position, sweep the full pitch
+  //       and yaw range, and require this to be FLAT. A good average over a
+  //       sweep hides the band where it drops, which is the failure this whole
+  //       architecture exists to remove.
+  //
+  // Gameplay-gated on the same floor the census and the scene-clear probes use:
+  // the menu and loading frames issue a handful of draws with no world behind
+  // them, and a frame of those reads like a clean, tiny, flat scene.
+  //
+  // ONE KNOWN UNDERCOUNT, STATED RATHER THAN LEFT TO BE DISCOVERED: a renderable
+  // is credited into drawn= by the NEXT gate call, so the last renderable of a
+  // frame on each dispatching thread is never credited. That is at most a
+  // handful of entries against a listed= in the hundreds, and it biases drawn=
+  // DOWN, never drawnNotListed= up -- so it cannot manufacture the one failure
+  // this probe is looking for.
+  static void joinProbeEndFrame() {
+    using namespace joinprobe;
+
+    const bool inGameplay =
+      tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u;
+    const uint32_t fid = g_remixFrameId.load(std::memory_order_relaxed);
+
+    // NV-DXVK [JoinStack]: arm, count down, report. Stepped BEFORE this
+    // function takes its own lock, because the two hold different locks and
+    // nesting them in one order here and the other order anywhere else is a
+    // deadlock waiting for a coincidence.
+    joinstack::endFrame(inGameplay, fid);
+
+    State& s = state();
+
+    std::lock_guard<std::mutex> g(s.mu);
+
+    static uint32_t s_lastLogFrame = 0u;
+    if (enabled() && inGameplay && s.draws > 0u
+        && fid - s_lastLogFrame >= 30u) {
+      s_lastLogFrame = fid;
+      Logger::warn(str::format(
+        "[Join] f=", fid,
+        " tid{gate=", s.gateTid, " draw=", s.drawTid,
+        " same=", (s.gateTid != 0u && s.gateTid == s.drawTid ? 1 : 0), "}",
+        " listCalls=", s.listCalls,
+        " listed=", static_cast<uint32_t>(s.listed.size()),
+        " gate{calls=", s.gateCalls, " pass=", s.gatePass, "}",
+        " draws=", s.draws,
+        " latched=", s.drawsLatched,
+        " noLatch=", (s.draws - s.drawsLatched),
+        " drawn=", static_cast<uint32_t>(s.drawn.size()),
+        " drawnNotListed=", s.drawnNotListed,
+        // THE RECORD/REPLAY JOIN, and it is read as a chain -- the first of
+        // these that is zero is where the chain breaks, and each one prescribes
+        // a different response.
+        //   rec=0        the allocator entry patch never fired, so matsys is
+        //                not queueing through sub_180087960 at all.
+        //   withRend=0   recording happens on threads the gate never ran on, so
+        //                there is nothing to attach even though the join works.
+        //                THIS IS THE §7 QUESTION, NOT A FAULT. Most queued
+        //                commands are world surfaces and static props, which
+        //                never pass through the client renderable list; the
+        //                ratio withRend/n is how much of the queue a renderable
+        //                identity can ever account for.
+        //   replay=0     records are written and never dispatched through our
+        //                island -- the dispatcher patch did not take.
+        //   miss high    the address key is not stable between the two halves;
+        //                the record address arithmetic is wrong and no amount
+        //                of latching will fix it. rec side computes
+        //                base + head, disp side computes base + cursor + 8, and
+        //                they must name the same byte.
+        // spans= DrawModel calls, spansWithRec= those that queued anything.
+        // Read them against gate{calls}: spans far below the gate count means
+        // most gate calls are the pre-pass at client+0x36E83E, which draws
+        // nothing; spans near it with spansWithRec near zero means DrawModel is
+        // running and producing no queue traffic. Those are different problems.
+        " spans{n=", s.spans.load(std::memory_order_relaxed),
+        " withRec=", s.spansWithRec.load(std::memory_order_relaxed), "}",
+        " rec{n=", s.recCalls.load(std::memory_order_relaxed),
+        " withRend=", s.recWithRend.load(std::memory_order_relaxed),
+        " lastTid=", s.recTid.load(std::memory_order_relaxed), "}",
+        // reuse= and unconsumed= replace the old lag= count, which read
+        // lag == hit on 41 of 44 frames and meant nothing: a hit now consumes
+        // its entry, so no record can be served across a frame at all. These
+        // two are the failures that ARE possible, and both must read 0.
+        " replay{n=", s.replayCalls.load(std::memory_order_relaxed),
+        " hit=", s.replayHit.load(std::memory_order_relaxed),
+        " miss=", s.replayMiss.load(std::memory_order_relaxed),
+        " sentinel=", s.replaySentinel.load(std::memory_order_relaxed),
+        " reuse=", s.recReuse.load(std::memory_order_relaxed),
+        " unconsumed=", s.recUnconsumed.load(std::memory_order_relaxed),
+        // NOT RESET PER FRAME, deliberately. This is the worst
+        // produce-to-consume gap seen since the hook went in, and its whole job
+        // is to say whether the sweep window is long enough; a per-frame value
+        // logged one frame in thirty would miss the stall that matters.
+        " maxAge=", s.maxAge.load(std::memory_order_relaxed),
+        " tid=", s.replayTid.load(std::memory_order_relaxed), "}",
+        " | read rec -> withRend -> replay -> hit, first zero is the break"));
+
+      // RAW SECOND, BUT NEVER OMITTED. The aggregate above cannot tell a
+      // correct latch from a stale one; the interleaving can.
+      std::string raw;
+      for (uint32_t i = 0; i < s.rawN; ++i) {
+        raw += " {";
+        raw += s.raw[i];
+        raw += "}";
+      }
+      Logger::warn(str::format("[Join.raw] f=", fid, " n=", s.rawN, raw.c_str()));
+
+      // THE POPULATION MAP. Every draw billed to the code that queued its
+      // record, ranked by share. This is the number the enumeration
+      // architecture needs before it picks identities: it says how much of the
+      // frame each producer is worth, so an identity gets built for the biggest
+      // one rather than for the one that was easiest to hook.
+      uint32_t order[State::kProducers];
+      for (uint32_t i = 0; i < s.nProducers; ++i)
+        order[i] = i;
+      std::sort(order, order + s.nProducers,
+                [&s](uint32_t a, uint32_t b) { return s.producers[a].draws > s.producers[b].draws; });
+      const uint32_t showP = s.nProducers < 10u ? s.nProducers : 10u;
+      uint32_t billed = 0u;
+      for (uint32_t i = 0; i < s.nProducers; ++i)
+        billed += s.producers[i].draws;
+      Logger::warn(str::format(
+        "[Join.who] f=", fid, " draws=", s.draws,
+        " billed=", billed,
+        " unknown=", s.producerUnknown,
+        " sites=", s.nProducers,
+        (s.producerOverflow > 0u
+           ? "  <-- TABLE FULL, ranking is TRUNCATED and must not be read as complete"
+           : "")));
+      for (uint32_t r = 0; r < showP; ++r) {
+        const State::Producer& pr = s.producers[order[r]];
+        void* const site = pr.site;
+        Logger::warn(str::format(
+          "[Join.who] #", r,
+          " draws=", pr.draws,
+          " pct=", (s.draws > 0u ? (100u * pr.draws) / s.draws : 0u),
+          // inSpan is the per-producer answer to "which movers is the span
+          // missing". A model producer with inSpan=0 is queued outside every
+          // span we bracket, and is the next site to wrap.
+          " inSpan=", pr.inSpan,
+          " queuedBy ", joinstack::resolve(&site, 1).c_str()));
+      }
+    }
+
+    // ---- the producer chain census: arm once, count down, report once.
+    // Armed from here rather than at install because it has to see a frame that
+    // is actually queueing records, and the same gameplay floor everything else
+    // in this file uses applies for the same reason.
+    {
+      ChainState& c = chains();
+      std::lock_guard<std::mutex> gc(c.mu);
+      if (!c.done) {
+        if (c.framesLeft.load(std::memory_order_relaxed) == 0u) {
+          if (!c.armed.load(std::memory_order_relaxed)
+              && enabled() && inGameplay
+              && s.recCalls.load(std::memory_order_relaxed) > 0u) {
+            c.armed.store(true, std::memory_order_relaxed);
+            c.framesLeft.store(kChainFrames, std::memory_order_relaxed);
+            Logger::warn(str::format(
+              "[Join.chain] armed for ", kChainFrames, " frames at f=", fid,
+              " -- one stack walk per distinct producer, then this stops for the process"));
+          }
+        } else {
+          c.framesLeft.fetch_sub(1u, std::memory_order_relaxed);
+          if (c.framesLeft.load(std::memory_order_relaxed) == 0u) {
+            c.done = true;
+            Logger::warn(str::format(
+              "[Join.chain] census complete f=", fid, " captured=", c.n,
+              " drawSites=", s.nProducers,
+              (c.n >= kChainMax
+                 ? "  <-- TABLE FULL, some producers were never captured"
+                 : "")));
+            // REPORTED IN DRAW ORDER, NOT CAPTURE ORDER. Capture order is
+            // whatever the engine happened to queue first, which is state and
+            // setup; the only chains worth reading are the ones behind the
+            // sites [Join.who] ranks. Anything captured that carries no draws
+            // is left unprinted rather than filling the log with it.
+            uint32_t ord[State::kProducers];
+            for (uint32_t i = 0; i < s.nProducers; ++i)
+              ord[i] = i;
+            std::sort(ord, ord + s.nProducers,
+                      [&s](uint32_t a, uint32_t b) {
+                        return s.producers[a].draws > s.producers[b].draws;
+                      });
+            uint32_t missing = 0u;
+            for (uint32_t r = 0; r < s.nProducers; ++r) {
+              const State::Producer& pr = s.producers[ord[r]];
+              void* const site = pr.site;
+              const ChainState::Entry* found = nullptr;
+              for (uint32_t i = 0; i < c.n && found == nullptr; ++i)
+                if (c.e[i].site == site)
+                  found = &c.e[i];
+              if (found == nullptr) {
+                missing += 1u;
+                Logger::warn(str::format(
+                  "[Join.chain] #", r, " draws=", pr.draws,
+                  " inSpan=", pr.inSpan,
+                  "  ", joinstack::resolve(&site, 1).c_str(),
+                  "  <== NO CHAIN CAPTURED -- this producer queued no record during the census"));
+                continue;
+              }
+              Logger::warn(str::format(
+                "[Join.chain] #", r, " draws=", pr.draws,
+                " inSpan=", pr.inSpan,
+                "  ", joinstack::resolve(&site, 1).c_str(),
+                "  <== ", joinstack::resolve(found->f, found->n).c_str()));
+            }
+            if (missing > 0u)
+              Logger::warn(str::format(
+                "[Join.chain] ", missing, " of ", s.nProducers,
+                " draw producers had no chain -- the census window did not overlap their records"));
+          }
+        }
+      }
+    }
+
+    // RESET EVERY FRAME, LOG EVERY THIRTIETH. The listed set is a union over the
+    // frame's views, so carrying it across frames would report the union over
+    // the whole capture and read as a large, reassuring, meaningless number.
+    s.listed.clear();
+    s.drawn.clear();
+    s.drawnNotListed = 0u;
+    s.listCalls = s.gateCalls = s.gatePass = 0u;
+    s.draws = s.drawsLatched = 0u;
+    s.rawN = 0u;
+    s.recCalls.store(0u, std::memory_order_relaxed);
+    s.recWithRend.store(0u, std::memory_order_relaxed);
+    s.replayCalls.store(0u, std::memory_order_relaxed);
+    s.replayHit.store(0u, std::memory_order_relaxed);
+    s.replayMiss.store(0u, std::memory_order_relaxed);
+    s.recReuse.store(0u, std::memory_order_relaxed);
+    s.recUnconsumed.store(0u, std::memory_order_relaxed);
+    s.replaySentinel.store(0u, std::memory_order_relaxed);
+    s.spans.store(0u, std::memory_order_relaxed);
+    s.spansWithRec.store(0u, std::memory_order_relaxed);
+    s.nProducers = 0u;
+    s.producerOverflow = 0u;
+    s.producerUnknown = 0u;
+    // maxAge is NOT reset -- see the log line.
+
+    // THE SWEEP IS NOW A LEAK CATCHER, NOT PART OF THE ANSWER. A dispatched
+    // record is erased the moment it is used, so anything still here after a
+    // few frames was allocated and never drained -- a queue that was reset, or
+    // a record written before the hooks went in. Counting them as it drops them
+    // is the point: recUnconsumed is a real defect signal, where the old
+    // frame-window eviction was silently doing the same work and reporting
+    // nothing.
+    //
+    // ONE SHARD AT A TIME, and the lock is dropped between them. The recording
+    // threads are running while this walks, and holding all 64 locks to make
+    // the sweep one instant would stall the engine's worker pool once a frame
+    // for no gain -- an entry dropped a shard early or late is an entry that
+    // was never dispatched either way.
+    for (uint32_t i = 0; i < kShards; ++i) {
+      Shard& sh = shards()[i];
+      std::lock_guard<std::mutex> gs(sh.mu);
+      for (auto it = sh.map.begin(); it != sh.map.end(); ) {
+        // EIGHT, NOT TWO. Two came from the double-buffering claim that
+        // sub_1800877E0 disproved. The producer blocks rather than recycle an
+        // undrained record, so anything still here is a genuine leak and the
+        // window only has to clear the worst drain latency -- which maxAge
+        // reports, and which this must stay comfortably above.
+        if (fid >= it->second.frame && (fid - it->second.frame) > 8u) {
+          s.recUnconsumed.fetch_add(1u, std::memory_order_relaxed);
+          it = sh.map.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+  }
+
   using RlpSub1A8350_t = uint64_t (*)(void*, void*, void*, void*);
   static RlpSub1A8350_t g_rlpOrig = nullptr;      // direct call to the real sub_1801A8350
   static void*          g_rlpModelInfo = nullptr; // engine.dll IVModelInfo singleton
@@ -2797,6 +3965,12 @@ namespace dxvk {
       return count;
 
     void** list = reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(a4) + 0x8000);
+
+    // NV-DXVK [Join] slice A: harvest this view's renderable list into the
+    // frame's union. Placed here rather than in the classify loop below because
+    // that loop exists to find one model and skips everything else; the join
+    // needs the whole population.
+    joinprobe::noteList(list, count);
 
     static std::mutex s_mu;
     static std::unordered_map<void*, int> s_cache;   // renderable ptr -> 1 dropship / 0 other
@@ -6796,6 +7970,12 @@ namespace dxvk {
   static char gateWrapper(void* rend, void* entry) {
     const char verdict = g_gateOrig ? g_gateOrig(rend, entry) : 1;
 
+    // NV-DXVK [Join] slice A: open the attribution latch. AFTER the original,
+    // because the verdict decides whether DrawModel runs at all and a latch on a
+    // rejected renderable would credit the next object's draws to it. Before
+    // the [GateAll] block below so an early return there cannot skip it.
+    joinprobe::latch(rend, verdict);
+
     // [GateAll] â€” name-free. Log EVERY handle-bearing (studio) renderable's gate
     // decision, keyed by render-handle (= *(u16*)(rend+1734) iff *(u8*)(rend+1733)).
     // The real dropship can't be name-matched, so identify it by BEHAVIOR: the
@@ -6914,6 +8094,525 @@ namespace dxvk {
       "[GateProbe] installed: sites=", patched, "/3 island=0x", std::hex,
       reinterpret_cast<uintptr_t>(island),
       " orig=0x", reinterpret_cast<uintptr_t>(g_gateOrig), std::dec));
+    return true;
+  }
+
+  // ============================================================
+  // NV-DXVK [Join] -- THE RECORD/DISPATCH JOIN, materialsystem_dx11.dll.
+  //
+  // WHY THIS EXISTS. The first [Join] capture read same=0 and latched=0 on
+  // every frame: renderables are dispatched on one thread (37464) and the D3D11
+  // draws are issued on another (47940), because matsys records draws into a
+  // queued render context and runs them elsewhere. The renderable cannot be
+  // recovered on the draw thread by reading engine data -- matsys is a
+  // primitive layer and its records name meshes and buffers, never objects.
+  //
+  // WHAT IS RECOVERABLE IS THE RECORD'S OWN ADDRESS. The recording thread knows
+  // where the record lands and still holds the gate latch; the draw thread
+  // computes that same address to find the record it is about to run. So the
+  // address is the join key, held in a side table. No engine memory is written
+  // and no ordering between the two threads is assumed -- which matters,
+  // because there is one queue PER RECORDING THREAD and an ordinal join would
+  // break the moment a second worker records.
+  //
+  // THE QUEUE, AS THE TWO SIDES SEE IT. sub_180087960 is the allocator. It
+  // picks the calling thread's queue out of thread-local storage (TLS slot ->
+  // index at +4136 -> the 64-byte descriptor array at qword_181BBA040), writes
+  // an 8-byte HEADER holding that record's per-subsystem helper, and leaves the
+  // write head at +0x10 pointing PAST the header, at the record BODY:
+  //
+  //     base + head - 8    the helper for this record's subsystem
+  //     base + head        the body: [+0] a functor, then the payload
+  //
+  // Its caller writes the body at base + head, which is exactly what
+  // sub_18006FCB0 does two instructions after the call:
+  // `mov edx,[rax+10h] ; add rdx,[rax+8] ; mov [rdx], rdi`.
+  //
+  // sub_180087E30 ("RenderThread") drains it. Per record it reads the header at
+  // base + readCursor, advances the cursor by 8 -- so the cursor now names the
+  // body -- and calls the helper, which recomputes base + cursor and runs the
+  // functor it finds there. BOTH SIDES NAME THE BODY, so the body address is
+  // the key, and it is `base + head` on the record side with NO further
+  // adjustment. (The earlier `+ 8` here was wrong: it was derived from the
+  // record's own layout rather than from the allocator, which had already
+  // stepped the head past the header before returning.)
+  //
+  // WHAT THIS REPLACED, AND WHY. Slice A2 hooked the functor sub_1800708D0 and
+  // read hit=0 on every frame. The dispatcher does not call that functor: it
+  // calls the record's helper, and the helper copies 32 bytes of the record
+  // ONTO ITS OWN STACK and hands the functor a pointer to the copy. No offset
+  // correction could ever have matched a fresh stack address, so that hook was
+  // one level too deep. It also sat on one call site carrying ~0.3% of the
+  // frame, because the site was chosen by reading IDA instead of by standing at
+  // the draw and looking up. [JoinStack] did that instead -- 4320 draws over 8
+  // frames, 34 distinct chains -- and every one of them bottoms out at the
+  // single `call rdi` this file now patches.
+  //
+  // TWO PATCHES, EACH ONE A SINGLE ALIGNED ATOMIC STORE:
+  //
+  //   0x87960  the allocator's ENTRY, not its call sites. It has more than 300
+  //            of those, so a call-site rewrite is not the precise instrument
+  //            here that it was for the three gate sites; it is 300 chances to
+  //            corrupt an instruction. The first instruction is a 5-byte
+  //            `mov [rsp+8], rbx`, position-independent, so it relocates into a
+  //            trampoline verbatim.
+  //   0x87F89  inside the dispatcher's drain loop, two bytes into the body,
+  //            where an E9 rel32 fits INSIDE one aligned 8-byte word. That is
+  //            the whole reason the jump does not start at the top of the body
+  //            at 0x87F87: the RenderThread is executing this loop while we
+  //            patch it, and only a single naturally-aligned store is safe to
+  //            land underneath a running thread. `mov ecx, edx` at 0x87F87 is
+  //            left in place and the island picks up after it.
+  //
+  // The 15 bytes from 0x87F90 to 0x87F9E are the rest of the original body and
+  // are deliberately NOT overwritten. Nothing reaches them once the jump is in
+  // -- IDA confirms the only entries into 0x87F87..0x87F9E are the fall-through
+  // from 0x87F80 -- and engine bytes we do not write are engine bytes we cannot
+  // get wrong.
+  // ============================================================
+
+  // The allocator, reached through the trampoline holding its stolen prologue.
+  using QAllocFn_t = void* (*)(void*, int, int);
+  static QAllocFn_t g_qAllocTramp = nullptr;
+
+  // Runs on the RECORDING thread, standing in for the queue allocator's entry,
+  // so every caller in matsys is covered by construction rather than by a list.
+  static void* qAllocWrapper(void* helper, int size, int align) {
+    void* const desc = g_qAllocTramp ? g_qAllocTramp(helper, size, align) : nullptr;
+    if (desc == nullptr)
+      return desc;
+    // TESTED FIRST. The patch is never reverted once installed, so this stays
+    // on every queued matsys command for the life of the process even after the
+    // option goes off. One option read is the whole cost of that.
+    if (!joinprobe::enabled())
+      return desc;
+    // NO studioMemReadable HERE, and that is a decision rather than an
+    // oversight. The guard is a cached VirtualQuery -- a syscall whenever it
+    // misses -- and this now runs thousands of times a frame across several
+    // engine threads. The descriptor is the engine's own return value, which
+    // the caller itself dereferences two instructions later; a guard the engine
+    // does not need cannot make the read safer, only slower than the thing it
+    // is measuring.
+    const uint8_t* const d = reinterpret_cast<const uint8_t*>(desc);
+    const uint64_t queueBase = *reinterpret_cast<const uint64_t*>(d + 0x08);
+    const uint32_t writeHead = *reinterpret_cast<const uint32_t*>(d + 0x10);
+    // THE PRODUCER, AND IT IS FREE HERE. Because the hook is an ENTRY detour
+    // reached by a jmp rather than a call, the stack is untouched and
+    // _ReturnAddress() is the real caller of sub_180087960 -- the engine,
+    // client or studiorender code that queued this record. A call-site hook
+    // could not have given this; it would have returned the island.
+    if (queueBase != 0ull)
+      joinprobe::noteRecord(queueBase + writeHead, _ReturnAddress());
+    return desc;
+  }
+
+  // Both of these are called from the dispatcher island, on the draw thread,
+  // around the record's own helper. They are two calls rather than one C
+  // wrapper around the helper so that the island can hand the helper the exact
+  // register state the original `call rdi` ran with -- see the island.
+  static void joinReplayEnter(uint64_t recordAddr, const void* helper) {
+    joinprobe::t_rendReplay = joinprobe::noteReplay(recordAddr, helper);
+  }
+  static void joinReplayLeave() {
+    joinprobe::t_rendReplay = nullptr;
+    // CLEARED WITH THE RENDERABLE, not left behind. A draw issued between two
+    // dispatched records would otherwise be billed to the previous record's
+    // producer -- the same stale-latch shape that made withRend read a false
+    // 100%, and it would be harder to spot here because a plausible producer
+    // is exactly what a wrong answer would look like.
+    joinprobe::t_producer = nullptr;
+  }
+
+  static bool queuedDrawInstallHook() {
+    HMODULE ms = GetModuleHandleA("materialsystem_dx11.dll");
+    if (ms == nullptr) return false;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(ms);
+
+    const uintptr_t allocFn    = base + 0x87960;    // sub_180087960, the allocator
+    const uintptr_t dispBase   = base + 0x87F80;    // mov rax, cs:qword_181BBA048
+    const uintptr_t dispBody   = base + 0x87F87;    // mov ecx, edx
+    const uintptr_t dispWord   = base + 0x87F88;    // the aligned qword we store
+    const uintptr_t dispPatch  = base + 0x87F89;    // where the E9 goes
+    const uintptr_t dispResume = base + 0x87F9F;    // cmp rdi, rbp, after the call
+    const uintptr_t descriptor = base + 0x1BBA040;  // qword_181BBA040, the drained queue
+    const uintptr_t readCursor = base + 0x1BBA054;  // dword_181BBA054
+
+    // VERIFY BEFORE WRITING, and verify the WHOLE body rather than the one byte
+    // the patch lands on. Every rel32 in these bytes is internal to the module,
+    // so they read the same at any load address and can be compared literally.
+    // A mismatch means this is a different build of the DLL, and then every
+    // offset here is a guess wearing a hex address.
+    static const uint8_t kDispBaseLoad[7] = {
+      0x48, 0x8B, 0x05, 0xC1, 0x20, 0xB3, 0x01,     // mov  rax, cs:qword_181BBA048
+    };
+    static const uint8_t kDispBody[24] = {
+      0x8B, 0xCA,                                   // mov  ecx, edx
+      0x83, 0xC2, 0x08,                             // add  edx, 8
+      0x48, 0x8B, 0x3C, 0x01,                       // mov  rdi, [rcx+rax]
+      0x48, 0x8D, 0x0D, 0xA9, 0x20, 0xB3, 0x01,     // lea  rcx, qword_181BBA040
+      0x89, 0x15, 0xB7, 0x20, 0xB3, 0x01,           // mov  cs:dword_181BBA054, edx
+      0xFF, 0xD7,                                   // call rdi
+    };
+    static const uint8_t kAllocEntry[5] = {
+      0x48, 0x89, 0x5C, 0x24, 0x08,                 // mov  [rsp+8], rbx
+    };
+
+    if (std::memcmp(reinterpret_cast<const void*>(dispBase), kDispBaseLoad, sizeof(kDispBaseLoad)) != 0
+     || std::memcmp(reinterpret_cast<const void*>(dispBody), kDispBody, sizeof(kDispBody)) != 0) {
+      Logger::warn("[Join] dispatcher body at matsys+0x87F80 does not match the expected bytes; nothing patched");
+      return true;
+    }
+    if (std::memcmp(reinterpret_cast<const void*>(allocFn), kAllocEntry, sizeof(kAllocEntry)) != 0) {
+      Logger::warn("[Join] allocator entry at matsys+0x87960 does not match the expected bytes; nothing patched");
+      return true;
+    }
+    // Both stores below are 8 bytes at a naturally aligned address, which is
+    // what makes them atomic. Assert the alignment rather than assume it.
+    if ((dispWord & 7u) != 0u || (allocFn & 7u) != 0u) {
+      Logger::warn("[Join] patch words are not 8-byte aligned; nothing patched");
+      return true;
+    }
+
+    // sub_1800872D0, the ring's wrap sentinel. Published before either patch
+    // lands, so the very first dispatched record can already be classified.
+    g_qWrapSentinel.store(reinterpret_cast<const void*>(base + 0x872D0),
+                          std::memory_order_relaxed);
+
+    uint8_t* island = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && island == nullptr; ++dir) {
+        void* hint = reinterpret_cast<void*>(dir == 0 ? allocFn - step : allocFn + step);
+        void* a = VirtualAlloc(hint, 256, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (a == nullptr) continue;
+        const intptr_t d = reinterpret_cast<intptr_t>(a) - static_cast<intptr_t>(allocFn);
+        if (d > -0x7FFF0000 && d < 0x7FFF0000) island = static_cast<uint8_t*>(a);
+        else VirtualFree(a, 0, MEM_RELEASE);
+      }
+    if (island == nullptr) { Logger::warn("[Join] no island within +-2GB; abort"); return true; }
+
+    uint8_t* p = island;
+    auto emit  = [&p](std::initializer_list<uint8_t> bytes) { for (uint8_t b : bytes) *p++ = b; };
+    auto imm64 = [&p](uint64_t v) { std::memcpy(p, &v, sizeof(v)); p += sizeof(v); };
+
+    // ---- the dispatcher island. -------------------------------------------
+    // ENTRY STATE, inherited from the two instructions left in place above the
+    // jump: rax = the queue base, rcx = rdx = the read cursor, and rsp is the
+    // dispatcher's own frame, so [rsp, rsp+0x20) is ITS shadow space -- exactly
+    // what the original `call rdi` handed the helper.
+    //
+    // THE 0x30 OF SCRATCH IS NOT DECORATION. rax and rdx have to survive a C
+    // call that is free to clobber both, and they have to be restored because
+    // the helper is entitled to the register state the original call site would
+    // have given it. Saving them on the stack rather than in a global keeps
+    // this correct if a second thread ever drains a queue here. The frame is
+    // 0x30 so that rsp stays 16-byte aligned across the call and so that the
+    // callee's shadow space at [rsp, rsp+0x20) cannot reach the saved values at
+    // [rsp+0x20] and [rsp+0x28].
+    uint8_t* const islandDisp = p;
+    emit({0x48, 0x83, 0xEC, 0x30});             // sub  rsp, 30h
+    emit({0x48, 0x89, 0x44, 0x24, 0x20});       // mov  [rsp+20h], rax     save queue base
+    emit({0x83, 0xC2, 0x08});                   // add  edx, 8             cursor -> record body
+    emit({0x48, 0x89, 0x54, 0x24, 0x28});       // mov  [rsp+28h], rdx     save it
+    emit({0x48, 0x8B, 0x3C, 0x01});             // mov  rdi, [rcx+rax]     the record's helper
+    emit({0x48, 0x8D, 0x0C, 0x10});             // lea  rcx, [rax+rdx]     arg1 = the record body
+    emit({0x48, 0xB8}); imm64(readCursor);      // mov  rax, &dword_181BBA054
+    emit({0x89, 0x10});                         // mov  [rax], edx         publish the cursor
+    // arg2 = this record's helper, so noteReplay can tell the ring's wrap
+    // sentinel -- which never passes through the allocator -- from a real miss.
+    // AFTER the store above, which still needs edx.
+    emit({0x48, 0x89, 0xFA});                   // mov  rdx, rdi
+    emit({0x48, 0xB8}); imm64(reinterpret_cast<uint64_t>(&joinReplayEnter));
+    emit({0xFF, 0xD0});                         // call rax
+    emit({0x48, 0x8B, 0x44, 0x24, 0x20});       // mov  rax, [rsp+20h]     restore base
+    emit({0x48, 0x8B, 0x54, 0x24, 0x28});       // mov  rdx, [rsp+28h]     restore cursor
+    emit({0x48, 0x83, 0xC4, 0x30});             // add  rsp, 30h
+    emit({0x48, 0xB9}); imm64(descriptor);      // mov  rcx, qword_181BBA040
+    emit({0xFF, 0xD7});                         // call rdi                THE ORIGINAL CALL
+    emit({0x48, 0xB8}); imm64(reinterpret_cast<uint64_t>(&joinReplayLeave));
+    emit({0xFF, 0xD0});                         // call rax
+    emit({0x48, 0xB8}); imm64(dispResume);      // mov  rax, matsys+0x87F9F
+    emit({0xFF, 0xE0});                         // jmp  rax
+    // rax is dead at 0x87F9F -- the dispatcher's next reads of it are writes
+    // (`mov eax, esi`), and the helper's return value is never used -- so
+    // clobbering it to jump back costs nothing. rdi, rbx, rbp and rsi are
+    // non-volatile, so the two C calls preserve them and `cmp rdi, rbp` at the
+    // resume point still compares what it did before.
+
+    // ---- the allocator trampoline: its stolen first instruction, then back.
+    // rax is undefined at a function's entry, so it is free to carry the jump.
+    uint8_t* const islandTramp = p;
+    emit({0x48, 0x89, 0x5C, 0x24, 0x08});       // mov  [rsp+8], rbx       stolen
+    emit({0x48, 0xB8}); imm64(allocFn + 5);     // mov  rax, sub_180087960+5
+    emit({0xFF, 0xE0});                         // jmp  rax
+
+    // ---- the allocator's new entry: an absolute jump, because qAllocWrapper
+    // is in our DLL and nothing bounds that to +-2GB of matsys.
+    uint8_t* const islandAlloc = p;
+    emit({0xFF, 0x25}); emit({0x00, 0x00, 0x00, 0x00});   // jmp [rip+0]
+    imm64(reinterpret_cast<uint64_t>(&qAllocWrapper));
+
+    FlushInstructionCache(GetCurrentProcess(), island, 256);
+    g_qAllocTramp = reinterpret_cast<QAllocFn_t>(islandTramp);
+
+    // ONE ALIGNED 8-BYTE STORE PER SITE, and this is why both patch shapes look
+    // the way they do. The threads that execute these bytes are running while
+    // we write them, and a five-byte memcpy can be observed half-written as an
+    // instruction stream -- a crash with no diagnosis attached to it. A single
+    // naturally-aligned 64-bit store cannot be torn.
+    auto patchWord = [](uintptr_t addr, const uint8_t* bytes) -> bool {
+      DWORD oldProt = 0;
+      if (!VirtualProtect(reinterpret_cast<void*>(addr), 8, PAGE_EXECUTE_READWRITE, &oldProt))
+        return false;
+      LONG64 word = 0;
+      std::memcpy(&word, bytes, sizeof(word));
+      InterlockedExchange64(reinterpret_cast<volatile LONG64*>(addr), word);
+      DWORD tmp = 0; VirtualProtect(reinterpret_cast<void*>(addr), 8, oldProt, &tmp);
+      FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(addr), 8);
+      return true;
+    };
+
+    // The allocator first, so that records are already being filed by the time
+    // the dispatcher starts looking them up. The other order costs a frame of
+    // misses that mean nothing.
+    uint8_t allocWord[8];
+    std::memcpy(allocWord, reinterpret_cast<const void*>(allocFn), sizeof(allocWord));
+    const int32_t allocRel = static_cast<int32_t>(
+      reinterpret_cast<intptr_t>(islandAlloc) - static_cast<intptr_t>(allocFn + 5));
+    allocWord[0] = 0xE9;                        // jmp rel32, over bytes 0..4
+    std::memcpy(allocWord + 1, &allocRel, 4);   // bytes 5..7 stay as they were:
+                                                // the head of `mov [rsp+10h], rbp`
+    const bool okAlloc = patchWord(allocFn, allocWord);
+
+    // The dispatcher: byte 0 of the word is the CA of `mov ecx, edx` and must
+    // survive; the jump goes in bytes 1..5; bytes 6..7 become int3 rather than
+    // nop, so that a branch into them -- which IDA says cannot happen -- would
+    // stop rather than fall into the original `call rdi` with wrong registers.
+    uint8_t dispWordBytes[8];
+    std::memcpy(dispWordBytes, reinterpret_cast<const void*>(dispWord), sizeof(dispWordBytes));
+    const int32_t dispRel = static_cast<int32_t>(
+      reinterpret_cast<intptr_t>(islandDisp) - static_cast<intptr_t>(dispPatch + 5));
+    dispWordBytes[1] = 0xE9;
+    std::memcpy(dispWordBytes + 2, &dispRel, 4);
+    dispWordBytes[6] = 0xCC;
+    dispWordBytes[7] = 0xCC;
+    const bool okDisp = patchWord(dispWord, dispWordBytes);
+
+    Logger::warn(str::format(
+      "[Join] queue hook installed: alloc=", (okAlloc ? 1 : 0),
+      " disp=", (okDisp ? 1 : 0),
+      " island=0x", std::hex, reinterpret_cast<uintptr_t>(island),
+      " allocFn=0x", allocFn, " dispatch=0x", dispPatch, std::dec,
+      " | rec side covers every matsys queue allocation, disp side covers every dispatched record"));
+    return true;
+  }
+
+  // ============================================================
+  // NV-DXVK [Join] -- THE DRAW SPAN, client.dll.
+  //
+  // WHAT THIS FIXES. The gate used to set the latch, and the first capture with
+  // the queue hook in showed what that was worth: withRend was EXACTLY equal to
+  // rec on all 44 frames -- 100.0%, never 99.8% -- while the renderables those
+  // records were attributed to were FOUR pointers across the entire run, one of
+  // them covering 1573 of 1800 sampled draws, against 36..210 gate calls per
+  // frame. A ratio that never moves off 100% is a flag nobody clears, not a
+  // measurement.
+  //
+  // THE BINARY AGREES, AND NAMES THE MECHANISM. The gate sub_180371590 has
+  // three call sites and they are not the same kind of thing:
+  //
+  //   +0x36E352  in sub_18036E2E0, a single-renderable dispatch. Gate, then
+  //              `call [rax+0x48]` -- IClientRenderable vtable slot 9,
+  //              DrawModel -- with rcx = rdi = the renderable it just gated.
+  //   +0x36E9CB  in sub_18036E8D0, the per-renderable draw LOOP. Gate, then
+  //              `call [r10+0x48]` with rcx = rbx = the same renderable.
+  //   +0x36E83E  in sub_18036E7D0, a visibility PRE-PASS. It gates a batch back
+  //              to back, counts the survivors into esi and parks them in a
+  //              stack array, and draws NOTHING. A hundred gate calls with no
+  //              queue traffic between them leave exactly one survivor latched,
+  //              which is precisely the handful of pointers the capture found.
+  //
+  // So the span is the DrawModel call, not the gate and not the enclosing
+  // function. A record belongs to a renderable if and only if it was allocated
+  // while that renderable's DrawModel was on the stack. Everything else -- the
+  // world surfaces, the static props, the two thirds of the frame [JoinStack]
+  // attributed to engine.dll -- now correctly carries no renderable at all,
+  // which is the number §7 is actually asking for.
+  //
+  // TWO PATCHES, EACH ONE A SINGLE ALIGNED ATOMIC STORE, same shape and same
+  // reason as the matsys dispatcher: the game thread is running this code while
+  // we write it.
+  //
+  //   0x36E36A  call [rax+0x48]  (FF 50 48) plus two bytes of the epilogue mov
+  //             that follows, inside the aligned word at 0x36E368.
+  //   0x36E9F9  call [r10+0x48]  (41 FF 52 48) plus one byte of the `test
+  //             sil, sil` that follows, inside the aligned word at 0x36E9F8.
+  //
+  // In both cases the bytes past the jump are left alone: nothing branches into
+  // them once the jump is in, and the island replays the whole instructions it
+  // displaced before returning. At the second site that replay order matters --
+  // `test sil, sil` sets the flags the very next instruction consumes, so it
+  // runs AFTER the C call, and the return is a rel32 jump, which touches
+  // neither the flags nor a register.
+  // ============================================================
+  static void joinDrawEnter(void* rend) { joinprobe::drawEnter(rend); }
+  static void joinDrawLeave()           { joinprobe::drawLeave(); }
+
+  static bool drawSpanInstallHook() {
+    HMODULE cl = GetModuleHandleA("client.dll");
+    if (cl == nullptr) return false;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(cl);
+
+    const uintptr_t siteA     = base + 0x36E36A;   // call [rax+0x48]
+    const uintptr_t wordA     = base + 0x36E368;   // the aligned word we store
+    const uintptr_t resumeA   = base + 0x36E372;   // after the mov we relocate
+    const uintptr_t siteC     = base + 0x36E9F9;   // call [r10+0x48]
+    const uintptr_t wordC     = base + 0x36E9F8;
+    const uintptr_t resumeC   = base + 0x36EA00;   // after the test we relocate
+
+    // VERIFY BEFORE WRITING. These reach past the patch to cover every
+    // instruction the islands replay, so a mismatch cannot leave us replaying
+    // something that is no longer there.
+    static const uint8_t kSiteA[10] = {
+      0x8B, 0xCF,                                   // mov  rcx, rdi   (tail of)
+      0xFF, 0x50, 0x48,                             // call [rax+48h]
+      0x48, 0x8B, 0x5C, 0x24, 0x40,                 // mov  rbx, [rsp+40h]
+    };
+    static const uint8_t kSiteC[8] = {
+      0xCB,                                         // mov  rcx, rbx   (tail of)
+      0x41, 0xFF, 0x52, 0x48,                       // call [r10+48h]
+      0x40, 0x84, 0xF6,                             // test sil, sil
+    };
+    if (std::memcmp(reinterpret_cast<const void*>(wordA), kSiteA, sizeof(kSiteA)) != 0) {
+      Logger::warn("[Join] draw site A at client+0x36E368 does not match the expected bytes; nothing patched");
+      return true;
+    }
+    if (std::memcmp(reinterpret_cast<const void*>(wordC), kSiteC, sizeof(kSiteC)) != 0) {
+      Logger::warn("[Join] draw site C at client+0x36E9F8 does not match the expected bytes; nothing patched");
+      return true;
+    }
+    if ((wordA & 7u) != 0u || (wordC & 7u) != 0u) {
+      Logger::warn("[Join] draw patch words are not 8-byte aligned; nothing patched");
+      return true;
+    }
+
+    uint8_t* island = nullptr;
+    for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
+      for (int dir = 0; dir < 2 && island == nullptr; ++dir) {
+        void* hint = reinterpret_cast<void*>(dir == 0 ? siteA - step : siteA + step);
+        void* a = VirtualAlloc(hint, 512, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (a == nullptr) continue;
+        const intptr_t d = reinterpret_cast<intptr_t>(a) - static_cast<intptr_t>(siteA);
+        if (d > -0x7FF00000 && d < 0x7FF00000) island = static_cast<uint8_t*>(a);
+        else VirtualFree(a, 0, MEM_RELEASE);
+      }
+    if (island == nullptr) { Logger::warn("[Join] no draw island within +-2GB; abort"); return true; }
+
+    uint8_t* p = island;
+    auto emit  = [&p](std::initializer_list<uint8_t> bytes) { for (uint8_t b : bytes) *p++ = b; };
+    auto imm64 = [&p](uint64_t v) { std::memcpy(p, &v, sizeof(v)); p += sizeof(v); };
+    auto jmpTo = [&p](uintptr_t target) {
+      const int32_t rel = static_cast<int32_t>(
+        static_cast<intptr_t>(target) - (reinterpret_cast<intptr_t>(p) + 5));
+      *p++ = 0xE9; std::memcpy(p, &rel, 4); p += 4;
+    };
+
+    // ---- site A. Entry state is the original call's: rax = the renderable's
+    // vtable, rcx = the renderable, rdx/r8/r9 = DrawModel's other arguments.
+    // All five have to survive a C call that may clobber every one of them, so
+    // they go in a 0x50 frame -- 0x20 of shadow for the callee plus five slots
+    // it cannot reach. The return is a rel32 jump rather than `mov rax, imm64 ;
+    // jmp rax` because rax is DrawModel's return value here and the epilogue
+    // that follows is entitled to it.
+    uint8_t* const islandA = p;
+    emit({0x48, 0x83, 0xEC, 0x50});             // sub  rsp, 50h
+    emit({0x48, 0x89, 0x44, 0x24, 0x20});       // mov  [rsp+20h], rax    vtable
+    emit({0x48, 0x89, 0x4C, 0x24, 0x28});       // mov  [rsp+28h], rcx    renderable
+    emit({0x48, 0x89, 0x54, 0x24, 0x30});       // mov  [rsp+30h], rdx
+    emit({0x4C, 0x89, 0x44, 0x24, 0x38});       // mov  [rsp+38h], r8
+    emit({0x4C, 0x89, 0x4C, 0x24, 0x40});       // mov  [rsp+40h], r9
+    emit({0x48, 0xB8}); imm64(reinterpret_cast<uint64_t>(&joinDrawEnter));
+    emit({0xFF, 0xD0});                         // call rax               arg1 = rcx already
+    emit({0x4C, 0x8B, 0x4C, 0x24, 0x40});       // mov  r9,  [rsp+40h]
+    emit({0x4C, 0x8B, 0x44, 0x24, 0x38});       // mov  r8,  [rsp+38h]
+    emit({0x48, 0x8B, 0x54, 0x24, 0x30});       // mov  rdx, [rsp+30h]
+    emit({0x48, 0x8B, 0x4C, 0x24, 0x28});       // mov  rcx, [rsp+28h]
+    emit({0x48, 0x8B, 0x44, 0x24, 0x20});       // mov  rax, [rsp+20h]
+    emit({0x48, 0x83, 0xC4, 0x50});             // add  rsp, 50h
+    emit({0xFF, 0x50, 0x48});                   // call [rax+48h]         THE DRAW
+    emit({0x48, 0x83, 0xEC, 0x30});             // sub  rsp, 30h
+    emit({0x48, 0x89, 0x44, 0x24, 0x20});       // mov  [rsp+20h], rax    return value
+    emit({0x48, 0xB8}); imm64(reinterpret_cast<uint64_t>(&joinDrawLeave));
+    emit({0xFF, 0xD0});                         // call rax
+    emit({0x48, 0x8B, 0x44, 0x24, 0x20});       // mov  rax, [rsp+20h]
+    emit({0x48, 0x83, 0xC4, 0x30});             // add  rsp, 30h
+    emit({0x48, 0x8B, 0x5C, 0x24, 0x40});       // mov  rbx, [rsp+40h]    relocated
+    jmpTo(resumeA);
+
+    // ---- site C. Same shape, but the call goes through r10 and rax is dead
+    // afterwards -- the two paths out of the branch below either ignore it or
+    // overwrite it -- so no return value has to be carried across the leave
+    // call. `test sil, sil` is replayed last because 0x36EA00 is a `je` that
+    // reads the flags it sets, and rsi is non-volatile so the C call preserves
+    // the value being tested.
+    uint8_t* const islandC = p;
+    emit({0x48, 0x83, 0xEC, 0x50});             // sub  rsp, 50h
+    emit({0x48, 0x89, 0x4C, 0x24, 0x20});       // mov  [rsp+20h], rcx    renderable
+    emit({0x48, 0x89, 0x54, 0x24, 0x28});       // mov  [rsp+28h], rdx
+    emit({0x4C, 0x89, 0x44, 0x24, 0x30});       // mov  [rsp+30h], r8
+    emit({0x4C, 0x89, 0x4C, 0x24, 0x38});       // mov  [rsp+38h], r9
+    emit({0x4C, 0x89, 0x54, 0x24, 0x40});       // mov  [rsp+40h], r10    vtable
+    emit({0x48, 0xB8}); imm64(reinterpret_cast<uint64_t>(&joinDrawEnter));
+    emit({0xFF, 0xD0});                         // call rax
+    emit({0x4C, 0x8B, 0x54, 0x24, 0x40});       // mov  r10, [rsp+40h]
+    emit({0x4C, 0x8B, 0x4C, 0x24, 0x38});       // mov  r9,  [rsp+38h]
+    emit({0x4C, 0x8B, 0x44, 0x24, 0x30});       // mov  r8,  [rsp+30h]
+    emit({0x48, 0x8B, 0x54, 0x24, 0x28});       // mov  rdx, [rsp+28h]
+    emit({0x48, 0x8B, 0x4C, 0x24, 0x20});       // mov  rcx, [rsp+20h]
+    emit({0x48, 0x83, 0xC4, 0x50});             // add  rsp, 50h
+    emit({0x41, 0xFF, 0x52, 0x48});             // call [r10+48h]         THE DRAW
+    emit({0x48, 0xB8}); imm64(reinterpret_cast<uint64_t>(&joinDrawLeave));
+    emit({0xFF, 0xD0});                         // call rax
+    emit({0x40, 0x84, 0xF6});                   // test sil, sil          relocated
+    jmpTo(resumeC);
+
+    FlushInstructionCache(GetCurrentProcess(), island, 512);
+
+    auto patchWord = [](uintptr_t addr, const uint8_t* bytes) -> bool {
+      DWORD oldProt = 0;
+      if (!VirtualProtect(reinterpret_cast<void*>(addr), 8, PAGE_EXECUTE_READWRITE, &oldProt))
+        return false;
+      LONG64 word = 0;
+      std::memcpy(&word, bytes, sizeof(word));
+      InterlockedExchange64(reinterpret_cast<volatile LONG64*>(addr), word);
+      DWORD tmp = 0; VirtualProtect(reinterpret_cast<void*>(addr), 8, oldProt, &tmp);
+      FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(addr), 8);
+      return true;
+    };
+
+    // Site A: bytes 0..1 are the tail of `mov rcx, rdi` and must survive; the
+    // jump takes 2..6; byte 7 is the middle of the mov we relocated and is now
+    // unreachable.
+    uint8_t wa[8];
+    std::memcpy(wa, reinterpret_cast<const void*>(wordA), sizeof(wa));
+    const int32_t relA = static_cast<int32_t>(
+      reinterpret_cast<intptr_t>(islandA) - static_cast<intptr_t>(siteA + 5));
+    wa[2] = 0xE9; std::memcpy(wa + 3, &relA, 4); wa[7] = 0xCC;
+    const bool okA = patchWord(wordA, wa);
+
+    // Site C: byte 0 is the tail of `mov rcx, rbx`; the jump takes 1..5; bytes
+    // 6..7 are the tail of the test we relocated.
+    uint8_t wc[8];
+    std::memcpy(wc, reinterpret_cast<const void*>(wordC), sizeof(wc));
+    const int32_t relC = static_cast<int32_t>(
+      reinterpret_cast<intptr_t>(islandC) - static_cast<intptr_t>(siteC + 5));
+    wc[1] = 0xE9; std::memcpy(wc + 2, &relC, 4); wc[6] = 0xCC; wc[7] = 0xCC;
+    const bool okC = patchWord(wordC, wc);
+
+    Logger::warn(str::format(
+      "[Join] draw span installed: A=", (okA ? 1 : 0), " C=", (okC ? 1 : 0),
+      " island=0x", std::hex, reinterpret_cast<uintptr_t>(island),
+      " siteA=0x", siteA, " siteC=0x", siteC, std::dec,
+      " | latch is now DrawModel, not the gate -- withRend/n is the real ratio"));
     return true;
   }
 
@@ -7151,7 +8850,26 @@ namespace dxvk {
         if (m != nullptr) g_liveWidowModel.store(m, std::memory_order_relaxed);
       }
     }
+    // NV-DXVK [Join]: THE THIRD DRAW SPAN, and it needs no patch of its own.
+    // The census settled where the renderable draws actually come from:
+    // client.dll+0x6c50d2 and studiorender.dll+0x13b6d are called DIRECTLY by
+    // the matsys dispatcher at matsys+0x87f9f, so a model's draw work is
+    // replayed on the render thread from a queue record, not run inside
+    // IClientRenderable::DrawModel on this one. The two DrawModel sites the
+    // draw-span islands cover fire only 4 times a frame, which is why
+    // withRend sat at 28 records while studio models carried 13% of the frame.
+    //
+    // This is where those records are queued from. a3[0] is the
+    // IClientRenderable -- the same field the hw=541 capture above reads -- and
+    // this wrapper already brackets the real draw, so the span costs two calls
+    // and no engine bytes. It nests inside a DrawModel span when one is open;
+    // drawEnter/drawLeave handle that.
+    void* lodRend = nullptr;
+    if (studioMemReadable(a3, 8))
+      lodRend = *reinterpret_cast<void**>(a3);
+    joinprobe::drawEnter(lodRend);
     const int64_t ret = g_lodOrig ? g_lodOrig(a1, a2, a3) : 0;          // run the real draw, capture return
+    joinprobe::drawLeave();
     t_curStudioHw = 0xFFFFu;                                              // left this model's draw
     lodLogSeh(a2, a3, hw, ret);
     return ret;
@@ -38113,6 +39831,21 @@ namespace dxvk {
     // unverified this is one predictable branch and nothing on screen can move.
     residentGateBegin(indexed, count, start, base);
 
+    // NV-DXVK [Join] slice A: read the attribution latch. Every draw is counted,
+    // not only the ones that carry a renderable -- world geometry and static
+    // props reach D3D11 through paths the client renderable list never sees, so
+    // draws WITHOUT a latch are expected and are themselves the measurement of
+    // how much of the frame this one list can ever account for.
+    joinprobe::noteDraw();
+
+    // NV-DXVK [JoinStack]: stand at the draw and look up. A2's hooks proved
+    // sub_18006FCB0 carries ~0.3% of the frame, so the path that carries the
+    // rest is still unknown -- and it is unknown in the one way static analysis
+    // cannot settle, because IDA shows that a path exists and not how often it
+    // runs. Costs one unlocked integer compare until it arms, then a bounded
+    // census of a few frames, then nothing for the life of the process.
+    joinstack::noteDraw();
+
     // [Perf.SubmitDraw] per-stage timing â€” see comment near static thread_local accumulators
     // above for stage definitions. markStg bumps both the running accumulator AND the per-draw
     // max (so we see whether a stage's cost is uniform across draws or concentrated in outliers).
@@ -63790,6 +65523,48 @@ namespace dxvk {
               s_de72aHookInstalled = true;
           }
 
+          // NV-DXVK [Join]: the matsys record/dispatch join -- two atomic
+          // 8-byte patches in materialsystem_dx11 that carry a renderable
+          // across the thread hop the first [Join] capture proved exists. See
+          // queuedDrawInstallHook.
+          //
+          // GATED ON rtx.residentScene.logStats, unlike the probes above, which
+          // install unconditionally. One patch is the entry of the matsys queue
+          // allocator and the other is inside the render thread's drain loop --
+          // between them they sit on every queued command and every dispatched
+          // record in the game, and a probe that rewrites engine code that hot
+          // should not be resident in a run that is not measuring. Once
+          // installed it stays installed for the process: the patches are not
+          // reverted when the option goes off, and the wrappers then cost one
+          // predictable branch each.
+          //
+          // HELD BACK UNTIL THE [JoinStack] CENSUS HAS FINISHED, which takes
+          // eight gameplay frames from the moment the option goes on. The
+          // dispatcher island has no unwind information, so a stack walk that
+          // crosses it reports garbage above the draw rather than failing --
+          // see joinstack::censusDone(). Running the census first costs eight
+          // frames and keeps both probes readable in the same session.
+          static bool s_joinHookInstalled = false;
+          if (kEngineHooksEnabled && !s_joinHookInstalled
+              && RtxOptions::ResidentScene::logStats()
+              && joinstack::censusDone()) {
+            if (queuedDrawInstallHook())
+              s_joinHookInstalled = true;
+          }
+
+          // NV-DXVK [Join]: the draw span. Two more atomic patches, this time
+          // in client.dll, that put the renderable latch around
+          // IClientRenderable::DrawModel instead of around the gate. Installed
+          // with the queue hook and under the same conditions -- on its own it
+          // would latch renderables nothing reads, and without it the queue
+          // hook attributes every record to whichever renderable was gated
+          // last. See drawSpanInstallHook.
+          static bool s_drawSpanInstalled = false;
+          if (kEngineHooksEnabled && !s_drawSpanInstalled && s_joinHookInstalled) {
+            if (drawSpanInstallHook())
+              s_drawSpanInstalled = true;
+          }
+
           // [MatBind] Option C: vtable-swap matsys slot 0x80 (sub_180071E80,
           // material Bind) to capture the bound material per-thread, so the
           // deferred ship draw (nameWhy=3) can be named at [SkinAABB]. See
@@ -63923,6 +65698,12 @@ namespace dxvk {
           // the frame thread from this one place, which is the whole of the
           // synchronisation between them.
           residentSeedUpdate();
+
+          // NV-DXVK [Join] slice A: the frame's readout, and the reset that
+          // makes the next frame's numbers mean anything. Emitted from here
+          // because this is the frame thread's one end-of-frame point, the same
+          // place the seed steps and for the same reason.
+          joinProbeEndFrame();
 
           cullOffUpdate();
 
