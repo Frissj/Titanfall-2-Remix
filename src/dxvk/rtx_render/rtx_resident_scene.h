@@ -160,11 +160,48 @@ namespace dxvk {
       //   decals       decalSortOrder is a per-frame counter that approximates
       //                draw order on the GPU; a stale one misorders the decal.
       //
+      // A FOURTH WAS ADDED BY MEASUREMENT, and it is excluded for a different
+      // reason than the three above:
+      //
+      //   blending on  a translucent surface's appearance is a function of the
+      //                scene BEHIND it, and residency retains only the sparse
+      //                subset of the scene that was actually drawn. Held
+      //                translucent geometry therefore composites against
+      //                whatever survived rather than against the scene it was
+      //                authored over. Nothing is rebuilt per frame here -- the
+      //                dependency is on the rest of the frame, which a record
+      //                cannot hold by definition.
+      //
       // Measured off the instances at build time rather than guessed from the
       // draw, and stored so the touch can refuse in O(1). This is the plan's own
       // Transient class, derived from what the instances turned out to be
-      // instead of declared from what a shader looks like.
+      // instead of declared from what a shader looks like -- and the fourth
+      // entry is what that design was FOR: it arrived as a visual bug, was named
+      // by [HeldRaw] dumping properties rather than by a shader allowlist, and
+      // cost one clause.
       bool skipUnsafe = false;
+      // DIAGNOSTIC BASELINE for [HeldRaw], captured off the first instance's
+      // geometry at build time.
+      //
+      // The question they answer cannot be answered without a baseline: a held
+      // instance keeps pointing at its BLAS, but nothing here proves the BLAS's
+      // vertex CONTENT is still the content the record was built against. If
+      // the geometry is regenerated each frame -- skinning being the obvious
+      // case, since a skinned mesh's positions are produced per draw -- then a
+      // held instance with no draw renders whatever was last written into that
+      // buffer, which need not be its own mesh.
+      //
+      // builtBoneHash non-zero identifies the skinned case directly;
+      // builtPosHash compared against the live hash catches any other producer
+      // of the same failure without having to name it first.
+      uint64_t builtPosHash = 0ull;
+      uint64_t builtBoneHash = 0ull;
+      // WHICH BlasEntry the baseline above was taken from. The content check is
+      // only meaningful against that same entry: a record whose instances span
+      // several BLASes would otherwise have one instance's hash validating all
+      // of them, which passes every instance except the one it was measured on.
+      // Held as a raw address for comparison only and never dereferenced.
+      const void* builtBlas = nullptr;
       std::vector<RtInstance*> instances;
     };
 
@@ -256,37 +293,121 @@ namespace dxvk {
       uint32_t instancesStamped = 0;
       // VERIFY TALLIES. predicted counts draws the frame-thread gate said it
       // could have skipped; fail counts those where the record disagreed with
-      // what the full path actually resolved. failNoRecord is the subset where
-      // there was no valid record to serve at all, which is a different defect
-      // (the gate and the record store disagree about what exists) from a
-      // record naming the wrong instances.
+      // what the full path actually resolved.
       //
-      // FAIL=0 ACROSS A PITCH-AND-YAW SWEEP IS THE GATE FOR TURNING verify OFF.
-      // Not a low rate -- zero. Every failure is an object that would have been
-      // held resident on stale contents.
+      // THE ARMING GATE IS fail - failNoRecEmpty, NOT fail, AND THE DIFFERENCE
+      // IS NOT A TOLERANCE. A draw that resolves to no instance is never filed:
+      // processDrawCallState skips build() on an empty list, deliberately,
+      // because a record serving an empty touch reads as a hit and does nothing.
+      // The inputs of such a draw are perfectly stable, so the gate predicts a
+      // hit on it every frame and score() finds no record every frame. That
+      // population -- the sky pass, the fog registration, the terrain bake --
+      // contributes a fixed non-zero FAIL for as long as the level is loaded,
+      // and no change to the key, the folds or the record store can move it.
+      // Reading the unsplit total as the arming gate means waiting for a zero
+      // that cannot arrive.
+      //
+      // So the four causes are counted apart, because they want four different
+      // responses:
+      //
+      //   failNoRecEmpty  no record, and the full path produced no instances
+      //                   either -- the side-effect class. BENIGN AND
+      //                   PERMANENT: the live path already handles it, since
+      //                   touch() finds nothing and the draw commits in full.
+      //                   Expected steady and non-zero.
+      //   failNoRecLost   no record, but the full path DID produce instances.
+      //                   A record was filed and went away between the two
+      //                   frames. Read evicted=, wiped= and invalidated= on the
+      //                   same line first: if those are moving, the eviction
+      //                   policy is the story rather than the key.
+      //   failSize        a record was there and named a DIFFERENT NUMBER of
+      //                   instances than the draw just produced. This is the
+      //                   occurrence ordinal sliding when engine culling removes
+      //                   one copy of a multi-copy identity (trap 2).
+      //   failMember      same count, different instances, position for
+      //                   position. The strictest failure, and the one the
+      //                   ordinal exists to prevent.
+      //
+      // failSize + failMember are the two that would have kept the wrong
+      // objects alive and let the right ones retire. THOSE must reach zero
+      // across a full pitch-and-yaw sweep before verify goes off.
       uint32_t predicted  = 0;
       uint32_t fail       = 0;
-      uint32_t failNoRecord = 0;
+      uint32_t failNoRecEmpty = 0;
+      uint32_t failNoRecLost  = 0;
+      uint32_t failSize       = 0;
+      uint32_t failMember     = 0;
+      // The two second-level splits, each answering a question its parent count
+      // cannot -- see the bodies in score() for what each one implies.
+      //
+      // failLostErased is the one to read sceptically: it is the count of
+      // records that were filed and then erased, which while verify is on is
+      // largely residency being disabled rather than residency being wrong.
+      uint32_t failLostErased = 0;
+      uint32_t failLostNever  = 0;
+      // NOT A FAILURE, and it is outside `fail` on purpose -- see score(). The
+      // record named the same instances in a different order, and touch()
+      // consumes the list as a set, so the right objects are kept alive. It is
+      // reported because unstable resolution order is worth knowing about, and
+      // because it is the number that would matter if a consumer ever became
+      // positional.
+      uint32_t memberPerm = 0;
       // Records retired because the engine freed the buffers they were built
       // from. CUMULATIVE, like wiped: this is the signal that keeps a destroyed
       // object from ghosting, and a policy that never fires needs to be visible
       // as never having fired rather than as a zero in the current window.
       uint32_t sourceDestroyed = 0;
+      // THE TWO NUMBERS THAT MAKE sourceDestroyed READABLE. Alone it reads 0 for
+      // two opposite reasons and cannot distinguish them:
+      //
+      //   srcNotices=0                   ~D3D11Buffer never runs for this
+      //                                  geometry. TF2 pools and reuses its
+      //                                  buffers, so the object dies and the
+      //                                  buffer does not -- which makes buffer
+      //                                  death the wrong death signal for this
+      //                                  engine, not a broken one.
+      //   srcNotices>0, srcDrained>0,    buffers die constantly and none of them
+      //   sourceDestroyed=0              is one a record was built from. The
+      //                                  join is broken and is a bug to find.
+      //
+      // Both CUMULATIVE, like wiped and sourceDestroyed: a policy that never
+      // fires has to be visible as never having fired rather than as a zero in
+      // the current window.
+      uint32_t srcNotices = 0;
+      uint32_t srcDrained = 0;
     };
 
     const Stats& stats() const { return m_stats; }
     void resetStats() {
       const uint32_t keepWiped = m_stats.wiped;
       const uint32_t keepSourceDestroyed = m_stats.sourceDestroyed;
+      const uint32_t keepSrcNotices = m_stats.srcNotices;
+      const uint32_t keepSrcDrained = m_stats.srcDrained;
       m_stats = Stats();
       m_stats.wiped = keepWiped;
       m_stats.sourceDestroyed = keepSourceDestroyed;
+      m_stats.srcNotices = keepSrcNotices;
+      m_stats.srcDrained = keepSrcDrained;
     }
 
     size_t size() const { return m_records.size(); }
 
   private:
+    // Records this store erased, and the frame it happened on. DIAGNOSTIC ONLY:
+    // it exists so score() can tell "this key's record was filed and then went
+    // away" from "this key never had a record", which are opposite findings that
+    // the missing-record count alone reports identically.
+    //
+    // Kept for a few frames and no longer. The question it answers is always
+    // about the immediately preceding frame -- the gate only predicts on a key
+    // it judged last frame -- so a long history would cost memory to answer
+    // nothing, and an unbounded one would be a leak in exactly the churning
+    // scene where it fills fastest.
+    static constexpr uint32_t kTombstoneFrames = 4u;
+    void recordTombstone(uint64_t key, uint32_t frame);
+
     std::unordered_map<uint64_t, Record> m_records;
+    std::unordered_map<uint64_t, uint32_t> m_tombstones;
     Stats m_stats;
   };
 

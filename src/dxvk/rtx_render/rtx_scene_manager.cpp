@@ -384,8 +384,13 @@ namespace dxvk {
     //
     // Costs a walk of the linked instances, and only for entries that have
     // already aged past the bound -- i.e. the ones about to be destroyed.
-    const bool residencyKeepsGeometry =
-      RtxOptions::ResidentScene::enable() && !RtxOptions::ResidentScene::verify();
+    // Tracks the instance-side keep clause in InstanceManager::garbageCollection
+    // and must not diverge from it: an instance held resident whose geometry is
+    // collected underneath it is the §2.3.1 failure, where the exemption is real
+    // and worth nothing. Both are now keyed on enable() alone rather than on
+    // enable() && !verify() -- see the long note at that clause for the
+    // measurement that forced it (noRecLost=481 erased=481 never=0).
+    const bool residencyKeepsGeometry = RtxOptions::ResidentScene::enable();
     const ResidentScene& residentScene = m_instanceManager.getResidentScene();
 
     auto blasEntryGarbageCollection = [&](auto& iter, auto& entries) -> void {
@@ -3393,8 +3398,40 @@ namespace dxvk {
     // that's the smoking gun and points the bug at determineMaterialData /
     // as<OpaqueMaterialData>() / createSurfaceMaterial.
     //
-    // Gating: skinned-only (numBones > 0). Skips world/UI/sky entirely.
-    if (drawCall.getSkinningState().numBones > 0) {
+    // Gating: any OPAQUE surface that ended up with no albedo texture index at
+    // all. Skinned or not -- see the narrowing note below.
+    //
+    // WIDENED 2026-08-22. The original gate was skinned-only and says so; that
+    // skips world, UI and sky entirely, which is fine for the bone-related bug
+    // it was written for and useless for the general case. An opaque surface
+    // whose albedo index is kSurfaceMaterialInvalidTextureIndex is LITERALLY the
+    // untextured-white symptom -- there is no texture for the shader to sample
+    // -- so it belongs in this probe whether or not the mesh has bones, and a
+    // prop that renders white without being skinned was invisible here before.
+    //
+    // Restricted to Opaque deliberately: surfaceAlbedoEmpty defaults to true for
+    // every other surface type below, so gating on it unrestricted would fire on
+    // every translucent draw in the frame and drown the thing being looked for.
+    // The existing sLoggedKeys dedup and kMaxLines cap still bound the volume.
+    //
+    // NARROWED to whiteCandidate alone. The skinned half of the gate logged
+    // draws that are FINE -- a session after the world white-surface fix landed
+    // spent all 557 of its lines on skinned draws reading surfEmpty=0, controls
+    // rather than findings. kMaxLines is 1500 for the whole process, so on a
+    // long session the controls exhaust the budget and a genuine white surface
+    // appearing later is never logged at all. That turns the probe from an alarm
+    // into one that quietly expires.
+    //
+    // Nothing is lost by dropping the skinned term. whiteCandidate is a property
+    // of the resulting surface, not of the mesh, so a white SKINNED draw still
+    // matches it -- which is the case the original skinned-only gate existed to
+    // catch. What goes away is only the healthy skinned traffic.
+    bool whiteCandidate = false;
+    if (surfaceMaterial.getType() == RtSurfaceMaterialType::Opaque) {
+      whiteCandidate = (surfaceMaterial.getOpaqueSurfaceMaterial().getAlbedoOpacityTextureIndex()
+                        == kSurfaceMaterialInvalidTextureIndex);
+    }
+    if (whiteCandidate) {
       static std::mutex sDiagMtx;
       static std::atomic<uint32_t> sDiagLines { 0 };
       // key = ((uintptr)instance ^ albedoHash) << 1 | isFirst
@@ -3438,6 +3475,15 @@ namespace dxvk {
           Logger::info(str::format(
             "[RtxWhiteDiag2]",
             " frame=", m_device->getCurrentFrameId(),
+            // THE JOIN THIS PROBE WAS MISSING. It reports that a surface ended
+            // up untextured but never said which shader produced it, so it
+            // could not be matched against [RtxTcNone], which is keyed by VS
+            // and reports which layouts have no texcoord element. Without this
+            // field the two probes describe the same bug and cannot be proven
+            // to describe the same DRAWS -- and fixing the wrong population is
+            // worse than not fixing it.
+            " vs=0x", std::hex,
+            static_cast<uint64_t>(drawCall.getTransformData().vertexShaderHash), std::dec,
             " inst=", static_cast<const void*>(&instance),
             " blas=", static_cast<const void*>(pBlas),
             " first=", (isFirstUpdateThisFrame ? 1 : 0),

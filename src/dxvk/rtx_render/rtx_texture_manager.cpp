@@ -1330,10 +1330,37 @@ namespace dxvk {
     // as we can't predict how draw call textures (sky, terrain, etc) are used
     for (ManagedTexture* tex : checkonlyframes) {
       assert(tex && tex->m_canDemote);
-      tex->requestMips(
-        (tex->m_frameLastUsed != UINT32_MAX) && (curframe - tex->m_frameLastUsed <= numFramesToKeepMaterialTextures)
-        ? MAX_MIPS
-        : 0);
+      const bool keep = (tex->m_frameLastUsed != UINT32_MAX)
+                        && (curframe - tex->m_frameLastUsed <= numFramesToKeepMaterialTextures);
+
+      // NV-DXVK [TexDemote] reason=age. THE TRANSITION, NOT THE STATE.
+      //
+      // This runs every pass, so logging whenever `keep` is false would print
+      // the same already-demoted texture forever. What is wanted is the frame a
+      // texture actually LOSES its mips, because that is the frame an object
+      // turns untextured on screen.
+      //
+      // WHY THIS SITE MATTERS. The keep window is
+      // numFramesToKeepMaterialTextures, which is just numFramesToKeepBLAS, and
+      // m_frameLastUsed is stamped in exactly one place -- addTexture, on the
+      // draw path. So a texture is demoted purely for not having been DRAWN
+      // recently. Before residency an undrawn object left the scene and took its
+      // demoted texture with it; a held instance stays visible, so the demotion
+      // became visible too. reason= separates this from the budget-driven
+      // demote, which needs an entirely different fix.
+      if (!keep && tex->m_requestedMips.load() > 0) {
+        Logger::warn(str::format(
+          "[TexDemote] f=", curframe,
+          " reason=age",
+          " key=0x", std::hex, static_cast<uint64_t>(tex->m_uniqueKey), std::dec,
+          " lastUsed=", tex->m_frameLastUsed,
+          " age=", (tex->m_frameLastUsed == UINT32_MAX
+                    ? 0u : (curframe - tex->m_frameLastUsed)),
+          " window=", numFramesToKeepMaterialTextures,
+          " hadMips=", static_cast<uint32_t>(tex->m_requestedMips.load())));
+      }
+
+      tex->requestMips(keep ? MAX_MIPS : 0);
       scheduleTextureLoad(tex, true);
     }
 
@@ -1435,6 +1462,19 @@ namespace dxvk {
       
       if (currentMips > 0) {
         const size_t oldSize = calcSizeForAsset(*tex->m_assetData, allmipcount - currentMips, allmipcount);
+        // NV-DXVK [TexDemote] reason=budget. The OTHER way a texture loses its
+        // mips, and it wants the opposite response from reason=age: this one
+        // fires because VRAM is over budget, so no amount of keeping an object's
+        // frame stamp fresh would prevent it. Distinguishing the two is the
+        // whole point of logging both -- an untextured object caused by budget
+        // pressure is not a residency bug at all.
+        Logger::warn(str::format(
+          "[TexDemote] f=", m_device->getCurrentFrameId(),
+          " reason=budget",
+          " key=0x", std::hex, static_cast<uint64_t>(tex->m_uniqueKey), std::dec,
+          " lastUsed=", tex->m_frameLastUsed,
+          " hadMips=", currentMips,
+          " freedBytes=", static_cast<uint64_t>(oldSize)));
         tex->requestMips(0);
         scheduleTextureLoad(tex, false);
         currentUsage -= oldSize;

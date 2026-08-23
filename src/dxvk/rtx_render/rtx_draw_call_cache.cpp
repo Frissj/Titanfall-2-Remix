@@ -139,16 +139,87 @@ namespace {
       return false;
     }
 
-    // See sameShader(): same mesh + same material drawn by a different shader is
-    // a DIFFERENT object (main-world prop vs its 3D-skybox copy), and must not
-    // share a BlasEntry or the SpatialMap inside it.
-    if (!sameShader(drawCall, blas)) {
+    const bool matMatches  = drawCall.getMaterialData().getHash()
+                          == blas.input.getMaterialData().getHash();
+    // geoMatches is FullGeometryHash, a hash of the vertex CONTENT, and it fails
+    // on most of this game's world geometry: Titanfall batches that geometry with
+    // world-space vertices which are rewritten every frame, so one unchanging
+    // prop hashes differently frame to frame and the term cannot re-identify its
+    // entry. [XMatch] measured geoOK=0 on 83% of comparisons, 5126 of those with
+    // the shader and the material both matching. That is the entry-churn defect
+    // and it is open.
+    //
+    // It looks like commit b1928c19 (2026-08-07, rtx_hashing.h) caused this and
+    // that reverting it would cure it. Do not. Before b1928c19, precombined[] was
+    // uninitialised, so on the draw path this term compared 0 against 0 and
+    // silently always passed; b1928c19 zeroed the array and made the draw path
+    // call precombine(), which is correct. It only started enforcing a term that
+    // was already unusable here. The fix is an identity that survives per-frame
+    // vertex rewrites, not a weaker geometry term.
+    const bool geoMatches  = drawCall.getGeometryData().getHashForRule<rules::FullGeometryHash>()
+                          == blas.input.getGeometryData().getHashForRule<rules::FullGeometryHash>();
+    const bool boneMatches = drawCall.getSkinningState().boneHash
+                          == blas.input.getSkinningState().boneHash;
+    // The per-component position hash, on top of FullGeometryHash. Deliberately
+    // redundant: it is what makes the relaxation below safe to state, because a
+    // scaled or relocated COPY of a mesh cannot agree on it.
+    const bool posMatches  = drawCall.getGeometryData().hashes[HashComponents::VertexPosition]
+                          == blas.input.getGeometryData().hashes[HashComponents::VertexPosition];
+
+    if (!(matMatches && geoMatches && boneMatches)) {
       return false;
     }
 
-    return drawCall.getMaterialData().getHash() == blas.input.getMaterialData().getHash()
-        && drawCall.getGeometryData().getHashForRule<rules::FullGeometryHash>() == blas.input.getGeometryData().getHashForRule<rules::FullGeometryHash>()
-        && drawCall.getSkinningState().boneHash == blas.input.getSkinningState().boneHash;
+    // See sameShader(): same mesh + same material drawn by a different shader is
+    // a DIFFERENT object (main-world prop vs its 3D-skybox copy), and must not
+    // share a BlasEntry or the SpatialMap inside it.
+    //
+    // NARROWED, and only for the case where the shader is the ONLY thing that
+    // differs. sameShader cannot tell two different objects apart from two
+    // PASSES OVER ONE OBJECT, and this engine does the latter constantly --
+    // [TcPair] measured 323 cases of a single index range drawn twice in one
+    // frame by different shaders. When a pass is split off into its own
+    // BlasEntry that entry is born with an EMPTY SpatialMap, so
+    // findSimilarInstance cannot match into it, the instance respawns, and last
+    // frame's instance is reaped. That is the reap storm.
+    //
+    // Measured with [XMatch] once shaderOK= existed to see it: 5468 comparisons
+    // where the shader was the only failing term, 5264 of them the single pair
+    // 0x2af9b90d63850ec3 -> 0x298e12b3d5bcd082, with material, FullGeometryHash,
+    // bone hash and space all byte-identical.
+    //
+    // WHY THIS DOES NOT REOPEN THE TREE BUG. That case was a 3D-skybox COPY:
+    // same asset, different placement and scale. It is admitted here only if it
+    // agrees on FullGeometryHash AND the vertex-position component hash AND the
+    // material AND the bone hash AND the space -- five exact terms with no
+    // threshold. Two objects that agree on all five are not a copy of each
+    // other, they are the same geometry submitted twice.
+    //
+    // TO REVERT: restore the early `return false` on !sameShader. The
+    // [ShaderSplitMerge] line below fires on every pairing this admits, so a
+    // regression names itself instead of showing up as flicker.
+    if (!sameShader(drawCall, blas)) {
+      if (!posMatches) {
+        return false;
+      }
+      static std::atomic<uint32_t> sMergeLines { 0 };
+      constexpr uint32_t kMaxMergeLines = 400;
+      if (sMergeLines.fetch_add(1, std::memory_order_relaxed) < kMaxMergeLines) {
+        Logger::info(str::format(
+          "[ShaderSplitMerge] pairing across shaders:"
+          " dVs=0x", std::hex,
+          static_cast<uint64_t>(drawCall.getTransformData().vertexShaderHash),
+          " eVs=0x",
+          static_cast<uint64_t>(blas.input.getTransformData().vertexShaderHash),
+          " mat=0x", static_cast<uint64_t>(drawCall.getMaterialData().getHash()),
+          " geo=0x",
+          static_cast<uint64_t>(drawCall.getGeometryData().getHashForRule<rules::FullGeometryHash>()),
+          std::dec,
+          " | material, geometry, position, bone and space all identical"));
+      }
+    }
+
+    return true;
   }
 
   // NV-DXVK [XMatch]: report WHICH exactMatch term failed, comparing the draw
@@ -177,6 +248,24 @@ namespace {
     const XXH64_hash_t eModPos = blas.modifiedGeometryData.hashes[HashComponents::VertexPosition];
     const XXH64_hash_t eInpPos = blas.input.getGeometryData().hashes[HashComponents::VertexPosition];
     const XXH64_hash_t dPos    = drawCall.getGeometryData().hashes[HashComponents::VertexPosition];
+
+    // NV-DXVK [KeyStab]: the CANDIDATE identity, reported and not acted on.
+    //
+    // THE QUESTION THIS ANSWERS. Every term above is derived from the vertex
+    // CONTENT, and this engine rewrites that content every frame, so all of them
+    // churn. engineDrawKey is derived from the engine's own buffer objects
+    // instead. If edkOK=1 on the population where shaderOK=1 matOK=1 geoOK=0 --
+    // the 5126 comparisons that are the entry churn -- then engineDrawKey is an
+    // identity that survives the rewrite, and it belongs in the geometry term.
+    // If edkOK=0 there too, it does not, and it must not be wired in.
+    //
+    // edkOK requires dEdk != 0: zero is "no vertex buffer bound, no identity",
+    // and two draws with no identity must not compare equal. That is the trap
+    // the geometry term itself fell into before b1928c19, when it compared 0
+    // against 0 and always passed.
+    const uint64_t dEdk = drawCall.engineDrawKey;
+    const uint64_t eEdk = blas.input.engineDrawKey;
+
     const XXH64_hash_t dBone = drawCall.getSkinningState().boneHash;
     const XXH64_hash_t eBone = blas.input.getSkinningState().boneHash;
     Logger::info(str::format(
@@ -184,9 +273,29 @@ namespace {
       " blasPtr=0x", std::hex, reinterpret_cast<uintptr_t>(&blas), std::dec,
       " skyDraw=", (isSky(drawCall.cameraType) ? 1 : 0),
       " skyBlas=", (isSky(blas.input.cameraType) ? 1 : 0),
+      // NV-DXVK: THE TERM THIS PROBE WAS MISSING, and it is the one deciding.
+      //
+      // exactMatch tests four things -- space, shader, and the three hashes.
+      // This probe reported the space check and all three hashes and never the
+      // shader, because sameShader was added after it (2026-07-29, the
+      // tree-versus-skybox pairing). So a rejection whose only failing term was
+      // the shader showed up here as every logged field passing, which reads as
+      // "no reason at all".
+      //
+      // Measured before this field existed: 9393 comparisons with
+      // matOK=1 geoOK=1 boneOK=1, skyDraw=skyBlas=0, and every raw hash
+      // byte-identical -- dMat==eMat, dGeo==eGeo, dPos==eInpPos==eModPos,
+      // dBone==eBone -- yet exactMatch returned false. By elimination that is
+      // sameShader, but a probe that forces its reader to reason by elimination
+      // is the same defect this file already recorded once, when two VS lists
+      // were compared across different hash spaces and declared disjoint.
+      // Print it, and print both hashes so it can be checked rather than
+      // inferred.
+      " shaderOK=", (sameShader(drawCall, blas) ? 1 : 0),
       " matOK=",  (dMat == eMat ? 1 : 0),
       " geoOK=",  (dGeo == eGeo ? 1 : 0),
       " boneOK=", (dBone == eBone ? 1 : 0),
+      " edkOK=", (dEdk != 0ull && dEdk == eEdk ? 1 : 0),
       " posInpVsMod=", (eInpPos == eModPos ? 1 : 0),
       " posDrawVsInp=", (dPos == eInpPos ? 1 : 0),
       " dMat=0x",  std::hex, static_cast<uint64_t>(dMat),
@@ -198,6 +307,15 @@ namespace {
       " eModPos=0x", static_cast<uint64_t>(eModPos),
       " dBone=0x", static_cast<uint64_t>(dBone),
       " eBone=0x", static_cast<uint64_t>(eBone),
+      " dEdk=0x", dEdk,
+      " eEdk=0x", eEdk,
+      // Both sides of the shader term, so shaderOK above can be checked rather
+      // than trusted. Same hash space on both -- getTransformData().vertexShaderHash
+      // is DxvkShader::getHash() on the draw AND on the entry, so these two are
+      // directly comparable to each other and to [FindSim] vs=, but NOT to the
+      // GetCurrentVsPsHashes values that [RtxTcNone] and friends print.
+      " dVs=0x", static_cast<uint64_t>(drawCall.getTransformData().vertexShaderHash),
+      " eVs=0x", static_cast<uint64_t>(blas.input.getTransformData().vertexShaderHash),
       // NV-DXVK [MatBind identity]: engine-truth IMaterial* on both sides.
       // engOK=1 means the engine bound the same material for the draw and
       // for the entry's allocation-time draw — the class test the matcher
@@ -368,14 +486,34 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
   Matrix4 newTransform = drawCall.getTransformData().objectToWorld;
   const Vector3 newWorldPosition = drawCall.getGeometryData().boundingBox.getTransformedCentroid(newTransform);
 
+  // NV-DXVK [EntryReject]: per-clause rejection census for this lookup, so a
+  // freshly allocated entry below can be ATTRIBUTED rather than guessed at.
+  //
+  // The measurement that motivated it: VS 0x2af9b90d63850ec3 burned 307 distinct
+  // BlasEntry addresses over 255 frames, 153 of which existed for exactly ONE
+  // frame. A one-frame entry has an empty SpatialMap, so findSimilarInstance
+  // cannot match into it, the instance respawns and the previous one is reaped.
+  // That is the reaping, and it originates here rather than in the matcher --
+  // [FindSim] measured 1 to 2 queries against maps holding 3 to 45 instances, so
+  // the matcher is not starved of candidates, it is handed the wrong map.
+  uint32_t dbgSiblings = 0;
+  uint32_t dbgEngReject = 0;
+  uint32_t dbgEngRejectWouldHashMatch = 0;
+  uint32_t dbgHashReject = 0;
+  uint32_t dbgTouchedReject = 0;
+  uint32_t dbgSpaceReject = 0;
+  uint32_t dbgShaderReject = 0;
+
   for (auto bucketIter = range.first; bucketIter != range.second; bucketIter++) {
     BlasEntry& blas  = bucketIter->second;
+    ++dbgSiblings;
     if (exactMatch(drawCall, blas)) {
       *out = &blas;
       return CacheState::kExisted;
     }
     logExactMatchFailure(drawCall, blas, m_device->getCurrentFrameId());
     if (blas.frameLastTouched == m_device->getCurrentFrameId()) {
+      ++dbgTouchedReject;
       continue;
     }
     // Never score a candidate from the other space. exactMatch() above rejects
@@ -387,6 +525,7 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
     // if no same-space candidate exists, allocateEntry() below makes one, which
     // is what should happen for geometry appearing in a space for the first time.
     if (!sameSpace(drawCall, blas)) {
+      ++dbgSpaceReject;
       continue;
     }
     // Same reasoning as sameSpace: never score a candidate produced by a
@@ -394,6 +533,7 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
     // tree with its 3D-skybox copy -- all three scoring bonuses tie, because the
     // mesh and material really are identical.
     if (!sameShader(drawCall, blas)) {
+      ++dbgShaderReject;
       continue;
     }
     // NV-DXVK [XMatch fix 2026-08-02]: eligibility gate + stable assignment.
@@ -428,9 +568,29 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
     const bool materialHashesMatch = blas.input.getMaterialData().getHash() == drawCall.getMaterialData().getHash();
     if (drawCall.engineMaterialPtr != 0 && blas.input.engineMaterialPtr != 0) {
       if (drawCall.engineMaterialPtr != blas.input.engineMaterialPtr) {
+        // NV-DXVK [EntryReject]: this clause is the suspect, and the counter
+        // beside it is what convicts or clears it.
+        //
+        // The comment above treats engineMaterialPtr as engine truth about
+        // OBJECT identity -- "different means they are different objects no
+        // matter what any derived hash says". That inference only holds one
+        // way. Two distinct objects sharing one material carry the SAME
+        // pointer, and one object whose material binding is re-created between
+        // frames carries a DIFFERENT one. Because this is a hard `continue`,
+        // the vertex/bone/material fallback that would still have paired them
+        // never runs.
+        //
+        // engRejWouldHash counts exactly the rejections where those hash
+        // clauses WOULD have accepted the pairing. If it tracks engRej, this
+        // gate is manufacturing the one-frame entries.
+        ++dbgEngReject;
+        if ((vertexDataMatches && boneHashesMatch) || materialHashesMatch) {
+          ++dbgEngRejectWouldHashMatch;
+        }
         continue;
       }
     } else if (!(vertexDataMatches && boneHashesMatch || materialHashesMatch)) {
+      ++dbgHashReject;
       continue;
     }
     // TODO these heuristics could use more refinement.
@@ -503,6 +663,43 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
         " seededMin=", std::numeric_limits<float>::min(),
         " newPos=(", newWorldPosition.x, ",", newWorldPosition.y, ",", newWorldPosition.z, ")"));
     }
+    // NV-DXVK [EntryReject]: one line per allocation, naming which clause turned
+    // every sibling away. A fresh entry has an empty SpatialMap, so this line is
+    // the direct cause of an instance respawn and of the reap that follows.
+    //
+    // Read engRej against engRejWouldHash. Equal means the engine-pointer gate
+    // rejected pairings that the hash clauses would have accepted, and the gate
+    // is the defect. engRejWouldHash near zero means the siblings genuinely were
+    // different objects and the allocation is correct -- then the churn is
+    // upstream of here, in whatever makes the bucket multi-entry.
+    //
+    // Gated on the probe VS list so it stays scoped to the shader being chased,
+    // and hard-capped because an allocation storm would otherwise be a firehose.
+    if (lookupHash(RtxOptions::findSimilarProbeVsHashes(),
+                   drawCall.getTransformData().vertexShaderHash)) {
+      static std::atomic<uint32_t> sEntryRejectLines { 0 };
+      constexpr uint32_t kMaxEntryRejectLines = 3000;
+      // Local: the [BucketMiss] block above scopes its own copy.
+      const size_t entryRejBucketN = m_entries.count(hash);
+      if (sEntryRejectLines.fetch_add(1, std::memory_order_relaxed) < kMaxEntryRejectLines) {
+        Logger::info(str::format(
+          "[EntryReject] f=", m_device->getCurrentFrameId(),
+          " vs=0x", std::hex,
+          static_cast<uint64_t>(drawCall.getTransformData().vertexShaderHash),
+          " dEng=0x", static_cast<uint64_t>(drawCall.engineMaterialPtr), std::dec,
+          " siblings=", dbgSiblings,
+          " engRej=", dbgEngReject,
+          " engRejWouldHash=", dbgEngRejectWouldHashMatch,
+          " hashRej=", dbgHashReject,
+          " touchedRej=", dbgTouchedReject,
+          " spaceRej=", dbgSpaceReject,
+          " shaderRej=", dbgShaderReject,
+          " bucketN=", entryRejBucketN,
+          " | engRej~=engRejWouldHash => the engineMaterialPtr gate is"
+          " manufacturing this entry"));
+      }
+    }
+
     // Failed to find similar blas, so allocate a new one
     g_brMissed.fetch_add(1, std::memory_order_relaxed);
     *out = allocateEntry(hash, drawCall);

@@ -21,6 +21,7 @@
 */
 
 #pragma once
+#include <functional>
 #include <unordered_map>
 
 #include "util_matrix.h"
@@ -190,6 +191,7 @@ namespace dxvk {
         return transformHash;
       }
       m_cells[getCellPos(centroid)].emplace_back(data, centroid, transformHash);
+      ++m_dbgInserts;
       return transformHash;
     }
 
@@ -213,6 +215,7 @@ namespace dxvk {
         const Vector3 centroid = m_cache.valueAt(slot).centroid;
         eraseFromCell(centroid, transformHash);
         m_cache.eraseAt(slot);
+        ++m_dbgErases;
       } else {
         // Note: This can happen if a duplicate hash is encountered in the insert() call.
         // TODO(REMIX-4134): Once spatial map is used on draw calls and not rtInstances, it should be safe to restore the assert() below.
@@ -263,7 +266,9 @@ namespace dxvk {
                       XXH64_hash_t precomputedMatrixHash = 0) {
       const XXH64_hash_t transformHash = computeKey(newTransform, overrideHash, precomputedMatrixHash);
 
+      ++m_dbgMoves;
       if (oldTransformHash != transformHash) {
+        ++m_dbgRefiled;
         // NV-DXVK [SpatialMove]: log when the erase+insert path fires. With
         // identity-based dedup the propId should be stable, so oldHash ==
         // newHash should be the common case (no-op). When this fires, the
@@ -360,6 +365,42 @@ namespace dxvk {
       return m_cache.size();
     }
 
+    // NV-DXVK [MapChurn]: per-map lifetime counters, so a miss can be attributed
+    // to the map LOSING an entry rather than to the cell scan failing to reach
+    // it. [FindSim] read cacheNearestDistSqr=11068 on a miss -- the closest entry
+    // in the WHOLE cache was 105 units away, with a 600 cell size and a 300
+    // search radius, so the query's own instance was not in the map at all. What
+    // removed it is the open question, and these answer it: `refiled` counts
+    // move() calls that actually erased and re-inserted because the key changed,
+    // which for a stationary prop should be zero.
+    uint64_t debugInserts() const { return m_dbgInserts; }
+    uint64_t debugErases()  const { return m_dbgErases; }
+    uint64_t debugMoves()   const { return m_dbgMoves; }
+    uint64_t debugRefiled() const { return m_dbgRefiled; }
+
+    // Closest entry that PASSES `filter`, ignoring cells and radius entirely.
+    // debugClosestCachedDistSqr ignores the filter as well, so it cannot separate
+    // "the instance is gone" from "the instance is present but was already
+    // claimed this frame" -- and those two want opposite fixes. This walks the
+    // cache directly: disagreement with getNearestData is a cell-patch defect,
+    // agreement means the entry really is absent.
+    float debugClosestPassingDistSqr(const Vector3& centroid,
+                                     const std::function<bool(const T*)>& filter,
+                                     Vector3& outCentroid) const {
+      float best = FLT_MAX;
+      m_cache.forEach([&](XXH64_hash_t, const Entry& entry) {
+        if (!filter(entry.data)) {
+          return;
+        }
+        const float d = lengthSqr(entry.centroid - centroid);
+        if (d < best) {
+          best = d;
+          outCentroid = entry.centroid;
+        }
+      });
+      return best;
+    }
+
   private:
 
     Vector3i getCellPos(const Vector3& position) const {
@@ -391,6 +432,15 @@ namespace dxvk {
 
       Logger::err("Couldn't find matching data in SpatialMap::erase().");
     }
+
+    // [MapChurn] counters. Plain, not atomic: SpatialMap is already written
+    // single-threaded by contract (Phase2b makes every map read-only on workers
+    // and records writes instead), so an atomic would buy nothing and cost the
+    // hot insert/erase path.
+    uint64_t m_dbgInserts = 0;
+    uint64_t m_dbgErases  = 0;
+    uint64_t m_dbgMoves   = 0;
+    uint64_t m_dbgRefiled = 0;
 
     float m_cellSize;
     // NV-DXVK [perf] handoff v7 sec 4b: m_cells is deliberately NOT flattened.

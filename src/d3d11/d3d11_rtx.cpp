@@ -27995,7 +27995,8 @@ namespace dxvk {
         "Throttle","NonTriTopology","NoPixelShader","NoRenderTarget",
         "CountTooSmall","FullscreenQuad","NoInputLayout","NoSemantics",
         "NoPosition","Position2D","NoPosBuffer","NoIndexBuffer","HashFailed",
-        "UIFallback","UnsupPosFmt","CharDepthPrepass","AlphaSurface"
+        "UIFallback","UnsupPosFmt","CharDepthPrepass","AlphaSurface",
+        "WorldNoShadeInputs"
       };
       // f= is required, not decorative: this fires for every filtered draw of
       // a traced shader (15k lines in ~70s, mostly routine shadow/depth-pass
@@ -28021,7 +28022,8 @@ namespace dxvk {
       static const char* kReason[] = {
         "Throttle","NonTri","NoPS","NoRTV","CountSmall","FsQuad","NoLayout",
         "NoSem","NoPos","Pos2D","NoPosBuf","NoIdxBuf","HashFail",
-        "UIFallback","UnsupPosFmt","CharDepthPrepass","AlphaSurf"
+        "UIFallback","UnsupPosFmt","CharDepthPrepass","AlphaSurf",
+        "WorldNoShade"
       };
       const char* reasonStr = (ri < std::size(kReason)) ? kReason[ri] : "?";
       Logger::info(str::format(
@@ -28085,7 +28087,7 @@ namespace dxvk {
         static const char* kReasonShort[] = {
           "Throttle","NonTri","NoPS","NoRTV","CountSmall","FsQuad","NoLayout",
           "NoSem","NoPos","Pos2D","NoPosBuf","NoIdxBuf","HashFail",
-          "UIFallback","UnsupPosFmt"
+          "UIFallback","UnsupPosFmt","CharDepthPrepass","AlphaSurf","WorldNoShade"
         };
         const char* reasonStr = (ri < std::size(kReasonShort)) ? kReasonShort[ri] : "?";
         Logger::info(str::format(
@@ -28921,6 +28923,13 @@ namespace dxvk {
       // arenaBacked gates deferral in the first place.
       DrawSnapshot* snap = nullptr;
       bool          snapValid = false;
+      // The matsys material bound for THIS draw. It rides the Slot for exactly
+      // the reason snap/snapValid do: t_matsysMatPtr is thread_local, the bind
+      // hook writes it on the FRAME thread, and the deferred half runs on a
+      // worker whose copy is always 0. Its declaration says "same thread, draw
+      // follows the bind synchronously", which stopped being true when the tail
+      // was allowed to cross to a worker.
+      uint64_t      matsysMatPtr = 0;
       // Written by the worker from the ctx after the deferred half returns.
       bool          aborted = false;
     };
@@ -29105,13 +29114,16 @@ namespace dxvk {
       // reach them directly.
       DrawSnapshot* const prevSnap  = D3D11Rtx::m_drawSnapCur;
       const bool          prevValid = D3D11Rtx::m_drawSnapValid;
+      const uint64_t      prevMat   = t_matsysMatPtr;
       D3D11Rtx::m_drawSnapCur   = s.snap;
       D3D11Rtx::m_drawSnapValid = s.snapValid;
+      t_matsysMatPtr            = s.matsysMatPtr;
 
       self->SubmitDrawDeferred(ctx);
 
       D3D11Rtx::m_drawSnapCur   = prevSnap;
       D3D11Rtx::m_drawSnapValid = prevValid;
+      t_matsysMatPtr            = prevMat;
 
       // §5.4: the append set this if it refused to stage. The frame thread
       // re-runs those inline at the join, in draw order.
@@ -29193,6 +29205,7 @@ namespace dxvk {
     // where these thread_locals are this draw's.
     s.snap         = m_drawSnapCur;
     s.snapValid    = m_drawSnapValid;
+    s.matsysMatPtr = t_matsysMatPtr;
     s.aborted      = false;
     m_xfChain->commit(idx);
   }
@@ -29250,11 +29263,19 @@ namespace dxvk {
       rc.arena            = SubmitDrawTailCtx::TailArena::Replay;
       DrawSnapshot* const prevSnap  = m_drawSnapCur;
       const bool          prevValid = m_drawSnapValid;
+      // The replay runs on the FRAME thread, so t_matsysMatPtr is readable --
+      // but it is no longer THIS draw's. The replay happens at the join, after
+      // the engine has bound other materials, so the live thread-local names a
+      // later draw's material. Install the one captured with the Slot, for the
+      // same reason snap is installed rather than read live.
+      const uint64_t      prevMat   = t_matsysMatPtr;
       m_drawSnapCur   = s.snap;
       m_drawSnapValid = s.snapValid;
+      t_matsysMatPtr  = s.matsysMatPtr;
       SubmitDrawDeferred(rc);
       m_drawSnapCur   = prevSnap;
       m_drawSnapValid = prevValid;
+      t_matsysMatPtr  = prevMat;
       s.aborted = false;
     }
     ch.replayed = done;
@@ -39818,6 +39839,24 @@ namespace dxvk {
     // in dxvk::tf2, which is why nearby code qualifies that one and not these.)
     latchEngineCameraForDraws();
 
+    // NV-DXVK [TcPair] entry count. The probe lives far down this function,
+    // behind roughly thirty filter returns, so it cannot see a draw that
+    // SubmitDraw rejected -- including, potentially, the textured twin it is
+    // looking for, which would make a prepass read as an only-draw.
+    //
+    // m_rawDrawCount could not serve as that backstop. It resets on a different
+    // frame boundary than getCurrentFrameId() changes, so the two are out of
+    // phase and it read LOWER than the probe's own draw count on some frames
+    // (f=4894: draws=704 rawDraws=517). Counting entries here puts the number in
+    // the probe's own frame-id space, so entered= minus draws= is exactly what
+    // this function discarded. Both statics live at function scope because the
+    // probe below needs them, and the armed flag gates this add so the residual
+    // cost after the probe disarms is one relaxed load.
+    static std::atomic<bool>     sTcPairArmed { true };
+    static std::atomic<uint32_t> sTcPairEntered { 0 };
+    if (sTcPairArmed.load(std::memory_order_relaxed))
+      sTcPairEntered.fetch_add(1, std::memory_order_relaxed);
+
     // NV-DXVK [ResidentScene]: the gate's ENTRY half, and it runs HERE -- first
     // thing, off live m_context->m_state, before captureDrawSnapshot and before
     // any derivation. It mints the identity key and takes the geometry and
@@ -41804,6 +41843,112 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK: the WORLD and BSP sibling of the filter above, and the cause of
+    // the flat-white surfaces.
+    //
+    // Same argument as CharDepthPrepass, different vertex layout. That filter
+    // states in its own comment that POSITION-only draws without BLEND inputs
+    // deliberately fall through it, and those are exactly the draws that arrive
+    // here with no way to be shaded.
+    //
+    // Evidence, in the order it was established:
+    //   - [RtxTcNone] reports seven shaders whose IL declares no TEXCOORD
+    //     element at all. [RtxTcDrop] never fired, so this is not a null vertex
+    //     buffer at a declared slot; there is genuinely no UV channel.
+    //   - the vsGetHash join proved those seven are the same shaders
+    //     [RtxWhiteDiag2] reports as surfEmpty=1. An earlier pass compared the
+    //     two probes' VS lists, found no overlap and concluded they were
+    //     different populations; the lists were in two different hash spaces.
+    //   - fxc /dumpbin of vs_29d58573f42e22fd confirms the shader itself has no
+    //     UV either: input POSITION.xy uint, outputs world position as TEXCOORD4
+    //     plus SV_Position, nothing else.
+    //   - [TcPairVs] measured depthOnly=0 for all seven, so these are NOT
+    //     depth-only prepasses, and vp=1024x1024 for the six that render white
+    //     while the main view is 1920x1080. They draw into an offscreen square
+    //     colour target.
+    //
+    // The rejection does not rest on the pairing evidence, which was mixed --
+    // one shader paired 294 of 300 keys, another 0 of 392. It rests on the
+    // layout: a draw whose IL supplies nothing per-vertex but position cannot
+    // produce a shaded surface under any pairing, and promoting it can only ever
+    // add an opaque instance with no albedo, which is the white surface.
+    //
+    // Signature kept tight on purpose. Position must be world-space (the packed
+    // BSP uint pair or a plain float3 -- R32G32_SFLOAT is screen space and the
+    // Position2D filter below owns it), and every OTHER element must be
+    // per-instance, so a layout carrying any per-vertex channel beyond position
+    // falls through untouched. COLOR1/PERINST, which five of the seven declare,
+    // is per-instance placement data and does not shade anything.
+    //
+    // If geometry disappears rather than turning white, this is the filter to
+    // revert: the [WorldNoShadeFilter] line names every shader it rejects.
+    {
+      const bool posIsWorldSpace = (posSem->format == VK_FORMAT_R32G32_UINT
+                                 || posSem->format == VK_FORMAT_R32G32B32_SFLOAT);
+      bool posAtSlot0Off0 = (posSem->inputSlot == 0 && posSem->byteOffset == 0);
+      // Matched by name rather than by comparing against posSem, because posSem
+      // can come from the cached-layout path above and need not point into this
+      // vector. A pointer compare would quietly fail there and disable the
+      // filter instead of erring toward keeping the draw.
+      bool anyOtherPerVertex = false;
+      for (const auto& s : semantics) {
+        if (s.perInstance)
+          continue;
+        if (std::strncmp(s.name, "POSITION", 8) == 0 && s.index == 0)
+          continue;
+        anyOtherPerVertex = true;
+        break;
+      }
+      const bool isWorldNoShadeInputs =
+          posIsWorldSpace && posAtSlot0Off0 && !anyOtherPerVertex
+          && tcSem == nullptr && nrmSem == nullptr;
+      if (isWorldNoShadeInputs) {
+        static std::mutex sWorldNoShadeMu;
+        static std::unordered_set<XXH64_hash_t> sWorldNoShadeLoggedVs;
+        XXH64_hash_t vsH = 0, psH = 0;
+        GetCurrentVsPsHashes(vsH, psH);
+        bool firstSeen = false;
+        {
+          std::lock_guard<std::mutex> lk(sWorldNoShadeMu);
+          firstSeen = sWorldNoShadeLoggedVs.insert(vsH).second;
+        }
+        if (firstSeen) {
+          // Both hash spaces, because this shader will be looked up in logs that
+          // use either and the two are not interchangeable.
+          // Com has no conversion to bool, so each step tests against nullptr.
+          uint64_t vsGetHash = 0ull;
+          const auto& wnsVs = drawVertexShaderCom();
+          if (wnsVs != nullptr) {
+            const auto* wnsCommon = wnsVs->GetCommonShader();
+            if (wnsCommon != nullptr) {
+              const auto& wnsShader = wnsCommon->GetShader();
+              if (wnsShader != nullptr)
+                vsGetHash = static_cast<uint64_t>(wnsShader->getHash());
+            }
+          }
+          float wnsVpW = 0.0f, wnsVpH = 0.0f;
+          if (m_context->m_state.rs.numViewports > 0) {
+            wnsVpW = m_context->m_state.rs.viewports[0].Width;
+            wnsVpH = m_context->m_state.rs.viewports[0].Height;
+          }
+          Logger::warn(str::format(
+            "[WorldNoShadeFilter] rejecting unshadeable world draw VS=0x",
+            std::hex, uint64_t(vsH),
+            " vsGetHash=0x", vsGetHash,
+            " PS=0x", uint64_t(psH), std::dec,
+            " posFmt=", static_cast<uint32_t>(posSem->format),
+            " nSem=", static_cast<uint32_t>(semantics.size()),
+            " vp=", static_cast<uint32_t>(wnsVpW), "x", static_cast<uint32_t>(wnsVpH),
+            " colorRt=", (m_context->m_state.om.renderTargetViews[0] != nullptr ? 1 : 0),
+            " (POSITION at slot0/off0, no TEXCOORD, no NORMAL,"
+            " nothing else per-vertex -- cannot be shaded)"));
+        }
+        ++m_filterCounts[static_cast<uint32_t>(FilterReason::WorldNoShadeInputs)];
+        m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
+        return;
+      }
+    }
+
     // Skip 2D UI/HUD draws: if position is R32G32_SFLOAT it is in screen/clip space,
     // not world space, and cannot be raytraced.
     if (posSem->format == VK_FORMAT_R32G32_SFLOAT) {
@@ -41941,6 +42086,100 @@ namespace dxvk {
       }
     }
     RasterBuffer tcBuffer  = makeVertexBuffer(tcSem);
+
+    // NV-DXVK [RtxTcNone]: THE OTHER WAY A DRAW ARRIVES WITH NO UVs, and it is
+    // the one with no diagnostic.
+    //
+    // [RtxWhiteDiag2] reads legacyEmpty=0 surfEmpty=1 tcDef=0 on 1479 of 1500
+    // lines with b=0 -- a valid albedo texture bound, no texcoords, so
+    // hasTextureCoordinates() is false, trackTexture drops the bind, and the
+    // surface renders untextured white. [RtxTcDrop] below covers the case where
+    // the layout DECLARES a texcoord whose vertex buffer is null, and it did not
+    // fire once, which leaves only this branch: tcSem itself is null, so nothing
+    // matched as a texcoord at all.
+    //
+    // That is after three fallbacks already ran -- TEXCOORD at index 0, TEXCOORD
+    // at any index, generic ATTRIBUTE by format, and any unmatched two-component
+    // float. So the useful thing to print is not "no texcoord" but WHAT THE
+    // LAYOUT ACTUALLY HAS, because that decides which of two very different bugs
+    // this is: a layout with genuinely no UV channel, where the game generates
+    // coordinates somewhere Remix never looks, or a UV channel under a name and
+    // format none of the fallbacks recognise, which is a matching bug here.
+    //
+    // [IlAudit] already dumps exactly this and cannot be switched on: it sits
+    // behind `static constexpr bool kDiagLogs = false`, so it is dead-stripped
+    // at compile time and no conf change reaches it. Flipping that constant
+    // would enable every diagnostic in this file at once. This is the same dump,
+    // scoped to the one branch that needs it.
+    //
+    // Deduplicated per (VS, layout) and hard-capped, so a stable bug leaves a
+    // small finite trail rather than a per-draw firehose.
+
+    // NV-DXVK: the field that makes VS= joinable, and why it had to exist.
+    //
+    // VS= below is GetCurrentVsPsHashes, i.e. sha1HashPrefix64(getShaderKey().sha1()).
+    // [RtxWhiteDiag2] in rtx_scene_manager prints transformData.vertexShaderHash,
+    // which is DxvkShader::getHash(). Those are two different numbers for the SAME
+    // shader -- the trap the [Perf.FanoutGate] census note in this file already
+    // calls out. A pass over this bug compared the two probes' VS lists directly,
+    // found no overlap, and concluded they described different populations; the
+    // disjointness was the hash spaces, not the draws.
+    //
+    // Join [RtxWhiteDiag2] vs= against vsGetHash=. Never against VS=.
+    //
+    // Called from inside the dedup, so a repeating draw pays nothing for it.
+    auto tcVsGetHash = [this]() -> XXH64_hash_t {
+      const auto& tcVs = drawVertexShaderCom();
+      if (tcVs == nullptr)
+        return 0ull;
+      const auto* tcCommon = tcVs->GetCommonShader();
+      if (tcCommon == nullptr)
+        return 0ull;
+      const auto& tcShader = tcCommon->GetShader();
+      return (tcShader != nullptr) ? static_cast<XXH64_hash_t>(tcShader->getHash()) : 0ull;
+    };
+
+    if (tcSem == nullptr) {
+      static std::mutex sTcNoneMtx;
+      static std::unordered_set<uint64_t> sTcNoneLogged;
+      static std::atomic<uint32_t> sTcNoneLines { 0 };
+      constexpr uint32_t kMaxTcNoneLines = 120;
+
+      if (sTcNoneLines.load() < kMaxTcNoneLines) {
+        XXH64_hash_t vsH = 0, psH = 0;
+        GetCurrentVsPsHashes(vsH, psH);
+        const uint64_t key = uint64_t(vsH) ^ reinterpret_cast<uintptr_t>(layout);
+
+        std::lock_guard<std::mutex> lock(sTcNoneMtx);
+        if (sTcNoneLogged.insert(key).second) {
+          sTcNoneLines.fetch_add(1);
+          std::string dump;
+          for (const auto& s : semantics) {
+            dump += " ";
+            dump += s.name;
+            dump += std::to_string(s.index);
+            dump += "/slot";
+            dump += std::to_string(s.inputSlot);
+            dump += "/off";
+            dump += std::to_string(s.byteOffset);
+            dump += "/fmt";
+            dump += std::to_string(static_cast<uint32_t>(s.format));
+            if (s.perInstance) dump += "/PERINST";
+          }
+          Logger::warn(str::format(
+            "[RtxTcNone] VS=0x", std::hex, uint64_t(vsH),
+            " vsGetHash=0x", uint64_t(tcVsGetHash()),
+            " PS=0x", uint64_t(psH), std::dec,
+            " nSem=", static_cast<uint32_t>(semantics.size()),
+            " hasPos=", (posSem != nullptr ? 1 : 0),
+            " hasNrm=", (nrmSem != nullptr ? 1 : 0),
+            " hasTc1=", (tc1Sem != nullptr ? 1 : 0),
+            " hasCol=", (colSem != nullptr ? 1 : 0),
+            " sems:", dump));
+        }
+      }
+    }
+
     // NV-DXVK TF2 "white character parts" diagnostic.
     // RtxWhiteDiag2 in scene_manager confirmed surfEmpty=1 / tcDef=0 for
     // skinned character draws with valid LegacyMaterialData albedo. Root
@@ -41968,6 +42207,7 @@ namespace dxvk {
           sTcDropLines.fetch_add(1);
           Logger::info(str::format(
             "[RtxTcDrop] VS=0x", std::hex, uint64_t(vsH),
+            " vsGetHash=0x", uint64_t(tcVsGetHash()),
             " PS=0x", uint64_t(psH), std::dec,
             " tcSlot=", uint32_t(tcSem->inputSlot),
             " tcByteOff=", uint32_t(tcSem->byteOffset),
@@ -42138,6 +42378,357 @@ namespace dxvk {
     geo.color0Buffer   = colBuffer;
     geo.indexBuffer    = idxBuffer;
     geo.indexCount     = indexed ? count : 0;
+
+    // NV-DXVK [TcPair]: is a UV-less draw the ONLY draw its geometry gets this
+    // frame, or does a textured draw cover the same geometry?
+    //
+    // [RtxTcNone] plus the vsGetHash join established that every white surface
+    // comes from a shader whose input layout declares no TEXCOORD element, and
+    // the disassembly of one of them (vs_29d58573f42e22fd) shows there is no UV
+    // in the shader either: it unpacks a 21/21/22-bit position, transforms it to
+    // world space, and emits world position as TEXCOORD4 plus SV_Position. So
+    // the semantic matcher is not missing anything. Nothing is there to match.
+    //
+    // That leaves two very different fixes, and the shader alone cannot choose:
+    //
+    //   PREPASS  the UV-less draw is a depth or shadow prepass, and the same
+    //            geometry is drawn again this frame by a shaded pass that DOES
+    //            carry UVs. Remix is promoting a pass never meant to be shaded
+    //            into an opaque RT surface. Fix is to stop promoting it.
+    //   ONLY     the UV-less draw is all that geometry gets, so the surface is
+    //            legitimately ours to shade and the UVs must be synthesised from
+    //            world position the way the pixel shader does. That needs
+    //            PS 0x803bf5f27ef3463a decompiled first.
+    //
+    // Three key granularities, because which buffers a prepass shares with its
+    // lit pass is exactly what is not known yet:
+    //
+    //   ibExact  same index buffer AND same sub-range: literally the same
+    //            triangles. Strong enough to settle PREPASS on its own.
+    //   ibBuf    same index buffer, any range. Coarse where the BSP is one large
+    //            IB, so both= proves little here -- but both=0 proves a lot,
+    //            because then no textured draw touches that index buffer at all.
+    //   vbPos    same position vertex buffer at the same offset. Catches a lit
+    //            pass that re-indexes shared vertices.
+    //
+    // Read both= against noTcOnly=. both close to noTcOnly is PREPASS; both near
+    // zero with noTcOnly large is ONLY. The raw lines carry the identities so a
+    // disagreement between the three keys can be inspected rather than averaged.
+    //
+    // Self-limiting, so it needs neither a conf entry nor a rebuild to stop: it
+    // disarms after kTcPairFrames summarised frames, caps both raw dumps for the
+    // whole session, and ignores frames too small to be gameplay.
+    {
+      // sTcPairArmed and sTcPairEntered are declared at the top of this
+      // function, where the entry count has to be taken.
+      if (sTcPairArmed.load(std::memory_order_relaxed)) {
+        constexpr uint32_t kTcPairFrames   = 300;
+        constexpr uint32_t kTcPairMinDraws = 200;
+        constexpr uint32_t kTcPairMaxRaw   = 200;
+
+        struct TcPairSlot {
+          uint32_t noTcDraws = 0;   // draws on this key whose layout declared no TEXCOORD
+          uint32_t tcDraws   = 0;   // draws on this key with a defined texcoord buffer
+          uint64_t noTcVs    = 0;   // getHash() VS of the last such UV-less draw
+          uint64_t tcVs      = 0;   // getHash() VS of the last such textured draw
+          // Same shader as noTcVs in the OTHER hash space, so a solo line joins
+          // straight to [RtxTcNone] VS= without a translation table.
+          uint64_t noTcVsPfx = 0;
+          uint64_t noTcPs    = 0;
+          uint64_t tcPs      = 0;
+          uint32_t idxCount  = 0;
+          uint32_t startIdx  = 0;
+          int32_t  baseVtx   = 0;
+        };
+
+        static std::mutex sTcPairMu;
+        static std::unordered_map<uint64_t, TcPairSlot> sTcPairIbExact;
+        static std::unordered_map<uint64_t, TcPairSlot> sTcPairIbBuf;
+        static std::unordered_map<uint64_t, TcPairSlot> sTcPairVbPos;
+        // Per-shader state. The frame aggregate mixes shaders and the first run
+        // proved they disagree: one shader paired on all three keys, another
+        // paired on 86 vbPos keys and zero ibExact keys. A verdict averaged over
+        // that is meaningless, so every number that decides the fix is kept per
+        // shader and the solo/paired split is recomputed per shader at rollover
+        // from the key maps -- which costs nothing per draw.
+        //
+        // depthOnly is the field that can settle this WITHOUT the pairing
+        // argument at all. A draw that binds no colour render target writes no
+        // colour, so it cannot be the shaded appearance of anything, and Remix
+        // has no business building an opaque RT surface out of it whether or not
+        // a twin is found. That is the same structural separator this file
+        // already uses at the scene census, and the same shape as the existing
+        // FilterReason::CharDepthPrepass, which rejects the SKINNED version of
+        // exactly this pattern and says in its own comment that POSITION-only
+        // draws without BLEND inputs deliberately fall through it.
+        struct TcPairVsStat {
+          uint32_t draws     = 0;
+          uint32_t depthOnly = 0;   // no colour RT bound
+          uint32_t soloExact = 0;   // filled at rollover
+          uint32_t pairExact = 0;
+          uint32_t soloVb    = 0;
+          uint32_t pairVb    = 0;
+          float    vpW       = 0.0f;
+          float    vpH       = 0.0f;
+        };
+        static std::unordered_map<uint64_t, TcPairVsStat> sTcPairNoTcVs;
+        static uint32_t sTcPairFrame    = 0xFFFFFFFFu;
+        static uint32_t sTcPairDraws    = 0;
+        static uint32_t sTcPairNoTc     = 0;   // draws with no TEXCOORD in the layout
+        static uint32_t sTcPairSemNoVb  = 0;   // layout declared one, VB at its slot was null
+        static uint32_t sTcPairTc       = 0;   // draws with a usable texcoord buffer
+        static uint32_t sTcPairFrameCnt = 0;
+        static uint32_t sTcPairRawPair  = 0;
+        static uint32_t sTcPairRawSolo  = 0;
+        // (UV-less VS, textured VS, key granularity) triples already reported.
+        static std::unordered_set<uint64_t> sTcPairPairSeen;
+
+        // Same mix the geometry-descriptor hashes in this file use. Order
+        // matters, so fold each component separately rather than xor-ing.
+        auto tcPairMix = [](uint64_t h, uint64_t v) -> uint64_t {
+          h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+          return h * 0xC2B2AE3D27D4EB4Full;
+        };
+
+        const uint32_t tcPairFid = m_context->m_device->getCurrentFrameId();
+        const bool     tcPairHasTc    = tcBuffer.defined();
+        const bool     tcPairNoTcSem  = (tcSem == nullptr);
+        const uint64_t tcPairVs = static_cast<uint64_t>(tcVsGetHash());
+        XXH64_hash_t   tcPairVsPfx = 0, tcPairPs = 0;
+        GetCurrentVsPsHashes(tcPairVsPfx, tcPairPs);
+
+        uint64_t tcPairIbExactKey = 0, tcPairIbBufKey = 0, tcPairVbPosKey = 0;
+        if (indexed) {
+          const auto& tcPairIb = m_context->m_state.ia.indexBuffer;
+          const uint32_t tcPairIdxStride =
+            (tcPairIb.format == DXGI_FORMAT_R32_UINT) ? 4u : 2u;
+          tcPairIbBufKey = tcPairMix(0x1ull,
+            reinterpret_cast<uint64_t>(tcPairIb.buffer.ptr()));
+          tcPairIbExactKey = tcPairMix(tcPairMix(tcPairMix(tcPairIbBufKey,
+            uint64_t(tcPairIb.offset) + uint64_t(start) * tcPairIdxStride),
+            uint64_t(count)), uint64_t(uint32_t(base)));
+        }
+        if (posSem != nullptr) {
+          const auto& tcPairVb = m_context->m_state.ia.vertexBuffers[posSem->inputSlot];
+          if (tcPairVb.buffer != nullptr) {
+            tcPairVbPosKey = tcPairMix(tcPairMix(0x2ull,
+              reinterpret_cast<uint64_t>(tcPairVb.buffer.ptr())),
+              uint64_t(tcPairVb.offset) + uint64_t(posSem->byteOffset));
+          }
+        }
+
+        // Snapshot before the rollover below consumes it: at this point the
+        // counter still holds the frame that is ending, plus this draw.
+        const uint32_t tcPairEnteredSnap = sTcPairEntered.load(std::memory_order_relaxed);
+
+        std::lock_guard<std::mutex> tcPairLock(sTcPairMu);
+
+        // Frame rollover: summarise the frame that just ended, then reset. Doing
+        // it here rather than at a frame-end hook keeps the probe entirely local
+        // to this function.
+        if (tcPairFid != sTcPairFrame) {
+          if (sTcPairFrame != 0xFFFFFFFFu && sTcPairDraws >= kTcPairMinDraws) {
+            auto tcPairCount = [](const std::unordered_map<uint64_t, TcPairSlot>& m,
+                                  uint32_t& outNoTcOnly, uint32_t& outTcOnly,
+                                  uint32_t& outBoth) {
+              outNoTcOnly = outTcOnly = outBoth = 0;
+              for (const auto& kv : m) {
+                const bool n = (kv.second.noTcDraws > 0);
+                const bool t = (kv.second.tcDraws   > 0);
+                if (n && t)      ++outBoth;
+                else if (n)      ++outNoTcOnly;
+                else if (t)      ++outTcOnly;
+              }
+            };
+            uint32_t ieN = 0, ieT = 0, ieB = 0;
+            uint32_t ibN = 0, ibT = 0, ibB = 0;
+            uint32_t vpN = 0, vpT = 0, vpB = 0;
+            tcPairCount(sTcPairIbExact, ieN, ieT, ieB);
+            tcPairCount(sTcPairIbBuf,   ibN, ibT, ibB);
+            tcPairCount(sTcPairVbPos,   vpN, vpT, vpB);
+
+            // Fold the key maps into the per-shader table. Every UV-less key
+            // carries the shader that drew it, so the split costs one walk here
+            // instead of anything per draw. Both granularities are kept per
+            // shader on purpose: ibExact says "the same triangles", vbPos says
+            // "the same vertex buffer, possibly a different sub-range", and a
+            // shader where those two disagree is telling you which of the two
+            // it is. Do not collapse them into one number.
+            for (const auto& kv : sTcPairIbExact) {
+              if (kv.second.noTcDraws == 0)
+                continue;
+              TcPairVsStat& v = sTcPairNoTcVs[kv.second.noTcVs];
+              if (kv.second.tcDraws > 0) ++v.pairExact; else ++v.soloExact;
+            }
+            for (const auto& kv : sTcPairVbPos) {
+              if (kv.second.noTcDraws == 0)
+                continue;
+              TcPairVsStat& v = sTcPairNoTcVs[kv.second.noTcVs];
+              if (kv.second.tcDraws > 0) ++v.pairVb; else ++v.soloVb;
+            }
+
+            std::string tcPairCensus;
+            for (const auto& kv : sTcPairNoTcVs) {
+              char buf[96];
+              std::snprintf(buf, sizeof(buf), " 0x%016llx=%u",
+                static_cast<unsigned long long>(kv.first), kv.second.draws);
+              tcPairCensus += buf;
+
+              // One line per shader. This is the line the fix is decided from.
+              Logger::warn(str::format(
+                "[TcPairVs] f=", sTcPairFrame,
+                " vs=0x", std::hex, kv.first, std::dec,
+                " draws=", kv.second.draws,
+                " depthOnly=", kv.second.depthOnly,
+                " colorRt=", kv.second.draws - kv.second.depthOnly,
+                " vp=", static_cast<uint32_t>(kv.second.vpW),
+                "x", static_cast<uint32_t>(kv.second.vpH),
+                " ibExact{solo=", kv.second.soloExact,
+                " paired=", kv.second.pairExact, "}",
+                " vbPos{solo=", kv.second.soloVb,
+                " paired=", kv.second.pairVb, "}",
+                " | depthOnly==draws => writes no colour, never shade it"));
+            }
+
+            Logger::warn(str::format(
+              "[TcPair] f=", sTcPairFrame,
+              " draws=", sTcPairDraws,
+              " entered=", (tcPairEnteredSnap > 0u ? tcPairEnteredSnap - 1u : 0u),
+              " filtered=", ((tcPairEnteredSnap > sTcPairDraws)
+                             ? (tcPairEnteredSnap - 1u - sTcPairDraws) : 0u),
+              " noTcVsCensus{", tcPairCensus, " }",
+              " noTcSem=", sTcPairNoTc,
+              " semNoVb=", sTcPairSemNoVb,
+              " hasTc=", sTcPairTc,
+              " | ibExact keys=", static_cast<uint32_t>(sTcPairIbExact.size()),
+              " noTcOnly=", ieN, " tcOnly=", ieT, " both=", ieB,
+              " | ibBuf keys=", static_cast<uint32_t>(sTcPairIbBuf.size()),
+              " noTcOnly=", ibN, " tcOnly=", ibT, " both=", ibB,
+              " | vbPos keys=", static_cast<uint32_t>(sTcPairVbPos.size()),
+              " noTcOnly=", vpN, " tcOnly=", vpT, " both=", vpB,
+              " | both~=noTcOnly => PREPASS (stop promoting);"
+              " both~=0 => ONLY (must synthesise UVs)"));
+
+            // Raw identities for the keys that stayed UV-less all frame. These
+            // are the draws that have to be explained; the aggregate above only
+            // says how many there are.
+            //
+            // Capped per frame as well as per session, so the trail spreads over
+            // the whole armed window instead of being spent entirely on the
+            // first frame. Whether this population is stable frame to frame is
+            // itself worth seeing.
+            uint32_t tcPairSoloThisFrame = 0;
+            for (const auto& kv : sTcPairIbExact) {
+              if (sTcPairRawSolo >= kTcPairMaxRaw || tcPairSoloThisFrame >= 12u)
+                break;
+              if (kv.second.noTcDraws == 0 || kv.second.tcDraws != 0)
+                continue;
+              ++sTcPairRawSolo;
+              ++tcPairSoloThisFrame;
+              Logger::warn(str::format(
+                "[TcPairSolo] f=", sTcPairFrame,
+                " ibExactKey=0x", std::hex, kv.first,
+                " noTcVS=0x", kv.second.noTcVs,
+                " noTcVSpfx=0x", kv.second.noTcVsPfx,
+                " noTcPS=0x", kv.second.noTcPs, std::dec,
+                " draws=", kv.second.noTcDraws,
+                " idx=", kv.second.idxCount,
+                " start=", kv.second.startIdx,
+                " base=", kv.second.baseVtx));
+            }
+
+            if (++sTcPairFrameCnt >= kTcPairFrames) {
+              sTcPairArmed.store(false, std::memory_order_relaxed);
+              Logger::warn(str::format(
+                "[TcPair] disarmed after ", sTcPairFrameCnt,
+                " gameplay frames (self-limiting, not an error)"));
+            }
+          }
+          sTcPairIbExact.clear();
+          sTcPairIbBuf.clear();
+          sTcPairVbPos.clear();
+          sTcPairNoTcVs.clear();
+          // Reset to 1 for the draw currently in hand. Another thread can slip
+          // an increment in between the snapshot above and this store, so
+          // entered= is accurate to a draw or two rather than exactly. It is
+          // read as a gap against draws=, and a gap that matters is large.
+          sTcPairEntered.store(1, std::memory_order_relaxed);
+          sTcPairFrame   = tcPairFid;
+          sTcPairDraws   = 0;
+          sTcPairNoTc    = 0;
+          sTcPairSemNoVb = 0;
+          sTcPairTc      = 0;
+        }
+
+        ++sTcPairDraws;
+        if (tcPairHasTc)         ++sTcPairTc;
+        else if (tcPairNoTcSem)  ++sTcPairNoTc;
+        else                     ++sTcPairSemNoVb;
+        if (!tcPairHasTc) {
+          TcPairVsStat& vst = sTcPairNoTcVs[tcPairVs];
+          ++vst.draws;
+          if (m_context->m_state.om.renderTargetViews[0] == nullptr)
+            ++vst.depthOnly;
+          if (m_context->m_state.rs.numViewports > 0) {
+            vst.vpW = m_context->m_state.rs.viewports[0].Width;
+            vst.vpH = m_context->m_state.rs.viewports[0].Height;
+          }
+        }
+
+        // Record into each key that applies, and log the moment a key first
+        // holds both kinds -- that transition IS the PREPASS evidence, and
+        // catching it here means the raw line names both shaders.
+        auto tcPairRecord = [&](std::unordered_map<uint64_t, TcPairSlot>& m,
+                                uint64_t key, const char* via, uint32_t viaId) {
+          if (key == 0)
+            return;
+          TcPairSlot& slot = m[key];
+          const bool hadNoTc = (slot.noTcDraws > 0);
+          const bool hadTc   = (slot.tcDraws   > 0);
+          if (tcPairHasTc) {
+            ++slot.tcDraws;
+            slot.tcVs = tcPairVs;
+            slot.tcPs = static_cast<uint64_t>(tcPairPs);
+          } else {
+            ++slot.noTcDraws;
+            slot.noTcVs    = tcPairVs;
+            slot.noTcVsPfx = static_cast<uint64_t>(tcPairVsPfx);
+            slot.noTcPs    = static_cast<uint64_t>(tcPairPs);
+            slot.idxCount = indexed ? count : 0;
+            slot.startIdx = start;
+            slot.baseVtx  = base;
+          }
+          const bool becamePaired = (hadNoTc != (slot.noTcDraws > 0)
+                                  || hadTc   != (slot.tcDraws   > 0))
+                                 && slot.noTcDraws > 0 && slot.tcDraws > 0;
+          // Deduplicated on (UV-less shader, textured shader, key granularity)
+          // rather than rate-capped. The first run spent all 200 lines on
+          // repeats of a handful of mappings and truncated at f=4918, which hid
+          // every mapping that first appeared later. What this line is for is
+          // the mapping itself, and each distinct one only needs saying once.
+          const uint64_t tcPairId =
+            tcPairMix(tcPairMix(tcPairMix(0x3ull, slot.noTcVs), slot.tcVs), viaId);
+          if (becamePaired && sTcPairRawPair < kTcPairMaxRaw
+              && sTcPairPairSeen.insert(tcPairId).second) {
+            ++sTcPairRawPair;
+            Logger::warn(str::format(
+              "[TcPairRaw] f=", tcPairFid,
+              " via=", via,
+              " key=0x", std::hex, key,
+              " noTcVS=0x", slot.noTcVs,
+              " noTcPS=0x", slot.noTcPs,
+              " tcVS=0x", slot.tcVs,
+              " tcPS=0x", slot.tcPs, std::dec,
+              " idx=", slot.idxCount,
+              " start=", slot.startIdx,
+              " base=", slot.baseVtx));
+          }
+        };
+        tcPairRecord(sTcPairIbExact, tcPairIbExactKey, "ibExact", 0u);
+        tcPairRecord(sTcPairIbBuf,   tcPairIbBufKey,   "ibBuf",   1u);
+        tcPairRecord(sTcPairVbPos,   tcPairVbPosKey,   "vbPos",   2u);
+      }
+    }
 
     // [IlAudit] One-shot-per-VS dump of the entire D3D11 input layout with the
     // per-semantic disposition (USED / DROPPED+reason). Lets us see every
@@ -55275,6 +55866,54 @@ namespace dxvk {
       // identity DrawCallCache matches on, not a probe). See
       // DrawCallState::engineMaterialPtr.
       dcs.engineMaterialPtr = t_matsysMatPtr;
+      // NV-DXVK [KeyStab]: mint the engine-side stream identity next to the
+      // material pointer, from the same record the [DrawName] block below reads.
+      //
+      // These are the GAME's D3D11Buffer objects. They are engine allocations
+      // made at level or entity spawn and reused for that entity's lifetime, so
+      // they survive the per-frame rewrite of the vertex CONTENT that defeats
+      // FullGeometryHash. That is the same reasoning, and the same inputs, as
+      // D3D11Rtx::residentDrawKey, which measured 0 new keys per frame on
+      // several draw populations with the camera moving.
+      //
+      // WHY NOT THE ONE exactMatch ALREADY TRIED. sameIaIdentity (removed
+      // 2026-08-22) compared RasterGeometry's buffers, which are DxvkBuffer --
+      // the VULKAN-side allocation, renamed on every dynamic map. It matched 31
+      // times against a population of 5126. Same idea, wrong side of the
+      // translation layer.
+      {
+        const auto& ksVb0 = drawVertexBuffer(0);
+        const auto& ksIb  = drawIndexBuffer();
+        if (ksVb0.buffer != nullptr) {
+          struct KeyStabHead {
+            uint64_t vbPtr;
+            uint64_t ibPtr;
+            uint64_t vsHash;
+            uint32_t vbOffset;
+            uint32_t vbStride;
+            uint32_t ibOffset;
+            uint32_t drawStart;
+            uint32_t drawCount;
+            int32_t  drawBase;
+            uint32_t indexed;
+            uint32_t pad;
+          };
+          static_assert(sizeof(KeyStabHead) == 56, "KeyStabHead must have no implicit padding");
+          KeyStabHead ks = { };
+          ks.vbPtr     = reinterpret_cast<uint64_t>(ksVb0.buffer.ptr());
+          ks.ibPtr     = (ksIb.buffer != nullptr)
+                       ? reinterpret_cast<uint64_t>(ksIb.buffer.ptr()) : 0ull;
+          ks.vsHash    = static_cast<uint64_t>(vsXxhRt);
+          ks.vbOffset  = ksVb0.offset;
+          ks.vbStride  = ksVb0.stride;
+          ks.ibOffset  = ksIb.offset;
+          ks.drawStart = c.start;
+          ks.drawCount = c.count;
+          ks.drawBase  = c.base;
+          ks.indexed   = c.indexed ? 1u : 0u;
+          dcs.engineDrawKey = XXH64(&ks, sizeof(ks), 0ull);
+        }
+      }
       // NV-DXVK [DrawName]: name the probe-VS draws with the matsys-Bind hook
       // ([MatBind] slot-0x80 -> t_matsysMatPtr, Option C) instead of inferring
       // what a VS draws from hashes or old comments. The bind happens on this
@@ -70052,9 +70691,17 @@ namespace dxvk {
     if (detailedDump
         && ::dxvk::tf2::boneDiagEnabled()
         && raw > 20 && !m_vsFrameStats.empty()) {
+      // NV-DXVK: this array is indexed by r over FilterReason::Count below, so
+      // it must have one entry per reason. It had fifteen against a Count of
+      // seventeen, which read two entries past the end of a static array of
+      // pointers whenever CharDepthPrepass or AlphaSurface rejected anything --
+      // and both do. The read is bounds-guarded at the use site now as well, so
+      // a future reason added without touching this line degrades to "?"
+      // instead of formatting a wild pointer.
       static const char* kReasonName[] = {
         "Throttle","NonTriTopo","NoPS","NoRTV","TooSmall","FsQuad","NoLayout",
-        "NoSem","NoPos","Pos2D","NoPosBuf","NoIdxBuf","HashFail","UIFallback","UnsupFmt"
+        "NoSem","NoPos","Pos2D","NoPosBuf","NoIdxBuf","HashFail","UIFallback","UnsupFmt",
+        "CharDepthPrepass","AlphaSurf","WorldNoShade"
       };
       const uint32_t fid = m_context->m_device->getCurrentFrameId();
       Logger::info(str::format("[VSHashFrame] f=", fid,
@@ -70082,7 +70729,8 @@ namespace dxvk {
           " t31=", st.modelInstBound);
         for (uint32_t r = 0; r < static_cast<uint32_t>(FilterReason::Count); ++r) {
           if (st.rejects[r] > 0)
-            line += str::format(" ", kReasonName[r], "=", st.rejects[r]);
+            line += str::format(" ", (r < std::size(kReasonName) ? kReasonName[r] : "?"),
+                                "=", st.rejects[r]);
         }
         Logger::info(line);
       }

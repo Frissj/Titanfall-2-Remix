@@ -1761,6 +1761,19 @@ namespace dxvk {
     // Remove instances past their lifetime or marked for GC explicitly
     const uint32_t currentFrame = m_device->getCurrentFrameId();
 
+    // NV-DXVK [HeldRaw] burst arming. One frame's worth of held instances every
+    // 10 frames, capped -- see the dump site below. Armed here rather than at
+    // the dump so a burst comes from ONE pass and is a snapshot of the held set
+    // rather than a sample smeared across several seconds of it.
+    static uint32_t s_heldRawBurstFrame = 0u;
+    static uint32_t s_heldRawLastBurst  = 0u;
+    static uint32_t s_heldRawPrinted    = 0u;
+    if (currentFrame - s_heldRawLastBurst >= 10u) {
+      s_heldRawLastBurst  = currentFrame;
+      s_heldRawBurstFrame = currentFrame;
+      s_heldRawPrinted    = 0u;
+    }
+
     // NV-DXVK [PitchProbe]: per-frame instance population vs CAMERA PITCH.
     //
     // WHY THIS AND NOT [Perf.Block]: the symptom is "look down and everything
@@ -2928,6 +2941,133 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [SliceCollide]: does a held BLAS still own the memory it points at?
+    //
+    // This replaces what the builtPosHash test was supposed to do and cannot.
+    // That test compares modifiedGeometryData.hashes against a copy of itself,
+    // because the hash is only written by processGeometryInfo, which runs on a
+    // DRAW, and a held instance is by definition one that got no draw. Measured:
+    // stale=1 on 1285 of 1296 held instances, so the guard is vacuous for 99.15%
+    // of the holds it decides, with touchAge running to 540 frames.
+    //
+    // The real question is not whether the content hash changed -- nobody
+    // recomputes it -- but whether some OTHER BlasEntry now claims the same
+    // vertex or index memory. Two distinct BlasEntry pointers resolving to one
+    // (buffer, offset, length) means one of them is reading the other's data,
+    // and if the loser is a held instance that is exactly the stretched plane:
+    // geometry whose buffer was recycled underneath a hold.
+    //
+    // The identity triple is the one the bindless buffer cache already treats as
+    // "one buffer" (RaytraceBufferHashFn in rtx_scene_manager.h), kept identical
+    // on purpose so this probe and the cache cannot disagree about what sharing
+    // means. Instances legitimately sharing ONE BlasEntry are ordinary
+    // instancing and are not collisions; only distinct entries count.
+    //
+    // Positions and indices are both keyed, because a recycled index buffer
+    // collapses geometry where a recycled position buffer stretches it, and the
+    // two have shown up separately in this tree before.
+    //
+    // No buffer contents are read. These are device-local and mapPtr is null,
+    // which is why the earlier attempts at a content test went through hashes in
+    // the first place.
+    if (RtxOptions::ResidentScene::enable() && RtxOptions::ResidentScene::logStats()) {
+      struct SliceOwner {
+        const BlasEntry* blas = nullptr;
+        uint32_t touchAge = 0;
+        uint32_t tri      = 0;
+      };
+      std::unordered_map<uint64_t, SliceOwner> owners;
+      owners.reserve(m_instances.size() * 2u);
+
+      uint32_t scSlices = 0, scCollide = 0, scStaleVictim = 0, scLines = 0;
+      constexpr uint32_t kScMaxLines = 24;   // per call; the counts carry the rest
+      // Session cap as well. If collisions are the steady state rather than an
+      // event, 24 lines a frame is 80,000 lines over a short session and the
+      // per-frame counts already say it is happening. The identities only need
+      // saying often enough to see whether the same pair recurs.
+      static uint32_t s_scLinesTotal = 0;
+      constexpr uint32_t kScMaxLinesTotal = 400;
+
+      auto sliceKey = [](const void* buf, uint64_t off, uint64_t len, uint64_t tag) {
+        const uint64_t identity[4] = {
+          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(buf)), off, len, tag
+        };
+        return XXH3_64bits(identity, sizeof(identity));
+      };
+
+      for (RtInstance* pInst : m_instances) {
+        const BlasEntry* b = (pInst != nullptr) ? pInst->getBlas() : nullptr;
+        if (b == nullptr) {
+          continue;
+        }
+        const uint32_t bTouchAge = (b->frameLastTouched != kInvalidFrameIndex
+                                    && currentFrame >= b->frameLastTouched)
+                                     ? (currentFrame - b->frameLastTouched) : 0u;
+        const uint32_t bTri = b->modifiedGeometryData.indexCount / 3u;
+
+        for (uint32_t which = 0; which < 2u; ++which) {
+          const auto& gb = (which == 0)
+            ? b->modifiedGeometryData.positionBuffer
+            : b->modifiedGeometryData.indexBuffer;
+          // defined() only asks whether a buffer is attached, so a slice with a
+          // non-null buffer and zero length passes it. Two of those on one
+          // buffer collide trivially and are not geometry. Measured: the only
+          // three collisions in two clean runs were len=0, one carrying
+          // off=346902116632, on the final frame of a session that ended in an
+          // unhandled exception -- dead entries at teardown, not recycling.
+          if (!gb.defined() || gb.length() == 0) {
+            continue;
+          }
+          const uint64_t key = sliceKey(gb.buffer().ptr(), gb.offset(), gb.length(), which);
+          auto it = owners.find(key);
+          if (it == owners.end()) {
+            ++scSlices;
+            owners.emplace(key, SliceOwner { b, bTouchAge, bTri });
+            continue;
+          }
+          if (it->second.blas == b) {
+            continue;   // ordinary instancing: many instances, one entry
+          }
+          ++scCollide;
+          // The one that has not been drawn recently is the one at risk: its
+          // geometry is frozen while another entry owns the same memory.
+          const bool victimStale = (it->second.touchAge > 0u || bTouchAge > 0u);
+          if (victimStale) {
+            ++scStaleVictim;
+          }
+          if (scLines < kScMaxLines && s_scLinesTotal < kScMaxLinesTotal) {
+            ++scLines;
+            ++s_scLinesTotal;
+            Logger::warn(str::format(
+              "[SliceCollide] f=", currentFrame,
+              " kind=", (which == 0 ? "pos" : "idx"),
+              " buf=0x", std::hex,
+              static_cast<uint64_t>(reinterpret_cast<uintptr_t>(gb.buffer().ptr())), std::dec,
+              " off=", gb.offset(),
+              " len=", gb.length(),
+              " incumbent{blas=0x", std::hex,
+              static_cast<uint64_t>(reinterpret_cast<uintptr_t>(it->second.blas)), std::dec,
+              " touchAge=", it->second.touchAge,
+              " tri=", it->second.tri, "}",
+              " newcomer{blas=0x", std::hex,
+              static_cast<uint64_t>(reinterpret_cast<uintptr_t>(b)), std::dec,
+              " touchAge=", bTouchAge,
+              " tri=", bTri, "}",
+              " | distinct entries on one slice: one is reading the other's data"));
+          }
+        }
+      }
+
+      Logger::warn(str::format(
+        "[SliceCollide] f=", currentFrame,
+        " instances=", static_cast<uint32_t>(m_instances.size()),
+        " slices=", scSlices,
+        " collisions=", scCollide,
+        " staleVictims=", scStaleVictim,
+        " | collisions=0 means recycling is NOT the stretched-plane cause;"
+        " staleVictims>0 names it"));
+    }
+
     const bool forceGarbageCollection = (m_instances.size() >= RtxOptions::AntiCulling::Object::numObjectsToKeep());
     for (uint32_t i = 0; i < m_instances.size();) {
       // Must take a ref here since we'll be swapping
@@ -3046,11 +3186,28 @@ namespace dxvk {
       // what engine culling produces, and treating it as death is exactly the
       // defect residency exists to remove.
       //
-      // GATED ON verify: while verification is on, the prediction is SCORED and
-      // NOT ACTED ON, so GC behaves exactly as it does today. That ordering is
-      // not negotiable here -- see the [PropIdKeepLong attempt reverted] note
-      // above for what a long keep on an unstable identity did to
-      // m_reorderedSurfaces.
+      // NOT GATED ON verify, AND IT USED TO BE. The reason is measured rather
+      // than argued: with the keep gated off during verification, an instance
+      // that missed one frame retired on numFramesToKeepInstances, took its
+      // record with it through invalidateFor, and the next frame's prediction
+      // then scored a failure for a record that verification itself had
+      // destroyed. [ResidentScene] read noRecLost=481 erased=481 never=0 -- one
+      // hundred percent of missing records had been filed and then erased, none
+      // was ever absent. So the old gating made FAIL measure how thoroughly the
+      // keep was disabled, and required FAIL=0 before enabling it. Circular.
+      //
+      // WHAT verify STILL MEANS, and this is the distinction the old clause
+      // blurred: verify governs the SKIP, which is a prediction being acted on.
+      // The keep is not a prediction -- it is driven by whether a valid record
+      // exists, which is a fact the CS side already holds. Holding an instance
+      // alive cannot make anything on screen wrong in the way a wrongly skipped
+      // draw can; the failure mode is retaining geometry too long, which is
+      // visible in records=, liveInst= and m_reorderedSurfaces.
+      //
+      // THE trap 3 GUARD IS NOT verify, IT IS THE CEILING BELOW plus the key
+      // stability reading. [ResidentGate] newKeys reads 14-32 per ten frames
+      // standing still, so the identity is stable and the
+      // [PropIdKeepLong attempt reverted] precondition does not hold here.
       // AND IT DOES NOT OVERRIDE forceGarbageCollection. That path is the
       // over-the-cap reap (numObjectsToKeep), i.e. the backstop against exactly
       // the runaway trap 3 describes -- an identity that churns mints a fresh
@@ -3058,13 +3215,129 @@ namespace dxvk {
       // unreapable the count would climb until the LRU noticed, with
       // m_reorderedSurfaces climbing with it. Residency defers ordinary
       // lifetime expiry; it does not get to defeat the ceiling.
+      // THROUGH holdsInstance RATHER THAN find()+valid, so this clause and the
+      // BLAS clause in SceneManager::garbageCollection ask the same question
+      // through the same code. They were two separate reads of the record and
+      // they had already drifted -- neither excluded skipUnsafe, which only
+      // stopped mattering because the touch refused those records separately.
       bool residencyHolds = false;
-      if (RtxOptions::ResidentScene::enable()
-          && !RtxOptions::ResidentScene::verify()
-          && !forceGarbageCollection
-          && pInstance->m_residentKey != 0ull) {
-        const ResidentScene::Record* pRec = m_residentScene.find(pInstance->m_residentKey);
-        residencyHolds = (pRec != nullptr) && pRec->valid;
+      if (RtxOptions::ResidentScene::enable() && !forceGarbageCollection) {
+        residencyHolds = m_residentScene.holdsInstance(pInstance);
+      }
+
+      // NV-DXVK [HeldRaw]: WHAT IS ACTUALLY BEING HELD, one raw line per
+      // instance, no classification.
+      //
+      // skipUnsafe is a property test over three properties -- billboards, ray
+      // portals, decals -- and the plan says in as many words that a fourth
+      // class will announce itself as a visual bug rather than as a counter.
+      // One has. Every residency counter reads healthy while the screen is
+      // wrong, so the counters are the wrong instrument and a histogram or a
+      // classifier here would only be the same guess with error bars.
+      //
+      // So this prints the facts and nothing derived: geometry size, material
+      // identity, the full alpha state, the camera mask and where the thing is
+      // in the world. A flat quad reads tri=2, which is what "floating plane"
+      // would be, and if it is something else the line says so instead.
+      //
+      // STALE ONLY. An instance drawn this frame is being maintained by the full
+      // path and is not what residency is doing to the scene; the population at
+      // issue is the one the keep is preserving without a draw.
+      if (residencyHolds
+          && RtxOptions::ResidentScene::logStats()
+          && pInstance->m_frameLastUpdated != currentFrame
+          && s_heldRawBurstFrame == currentFrame
+          && s_heldRawPrinted < 24u) {
+        s_heldRawPrinted += 1;
+        const auto& sf = pInstance->surface;
+        const auto& as = sf.alphaState;
+        const Matrix4& o2w = sf.objectToWorld;
+        // The counts live on the BLAS's RaytraceGeometry, not on RtSurface,
+        // which carries bindless buffer INDICES rather than sizes. Null-guarded
+        // because an instance can outlive its geometry link, and only the counts
+        // are read -- never the buffers, whose mapPtr is null for device-local
+        // index data.
+        const BlasEntry* blas = pInstance->getBlas();
+        const uint32_t idxCount = (blas != nullptr) ? blas->modifiedGeometryData.indexCount : 0u;
+        const uint32_t vtxCount = (blas != nullptr) ? blas->modifiedGeometryData.vertexCount : 0u;
+        const ResidentScene::Record* heldRec = m_residentScene.find(pInstance->m_residentKey);
+        Logger::warn(str::format(
+          "[HeldRaw] f=", currentFrame,
+          " age=", (currentFrame - pInstance->m_frameLastUpdated),
+          " tri=", (idxCount / 3u),
+          " vtx=", vtxCount,
+          // getMaterialDataHash, NOT getImageHash: this walk runs concurrently
+          // with streaming and getImageHash on a GC walk is the documented
+          // use-after-free in this tree.
+          " mat=", std::hex, pInstance->getMaterialDataHash(), std::dec,
+          " type=", static_cast<uint32_t>(pInstance->getMaterialType()),
+          " bb=", pInstance->getBillboardCount(),
+          " cam=", pInstance->getSeenCameraMask(),
+          // THE CONTENT TEST, AND THE REASON IT READS ZERO.
+          //
+          // A held instance keeps its BLAS alive, but nothing proves the BLAS's
+          // vertex content is still what the record was built against. bone!=0
+          // says the geometry is skinned, so its positions are regenerated per
+          // draw and a held instance with no draw renders whatever was written
+          // there last. posMoved=1 says the content changed under the hold, in
+          // the general form that catches unnamed producers.
+          //
+          // stale= is what makes posMoved readable, and it was missing.
+          // modifiedGeometryData.hashes is written in exactly one place --
+          // processGeometryInfo in rtx_scene_manager.cpp -- which runs when a
+          // DRAW arrives. A held instance is by definition one that got no draw,
+          // so its hash is frozen at the value builtPosHash was copied from, and
+          // the comparison is a value against a copy of itself. It cannot report
+          // a change. posMoved=0 across every held instance is that tautology,
+          // not evidence, and it has already been read once as a pass.
+          //
+          // frameLastTouched answers "did any draw for this geometry arrive", so
+          // stale=1 marks exactly the lines where posMoved knows nothing. Only
+          // stale=0 lines carry a verdict. If stale=1 dominates, the hash is the
+          // wrong invariant for this job rather than a broken one: what a hold
+          // actually needs is that the BLAS's buffers cannot be recycled beneath
+          // it, which is a different question and needs its own answer.
+          " bone=", std::hex, (blas != nullptr ? blas->modifiedGeometryData.lastBoneHash : 0ull), std::dec,
+          " stale=", (blas == nullptr || blas->frameLastTouched != currentFrame) ? 1 : 0,
+          " touchAge=", (blas != nullptr && blas->frameLastTouched != kInvalidFrameIndex
+                         && currentFrame >= blas->frameLastTouched)
+                          ? (currentFrame - blas->frameLastTouched) : 0u,
+          " posMoved=", (heldRec != nullptr && blas != nullptr && heldRec->builtPosHash != 0ull
+                         && heldRec->builtPosHash
+                              != blas->modifiedGeometryData.hashes[HashComponents::VertexPosition]) ? 1 : 0,
+          " alpha{blendOff=", as.isBlendingDisabled ? 1 : 0,
+          " opaque=", as.isFullyOpaque ? 1 : 0,
+          " test=", static_cast<uint32_t>(as.alphaTestType),
+          " blend=", static_cast<uint32_t>(as.blendType),
+          " emissive=", as.emissiveBlend ? 1 : 0,
+          " particle=", as.isParticle ? 1 : 0,
+          " decal=", as.isDecal ? 1 : 0, "}",
+          " pos=", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2],
+          // NV-DXVK: THE TRANSFORM ITSELF, because a stretched quad is a
+          // statement about the matrix and every field above describes the
+          // MESH. tri, vtx, posMoved and the alpha state all said this geometry
+          // is a healthy four-triangle alpha-tested cutout, and they would say
+          // that whether it rendered correctly or smeared across the map.
+          //
+          // A held instance keeps the objectToWorld it last received. If that
+          // matrix was captured mid-update, or if the instance is held while the
+          // basis it was built against moves on, the mesh is drawn correct but
+          // POSED wrong -- which is a stretch, not a content error, and no hash
+          // over vertex data can see it.
+          //
+          // Read basis lengths against each other: a rigid placement has three
+          // similar, moderate values. One axis far larger than the others is
+          // literally the stretch. det near zero is a collapsed (degenerate)
+          // basis, which draws as a sliver. Non-finite is a poisoned matrix.
+          " basis=", length(Vector3(o2w[0][0], o2w[0][1], o2w[0][2])),
+          ",", length(Vector3(o2w[1][0], o2w[1][1], o2w[1][2])),
+          ",", length(Vector3(o2w[2][0], o2w[2][1], o2w[2][2])),
+          " det=", (o2w[0][0] * (o2w[1][1] * o2w[2][2] - o2w[1][2] * o2w[2][1])
+                  - o2w[0][1] * (o2w[1][0] * o2w[2][2] - o2w[1][2] * o2w[2][0])
+                  + o2w[0][2] * (o2w[1][0] * o2w[2][1] - o2w[1][1] * o2w[2][0])),
+          " finite=", (std::isfinite(float(o2w[3][0])) && std::isfinite(float(o2w[3][1]))
+                    && std::isfinite(float(o2w[3][2])) && std::isfinite(float(o2w[0][0]))
+                    && std::isfinite(float(o2w[1][1])) && std::isfinite(float(o2w[2][2])) ? 1 : 0)));
       }
 
       const bool clauseLifetime = (forceGarbageCollection || enableGarbageCollection) &&
@@ -3160,6 +3433,39 @@ namespace dxvk {
         // lives on [MapGate]'s per-frame counters ([GcExit] also keeps totals
         // but is itself denylisted by default), so denying the detail lines
         // loses identity only, not the measurement.
+        // RESPAWNS ARE LOGGED UNDER THEIR OWN TAG, and the reason is volume
+        // rather than taste. [InstReap] is uncapped and is denied in rtx.conf's
+        // logDenyTags because it fires on EVERY reap -- ~3/frame in steady state
+        // and 500+/frame during the warm-up wave, which is enough file I/O to
+        // stall the game. But a respawn is the rare and interesting case: an
+        // instance removed and immediately recreated for the same geometry,
+        // which is what an object flickering or losing its material looks like
+        // from here. Steady state is 0.1-0.4/frame.
+        //
+        // So the identity that already exists in the block below is emitted a
+        // second time under [Respawn], which is NOT denied, and the expensive
+        // per-reap firehose stays off. Same fields, one thousandth the lines.
+        const bool reapIsRespawn = (reapFreshSib > 0);
+        if (reapIsRespawn
+            && tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
+          const BlasEntry* pBlasRs = pInstance->getBlas();
+          const Vector3 posRs = pInstance->getWorldPosition();
+          Logger::warn(str::format(
+            "[Respawn] f=", currentFrame,
+            " vs=0x", std::hex,
+            static_cast<uint64_t>(pBlasRs != nullptr
+              ? pBlasRs->input.getTransformData().vertexShaderHash : 0ull),
+            " mat=0x", static_cast<uint64_t>(pInstance->getMaterialDataHash()), std::dec,
+            " v=", (pBlasRs != nullptr ? pBlasRs->modifiedGeometryData.vertexCount : 0u),
+            " freshSib=", reapFreshSib,
+            " reusedSib=", reapReusedSib,
+            " draws=", reapDraws,
+            // Was residency holding this one? A respawn on a HELD instance would
+            // mean the keep failed to prevent the very churn it exists to stop.
+            " heldKey=", (pInstance->m_residentKey != 0ull) ? 1 : 0,
+            " pos=", posRs.x, ",", posRs.y, ",", posRs.z));
+        }
+
         if (!Logger::tagDenied("[InstReap]")
             && tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
           // UNCAPPED. This was 24/frame and it SATURATED on every single frame
@@ -3373,8 +3679,11 @@ namespace dxvk {
           const ResidentScene::Stats& rs = m_residentScene.stats();
           Logger::warn(str::format(
             "[ResidentScene] f=", probeFrame,
+            // hold = the keep is armed and the skip is not, which is what
+            // verify now means. It is no longer a mode in which residency does
+            // nothing, so calling it "verify" would misreport what is running.
             " mode=", (RtxOptions::ResidentScene::enable()
-                        ? (RtxOptions::ResidentScene::verify() ? "verify" : "live")
+                        ? (RtxOptions::ResidentScene::verify() ? "hold" : "live")
                         : "off"),
             " records=", static_cast<uint32_t>(m_residentScene.size()),
             " built=", rs.built,
@@ -3403,7 +3712,15 @@ namespace dxvk {
             // ghosting in the ray-traced scene. Reading zero for a whole session
             // in a game with entities means the signal is not arriving, which is
             // a defect and not a quiet scene.
+            // srcDied alone reads 0 for two opposite reasons; srcNotices is what
+            // separates them. notices=0 means ~D3D11Buffer never runs for this
+            // geometry, i.e. pooled buffers outlive the objects using them and
+            // buffer death is the wrong signal for this engine. notices>0 with
+            // srcDied=0 means buffers die and none belongs to a record, which is
+            // a broken join. See ResidentScene::Stats.
             " srcDied=", rs.sourceDestroyed,
+            " srcNotices=", rs.srcNotices,
+            " srcDrained=", rs.srcDrained,
             " instStamped=", rs.instancesStamped,
             " liveInst=", static_cast<uint32_t>(m_instances.size()),
             // THE VERIFY VERDICT, and it is the gate for arming this feature.
@@ -3413,20 +3730,36 @@ namespace dxvk {
             // list than the record names, so the touch would have kept the
             // wrong objects alive and let the right ones retire.
             //
-            // FAIL must read 0, not "low", across a full pitch-and-yaw sweep
-            // before rtx.residentScene.verify goes off. failNoRec breaking out
-            // separately matters: that one says the frame thread's gate index
-            // and the record store disagree about what exists, which no amount
-            // of tightening the dirty test would fix.
+            // THE GATE IS realFail, NOT FAIL. noRecEmpty is the draw that
+            // resolves to no instance at all: it is never filed, so the gate
+            // predicts a hit on it and score() misses on it every frame for as
+            // long as the level is loaded. That number is permanent, benign and
+            // handled by the live path (touch finds nothing, the draw commits in
+            // full), so including it means waiting for a zero that cannot
+            // arrive. See ResidentScene::Stats for the full four-way split.
+            //
+            // realFail must read 0, not "low", across a full pitch-and-yaw
+            // sweep before rtx.residentScene.verify goes off. Then read WHICH:
+            // size= is the occurrence ordinal sliding under engine culling,
+            // member= is the ordinal failing at its own job, and noRecLost= is a
+            // record that existed and went away -- check evicted/wiped first.
             " | predicted=", rs.predicted,
             " FAIL=", rs.fail,
-            " failNoRec=", rs.failNoRecord,
+            " realFail=", (rs.fail - rs.failNoRecEmpty),
+            " fail{noRecEmpty=", rs.failNoRecEmpty,
+            " noRecLost=", rs.failNoRecLost,
+            "(erased=", rs.failLostErased, " never=", rs.failLostNever, ")",
+            " size=", rs.failSize,
+            " member=", rs.failMember, "}",
+            // Outside fail{} because it is not one: same instances, different
+            // order, and touch() consumes the list as a set.
+            " memberPerm=", rs.memberPerm,
             // The two numbers that decide whether this is working. records must
             // PLATEAU in a stationary scene -- a rising count is trap 3 (an
             // unstable key minting a fresh record every frame) and is a hard
             // fail, not a tuning problem. touchMiss must be ~0 once the key is
             // stable; every miss is a fallback to the full path.
-            " | records must plateau; missInval ~0; FAIL=0 before verify goes off"));
+            " | records must plateau; missInval ~0; realFail=0 before verify goes off"));
           m_residentScene.resetStats();
         }
       }
@@ -6372,6 +6705,20 @@ namespace dxvk {
           const float dbgCacheDistSqr =
             blas.getSpatialMap().debugClosestCachedDistSqr(worldPosition, dbgNearestPos, &dbgOwner);
           const size_t dbgCellEntries = blas.getSpatialMap().debugCellEntryCount();
+
+          // NV-DXVK: same three clauses getNearestData's filter applies, so a
+          // disagreement between passDistSqr and nearestDistSqr is attributable
+          // to the cell patch alone rather than to a filter difference. Kept
+          // literally identical to the lambda above -- if that one changes and
+          // this does not, the comparison silently stops meaning anything.
+          Vector3 dbgPassPos { 0.f, 0.f, 0.f };
+          const float dbgPassDistSqr =
+            blas.getSpatialMap().debugClosestPassingDistSqr(worldPosition,
+              [&] (const RtInstance* instance) {
+                return instance->m_frameLastUpdated != currentFrameIdx
+                    && instance->m_materialHash == material.getHash()
+                    && !instance->m_primInstanceOwner.isSubPrim();
+              }, dbgPassPos);
           // Identify who owns the far-away entry. If its VS differs from ours,
           // two different draws are sharing one BlasEntry and evicting each
           // other; if it matches, the same draw is being placed in two spaces.
@@ -6463,6 +6810,47 @@ namespace dxvk {
             " rejMat=", probeRejMaterialHash,
             " rejSub=", probeRejSubPrim,
             " passed=", probePassedFilter,
+            // NV-DXVK: THE SPLIT THIS PROBE COULD NOT MAKE. cacheNearest* above
+            // ignores the filter, so a miss could mean either "the instance is
+            // gone from the map" or "it is there and was already claimed this
+            // frame", and those want opposite fixes. passDistSqr walks the cache
+            // applying the SAME filter getNearestData uses, with no cell patch
+            // and no radius:
+            //   passDistSqr == FLT_MAX          nothing in the entire map could
+            //                                   have matched. The instance is
+            //                                   absent -- look at churn= below.
+            //   passDistSqr <= maxDistSqr       a legal match existed and the
+            //                                   CELL SCAN failed to reach it.
+            //                                   That is a cell/patch defect.
+            //   passDistSqr >  maxDistSqr       present but genuinely too far.
+            // NV-DXVK: WHICH MAP was queried, and it is the field that decides
+            // the pigeonhole. Measured f=7314: 98 queries against a map holding
+            // at most 63 instances, so ~35 draws per frame CANNOT match anything
+            // no matter how good the matcher is -- every entry is legitimately
+            // claimed by an earlier draw and the surplus mints and is reaped.
+            // What that count cannot say is whether the 98 hit ONE BlasEntry
+            // (genuine surplus: more draws than objects, i.e. multi-pass, and
+            // the fix is to drop the redundant pass the way CharDepthPrepass
+            // and WorldNoShadeInputs already do) or SEVERAL BlasEntries (the
+            // draws for one prop family are being split across entries, so the
+            // instances are filed in a different map than the one queried, and
+            // the fix is in entry selection in rtx_draw_call_cache). Group the
+            // log by (curFrame, blas) to tell them apart.
+            " blas=0x", std::hex,
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&blas)), std::dec,
+            " passDistSqr=", dbgPassDistSqr,
+            " passPos=(", dbgPassPos.x, ",", dbgPassPos.y, ",", dbgPassPos.z, ")",
+            // Lifetime churn for THIS map. refiled is the one to read: it counts
+            // move() calls where the key actually changed, forcing an erase and
+            // re-insert. For a stationary prop that should never happen, so
+            // refiled climbing in step with the misses means the key is moving
+            // under the instance and the map is losing it every frame.
+            " churn{ins=", blas.getSpatialMap().debugInserts(),
+            " era=", blas.getSpatialMap().debugErases(),
+            " mov=", blas.getSpatialMap().debugMoves(),
+            " refiled=", blas.getSpatialMap().debugRefiled(), "}",
+            " cellSize=", blas.getSpatialMap().debugCellSize(),
+            " cellEntryCount=", blas.getSpatialMap().debugCellEntryCount(),
             " worldPos=(", worldPosition.x, ",", worldPosition.y, ",", worldPosition.z, ")",
             " curMatHash=0x", std::hex, material.getHash(), std::dec));
           // NV-DXVK [MapDump]: on a MISS against a NON-EMPTY map, dump every

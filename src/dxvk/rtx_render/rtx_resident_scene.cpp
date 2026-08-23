@@ -1,5 +1,6 @@
 #include "rtx_resident_scene.h"
 
+#include <algorithm>
 #include <iterator>
 #include <mutex>
 #include <unordered_set>
@@ -37,6 +38,12 @@ namespace dxvk {
     // allocation, no set insertion. Constant-initialised with a trivial
     // destructor, so it is readable at any point in the process's life.
     std::atomic<uint32_t> g_residentTracking { 0u };
+
+    // Cumulative count of death notices that got past the armed guard, i.e.
+    // buffers the engine actually freed while residency was live. Read against
+    // Stats::sourceDestroyed to tell "the signal never arrives" from "the signal
+    // arrives and never matches" -- see noteResidentSourceBufferDestroyed.
+    std::atomic<uint32_t> g_srcDeathNotices { 0u };
   }
 
   void noteResidentSourceBufferDestroyed(uint64_t bufferPtr) {
@@ -50,6 +57,20 @@ namespace dxvk {
     // this must not grow without limit. Dropping notices is safe in the only
     // direction that matters -- a missed death leaves a record standing until
     // the LRU takes it, where an unbounded set would be a memory leak.
+    // COUNTED HERE, PAST THE ARMED GUARD, and that placement is the point.
+    //
+    // srcDied has read 0 for entire sessions and that single number cannot say
+    // which of two opposite things is true: the destructor never runs for these
+    // buffers, or it runs constantly and none of them belongs to a record. The
+    // first would mean TF2 pools its geometry and never frees it, which makes
+    // ~D3D11Buffer the wrong death signal for this engine entirely. The second
+    // would mean the join is broken and is a bug to find.
+    //
+    // Past the g_residentTracking guard rather than before it, so a run with
+    // residency off still pays nothing -- this is called for every buffer the
+    // engine frees, which during streaming is a hot path. The guard is only
+    // false before the first record exists, so nothing that matters is missed.
+    g_srcDeathNotices.fetch_add(1u, std::memory_order_relaxed);
     if (deaths.pending.size() < 65536u) {
       deaths.pending.insert(bufferPtr);
     }
@@ -120,17 +141,52 @@ namespace dxvk {
     // m_seenCameraTypes is exactly what this draw registered.
     rec.cameraMask = 0u;
     rec.skipUnsafe = false;
+    rec.builtPosHash = 0ull;
+    rec.builtBoneHash = 0ull;
+    rec.builtBlas = nullptr;
     for (RtInstance* inst : rec.instances) {
       if (inst != nullptr) {
         inst->m_residentKey = key;
         rec.cameraMask |= inst->getSeenCameraMask();
-        // See Record::skipUnsafe. Each of these three names per-frame work that
-        // hangs off the instance rather than off the geometry, the transform or
-        // the material, so the gate cannot speak for it.
+        // See Record::skipUnsafe. The first three name per-frame work that hangs
+        // off the instance rather than off the geometry, the transform or the
+        // material, so the gate cannot speak for it.
+        //
+        // BLENDING IS THE FOURTH, AND IT IS A DIFFERENT ARGUMENT FROM THE OTHER
+        // THREE. Those are excluded because something is rebuilt each frame that
+        // a record does not hold. A blended surface is excluded because of what
+        // it IS: its appearance is a function of the scene BEHIND it, and
+        // residency by construction retains a sparse subset of the scene -- only
+        // what has actually been drawn. So a held translucent surface composites
+        // against whatever else happened to survive rather than against the
+        // scene it was authored over, and the error grows the longer it is held.
+        // An opaque surface has no such dependency, which is exactly why it is
+        // safe to keep and a blended one is not.
+        //
+        // MEASURED, not anticipated. [HeldRaw] over 2136 held instances: 250
+        // were blended with particle=0 decal=0 bb=0, so every existing test
+        // passed them; 226 of those were under 100 triangles and 63 were single
+        // quads, concentrated in three materials. They are the floating planes.
+        //
+        // This does over-exclude genuinely static translucent world geometry --
+        // glass, for one -- and that is the right direction to be wrong in: such
+        // geometry falls back to the pre-residency behaviour it has always had,
+        // which is a cost in coverage rather than a visible defect. A narrower
+        // test would need to distinguish static glass from effect geometry, and
+        // nothing on the instance says which is which.
         if (inst->getBillboardCount() != 0u
             || inst->getMaterialType() == MaterialDataType::RayPortal
-            || inst->surface.alphaState.isDecal) {
+            || inst->surface.alphaState.isDecal
+            || !inst->surface.alphaState.isBlendingDisabled) {
           rec.skipUnsafe = true;
+        }
+        // Baseline for [HeldRaw], off the first instance that has geometry.
+        if (rec.builtPosHash == 0ull) {
+          if (const BlasEntry* blas = inst->getBlas()) {
+            rec.builtPosHash = blas->modifiedGeometryData.hashes[HashComponents::VertexPosition];
+            rec.builtBoneHash = blas->modifiedGeometryData.lastBoneHash;
+            rec.builtBlas = static_cast<const void*>(blas);
+          }
         }
       }
     }
@@ -259,7 +315,41 @@ namespace dxvk {
       //
       // Either way no amount of tightening the dirty test would change it, which
       // is why it is not folded in with the FAILs that do want that response.
-      m_stats.failNoRecord += 1;
+      //
+      // AND THE TWO ARE TOLD APART BY WHAT THE FULL PATH JUST PRODUCED, which
+      // is the one piece of evidence that separates them and is already in hand.
+      // An empty produced list means the draw resolves to nothing, so nothing
+      // was ever filed and nothing ever will be -- processDrawCallState skips
+      // build() on an empty list by design. That case is permanent and cannot
+      // be driven to zero, so counting it inside the arming gate makes the gate
+      // unsatisfiable. A non-empty produced list means a record DID exist at
+      // some point and has gone missing, which is a real defect.
+      if (produced.empty()) {
+        m_stats.failNoRecEmpty += 1;
+      } else {
+        m_stats.failNoRecLost += 1;
+        // AND WHICH KIND OF MISSING, because the two want opposite responses and
+        // the difference is invisible from the count alone.
+        //
+        // A record that was FILED AND THEN ERASED is this measurement fighting
+        // itself: while verify is on the keep clause is off, so an instance that
+        // misses a frame retires on numFramesToKeepInstances, invalidateFor
+        // clears its record and onFrameEnd erases it. That failure is caused by
+        // residency being disabled, and arming the keep is what removes it --
+        // so counting it against the gate that guards arming is circular.
+        //
+        // A key that NEVER had a record is a real disagreement: the frame thread
+        // says it judged this draw last frame, and the CS side never filed
+        // anything for it. That one no amount of arming would fix.
+        //
+        // The tombstone map is what tells them apart -- see recordTombstone.
+        const auto tomb = m_tombstones.find(key);
+        if (tomb != m_tombstones.end()) {
+          m_stats.failLostErased += 1;
+        } else {
+          m_stats.failLostNever += 1;
+        }
+      }
       m_stats.fail += 1;
       return false;
     }
@@ -270,12 +360,62 @@ namespace dxvk {
     // describe two different assignments of placements to instances, so an
     // order-insensitive comparison would pass exactly the case that renders
     // every copy of a mesh at another copy's transform.
+    //
+    // A COUNT MISMATCH AND A MEMBER MISMATCH ARE DIFFERENT FINDINGS. The count
+    // changing says this draw resolved to a different NUMBER of objects than the
+    // one that filed the record, which is what happens when the occurrence
+    // ordinal slides: engine culling removes copy 1 of a multi-copy identity and
+    // copies 2 and 3 shift down onto records built for their neighbours. The
+    // count matching while the members differ says the ordinal held and the
+    // resolution still landed elsewhere, which the ordinal was introduced to
+    // prevent and would mean it does not.
     if (rec->instances.size() != produced.size()) {
+      m_stats.failSize += 1;
       m_stats.fail += 1;
       return false;
     }
     for (size_t i = 0; i < produced.size(); ++i) {
       if (rec->instances[i] != produced[i]) {
+        // A PERMUTATION AND A DIFFERENT SET ARE DIFFERENT FINDINGS, and only one
+        // of them is a failure.
+        //
+        // Same instances in a different order means resolution is not
+        // order-stable: two draws sharing one identity claimed each other's
+        // instances this frame. A genuinely different set means the draw
+        // resolved to objects the record never named, which is the serious
+        // reading and the one that would keep the wrong geometry resident.
+        //
+        // O(n^2), and deliberately: this runs only on a failure, the lists are
+        // a handful of entries, and a set allocation per failure would cost more
+        // than the scan it replaces.
+        bool permutation = true;
+        for (RtInstance* p : produced) {
+          if (std::find(rec->instances.begin(), rec->instances.end(), p) == rec->instances.end()) {
+            permutation = false;
+            break;
+          }
+        }
+        if (permutation) {
+          // A PERMUTATION IS NOT A FAILURE, BECAUSE OF WHAT touch() DOES WITH
+          // THE LIST. It walks every entry and stamps it -- setFrameLastUpdated,
+          // the camera replay, the BLAS frameLastTouched -- and reads position i
+          // for nothing. The list is consumed as a SET, so a record naming the
+          // same instances in a different order keeps exactly the right objects
+          // alive.
+          //
+          // The comment above about placements being positional describes how
+          // the list was PRODUCED, not how it is used, and applying it here made
+          // score() stricter than the only consumer requires. Measured cost of
+          // that strictness: 113 of 730 failures, 15%, none of which would have
+          // kept a wrong object.
+          //
+          // STILL COUNTED, because the day a consumer does become positional
+          // this is the number that says how often it would be wrong -- and
+          // because unstable resolution order is worth knowing about on its own.
+          m_stats.memberPerm += 1;
+          return true;
+        }
+        m_stats.failMember += 1;
         m_stats.fail += 1;
         return false;
       }
@@ -288,7 +428,91 @@ namespace dxvk {
       return false;
     }
     const Record* rec = find(instance->m_residentKey);
-    return rec != nullptr && rec->valid;
+    if (rec == nullptr || !rec->valid) {
+      return false;
+    }
+    // skipUnsafe DISQUALIFIES A RECORD FROM HOLDING, not just from being
+    // skipped, and the two were only ever the same question by accident.
+    //
+    // While the keep and the skip armed together, a skipUnsafe record was held
+    // alive but its draw always arrived to rebuild the per-frame work -- the
+    // billboard vector, the portal registration, the decal sort order -- so
+    // holding it was harmless. Arming the keep on its own breaks that: the
+    // instance survives a frame with no draw, and nothing reproduces any of it.
+    // A held particle, beam or decal is then a frozen one, which is worse than
+    // the retirement it was exempted from.
+    //
+    // OPACITY MICROMAPS ARE NOT TESTED HERE, AND touch() IS RIGHT TO TEST THEM.
+    // The two are asking different questions and the option was briefly copied
+    // across, which disabled the keep outright on any build where micromaps are
+    // supported -- this one. Residency held nothing and liveInst sat at its
+    // pre-residency baseline while every counter read healthy.
+    //
+    // The difference is what the game is doing. touch() stands in for a draw
+    // that ARRIVED: the object is actively rendering, the micromap manager is
+    // expecting the instance-update event, and suppressing it starves live
+    // bookkeeping. The keep covers an object that got NO DRAW AT ALL, which
+    // before residency was simply destroyed. Its manager state going stale is a
+    // quality cost on an off-screen caster, and onInstanceDestroyed still fires
+    // when the record finally ages out, so nothing is left dangling.
+    //
+    // skipUnsafe applies to both because it is not about the draw -- billboards,
+    // beams, portals and decals are rebuilt from scratch each frame, so an
+    // instance carrying one is wrong on screen whether it was skipped or merely
+    // held.
+    if (rec->skipUnsafe) {
+      return false;
+    }
+
+    // AND THE GEOMETRY MUST STILL BE THE GEOMETRY THE RECORD WAS BUILT AGAINST.
+    //
+    // Holding an instance keeps its BLAS alive; it does NOT keep the BLAS's
+    // vertex CONTENT from being rewritten. When the buffer behind it is reused
+    // for another mesh, the held instance renders that mesh's vertices through
+    // its own indices and transform, which on screen is a quad stretched into a
+    // diagonal sliver.
+    //
+    // MEASURED. [HeldRaw] posMoved=1 on 90 of 1080 held instances, and the
+    // population is completely uniform: every one is tri=4, one material, an
+    // alpha-tested cutout, held between 10 and 450 frames. Small quads are the
+    // ones that show it because a rewritten 8-vertex buffer produces a shape
+    // with no resemblance to the original.
+    //
+    // THIS IS A CONTENT TEST, NOT A CLASS TEST, which is why it belongs here
+    // rather than in skipUnsafe. skipUnsafe asks "what kind of thing is this",
+    // and no answer to that question would have caught this: the geometry is
+    // ordinary opaque cutout world geometry right up until its buffer is
+    // recycled. Asking whether the content still matches is the only test that
+    // catches a producer nobody has enumerated, and it self-corrects -- the next
+    // draw rebuilds the record against the new content and holding resumes.
+    // NO BASELINE MEANS NO HOLD. builtPosHash is 0 when the record's first
+    // instance had no BLAS at build time, and the old form of this check skipped
+    // validation entirely in that case -- so the records that could not be
+    // verified were exactly the ones held unconditionally. Refusing is the safe
+    // direction: the instance falls back to the lifetime it had before residency.
+    if (rec->builtPosHash == 0ull) {
+      return false;
+    }
+    // AND ONLY AGAINST THE ENTRY THE BASELINE CAME FROM. A record whose
+    // instances span several BLASes would otherwise have one instance's hash
+    // clear all of them, which validates every instance except the one it was
+    // actually measured on.
+    if (rec->builtBlas != static_cast<const void*>(instance->getBlas())) {
+      return false;
+    }
+    {
+      if (const BlasEntry* blas = instance->getBlas()) {
+        // Baseline came from the record's first instance with geometry. For a
+        // fanout record every placement shares one mesh, so one baseline is the
+        // right one; if that ever stops being true the mismatch refuses the
+        // hold, which is the safe direction -- the instance falls back to the
+        // ordinary lifetime it had before residency.
+        if (blas->modifiedGeometryData.hashes[HashComponents::VertexPosition] != rec->builtPosHash) {
+          return false;
+        }
+      }
+    }
+    return true;
   }
 
   void ResidentScene::invalidateFor(const RtInstance* instance) {
@@ -371,6 +595,12 @@ namespace dxvk {
       std::lock_guard<dxvk::mutex> lock(deaths.mutex);
       dead.swap(deaths.pending);
     }
+    // The three numbers that make srcDied readable, published together so they
+    // cannot be read from different windows: notices ever received, buffers
+    // drained this frame, and (below, as sourceDestroyed) records those buffers
+    // actually matched.
+    m_stats.srcNotices = g_srcDeathNotices.load(std::memory_order_relaxed);
+    m_stats.srcDrained += static_cast<uint32_t>(dead.size());
 
     // Pass 1: erase records that were invalidated. They cannot serve, and
     // leaving them resident makes the map grow without bound in exactly the
@@ -397,6 +627,20 @@ namespace dxvk {
       // keepFrames is 0 = UNBOUNDED by design; residency ends lifetime-by-age
       // rather than lengthening it. Non-zero exists only to bisect a residency
       // bug against the old behaviour, so the age test is guarded on it.
+      // keepFrames is 0 = UNBOUNDED by design; residency ends lifetime-by-age
+      // rather than lengthening it. Non-zero exists only to bisect a residency
+      // bug against the old behaviour, so the age test is guarded on it.
+      //
+      // DO NOT USE THIS TO BOUND GHOSTS. It is a single fixed age bound, which
+      // the eviction note in pass 2 already identifies as the wrong shape, and a
+      // measurement confirmed it: with keepFrames=600 the whole load-time cohort
+      // aged out on one frame (evicted 25 -> 885 -> 694 while invalidated stayed
+      // at ~20), liveInst fell 4144 -> 1200 and never recovered, because engine
+      // culling means nothing redraws those objects. Bound the set with
+      // maxRecords instead and let the age-rung LADDER below do it: that policy
+      // is demand-driven, evicts least-recently-seen first, and stops the moment
+      // it is under the cap, so a cohort drains gradually instead of falling off
+      // a cliff.
       if (!erase && keepFrames != 0u
           && it->second.frameLastSeen != kInvalidFrameIndex
           && frame > it->second.frameLastSeen
@@ -410,6 +654,7 @@ namespace dxvk {
             inst->m_residentKey = 0ull;
           }
         }
+        recordTombstone(it->first, frame);
         it = m_records.erase(it);
         m_stats.evicted += 1;
       } else {
@@ -466,6 +711,7 @@ namespace dxvk {
               && frame > it->second.frameLastSeen
               && (frame - it->second.frameLastSeen) > maxAge) {
             dropRecord(it);
+            recordTombstone(it->first, frame);
             it = m_records.erase(it);
             m_stats.evicted += 1;
           } else {
@@ -488,7 +734,35 @@ namespace dxvk {
         m_stats.evicted += static_cast<uint32_t>(m_records.size());
         m_records.clear();
         m_stats.wiped += 1;
+        // NOT TOMBSTONED, and wiped= is what says so. A wipe erases the whole
+        // store at once, so tombstoning it would mint one entry per record and
+        // then answer "erased" for every key in the scene for the next few
+        // frames -- a diagnostic loud enough to drown the finding it exists to
+        // report. Read wiped= alongside failLostNever instead: a non-zero wipe
+        // is the reason for the burst that follows it.
       }
+    }
+
+    // Age out the tombstones, in the same pass that produced them. The window is
+    // kTombstoneFrames because the only question asked of this map is about the
+    // immediately preceding frame.
+    for (auto it = m_tombstones.begin(); it != m_tombstones.end(); ) {
+      if (frame > it->second && (frame - it->second) > kTombstoneFrames) {
+        it = m_tombstones.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  void ResidentScene::recordTombstone(uint64_t key, uint32_t frame) {
+    // Bounded for the same reason the buffer-death queue is: this fills fastest
+    // in exactly the churning scene where it would hurt most, and dropping a
+    // tombstone only costs the diagnostic its precision -- a dropped entry reads
+    // as failLostNever, which is the conservative direction because it reports
+    // the more serious of the two findings rather than the excusable one.
+    if (m_tombstones.size() < 131072u) {
+      m_tombstones[key] = frame;
     }
   }
 
@@ -501,6 +775,7 @@ namespace dxvk {
       }
     }
     m_records.clear();
+    m_tombstones.clear();
   }
 
 }

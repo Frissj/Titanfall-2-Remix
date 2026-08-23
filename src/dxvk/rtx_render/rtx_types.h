@@ -1381,6 +1381,15 @@ struct DrawCallState {
   // hashes are one padding bug away from lying. 0 = no matsys bind seen on
   // this thread (non-matsys draw) — callers must then fall back to hashes.
   uint64_t engineMaterialPtr = 0;
+  // NV-DXVK [KeyStab]: the ENGINE-side geometry-stream identity for this draw --
+  // the game's D3D11 buffer objects and the range into them, minted in
+  // SubmitDrawDeferred. Zero when the draw has no vertex buffer bound.
+  //
+  // Read by a log and NOTHING ELSE. It is a candidate for exactMatch's geometry
+  // term, and per the standing rule in this investigation a candidate identity
+  // gets its cross-frame stability measured before it is wired in. See
+  // logExactMatchFailure's edkOK= in rtx_draw_call_cache.cpp.
+  uint64_t engineDrawKey = 0;
 
   // NV-DXVK [ResidentScene]: the frame thread's record key for this draw, and
   // the dirty fold it was judged against. See RESIDENT_SCENE_PLAN.md.

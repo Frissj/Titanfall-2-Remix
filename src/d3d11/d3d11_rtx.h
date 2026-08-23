@@ -3768,7 +3768,16 @@ namespace dxvk {
       // NV-DXVK: dropped because rtx.tf2DisableAlphaSurfaces is set and the
       // draw's RT0 blend is enabled (a translucent / alpha-blended surface).
       AlphaSurface    = 16,
-      Count           = 17
+      // NV-DXVK: the world and BSP sibling of CharDepthPrepass. Same argument,
+      // different vertex layout: the IL supplies nothing per-vertex except
+      // POSITION -- no TEXCOORD, no NORMAL, no BLEND inputs -- so the draw
+      // cannot produce a shaded surface, and promoting it yields an opaque RT
+      // instance with no albedo that renders flat white. Measured population is
+      // seven shaders drawing into a 1024x1024 offscreen colour target while the
+      // main view is 1920x1080. See the filter site in SubmitDraw for the
+      // evidence and the exact signature.
+      WorldNoShadeInputs = 17,
+      Count           = 18
     };
   private:
     uint32_t m_filterCounts[static_cast<uint32_t>(FilterReason::Count)] = {};
