@@ -64,7 +64,14 @@ namespace dxvk {
     void InitHostVisibleTexture(
             D3D11CommonTexture*         pTexture,
       const D3D11_SUBRESOURCE_DATA*     pInitialData);
-    
+
+    // NV-DXVK [texture identity]: content-derived DxvkImage hash, stamped at
+    // creation so a texture the game recreates keeps its material. See the
+    // definition for the measurement that motivated it.
+    void StampContentHash(
+            D3D11CommonTexture*         pTexture,
+      const D3D11_SUBRESOURCE_DATA*     pInitialData);
+
     void FlushImplicit();
     void FlushInternal();
 

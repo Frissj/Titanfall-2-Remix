@@ -1,4 +1,5 @@
 #include <cstring>
+#include <algorithm>
 
 #include "d3d11_device.h"
 #include "d3d11_initializer.h"
@@ -41,9 +42,101 @@ namespace dxvk {
   void D3D11Initializer::InitTexture(
           D3D11CommonTexture*         pTexture,
     const D3D11_SUBRESOURCE_DATA*     pInitialData) {
+    StampContentHash(pTexture, pInitialData);
+
     (pTexture->GetMapMode() == D3D11_COMMON_TEXTURE_MAP_MODE_DIRECT)
       ? InitHostVisibleTexture(pTexture, pInitialData)
       : InitDeviceLocalTexture(pTexture, pInitialData);
+  }
+
+
+  // NV-DXVK [texture identity]: STAMP A CONTENT HASH AT CREATION.
+  //
+  // THE DEFECT. d3d11_rtx.cpp's FillMaterialData stamps a DxvkImage hash only
+  // when getHash()==0, and seeds it with img->cookie() -- a PER-OBJECT cookie.
+  // The game recreates D3D11 texture objects for textures already on screen, so
+  // every recreation mints a fresh image hash, which propagates to a fresh
+  // material hash and a fresh surface material index. Measured over 1,819
+  // frames of ordinary play: imgNew 1,899 (1.04/frame), matNew 1.5/frame,
+  // texNew 2.6/frame, texFree 0, texTotal 363 -> 2,039 and still climbing --
+  // against rtx_scene_manager.h's own acceptance line, "in a steady scene with a
+  // still camera, matNew / texNew / imgNew should all be 0. Any of them running
+  // hot continuously IS the churn". Remix's managed-texture streaming is idle
+  // throughout (mtQueue/mtDemote/mtVid/mtSwap all 0), so the recreation is
+  // game-side, not self-inflicted.
+  //
+  // WHY NOT THE TWO OBVIOUS KEYS, both already closed off at that site. The
+  // object ADDRESS was tried and reverted ("flicker fix A"): the allocator
+  // reuses addresses, so a new texture inherited a dead one's material whenever
+  // the two shared extent, format and mip count. Extent/format/mips ALONE
+  // collide across same-sized textures, which is exactly why the cookie was
+  // added. Only the content is both stable across recreation and distinct
+  // between textures.
+  //
+  // WHAT IS HASHED, and it is bounded on purpose. Up to kHashRows rows sampled
+  // evenly across mip 0, at most kHashRowBytes each, folded with the descriptor.
+  // Striding across the image rather than taking a prefix matters: art assets
+  // routinely share a uniform first row (sky, UI, anything with a border), so a
+  // prefix would collide where a stride does not. The cap holds the cost near
+  // 64 KB per texture creation, about one creation per frame here.
+  //
+  // Textures with no initial data -- render targets, dynamic and staging
+  // textures -- are left alone. They have no stable content to hash, they are
+  // not the churning population, and FillMaterialData's cookie stamp still
+  // covers them because this only fires when there is data to read.
+  void D3D11Initializer::StampContentHash(
+          D3D11CommonTexture*         pTexture,
+    const D3D11_SUBRESOURCE_DATA*     pInitialData) {
+    if (pInitialData == nullptr || pInitialData[0].pSysMem == nullptr) {
+      return;
+    }
+
+    // GetImage() returns by value; taken as a value rather than a const
+    // reference so nothing depends on temporary lifetime extension here.
+    const Rc<DxvkImage> image = pTexture->GetImage();
+    if (image == nullptr) {
+      return;
+    }
+
+    constexpr uint32_t kHashRows = 32u;
+    constexpr size_t   kHashRowBytes = 2048u;
+
+    const D3D11_COMMON_TEXTURE_DESC* desc = pTexture->Desc();
+    const D3D11_SUBRESOURCE_DATA& d0 = pInitialData[0];
+
+    const size_t pitch = static_cast<size_t>(d0.SysMemPitch);
+    const size_t slice = static_cast<size_t>(d0.SysMemSlicePitch);
+    // rows is derived rather than taken from the height, because the pitch is in
+    // BLOCK rows for compressed formats and the height is in texels. Dividing
+    // the slice pitch by the row pitch gives block rows without needing the
+    // format's block size. A game that leaves SysMemSlicePitch at 0 for a 2D
+    // texture falls back to a single row, which still hashes real content.
+    const size_t rows = (pitch != 0u && slice >= pitch) ? (slice / pitch) : 1u;
+
+    // The descriptor first, so two textures with identical sampled bytes but
+    // different dimensions or formats cannot collide.
+    struct DescKey {
+      uint32_t width, height, mipLevels, arraySize;
+      uint32_t format, sampleCount;
+      uint32_t pitch, rows;
+    };
+    const DescKey dk = {
+      desc->Width, desc->Height, desc->MipLevels, desc->ArraySize,
+      static_cast<uint32_t>(desc->Format), desc->SampleDesc.Count,
+      static_cast<uint32_t>(pitch), static_cast<uint32_t>(rows),
+    };
+    XXH64_hash_t h = XXH3_64bits(&dk, sizeof(dk));
+
+    const uint8_t* base = reinterpret_cast<const uint8_t*>(d0.pSysMem);
+    const size_t rowBytes = std::min<size_t>(pitch != 0u ? pitch : kHashRowBytes,
+                                             kHashRowBytes);
+    const size_t stride = (rows > kHashRows) ? (rows / kHashRows) : 1u;
+
+    for (size_t r = 0; r < rows; r += stride) {
+      h = XXH3_64bits_withSeed(base + r * pitch, rowBytes, h);
+    }
+
+    image->setHash(h);
   }
 
 
