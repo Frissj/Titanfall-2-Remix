@@ -3266,6 +3266,88 @@ namespace dxvk {
         residencyHolds = m_residentScene.holdsInstance(pInstance);
       }
 
+      // NV-DXVK [HeldCensus]: IS THE STALE-HOLD DEFECT STILL HAPPENING, over
+      // ALL geometry rather than the 24-line [HeldRaw] burst.
+      //
+      // The defect: a held instance whose vertex content is regenerated per
+      // draw renders whatever was last written into its buffer when no draw
+      // arrives. On the Titanfall viewmodel that showed as one side of the
+      // weapon and hands going black -- stale normals, so a shading artefact on
+      // part of a mesh rather than a missing object -- while every residency
+      // counter read healthy. [HeldRaw] is capped and samples; this counts.
+      //
+      // bone= IS THE ACCEPTANCE COLUMN. ResidentScene::build now sets
+      // skipUnsafe on any record with a non-zero builtBoneHash, so a skinned
+      // instance must never be held. This must read 0. If it does not, the
+      // disqualification is not reaching these instances and the bone signal is
+      // wrong, which is a different finding from the fix not working.
+      //
+      // stale= IS THE GENERAL FORM, and it is why this counts all geometry
+      // rather than skinned alone. Skinning is one way for held content to go
+      // stale; any producer that rewrites a BLAS's buffers between frames is
+      // another, and nothing here knows their names. An instance held with
+      // frameLastTouched behind the current frame is one whose geometry nobody
+      // refreshed, so stale= climbing while bone= sits at 0 says a sixth class
+      // exists and names the population to go looking in.
+      //
+      // Counted, never classified. The counters below are raw populations with
+      // no threshold and no verdict, because the last four readings of this
+      // system were each a classifier confirming its own premise.
+      //
+      // getBlas() IS GUARDED ON isUnlinkedForGC, not on null. This runs inside
+      // the same garbage-collection pass that erases BlasEntries, and an
+      // unlinked instance keeps m_linkedBlas pointing at the erased entry, so
+      // getBlas() returns a dangling pointer that survives a null test. That is
+      // the [ReapBlasUAF] hazard the block below already documents.
+      if (RtxOptions::ResidentScene::enable()) {
+        static uint32_t sHcFrame = 0xFFFFFFFFu;
+        static uint32_t sHcLastDump = 0xFFFFFFFFu;
+        static uint32_t sHcLive = 0u, sHcHeld = 0u, sHcHeldNoDraw = 0u;
+        static uint32_t sHcBone = 0u, sHcStale = 0u, sHcUnlinked = 0u, sHcNoBlas = 0u;
+        constexpr uint32_t kHcDumpFrames = 300u;
+
+        if (sHcFrame != currentFrame) {
+          sHcFrame = currentFrame;
+          if (sHcLastDump == 0xFFFFFFFFu) {
+            sHcLastDump = currentFrame;
+          } else if (currentFrame - sHcLastDump >= kHcDumpFrames) {
+            sHcLastDump = currentFrame;
+            Logger::warn(str::format(
+              "[HeldCensus] f=", currentFrame,
+              " live=", sHcLive,
+              " held=", sHcHeld,
+              " heldNoDraw=", sHcHeldNoDraw,
+              " bone=", sHcBone,
+              " stale=", sHcStale,
+              " unlinked=", sHcUnlinked,
+              " noBlas=", sHcNoBlas));
+            sHcLive = sHcHeld = sHcHeldNoDraw = 0u;
+            sHcBone = sHcStale = sHcUnlinked = sHcNoBlas = 0u;
+          }
+        }
+
+        sHcLive += 1u;
+        if (residencyHolds) {
+          sHcHeld += 1u;
+          const bool noDraw = (pInstance->m_frameLastUpdated != currentFrame);
+          if (noDraw) {
+            sHcHeldNoDraw += 1u;
+          }
+          if (pInstance->isUnlinkedForGC()) {
+            sHcUnlinked += 1u;
+          } else if (const BlasEntry* hcBlas = pInstance->getBlas()) {
+            if (hcBlas->modifiedGeometryData.lastBoneHash != 0ull) {
+              sHcBone += 1u;
+            }
+            if (noDraw && hcBlas->frameLastTouched != currentFrame) {
+              sHcStale += 1u;
+            }
+          } else {
+            sHcNoBlas += 1u;
+          }
+        }
+      }
+
       // NV-DXVK [HeldRaw]: WHAT IS ACTUALLY BEING HELD, one raw line per
       // instance, no classification.
       //

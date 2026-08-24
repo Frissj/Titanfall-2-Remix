@@ -199,6 +199,42 @@ namespace dxvk {
       }
     }
 
+    // SKINNED GEOMETRY IS THE FIFTH UNSAFE CLASS, and it is the one the
+    // [HeldRaw] block predicted would "announce itself as a visual bug rather
+    // than as a counter".
+    //
+    // It did. Holding a skinned instance turns part of a mesh black: the
+    // Titanfall viewmodel -- the weapon and the hands -- shaded correctly on one
+    // side and black on the other for as long as the hold lasted, while every
+    // residency counter read healthy.
+    //
+    // WHY THE OTHER FOUR TESTS CANNOT CATCH IT. A skinned mesh has no
+    // billboards, is not a ray portal, is not a decal and is not blended, so it
+    // passes all of skipUnsafe. Its positions are REGENERATED PER DRAW from the
+    // bone palette, so a held instance that misses a draw renders whatever the
+    // skinning pass last wrote into that buffer -- stale normals, hence a
+    // shading artefact on part of the mesh rather than a missing object.
+    //
+    // AND WHY builtPosHash CANNOT CATCH IT EITHER, which is the part worth
+    // reading twice. holdsInstance compares hashes[VertexPosition] against
+    // builtPosHash and refuses when they differ. But that hash is written in
+    // exactly one place, processGeometryInfo, and processGeometryInfo runs when
+    // a DRAW ARRIVES. A held instance with no draw never updates it, so the
+    // hash still matches the baseline while the buffer underneath has been
+    // rewritten. The check passes precisely in the case that is unsafe.
+    //
+    // builtBoneHash was already captured above and was read by nothing. A
+    // non-zero lastBoneHash is the tree's own definition of "this geometry is
+    // bone-driven", used the same way by the [HeldRaw] bone= column.
+    //
+    // Disqualifying through skipUnsafe rather than a new flag is deliberate: it
+    // is the existing meaning of "this record must not be held", and it also
+    // stops the record being SERVED, which a skinned draw must not be either,
+    // for the same reason.
+    if (rec.builtBoneHash != 0ull) {
+      rec.skipUnsafe = true;
+    }
+
     m_stats.built += 1;
   }
 

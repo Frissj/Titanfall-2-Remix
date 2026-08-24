@@ -5487,7 +5487,20 @@ namespace dxvk {
       //
       // VERIFY FIRST, SKIP SECOND. While rtx.residentScene.verify is on the
       // prediction is carried, scored in processDrawCallState and DISCARDED --
-      // the draw commits in full and this feature can change nothing on screen.
+      // the draw commits in full and NO DRAW IS SKIPPED.
+      //
+      // THAT IS NOT THE SAME AS "changes nothing on screen", which is what this
+      // comment used to claim, and the difference cost a long afternoon. verify
+      // disarms THE SKIP, here. It does not disarm THE KEEP: build() runs
+      // unconditionally and stamps RtInstance::m_residentKey, and the retention
+      // clause in rtx_instance_manager.cpp is guarded by
+      // ResidentScene::enable() ALONE -- see the note there, which chose that
+      // deliberately. So with enable=True and verify=True, instance LIFETIME is
+      // already a function of the residency key, and changing how that key is
+      // composed changes which instances are held alive and therefore what is
+      // on screen. Every key experiment run under verify is a live change, not
+      // a dry run. Read holdsInstance() before assuming otherwise.
+      //
       // Nothing is skipped until [ResidentScene] reads FAIL=0 with the record
       // count plateaued across a pitch-and-yaw sweep. That ordering is what the
       // [PropIdKeepLong attempt reverted] note exists to enforce: a long keep on

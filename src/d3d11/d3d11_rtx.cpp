@@ -40957,16 +40957,8 @@ namespace dxvk {
     // quarter is a quarter fewer draws depending on the one term known to be
     // unstable across frames.
     //
-    // While the fold was in, missO2w could not fire -- a moving object missed on
-    // the key before the comparison was reached, the §6.2 shape. It is LIVE
-    // AGAIN now that the fold is out, and it is the counter to read for how much
-    // real transform movement the gate is refusing.
-    //
-    // AND THE TRANSFORM IS OUT AGAIN. It was restored earlier the same day on
-    // gap0/gap1 evidence, which was real and is not being disputed -- what that
-    // reading could not see is that o2w NEVER SATURATES.
-    //
-    // [RsIdent], settled, identHead new at 0% in both windows:
+    // THE TRANSFORM IS OUT AND THE MATERIAL IS IN, because they are not the same
+    // kind of term. [RsIdent], settled, identHead new at 0%:
     //
     //                  new f=3339   new f=3639   distinct 3339 -> 3639 -> 3939
     //   identHead          407          318        7272   7590   8360
@@ -40974,88 +40966,23 @@ namespace dxvk {
     //   hdPlusO2w         2183         1898       12572  14470  16604
     //   o2wPlusMat        2359         2012       19843  21855  24535
     //
-    // identHead is saturated at ~1.2 new keys a frame: the scene has a finite
-    // identity set and it has been registered. hdPlusMat adds ~100 per window
-    // on top, so it is finite too. hdPlusO2w adds ~1,700 per window and its
-    // distinct climbs LINEARLY AND WITHOUT BOUND in a scene that is not
-    // changing -- so the transform is not naming a fixed set of things, it is
-    // minting fresh values forever.
+    // identHead is saturated at ~1.2 new keys a frame and hdPlusMat adds ~100
+    // per window on top, so material names a FINITE set. hdPlusO2w adds ~1,700
+    // per window and its distinct climbs linearly without bound in a scene that
+    // is not changing, so the transform mints fresh values forever.
     //
-    // The separation each one buys, gap0: 12792 bare, ~7600 with material
-    // alone, 7042 with the transform alone, 2818 with both. Material does most
-    // of the separating for 6% of the churn.
+    // gap0: 12792 bare, ~7600 with material alone, 7042 with the transform
+    // alone, 2818 with both. Material does most of the separating for 6% of the
+    // churn. An identity has to be stable to be found again and a dirty test
+    // has to be sensitive to notice change, so material goes in the key and o2w
+    // goes in the comparison, where missO2w is live again.
     //
-    // SO THEY ARE NOT THE SAME KIND OF TERM AND DO NOT BELONG IN THE SAME
-    // PLACE. An identity has to be stable to be found again; a dirty test has
-    // to be sensitive to notice change. Material is stable AND separating, so
-    // it goes in the key. o2w separates but does not survive, so it goes in the
-    // comparison, where its sensitivity is the point and its instability costs
-    // nothing.
+    // Measured live: newKeys 563-794 per ten frames -> 38-47.
     //
-    // AND THIS IS THE SAFER PLACEMENT, not merely the cheaper one. With o2w in
-    // the key a moving prop mints a fresh key every frame and ORPHANS ITS
-    // RECORD every frame. Under the keep clause that is the duplicated-geometry
-    // failure with a receipt already in the tree: [PropIdKeepLong attempt
-    // reverted], where new instances were created and then all kept alive and
-    // m_reorderedSurfaces doubled 8500 -> 17155. In the dirty test the mover
-    // keeps its key, scores missO2w, and rebuilds the same record. Nothing is
-    // orphaned, and missO2w becomes a live counter again for the first time.
-    //
-    // Watch gap0. It rises to ~7600, so more draws fall back on the occurrence
-    // ordinal, which [RsFailMember] measures 81% disjoint. Those lose to
-    // failMember, which REFUSES the serve -- a miss, not a wrong serve -- so
-    // the cost is hit rate and the gain is that nothing is left behind.
+    // AND IT IS THE SAFER PLACEMENT. With o2w in the key a moving prop mints a
+    // fresh key every frame and orphans its record every frame; in the dirty
+    // test it keeps its key and rebuilds the same record.
     uint64_t narrowed = baseKey;
-
-    // AND THE MATERIAL IS BACK, ON EVIDENCE, AFTER ITS ALTERNATOR WAS FOUND.
-    //
-    // It was removed for alternating with period 2 -- hdPlusMat gap1=0.4% /
-    // gap2=51-61% -- and that reading was correct at the time. The alternator
-    // has since been identified and fixed: SRV slot 30 carried a 1x1 R16_UNORM
-    // COLOUR ATTACHMENT ([SeqTex] usage=0x17 rt=1), double-buffered, which
-    // FillMaterialData already rejects at rejTiny and residentMaterialFold now
-    // sentinels. missMat fell from ~2,400/frame to 5-274 and the watched keys
-    // read matChg=8/1239. The condition that removed it does not hold any more.
-    //
-    // WHY IT IS NOT REDUNDANT WITH o2w, which is the question that decides it.
-    // [RsGroup] samples the draws that collide inside a frame and every pair
-    // reads n=2 o2wSame=1 matSame=0 genSame=1 -- one mesh, one transform, one
-    // geometry generation, two materials. Those are multi-pass draws of a
-    // single object and no transform can separate them, in principle.
-    //
-    // MEASURED AS A PAIR before landing, per this file's standing rule.
-    // [RsIdent] f=2530, settled, identHead new=478 (0%):
-    //
-    //                 new     gap0     gap1     gap3plus
-    //   identHead     478     12097    85629    24070
-    //   hdPlusO2w     2175     5920    90162    24021
-    //   o2wPlusMat    3108     1822    93868    23505
-    //   keyWithOrd    2177        0    96047    24053
-    //
-    // The pair beats o2w alone on every axis but new: gap0 down 69%, gap1 up
-    // 3,706, and gap3plus DOWN -- so it does not inherit the recurrence cost
-    // hdPlusMat carried on its own (18222 against 9963 under motion), which was
-    // the pre-registered risk. Same shape moving, at f=1930.
-    //
-    // THE EXTRA `new` IS NOT CHURN, and gap1 is what proves it. distinct goes
-    // 10397 -> 17502, so 7,105 more identities exist -- the multi-pass draws
-    // being told apart at last -- and a churning key DEPRESSES gap1 while these
-    // RAISE it. They are minted once and then recur.
-    //
-    // WHAT IT BUYS BEYOND THE COLUMNS. keyWithOrd reaches gap0=0 only because
-    // the occurrence ordinal forces it, and the ordinal is submission order,
-    // which culling reorders -- [RsFailMember] measures it 81% disjoint across
-    // frames, and it is the term behind wrong-record serves. Material alone
-    // takes gap0 from 12792 to ~7600, so it is that many fewer draws relying on
-    // the one term known not to survive a frame.
-    //
-    // (The 2818 figure in the table above is o2w AND material together. The
-    // transform was subsequently removed -- see the note on the assignment
-    // above -- so the live key gets the ~7600, not the 2818. The pair is still
-    // measured, as o2wPlusMat, which is what would justify bringing it back.)
-    //
-    // If newKeys climbs without gap1 climbing with it, that is the reverse of
-    // what was measured here and the fold comes back out.
     narrowed = XXH64(&m_rsDrawMat, sizeof(m_rsDrawMat), narrowed);
 
     // [RsIdent] candidate `hdPlusMat`: what the key USED to be, kept as a probe
@@ -41296,30 +41223,23 @@ namespace dxvk {
         //                               instead of orphaning a record.
         // ONE SAMPLE PER KEY PER FRAME, AND ONLY FOR KEYS DRAWN ONCE.
         //
-        // The first version of this compared consecutive STORES under one
-        // baseKey, and identHead collides inside a frame -- gap0=20148 per 300
-        // frames, about 67 a frame. So when two props share an identHead it
-        // stored A's matrix and then compared B against it, and printed the
-        // DISTANCE BETWEEN TWO DIFFERENT PROPS as though it were one prop's
-        // motion. That is what ge1=8356 with max=5303 units was: not an object
-        // crossing the map in 16 ms, which was never physically plausible, but
-        // two objects that were always thousands of units apart.
+        // The first version compared consecutive STORES under one baseKey, and
+        // identHead collides inside a frame -- gap0=20148 per 300 frames, about
+        // 67 a frame. So when two props share an identHead it stored A's matrix
+        // and compared B against it, printing THE DISTANCE BETWEEN TWO PROPS as
+        // though it were one prop's motion. That is what ge1=8356 with max=5303
+        // units was: not an object crossing the map in 16 ms, which was never
+        // physically plausible, but two objects always thousands of units apart.
         //
-        // So: compare only on the FIRST draw of a key each frame, which makes
-        // the comparison frame-to-frame rather than draw-to-draw, and count the
-        // rest as multi= rather than folding them in. A key with multi>0 is one
-        // where identHead names more than one object, and its delta cannot mean
-        // what this probe wants to measure at all -- excluded rather than
-        // silently averaged, since it is the same population gap0 counts.
+        // So compare only on the FIRST draw of a key each frame, and count the
+        // rest as multi=. everMulti is STICKY: if submission order ever flips
+        // between two props sharing an identHead, the "first draw" is a
+        // different object than last frame and the comparison breaks again one
+        // frame out. A key that has ever collided is dropped for good, so the
+        // histogram describes only keys naming exactly one object.
         struct PrevO2w {
           Matrix4 m;
           uint32_t frame = 0xFFFFFFFFu;
-          // Sticky, not per-frame. If submission order ever flips between two
-          // props sharing an identHead, the "first draw" is a different object
-          // than it was last frame and the comparison is meaningless again --
-          // the same defect, just one frame further out. A key that has ever
-          // collided is dropped from the deltas for good, so the histogram
-          // describes only keys that name exactly one object.
           bool everMulti = false;
         };
         static std::unordered_map<uint64_t, PrevO2w> sPrevO2w;
@@ -41336,9 +41256,6 @@ namespace dxvk {
         }
         auto pIt = sPrevO2w.find(m_rsDrawBaseKey);
         if (pIt != sPrevO2w.end() && pIt->second.frame == frameId) {
-          // Same key, same frame: a second object under one identity. Counted,
-          // not compared, and the stored matrix is left as the first draw's so
-          // the next frame still compares like with like.
           sDeltaMulti[fanIdx] += 1u;
           pIt->second.everMulti = true;
         } else if (pIt != sPrevO2w.end() && pIt->second.everMulti) {
@@ -41431,42 +41348,11 @@ namespace dxvk {
         // hdPlusO2w above and would have made this slot a duplicate.
         narrowedWithPlace,
         key,
-        // BOTH DISCRIMINATORS AT ONCE, which nothing has measured.
+        // THE REMOVED TRANSFORM, still priced alongside the material that
+        // replaced it, the same way keyPlusPlace holds the removed placement
+        // count. The live key is baseKey+material; this is baseKey+o2w+material.
         //
-        // [RsGroup] settles what separates two draws sharing an IA identity,
-        // and it is not the transform: every sampled pair reads n=2 o2wSame=1
-        // matSame=0 genSame=1 -- same mesh, same transform, same geometry
-        // generation, DIFFERENT MATERIAL. Those are multi-pass draws of one
-        // object, and o2w cannot tell them apart by construction.
-        //
-        // Yet hdPlusO2w beats hdPlusMat globally, f=2763 settled: new 1790 vs
-        // 3813, gap0 6079 vs 7605, gap1 89098 vs 86927. Both are true because
-        // they separate DIFFERENT groups -- [RsGroup]'s sampled pairs share one
-        // constant transform (o2w=0xdcb217471446c01f on every row, across
-        // unrelated base keys), while elsewhere the transform is what differs.
-        // Neither term dominates the other, so the pair is the open question.
-        //
-        // WHY THE MATERIAL IS ELIGIBLE AGAIN. It was taken out of the key for
-        // alternating with period 2, and the alternator was found and fixed
-        // this session: slot 30 carried a 1x1 R16_UNORM colour attachment,
-        // double-buffered, which residentMaterialFold now sentinels. missMat
-        // fell from ~2,400/frame to 5-274 and the watched keys read
-        // matChg=8/1239. The condition that removed it no longer holds.
-        //
-        // MEASURED BEFORE IT GOES NEAR THE KEY, which is this file's standing
-        // rule: every identity killed here died from separating within a frame
-        // and not surviving one, or the reverse. Read gap0 against hdPlusO2w --
-        // if the pair does not beat it there, the material adds nothing the
-        // transform did not already have. Read gap3plus too: hdPlusMat costs
-        // 18222 against hdPlusO2w's 9963 under motion, so the material has a
-        // recurrence cost of its own and the pair must be shown to escape it.
-        // THE REMOVED TRANSFORM, still priced alongside the material it was
-        // removed next to, the same way keyPlusPlace holds the removed
-        // placement count. The live key is baseKey+material; this is
-        // baseKey+o2w+material, so the gap between this row and hdPlusMat is
-        // exactly what the transform would buy and cost if it went back in.
-        //
-        // What would justify restoring it: this row's `distinct` levelling off
+        // What would justify restoring o2w: this row's `distinct` levelling off
         // instead of climbing linearly. That is the property it failed on, and
         // gap0 alone -- which is what restored it once already -- cannot see it.
         XXH64(&m_rsDrawMat, sizeof(m_rsDrawMat), XXH64(&o2w, sizeof(o2w), baseKey))
@@ -41639,14 +41525,13 @@ namespace dxvk {
     } else if (!o2wMatch) {
       m_rsMissO2w += 1;
     } else if (!matMatch) {
-      // EXPECT THIS TO READ 0 NOW, AND DO NOT READ THAT AS A FIX. The material
-      // is folded into the key above, so a changed material re-keys the draw
-      // into missKey before this comparison is ever reached -- the same §6.2
-      // shape missO2w already has, and the same one that made an earlier
-      // missMat=0 over 911,176 draws look like a passing check when it was a
-      // counter that could not fire. The live reading for material churn is
-      // [MatChurnSlot] matChg and [MatChurn] matNew, neither of which depends
-      // on the key.
+      // EXPECT THIS TO READ 0, AND DO NOT READ THAT AS A FIX. The material is
+      // folded into the key above, so a changed material re-keys the draw into
+      // missKey before this comparison is reached -- the same §6.2 shape missO2w
+      // used to have, and the same one that made an earlier missMat=0 over
+      // 911,176 draws look like a passing check when it was a counter that could
+      // not fire. Read material churn from [MatChurnSlot] matChg and [MatChurn]
+      // matNew, neither of which depends on the key.
       m_rsMissMat += 1;
     } else {
       m_rsHit += 1;
