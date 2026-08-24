@@ -38851,12 +38851,102 @@ namespace dxvk {
     const uint64_t psPtr = reinterpret_cast<uint64_t>(ps.shader.ptr());
     fold = XXH64(&psPtr, sizeof(psPtr), fold);
 
+    // CONTENT HASH FIRST, POINTER ONLY AS A FALLBACK.
+    //
+    // This loop used to fold views[i].ptr() -- the D3D11 view WRAPPER. The game
+    // recreates texture objects for textures already on screen, so that pointer
+    // moves while the material is identical, and the fold moved with it:
+    // [MatChurnSlot] read matChg=76/76 with srv=# and img=# on a draw whose
+    // identHead and objectToWorld were both stable, which is what pinned
+    // [ResidentGate] missMat near half of all draws.
+    //
+    // DxvkImage::getHash() is now content-derived (D3D11Initializer::
+    // StampContentHash), so a recreated texture with identical texels keeps its
+    // hash. Measured after that change: imgNew 1.04/frame -> 0.00, matNew and
+    // texNew -> 0 in a settled scene, texTotal plateaued instead of climbing
+    // 363 -> 2039. The material SYSTEM is stable; this fold was the last place
+    // still reading the handle.
+    //
+    // The pointer fallback stays for views with no image behind them -- buffer
+    // SRVs -- and for anything whose hash was never stamped. Those are no worse
+    // than before, and a zero hash must not silently collapse every slot to one
+    // value, which is why the fallback is per-slot rather than a skip.
     for (uint32_t i = 0; i < ps.shaderResources.views.size(); ++i) {
-      const uint64_t v = reinterpret_cast<uint64_t>(ps.shaderResources.views[i].ptr());
-      if (v == 0ull) {
+      auto* srvPtr = ps.shaderResources.views[i].ptr();
+      if (srvPtr == nullptr) {
         continue;
       }
-      // The SLOT rides with the pointer so that moving the same view between
+      // TODO: GetImageView() returns Rc<DxvkImageView> BY VALUE, so this costs an
+      // atomic incref/decref pair per bound SRV per draw -- order 40,000 atomic
+      // pairs a frame at ~8 bound views and ~5,000 draws. This function is on the
+      // frame thread, which is the one already at the budget. Replace with a
+      // non-refcounting accessor (a raw DxvkImageView* getter on
+      // D3D11ShaderResourceView, or caching the hash on the view at creation)
+      // before this leaves the diagnostic build. Watch [Perf.Report] frame thread
+      // against the pre-change baseline to size it.
+      // FOLD EXACTLY WHAT THE MATERIAL PATH CONSUMES, AND NOTHING ELSE.
+      //
+      // The pointer fallback this replaces was the residual churn.
+      // [MatChurnSlot] on 0x8c352ed65ba6adf1: ps=0, state=0/0/0, samplers
+      // stable, every image hash stable (hashAlways=0, hashZero=0/1288) -- and
+      // matChg still 319/321, because slot 4 has NO image view, took the
+      // pointer, and its pointer moved on ~95% of frames (srv=....9, img=....9).
+      //
+      // FillMaterialData cannot consume that slot: every one of its paths
+      // filters on GetResourceType()==D3D11_RESOURCE_DIMENSION_TEXTURE2D with a
+      // non-null image view (~:35863, ~:37147, ~:63452). So a non-texture SRV
+      // can never change the material, and folding it could only ever refuse a
+      // serve that was correct -- the superset argument in the one place it does
+      // NOT hold, which is what this function's header claims it does.
+      //
+      // A bound-but-unhashed view folds a slot-tagged sentinel rather than being
+      // skipped outright, so binding or unbinding one still reads as dirty. Only
+      // its unstable ADDRESS is dropped, never its presence.
+      const Rc<DxvkImageView> iv = srvPtr->GetImageView();
+      if (iv == nullptr || iv->image() == nullptr) {
+        continue;
+      }
+      uint64_t v = static_cast<uint64_t>(iv->image()->getHash());
+      // A TEXTURE THE CONSUMER ALREADY REJECTS CANNOT CHANGE THE MATERIAL.
+      //
+      // The fallback path drops any SRV of 2x2 or smaller before scoring it
+      // ("Skip tiny dummy textures", ~:37192, counted as rejTiny), so such a
+      // view can never become a candidate and never reaches the material. This
+      // fold was reading it anyway, and that was the residual missMat.
+      //
+      // [SeqTex] named it: slot 30 carries a 1x1 R16_UNORM COLOUR ATTACHMENT
+      // (usage=0x17, rt=1), double-buffered, and every churning key in a
+      // settled scene ping-ponged between exactly two of them -- dist=2 with
+      // both hashes stable over ~970 samples, four base keys reading the same
+      // hash on the same frame and swapping together every frame. An engine
+      // scratch or readback target, not art. Folding it re-keyed roughly half
+      // the frame's draws every frame for a texture the material path had
+      // already thrown away.
+      //
+      // Same shape as the non-image SRV above and the same remedy: fold a
+      // slot-tagged sentinel, distinct from the unhashed one so the two cases
+      // cannot alias, so that binding or unbinding such a view still reads
+      // dirty while its alternating identity does not.
+      //
+      // THE COLOUR-ATTACHMENT TERM IS LOAD-BEARING, so do not simplify this to
+      // the size test alone. Size alone is what the fallback path rejects, but
+      // the RDEF path (~:35858) does NOT apply that reject: it binds whatever
+      // slot a reflected role resolves to, and an unbound role resolves to the
+      // 1x1 default white or black dummy. Sentinelling on size alone would
+      // therefore also erase a role legitimately switching between two
+      // different dummies. A 1x1 dummy fill is not a render target, so
+      // requiring COLOUR_ATTACHMENT keeps this to exactly the population
+      // [SeqTex] measured and leaves every material role's identity intact.
+      const auto& imgInfo = iv->image()->info();
+      const bool tinyAttachment = imgInfo.extent.width <= 2u
+                               && imgInfo.extent.height <= 2u
+                               && (imgInfo.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0;
+      if (tinyAttachment) {
+        v = 0xC2B2AE3D27D4EB4Full;
+      } else if (v == 0ull) {
+        v = 0x9E3779B97F4A7C15ull;
+      }
+      // The SLOT rides with the value so that moving the same texture between
       // slots reads as dirty: it changes which resource the shader samples for a
       // given register even though nothing was created or destroyed.
       const uint64_t slotted = v ^ (static_cast<uint64_t>(i) << 56);
@@ -39906,6 +39996,15 @@ namespace dxvk {
       constexpr uint32_t kSampSlots = 16;
       constexpr size_t kMatWatch = 8;
       constexpr uint32_t kMatDumpFrames = 300u;
+      // Long enough to show several turns of a plausible texture animation and
+      // still fit on one log line.
+      constexpr uint32_t kSeqRing = 64u;
+      // Above the 2,214-texture plateau, so a walk that visits the whole pool
+      // is countable rather than saturating the counter that would prove it.
+      constexpr uint32_t kSeqDistCap = 4096u;
+      // Comparisons required before the sequence slot is latched. Enough that
+      // the change rate that picks the slot is a rate and not one sample.
+      constexpr uint32_t kSeqLatchMin = 8u;
       struct MatWatch {
         uint32_t lastFrame = 0xFFFFFFFFu;
         uint32_t cmp = 0u;
@@ -39955,6 +40054,61 @@ namespace dxvk {
         uint64_t prevHash[kSrvSlots] = {};
         uint32_t chgHash[kSrvSlots] = {};
         uint32_t hashZero = 0u, hashSeen = 0u;
+        // THE SEQUENCE OF BOUND CONTENT HASHES, which is what decides whether
+        // the remaining churn is a bug at all.
+        //
+        // hashAlways=1 says the content hash under this key changes every
+        // frame. With texNew=0 and texTotal plateaued no texture is being
+        // created, so those hashes are stamped once and stable per texture and
+        // the game is binding a DIFFERENT PRE-EXISTING texture each frame. The
+        // change COUNT cannot separate the two readings of that, and they want
+        // opposite responses:
+        //
+        //   a short repeating cycle   a texture animation. The draw really does
+        //                             sample a different image each frame, the
+        //                             material fold is reporting the truth, and
+        //                             the residency ceiling on these draws is
+        //                             real rather than a defect to fix.
+        //   a walk over many values   a misbind. We resolve the wrong texture,
+        //                             and the churn is ours.
+        //
+        // dist against samples is the deciding pair, and sinceNew is what tells
+        // a cycle that has settled from a walk still in progress: a cycle stops
+        // minting ordinals after its first turn, a walk never does.
+        //
+        // The ring is printed as FIRST-SEEN ORDINALS rather than hashes so that
+        // "0120120120" and "0123456789" are distinguishable by eye. Ordinals at
+        // or above 62 exhaust the alphabet and print as '+', which is itself
+        // only reachable by a walk.
+        int32_t seqSlot = -1;
+        std::unordered_map<uint64_t, uint32_t> seqOrd;
+        uint32_t seqRing[kSeqRing] = {};
+        uint32_t seqSamples = 0u;
+        uint32_t seqNewAt = 0u;
+        uint32_t seqZero = 0u;
+        uint32_t seqCapped = 0u;
+        uint64_t seqFirst = 0ull, seqLast = 0ull;
+        // DOES THE SEQUENCE WALK THE SET IN ORDER, counted rather than read off
+        // the printed string by eye.
+        //
+        // period= cannot answer this. It requires an EXACT repeat, and a cycle
+        // sampled at a rate not locked to it stalls on some frames and skips on
+        // others, so the one case worth detecting reports period=0. The first
+        // capture showed exactly that: 29 values, revisited in ascending runs
+        // with holds, and period=0 on every row.
+        //
+        // Ordinals are assigned in first-pass order, so "the next texture in
+        // the rotation" is ordinal+1, wrapping at the highest ordinal seen.
+        // Only transitions INTO an already-seen value are classified: a
+        // transition into a new one is ascending by construction and would
+        // manufacture the very evidence being sought.
+        //
+        //   adv+hold dominant   the draw cycles a fixed set in a fixed order.
+        //                       An animation, and the fold reports the truth.
+        //   jump dominant       arbitrary rebinding. A misbind.
+        uint32_t seqPrevOrd = 0xFFFFFFFFu;
+        uint32_t seqMaxOrd = 0u;
+        uint32_t seqAdv = 0u, seqHold = 0u, seqJump = 0u;
         // The fold value itself, so the dump can show WHETHER it is a two-state
         // A/B/A/B flip or a walk through many values. Those want different
         // fixes and the change count alone cannot tell them apart.
@@ -40157,6 +40311,117 @@ namespace dxvk {
             }
           }
         }
+        // DETECT, THEN LATCH. Picking the sequence slot on first sight is the
+        // §6.6 mistake this probe already made once: it would sample whichever
+        // slot happened to be bound, and report a stable sequence because the
+        // slot it chose was not in the churning population. The slot is chosen
+        // only after kSeqLatchMin comparisons have measured a change rate, and
+        // it is the slot with the HIGHEST rate, admitted only above 80%. Until
+        // then nothing is recorded and the dump prints seqSlot=-1, so a starved
+        // latch is visible instead of reading as "no walk".
+        if (w.seqSlot < 0 && w.cmp >= kSeqLatchMin) {
+          uint32_t bestSlot = 0u, bestChg = 0u;
+          for (uint32_t i = 0; i < kSrvSlots; ++i) {
+            if (w.chgHash[i] > bestChg) {
+              bestChg = w.chgHash[i];
+              bestSlot = i;
+            }
+          }
+          if (bestChg * 10u >= w.cmp * 8u) {
+            w.seqSlot = static_cast<int32_t>(bestSlot);
+          }
+        }
+        if (w.seqSlot >= 0) {
+          const uint64_t hv = hashNow[static_cast<uint32_t>(w.seqSlot)];
+          uint32_t ord = 0xFFFFFFFFu;
+          bool ordIsNew = false;
+          auto oIt = w.seqOrd.find(hv);
+          if (oIt != w.seqOrd.end()) {
+            ord = oIt->second;
+          } else {
+            ordIsNew = true;
+            // Not in the map, so new either way. seqNewAt is stamped on BOTH
+            // branches: past the cap the value is still one never seen before,
+            // and stamping only the uncapped branch would let sinceNew climb
+            // while new textures kept arriving -- a walk reading as settled,
+            // which is the exact reversal this probe exists to avoid.
+            w.seqNewAt = w.seqSamples;
+            if (w.seqOrd.size() < kSeqDistCap) {
+              ord = static_cast<uint32_t>(w.seqOrd.size());
+              w.seqOrd.emplace(hv, ord);
+              if (ord == 0u) {
+                w.seqFirst = hv;
+              }
+              // WHAT THE ALTERNATING TEXTURE ACTUALLY IS, emitted once per
+              // never-before-seen value and so bounded by dist -- two lines per
+              // key for an A/B ping-pong.
+              //
+              // dist=2 with two stable hashes says the draw alternates between
+              // two textures, and stops there. A double-buffered engine target
+              // -- a refraction or framebuffer copy, which residentMaterialFold's
+              // own header already names as the shape that would do this while
+              // the material is genuinely unchanged -- and two ordinary art
+              // textures are indistinguishable from the sequence alone, and they
+              // want opposite fixes. rt=1 settles it: a colour attachment is not
+              // art, and a material whose only moving part is which half of a
+              // ping-pong it reads is one material, not two.
+              //
+              // Read from the DxvkImage already resolved for the hash rather
+              // than from a D3D11 desc, so it costs no GetDesc and no
+              // QueryInterface.
+              const auto& seqViews = psNow.shaderResources.views;
+              auto* seqSrv = (static_cast<uint32_t>(w.seqSlot) < seqViews.size())
+                           ? seqViews[w.seqSlot].ptr() : nullptr;
+              if (seqSrv != nullptr) {
+                const Rc<DxvkImageView> seqIv = seqSrv->GetImageView();
+                if (seqIv != nullptr && seqIv->image() != nullptr) {
+                  const DxvkImageCreateInfo& ii = seqIv->image()->info();
+                  Logger::warn(str::format(
+                    "[SeqTex] f=", mfid,
+                    " base=0x", std::hex, m_rsDrawBaseKey,
+                    " slot=", std::dec, w.seqSlot,
+                    " ord=", ord,
+                    " hash=0x", std::hex, hv,
+                    " usage=0x", ii.usage, std::dec,
+                    " rt=", ((ii.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ? 1 : 0),
+                    " ds=", ((ii.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) ? 1 : 0),
+                    " storage=", ((ii.usage & VK_IMAGE_USAGE_STORAGE_BIT) ? 1 : 0),
+                    " fmt=", static_cast<uint32_t>(ii.format),
+                    " ext=", ii.extent.width, "x", ii.extent.height,
+                    " mips=", ii.mipLevels,
+                    " layers=", ii.numLayers));
+                }
+              }
+            } else {
+              w.seqCapped += 1u;
+            }
+          }
+          // A zero hash is "never stamped", not a value -- §6.5, which cost a
+          // fold keyed on an all-zero column. Counted apart so that a dist=2
+          // sequence alternating a real hash with 0 reads as a stamping failure
+          // rather than as a two-frame animation.
+          if (hv == 0ull) {
+            w.seqZero += 1u;
+          }
+          if (!ordIsNew && w.seqPrevOrd != 0xFFFFFFFFu && ord != 0xFFFFFFFFu) {
+            if (ord == w.seqPrevOrd) {
+              w.seqHold += 1u;
+            } else if (ord == w.seqPrevOrd + 1u
+                       || (w.seqPrevOrd == w.seqMaxOrd && ord == 0u)) {
+              w.seqAdv += 1u;
+            } else {
+              w.seqJump += 1u;
+            }
+          }
+          if (ord != 0xFFFFFFFFu && ord > w.seqMaxOrd) {
+            w.seqMaxOrd = ord;
+          }
+          w.seqPrevOrd = ord;
+          w.seqRing[w.seqSamples % kSeqRing] = ord;
+          w.seqLast = hv;
+          w.seqSamples += 1u;
+        }
+
         w.prevPs = psNowPtr;
         std::memcpy(w.prevImg, imgNow, sizeof(imgNow));
         std::memcpy(w.prevHash, hashNow, sizeof(hashNow));
@@ -40253,6 +40518,44 @@ namespace dxvk {
                 '0' + std::min<uint32_t>(9u, (10u * w.chgSamp[i]) / w.cmp));
             }
           }
+          // The ring in chronological order, oldest first, so that both the
+          // printed string and the period search read left to right.
+          const uint32_t seqN = std::min<uint32_t>(w.seqSamples, kSeqRing);
+          uint32_t seqOrder[kSeqRing] = {};
+          for (uint32_t j = 0; j < seqN; ++j) {
+            seqOrder[j] = w.seqRing[(w.seqSamples - seqN + j) % kSeqRing];
+          }
+          // The smallest k for which the whole window repeats with period k, or
+          // 0 if none does. A texture animation has one; a walk cannot. k=1 is
+          // reported honestly and means the slot stopped changing after it was
+          // latched, which is a finding of its own rather than a cycle.
+          uint32_t seqPeriod = 0u;
+          for (uint32_t k = 1u; k * 2u <= seqN; ++k) {
+            bool repeats = true;
+            for (uint32_t j = k; j < seqN && repeats; ++j) {
+              if (seqOrder[j] != seqOrder[j - k]) {
+                repeats = false;
+              }
+            }
+            if (repeats) {
+              seqPeriod = k;
+              break;
+            }
+          }
+          std::string seqShape;
+          seqShape.reserve(seqN);
+          for (uint32_t j = 0; j < seqN; ++j) {
+            const uint32_t o = seqOrder[j];
+            if (o < 10u) {
+              seqShape += static_cast<char>('0' + o);
+            } else if (o < 36u) {
+              seqShape += static_cast<char>('a' + (o - 10u));
+            } else if (o < 62u) {
+              seqShape += static_cast<char>('A' + (o - 36u));
+            } else {
+              seqShape += '+';
+            }
+          }
           // matChg/matSamples is the ADMISSION evidence: it says this key's fold
           // really does alternate, so a row of all-dots below it is a finding
           // (the fold changed while none of its inputs did) rather than a key
@@ -40277,10 +40580,49 @@ namespace dxvk {
             " imgAlways=", imgAlways,
             " hashAlways=", hashAlways,
             " hashZero=", w.hashZero, "/", w.hashSeen,
+            " lastF=", w.lastFrame,
+            " seqSlot=", w.seqSlot,
+            " dist=", static_cast<uint32_t>(w.seqOrd.size()),
+            "/", w.seqSamples,
+            " sinceNew=", (w.seqSamples > w.seqNewAt ? w.seqSamples - w.seqNewAt - 1u : 0u),
+            " period=", seqPeriod,
+            " adv=", w.seqAdv,
+            " hold=", w.seqHold,
+            " jump=", w.seqJump,
+            " seqZero=", w.seqZero,
+            " seqCapped=", w.seqCapped,
+            " seqFirst=0x", std::hex, w.seqFirst,
+            " seqLast=0x", w.seqLast, std::dec,
+            " seq=", seqShape,
             " srv=", srvShape,
             " img=", imgShape,
             " hash=", hashShape,
             " samp=", sampShape));
+        }
+        // ROTATE THE WATCH SET, because a slot held by a key that has stopped
+        // drawing is a slot the settled scene cannot have.
+        //
+        // The first capture lost the entire scene to that. All eight slots
+        // filled while POPULATION read tracked=52-100 during the load
+        // transition, and when the level arrived with tracked=20207 and
+        // alternating=3522 the cap was already full, so not one key of the
+        // churning population was ever sampled. The held keys then stopped
+        // drawing and their rows reprinted frozen -- identical cmp and
+        // seqSamples across three consecutive dumps -- which reads as steady
+        // state and is not. lastF= exists so that a frozen row is legible as
+        // frozen even in the dump where it is evicted.
+        //
+        // §6.6 names the shape and this is a second dress of it: knowing the
+        // property is not enough if the population has not arrived yet, so the
+        // set has to be able to let go. A key that has not drawn once in a
+        // whole dump window is done talking, and its row is printed above
+        // before it goes.
+        for (auto evIt = sMatW.begin(); evIt != sMatW.end(); ) {
+          if (mfid - evIt->second.lastFrame >= kMatDumpFrames) {
+            evIt = sMatW.erase(evIt);
+          } else {
+            ++evIt;
+          }
         }
       }
     }
@@ -40454,6 +40796,22 @@ namespace dxvk {
     m_rsDrawKey = 0ull;
 
     const uint32_t frameId = m_context->m_device->getCurrentFrameId();
+    // THE TRANSFORM, HASHED BYTE-EXACT, AND THE QUANTISER THAT IS NOT HERE.
+    //
+    // A masked version of this stood here briefly, on the theory that the
+    // transform churn standing still was low-bit noise from the paths that
+    // reconstruct o2w camera-relatively. It was measured and removed the same
+    // day. [RsIdent] carried both at once -- hdPlusO2w quantised against
+    // hdPlusO2wRaw byte-exact -- and standing still they read new=2093 against
+    // new=2099. Dropping 8 mantissa bits, one part in 32,768, absorbed SIX keys
+    // out of 2,093.
+    //
+    // [O2wDelta] then said why, and it closes the question rather than
+    // suggesting a wider mask: 9,260 of 9,520 observed changes are one world
+    // unit or larger, with a maximum of 17,712 units in a single frame.
+    // Absorbing that would need a bucket a full unit wide, which would merge
+    // props that are genuinely distinct. There is no mask that helps here, so
+    // there is no mask.
     const uint64_t o2w = XXH64(&drawCallState.transformData.objectToWorld, sizeof(Matrix4), 0ull);
 
     // NARROW THE IDENTITY FIRST, THEN TAKE THE ORDINAL WITHIN IT.
@@ -40484,7 +40842,10 @@ namespace dxvk {
     //   standing still, drop o2w from this fold and keep material: that is 80%
     //   of the benefit with neither cost.
     //
-    // THAT CONDITION WAS MEASURED AND MET, so the fold is dropped. 2026-08-24,
+    // THAT CONDITION WAS MEASURED AND MET, AND THE FOLD WAS DROPPED ON IT --
+    // THEN RESTORED. The numbers below are sound; the inference drawn from them
+    // is not, and the restoration note on the `narrowed` assignment carries the
+    // refutation. Read that before acting on this block. 2026-08-24,
     // [ResidentGate] bucketed by 100 frames against [MtnCam] mean per-frame
     // camera travel:
     //
@@ -40506,7 +40867,16 @@ namespace dxvk {
     // THE ATTRIBUTION RESTS ON THE STILL/MOVING SPLIT ALONE, deliberately.
     // o2w is the only camera-derived term in this fold -- material and source
     // generation are not -- so a newKeys rate that tracks camera travel can
-    // only be entering through it. Do NOT reach for [RsGroup] to support this:
+    // only be entering through it.
+    //
+    // THAT INFERENCE IS FALSE, and it is the reason this fold was removed.
+    // [RsIdent] carries identHead, which contains no o2w, and it goes new=651
+    // (0%) standing still to new=15975 (14%) under motion -- the same climb, on
+    // a candidate the term cannot be entering. A single term being the only
+    // camera-DERIVED one does not make it the only camera-SENSITIVE one, and
+    // the split does not separate them. See the restoration note on `narrowed`.
+    //
+    // Do NOT reach for [RsGroup] to support this:
     // its slot is reset every frame and compared against the FIRST DRAW OF THE
     // SAME FRAME, so o2wSame/matSame measure within-frame SEPARATION between
     // co-grouped draws, not whether a term survives a frame. Reading its
@@ -40555,7 +40925,138 @@ namespace dxvk {
     // DIRTY TEST, and it still is: matMatch below compares e.matHash and a
     // mismatch scores missMat, so a material change refuses the serve exactly as
     // before. Having it in BOTH places was redundant and cost the lookup.
+    // THE TRANSFORM IS BACK IN, AND THE ATTRIBUTION THAT REMOVED IT WAS WRONG.
+    //
+    // The removal above rests on one inference: "o2w is the only camera-derived
+    // term in this fold ... so a newKeys rate that tracks camera travel can only
+    // be entering through it." [RsIdent] refutes it directly, because identHead
+    // carries NO o2w and tracks camera travel just as hard.
+    //
+    //                draws     new           gap0    gap1
+    //   f=9234  (still)
+    //     identHead  122980    651   ( 0%)   21931   66091
+    //     hdPlusO2w  122980    2107  ( 1%)   15715   70899
+    //   f=9834  (moving)
+    //     identHead  112212    15975 (14%)   18982   60218
+    //     hdPlusO2w  112212    18531 (16%)   14401   62554
+    //   f=10134 (moving)
+    //     identHead  109194    11946 (10%)   15761   64238
+    //     hdPlusO2w  109194    14274 (13%)   11770   66245
+    //
+    // identHead going 0% -> 14% on the same still/moving split is the base
+    // identity churning, which is what a moving camera does: it draws geometry
+    // it was not drawing before. o2w's MARGINAL cost is 2.3 points, not the
+    // 5-12x climb it was charged with, and against that it buys 24% fewer
+    // within-frame collisions and more draws surviving exactly one frame -- both
+    // directions, standing still and moving.
+    //
+    // gap0 is the axis worth the 2.3 points. A gap0 collision is two draws the
+    // identity failed to SEPARATE, and the only thing separating them afterwards
+    // is the occurrence ordinal, which is submission order and reorders under
+    // culling -- [RsFailMember] measures it 81% disjoint. Cutting gap0 by a
+    // quarter is a quarter fewer draws depending on the one term known to be
+    // unstable across frames.
+    //
+    // While the fold was in, missO2w could not fire -- a moving object missed on
+    // the key before the comparison was reached, the §6.2 shape. It is LIVE
+    // AGAIN now that the fold is out, and it is the counter to read for how much
+    // real transform movement the gate is refusing.
+    //
+    // AND THE TRANSFORM IS OUT AGAIN. It was restored earlier the same day on
+    // gap0/gap1 evidence, which was real and is not being disputed -- what that
+    // reading could not see is that o2w NEVER SATURATES.
+    //
+    // [RsIdent], settled, identHead new at 0% in both windows:
+    //
+    //                  new f=3339   new f=3639   distinct 3339 -> 3639 -> 3939
+    //   identHead          407          318        7272   7590   8360
+    //   hdPlusMat          569          417       14506  14923  16222
+    //   hdPlusO2w         2183         1898       12572  14470  16604
+    //   o2wPlusMat        2359         2012       19843  21855  24535
+    //
+    // identHead is saturated at ~1.2 new keys a frame: the scene has a finite
+    // identity set and it has been registered. hdPlusMat adds ~100 per window
+    // on top, so it is finite too. hdPlusO2w adds ~1,700 per window and its
+    // distinct climbs LINEARLY AND WITHOUT BOUND in a scene that is not
+    // changing -- so the transform is not naming a fixed set of things, it is
+    // minting fresh values forever.
+    //
+    // The separation each one buys, gap0: 12792 bare, ~7600 with material
+    // alone, 7042 with the transform alone, 2818 with both. Material does most
+    // of the separating for 6% of the churn.
+    //
+    // SO THEY ARE NOT THE SAME KIND OF TERM AND DO NOT BELONG IN THE SAME
+    // PLACE. An identity has to be stable to be found again; a dirty test has
+    // to be sensitive to notice change. Material is stable AND separating, so
+    // it goes in the key. o2w separates but does not survive, so it goes in the
+    // comparison, where its sensitivity is the point and its instability costs
+    // nothing.
+    //
+    // AND THIS IS THE SAFER PLACEMENT, not merely the cheaper one. With o2w in
+    // the key a moving prop mints a fresh key every frame and ORPHANS ITS
+    // RECORD every frame. Under the keep clause that is the duplicated-geometry
+    // failure with a receipt already in the tree: [PropIdKeepLong attempt
+    // reverted], where new instances were created and then all kept alive and
+    // m_reorderedSurfaces doubled 8500 -> 17155. In the dirty test the mover
+    // keeps its key, scores missO2w, and rebuilds the same record. Nothing is
+    // orphaned, and missO2w becomes a live counter again for the first time.
+    //
+    // Watch gap0. It rises to ~7600, so more draws fall back on the occurrence
+    // ordinal, which [RsFailMember] measures 81% disjoint. Those lose to
+    // failMember, which REFUSES the serve -- a miss, not a wrong serve -- so
+    // the cost is hit rate and the gain is that nothing is left behind.
     uint64_t narrowed = baseKey;
+
+    // AND THE MATERIAL IS BACK, ON EVIDENCE, AFTER ITS ALTERNATOR WAS FOUND.
+    //
+    // It was removed for alternating with period 2 -- hdPlusMat gap1=0.4% /
+    // gap2=51-61% -- and that reading was correct at the time. The alternator
+    // has since been identified and fixed: SRV slot 30 carried a 1x1 R16_UNORM
+    // COLOUR ATTACHMENT ([SeqTex] usage=0x17 rt=1), double-buffered, which
+    // FillMaterialData already rejects at rejTiny and residentMaterialFold now
+    // sentinels. missMat fell from ~2,400/frame to 5-274 and the watched keys
+    // read matChg=8/1239. The condition that removed it does not hold any more.
+    //
+    // WHY IT IS NOT REDUNDANT WITH o2w, which is the question that decides it.
+    // [RsGroup] samples the draws that collide inside a frame and every pair
+    // reads n=2 o2wSame=1 matSame=0 genSame=1 -- one mesh, one transform, one
+    // geometry generation, two materials. Those are multi-pass draws of a
+    // single object and no transform can separate them, in principle.
+    //
+    // MEASURED AS A PAIR before landing, per this file's standing rule.
+    // [RsIdent] f=2530, settled, identHead new=478 (0%):
+    //
+    //                 new     gap0     gap1     gap3plus
+    //   identHead     478     12097    85629    24070
+    //   hdPlusO2w     2175     5920    90162    24021
+    //   o2wPlusMat    3108     1822    93868    23505
+    //   keyWithOrd    2177        0    96047    24053
+    //
+    // The pair beats o2w alone on every axis but new: gap0 down 69%, gap1 up
+    // 3,706, and gap3plus DOWN -- so it does not inherit the recurrence cost
+    // hdPlusMat carried on its own (18222 against 9963 under motion), which was
+    // the pre-registered risk. Same shape moving, at f=1930.
+    //
+    // THE EXTRA `new` IS NOT CHURN, and gap1 is what proves it. distinct goes
+    // 10397 -> 17502, so 7,105 more identities exist -- the multi-pass draws
+    // being told apart at last -- and a churning key DEPRESSES gap1 while these
+    // RAISE it. They are minted once and then recur.
+    //
+    // WHAT IT BUYS BEYOND THE COLUMNS. keyWithOrd reaches gap0=0 only because
+    // the occurrence ordinal forces it, and the ordinal is submission order,
+    // which culling reorders -- [RsFailMember] measures it 81% disjoint across
+    // frames, and it is the term behind wrong-record serves. Material alone
+    // takes gap0 from 12792 to ~7600, so it is that many fewer draws relying on
+    // the one term known not to survive a frame.
+    //
+    // (The 2818 figure in the table above is o2w AND material together. The
+    // transform was subsequently removed -- see the note on the assignment
+    // above -- so the live key gets the ~7600, not the 2818. The pair is still
+    // measured, as o2wPlusMat, which is what would justify bringing it back.)
+    //
+    // If newKeys climbs without gap1 climbing with it, that is the reverse of
+    // what was measured here and the fold comes back out.
+    narrowed = XXH64(&m_rsDrawMat, sizeof(m_rsDrawMat), narrowed);
 
     // [RsIdent] candidate `hdPlusMat`: what the key USED to be, kept as a probe
     // input so the alternation stays measured after being removed. If this keeps
@@ -40598,11 +41099,45 @@ namespace dxvk {
     // alone. A draw carrying N placements is asking for something different from
     // one carrying M whichever producer filled the list, and for the paths not
     // measured here the fold can only turn a wrong serve into a miss.
-    if (drawCallState.transformData.instancesToObject != nullptr) {
-      const uint32_t nPlace =
-        static_cast<uint32_t>(drawCallState.transformData.instancesToObject->size());
-      narrowed = XXH64(&nPlace, sizeof(nPlace), narrowed);
-    }
+    // AND IT IS OUT AGAIN, ON THE CONDITION THE BLOCK ABOVE PRE-REGISTERED.
+    //
+    // That condition is "watch newKeys -- it should rise by about 0.67% of
+    // fanout draws and no more". It reads +1.1 points. But newKeys understates
+    // what the fold costs, and [RsIdent] shows the real damage on an axis the
+    // condition did not name: the count is stable standing still and unstable
+    // under motion, so the fold pushes draws past the gate's gap<=1 window
+    // exactly when the camera moves.
+    //
+    //                    gap0     gap1      gap3plus
+    //   f=6550  still
+    //     hdPlusO2w      11772    78254     22181
+    //     +nPlace         8837    80486     22416   <- no cost, helps
+    //   f=7150  moving
+    //     hdPlusO2w      12720    61051      8874
+    //     +nPlace         8416    54692     19398   <- 6,359 out of gap1
+    //
+    // Standing still the fold is free and improves both axes. Moving, it takes
+    // 6,359 draws out of gap1 and more than doubles gap3plus. A draw at gap3+
+    // can never hit, so that is the hit rate the o2w restore above was supposed
+    // to buy, being given away here.
+    //
+    // NOTHING IS LOST BY REMOVING IT, and this is the material precedent
+    // verbatim. rtx_resident_scene.cpp:396 already compares
+    // rec->instances.size() against produced.size() AFTER the record is found,
+    // scores failSize, and returns false -- the serve is refused. The block
+    // above measured the correspondence exactly: 180 count-differing draws
+    // against exactly 180 [RsFailSize] events, "every size failure is one of
+    // these and there are no others". So the judge catches this population
+    // already, and the fold was the same check paid for twice: once where it
+    // costs a lookup, once where it costs nothing.
+    //
+    // The trade is 0.4% of draws moving from missKey back to failSize, against
+    // 5.6% returning from gap3plus to gap1. Watch failSize: it should rise to
+    // roughly the 180-per-3,000-frame rate that was measured before the fold
+    // existed, and no higher. A larger climb means the count is unstable for a
+    // reason neither measurement caught, and the fold goes back in.
+    // The fold is gone from the key. [RsIdent]'s o2wPlusPlace candidate rebuilds
+    // it so the removed term stays measured.
 
     ResidentOccupancy& occ = m_residentOccupancy[narrowed];
     if (occ.frame != frameId) {
@@ -40639,18 +41174,24 @@ namespace dxvk {
     //                the draw stream genuinely differs -- a ceiling no key
     //                lifts, and the point at which to stop working on keys.
     //   drawKey      the narrower downstream identity actually used as baseKey.
-    //   narrowed     drawKey + material + placement count, i.e. today's key
-    //                without the ordinal.
-    //   keyWithOrd   today's key. Compared against `narrowed` it prices the
+    //   hdPlusO2w    drawKey + objectToWorld, i.e. today's key without the
+    //                ordinal. Both other folds that once sat here are gone: the
+    //                material to the dirty test, the placement count to the
+    //                judge's own size check.
+    //   o2wPlusPlace hdPlusO2w plus the REMOVED placement count, kept so the
+    //                removal stays measured. Its gap3plus against hdPlusO2w's
+    //                is what took the fold out, and a reversal there is what
+    //                would put it back.
+    //   keyWithOrd   today's key. Compared against `hdPlusO2w` it prices the
     //                ordinal exactly: any excess `new` is the ordinal sliding.
-    //   xfSnapshot   memoXfHash, the decoded draw-state hash [DrawRedund] uses.
-    //                Included because it is the obvious thing to reach for and
-    //                it should be measured rather than argued about -- note it
-    //                folds worldToView AND viewToProjection, so it is expected
-    //                to be ~100% new under any camera motion. If it is, that
-    //                settles it as a residency identity; it is built to detect
-    //                frame-to-frame redundancy INCLUDING the camera, which is
-    //                the opposite question.
+    //   Two candidates were removed rather than kept for symmetry. xfSnapshot
+    //                (memoXfHash) folds worldToView AND viewToProjection and
+    //                read 4% new standing still against 71% moving, so it
+    //                answers the opposite question by construction.
+    //                hdPlusO2wRaw briefly carried a byte-exact transform beside
+    //                a quantised hdPlusO2w to price a mantissa mask; the mask
+    //                is gone (see the o2w note above) so the pair collapsed to
+    //                one candidate.
     //
     // gap0 is counted apart from gap1: a candidate repeating inside one frame
     // failed to SEPARATE two draws, which is a different defect from failing to
@@ -40695,16 +41236,240 @@ namespace dxvk {
       // It is measured here rather than in residentGateBegin because o2w is not
       // final until the tail -- the same reason censusRecordO2w is taken there.
       static const char* const kIdentName[kVariants] =
-        { "identHead", "drawKey", "hdPlusMat", "hdPlusO2w", "narrowed", "keyWithOrd", "xfSnapshot" };
+        { "identHead", "drawKey", "hdPlusMat", "hdPlusO2w", "keyPlusPlace", "keyWithOrd", "o2wPlusMat" };
+
+      // NV-DXVK [O2wDelta]: HOW FAR THE TRANSFORM ACTUALLY MOVES, in units,
+      // for one identity between consecutive frames.
+      //
+      // THE MEASUREMENT THAT FORCED THIS. hdPlusO2w carries a mantissa-masked
+      // transform and hdPlusO2wRaw the byte-exact one, and standing still they
+      // read new=2093 against new=2099 -- the mask absorbed 6 keys out of
+      // 2,093. Dropping 8 mantissa bits is one part in 32,768, so whatever
+      // moves this matrix moves it by MORE than that, and the "low-bit
+      // reconstruction wobble" the quantisation was built for is not what is
+      // happening. That reading came from the block above, which documents the
+      // camera-relative paths, and it is refuted for this population.
+      //
+      // Two readings remain and they want opposite responses:
+      //   deltas in the 1e-4..1e-2 band   still numerical, just wider than the
+      //                                   mask. Widen it, and gap0 says when it
+      //                                   is too wide.
+      //   deltas at 1e-1 and above        the object is genuinely moving. No
+      //                                   key fold helps, those draws are not
+      //                                   residency candidates, and o2w belongs
+      //                                   in the dirty test instead so a mover
+      //                                   keeps its key and scores missO2w
+      //                                   rather than orphaning a record.
+      //
+      // A HISTOGRAM, NOT A MEAN. The population is a few continuously-moving
+      // objects inside a large stationary one, so any average is dominated by
+      // the stationary majority and would read ~0 while the movers drive every
+      // new key. §6-class trap, and binning by magnitude is what avoids it.
+      // same= is counted apart because "did not move at all" is the bucket the
+      // other readings are measured against.
+      {
+        constexpr uint32_t kDeltaDumpFrames = 300u;
+        constexpr size_t kDeltaCap = 20000;
+        // SPLIT ON FANOUT, because the magnitude already ruled out both of the
+        // readings this probe was built to separate.
+        //
+        // ge1=9260 of 9520 changes, with max=17712 units in ONE frame. Nothing
+        // in this game travels 17,712 units in 16 ms -- that is roughly a
+        // million units a second -- so these are not objects moving. A jump
+        // that size is objectToWorld naming a DIFFERENT object.
+        //
+        // The mechanism is already documented two blocks up: a fanout draw
+        // carries N independent props in one call and its DrawCallState carries
+        // identity or only the FIRST instance's transform, so culling
+        // reordering which prop is first snaps o2w between distant props while
+        // nothing has moved. It also explains the count: 31 changed draws a
+        // frame yielding only 5.2 NEW keys means the transform keeps landing
+        // back on props it has already named, which is reordering, not travel.
+        //
+        //   fan= carries the ge1 mass   o2w is not a per-draw quantity for
+        //                               these draws and folding it into the key
+        //                               is folding submission order. It has to
+        //                               come out for fanout, and the placement
+        //                               list is what identifies them instead.
+        //   non= carries it             real movement, and o2w belongs in the
+        //                               dirty test so a mover keeps its key
+        //                               instead of orphaning a record.
+        // ONE SAMPLE PER KEY PER FRAME, AND ONLY FOR KEYS DRAWN ONCE.
+        //
+        // The first version of this compared consecutive STORES under one
+        // baseKey, and identHead collides inside a frame -- gap0=20148 per 300
+        // frames, about 67 a frame. So when two props share an identHead it
+        // stored A's matrix and then compared B against it, and printed the
+        // DISTANCE BETWEEN TWO DIFFERENT PROPS as though it were one prop's
+        // motion. That is what ge1=8356 with max=5303 units was: not an object
+        // crossing the map in 16 ms, which was never physically plausible, but
+        // two objects that were always thousands of units apart.
+        //
+        // So: compare only on the FIRST draw of a key each frame, which makes
+        // the comparison frame-to-frame rather than draw-to-draw, and count the
+        // rest as multi= rather than folding them in. A key with multi>0 is one
+        // where identHead names more than one object, and its delta cannot mean
+        // what this probe wants to measure at all -- excluded rather than
+        // silently averaged, since it is the same population gap0 counts.
+        struct PrevO2w {
+          Matrix4 m;
+          uint32_t frame = 0xFFFFFFFFu;
+          // Sticky, not per-frame. If submission order ever flips between two
+          // props sharing an identHead, the "first draw" is a different object
+          // than it was last frame and the comparison is meaningless again --
+          // the same defect, just one frame further out. A key that has ever
+          // collided is dropped from the deltas for good, so the histogram
+          // describes only keys that name exactly one object.
+          bool everMulti = false;
+        };
+        static std::unordered_map<uint64_t, PrevO2w> sPrevO2w;
+        static uint32_t sDeltaBuckets[2][8] = {};
+        static uint32_t sDeltaSame[2] = {};
+        static uint32_t sDeltaMulti[2] = {};
+        static uint32_t sDeltaLastDump = 0xFFFFFFFFu;
+        static float sDeltaMax[2] = { 0.0f, 0.0f };
+        const uint32_t fanIdx = drawCallState.transformData.isFanoutBatch ? 1u : 0u;
+
+        const Matrix4& cur = drawCallState.transformData.objectToWorld;
+        if (sPrevO2w.size() > kDeltaCap) {
+          sPrevO2w.clear();
+        }
+        auto pIt = sPrevO2w.find(m_rsDrawBaseKey);
+        if (pIt != sPrevO2w.end() && pIt->second.frame == frameId) {
+          // Same key, same frame: a second object under one identity. Counted,
+          // not compared, and the stored matrix is left as the first draw's so
+          // the next frame still compares like with like.
+          sDeltaMulti[fanIdx] += 1u;
+          pIt->second.everMulti = true;
+        } else if (pIt != sPrevO2w.end() && pIt->second.everMulti) {
+          sDeltaMulti[fanIdx] += 1u;
+          pIt->second.m = cur;
+          pIt->second.frame = frameId;
+        } else if (pIt != sPrevO2w.end()) {
+          const float* a = reinterpret_cast<const float*>(&pIt->second.m);
+          const float* b = reinterpret_cast<const float*>(&cur);
+          float worst = 0.0f;
+          for (uint32_t i = 0; i < 16u; ++i) {
+            const float d = std::fabs(a[i] - b[i]);
+            if (d > worst) {
+              worst = d;
+            }
+          }
+          if (worst == 0.0f) {
+            sDeltaSame[fanIdx] += 1u;
+          } else {
+            if (worst > sDeltaMax[fanIdx]) {
+              sDeltaMax[fanIdx] = worst;
+            }
+            // Decade bins from 1e-6 up, last bucket catching everything >=1.
+            uint32_t b8 = 0u;
+            float edge = 1e-6f;
+            while (b8 < 7u && worst >= edge) {
+              edge *= 10.0f;
+              b8 += 1u;
+            }
+            sDeltaBuckets[fanIdx][b8] += 1u;
+          }
+          pIt->second.m = cur;
+          pIt->second.frame = frameId;
+        } else {
+          PrevO2w fresh;
+          fresh.m = cur;
+          fresh.frame = frameId;
+          sPrevO2w.emplace(m_rsDrawBaseKey, fresh);
+        }
+
+        if (sDeltaLastDump == 0xFFFFFFFFu) {
+          sDeltaLastDump = frameId;
+        } else if (frameId - sDeltaLastDump >= kDeltaDumpFrames) {
+          sDeltaLastDump = frameId;
+          for (uint32_t f = 0; f < 2u; ++f) {
+            Logger::warn(str::format(
+              "[O2wDelta] f=", frameId,
+              (f == 1u ? " fan=1" : " fan=0"),
+              " same=", sDeltaSame[f],
+              " multi=", sDeltaMulti[f],
+              " lt1e6=", sDeltaBuckets[f][0],
+              " lt1e5=", sDeltaBuckets[f][1],
+              " lt1e4=", sDeltaBuckets[f][2],
+              " lt1e3=", sDeltaBuckets[f][3],
+              " lt1e2=", sDeltaBuckets[f][4],
+              " lt1e1=", sDeltaBuckets[f][5],
+              " lt1=", sDeltaBuckets[f][6],
+              " ge1=", sDeltaBuckets[f][7],
+              " max=", sDeltaMax[f],
+              " tracked=", static_cast<uint32_t>(sPrevO2w.size())));
+            sDeltaSame[f] = 0u;
+            sDeltaMulti[f] = 0u;
+            sDeltaMax[f] = 0.0f;
+            for (uint32_t i = 0; i < 8u; ++i) {
+              sDeltaBuckets[f][i] = 0u;
+            }
+          }
+        }
+      }
+
+      // The removed placement fold, rebuilt HERE rather than beside the key, so
+      // a term no longer in the key costs no hash on the frame thread when the
+      // probe is off. See the removal note at the fold site.
+      uint64_t narrowedWithPlace = narrowed;
+      if (drawCallState.transformData.instancesToObject != nullptr) {
+        const uint32_t nPlace =
+          static_cast<uint32_t>(drawCallState.transformData.instancesToObject->size());
+        narrowedWithPlace = XXH64(&nPlace, sizeof(nPlace), narrowed);
+      }
 
       const uint64_t candId[kVariants] = {
         m_rsDrawBaseKey,
         baseKey,
         narrowedMatOnly,
         XXH64(&o2w, sizeof(o2w), baseKey),
-        narrowed,
+        // The REMOVED placement fold, kept as a candidate for the same reason
+        // narrowedMatOnly keeps the removed material fold: a term taken out of
+        // the key stays measured, so the decision can be revisited on evidence
+        // rather than re-argued. `narrowed` itself is now identical to
+        // hdPlusO2w above and would have made this slot a duplicate.
+        narrowedWithPlace,
         key,
-        memoXfHash(drawCallState.transformData)
+        // BOTH DISCRIMINATORS AT ONCE, which nothing has measured.
+        //
+        // [RsGroup] settles what separates two draws sharing an IA identity,
+        // and it is not the transform: every sampled pair reads n=2 o2wSame=1
+        // matSame=0 genSame=1 -- same mesh, same transform, same geometry
+        // generation, DIFFERENT MATERIAL. Those are multi-pass draws of one
+        // object, and o2w cannot tell them apart by construction.
+        //
+        // Yet hdPlusO2w beats hdPlusMat globally, f=2763 settled: new 1790 vs
+        // 3813, gap0 6079 vs 7605, gap1 89098 vs 86927. Both are true because
+        // they separate DIFFERENT groups -- [RsGroup]'s sampled pairs share one
+        // constant transform (o2w=0xdcb217471446c01f on every row, across
+        // unrelated base keys), while elsewhere the transform is what differs.
+        // Neither term dominates the other, so the pair is the open question.
+        //
+        // WHY THE MATERIAL IS ELIGIBLE AGAIN. It was taken out of the key for
+        // alternating with period 2, and the alternator was found and fixed
+        // this session: slot 30 carried a 1x1 R16_UNORM colour attachment,
+        // double-buffered, which residentMaterialFold now sentinels. missMat
+        // fell from ~2,400/frame to 5-274 and the watched keys read
+        // matChg=8/1239. The condition that removed it no longer holds.
+        //
+        // MEASURED BEFORE IT GOES NEAR THE KEY, which is this file's standing
+        // rule: every identity killed here died from separating within a frame
+        // and not surviving one, or the reverse. Read gap0 against hdPlusO2w --
+        // if the pair does not beat it there, the material adds nothing the
+        // transform did not already have. Read gap3plus too: hdPlusMat costs
+        // 18222 against hdPlusO2w's 9963 under motion, so the material has a
+        // recurrence cost of its own and the pair must be shown to escape it.
+        // THE REMOVED TRANSFORM, still priced alongside the material it was
+        // removed next to, the same way keyPlusPlace holds the removed
+        // placement count. The live key is baseKey+material; this is
+        // baseKey+o2w+material, so the gap between this row and hdPlusMat is
+        // exactly what the transform would buy and cost if it went back in.
+        //
+        // What would justify restoring it: this row's `distinct` levelling off
+        // instead of climbing linearly. That is the property it failed on, and
+        // gap0 alone -- which is what restored it once already -- cannot see it.
+        XXH64(&m_rsDrawMat, sizeof(m_rsDrawMat), XXH64(&o2w, sizeof(o2w), baseKey))
       };
 
       for (uint32_t v = 0; v < kVariants; ++v) {
@@ -40874,6 +41639,14 @@ namespace dxvk {
     } else if (!o2wMatch) {
       m_rsMissO2w += 1;
     } else if (!matMatch) {
+      // EXPECT THIS TO READ 0 NOW, AND DO NOT READ THAT AS A FIX. The material
+      // is folded into the key above, so a changed material re-keys the draw
+      // into missKey before this comparison is ever reached -- the same §6.2
+      // shape missO2w already has, and the same one that made an earlier
+      // missMat=0 over 911,176 draws look like a passing check when it was a
+      // counter that could not fire. The live reading for material churn is
+      // [MatChurnSlot] matChg and [MatChurn] matNew, neither of which depends
+      // on the key.
       m_rsMissMat += 1;
     } else {
       m_rsHit += 1;
