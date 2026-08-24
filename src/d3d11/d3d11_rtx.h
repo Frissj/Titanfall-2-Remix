@@ -3379,6 +3379,10 @@ namespace dxvk {
     // matrix, which is a silent cross-draw contamination that reads exactly like
     // real transform churn -- the same trap censusRecordDraw's stash note names.
     uint64_t m_rsDrawKey  = 0ull;
+    // [RsGroup]: the key BEFORE the occurrence ordinal is folded in. The judge
+    // needs it to group the draws that share one IA identity within a frame,
+    // and XXH64(ordinal, baseKey) cannot be run backwards to recover it.
+    uint64_t m_rsDrawBaseKey = 0ull;
     uint64_t m_rsDrawGens = 0ull;
     uint64_t m_rsDrawMat  = 0ull;
     uint64_t m_rsDrawSrcVb = 0ull;
@@ -4427,7 +4431,14 @@ namespace dxvk {
     //
     // Passed rather than reached through a member: the slot lives on
     // SubmitDraw's stack (B1), so there is no `this` to find it on.
-    bool SetSkyCategoryFromCb2(DrawCallState& dcs, const PendingDrawSlot& pend);
+    // startIndex / baseVertex are the draw's slice into the shared vertex and
+    // index buffers. They are passed because the sub-view propId produced inside
+    // this function needs a per-prop identity that does not drift, and the
+    // matrix it uses today does -- see the producer's comment block. Source 1
+    // selects each static prop by a slice, so the slice is the engine's own
+    // per-prop handle and the only one that reaches this far.
+    bool SetSkyCategoryFromCb2(DrawCallState& dcs, const PendingDrawSlot& pend,
+                               UINT startIndex, INT baseVertex);
     // NV-DXVK [ShipHunt v2]: one-shot discovery probe that logs the first
     // appearance of every distinct (VS hash, viewport width) tuple seen
     // in this session.

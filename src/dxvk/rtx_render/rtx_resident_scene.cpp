@@ -9,6 +9,8 @@
 
 #include "rtx_instance_manager.h"
 #include "rtx_options.h"
+#include "../../util/log/log.h"
+#include "../../util/util_string.h"
 
 namespace dxvk {
 
@@ -180,8 +182,14 @@ namespace dxvk {
             || !inst->surface.alphaState.isBlendingDisabled) {
           rec.skipUnsafe = true;
         }
-        // Baseline for [HeldRaw], off the first instance that has geometry.
-        if (rec.builtPosHash == 0ull) {
+        // Baseline for [HeldRaw], off the first instance that has geometry AND
+        // a live entry to read it from -- isUnlinkedForGC() means m_linkedBlas
+        // still points at an erased BlasEntry, so getBlas() would hand back a
+        // dangling pointer the null test cannot see. Skipping such an instance
+        // simply moves the baseline to the next one; if none qualifies,
+        // builtPosHash stays 0 and holdsInstance refuses the hold, which is the
+        // direction this file already chose to be wrong in.
+        if (rec.builtPosHash == 0ull && !inst->isUnlinkedForGC()) {
           if (const BlasEntry* blas = inst->getBlas()) {
             rec.builtPosHash = blas->modifiedGeometryData.hashes[HashComponents::VertexPosition];
             rec.builtBoneHash = blas->modifiedGeometryData.lastBoneHash;
@@ -283,8 +291,24 @@ namespace dxvk {
       // Reached through the instance's own link rather than by holding a
       // BlasEntry* in the record: the entry can be destroyed while the record
       // lives, and a raw pointer here would be a second lifetime to police for
-      // no benefit. m_linkedBlas is cleared when the instance is unlinked.
-      if (BlasEntry* blas = inst->getBlas()) {
+      // no benefit.
+      //
+      // AND m_linkedBlas IS NOT CLEARED WHEN THE INSTANCE IS UNLINKED, which is
+      // the whole reason isUnlinkedForGC() is tested here.
+      // markAsUnlinkedFromBlasEntryForGarbageCollection() sets that flag and
+      // leaves m_linkedBlas pointing at the erased entry, so getBlas() returns a
+      // DANGLING pointer that a null check cannot see -- and this site writes
+      // through it, which is worse than the read that faulted at +0x278 in the
+      // instance-manager reap walk. The flag is the only evidence available: it
+      // is set in exactly one place and means "my entry is gone".
+      //
+      // Skipping the stamp is also the right ANSWER and not merely the safe one.
+      // An unlinked instance has no geometry left to keep alive, and it is
+      // already marked for collection -- which residency's keep clause
+      // deliberately does not override, because an instance must not outlive its
+      // geometry.
+      BlasEntry* blas = inst->isUnlinkedForGC() ? nullptr : inst->getBlas();
+      if (blas != nullptr) {
         blas->frameLastTouched = frame;
       }
     }
@@ -295,7 +319,7 @@ namespace dxvk {
     return true;
   }
 
-  bool ResidentScene::score(uint64_t key, const std::vector<RtInstance*>& produced) {
+  bool ResidentScene::score(uint64_t key, const std::vector<RtInstance*>& produced, uint32_t ordinal) {
     m_stats.predicted += 1;
 
     const Record* rec = find(key);
@@ -372,6 +396,65 @@ namespace dxvk {
     if (rec->instances.size() != produced.size()) {
       m_stats.failSize += 1;
       m_stats.fail += 1;
+      // WHICH WAY, because the two directions are different findings and only
+      // one of them is a defect. See Stats::failSizeOver / failSizeUnder.
+      if (rec->instances.size() > produced.size()) {
+        m_stats.failSizeOver += 1;
+      } else {
+        m_stats.failSizeUnder += 1;
+      }
+      // NV-DXVK [RsFailSize]: the counter says HOW MANY size failures, and the
+      // two things that decide what a size failure MEANS are not in it.
+      //
+      // THE SIGN. failSize covers both "the record names more than the draw
+      // produced" and "fewer", and those are opposite defects -- a record left
+      // holding objects that no longer resolve, versus a draw resolving to
+      // objects the record never had. Summed into one counter they are
+      // indistinguishable, and the comment above commits to a mechanism
+      // (culling removes a copy, later copies shift down) that predicts one
+      // sign and not the other.
+      //
+      // THE OVERLAP. The ordinal-slide story says the draw lands on a
+      // NEIGHBOUR's instances, so produced should still be mostly drawn from
+      // the same pool the record names. A resolution that went somewhere
+      // unrelated shares nothing with it. Same count, same failure, completely
+      // different cause, and overlap is what separates them. O(n*m) on a
+      // failure path only, over lists the file already documents as a handful
+      // of entries -- the same trade the permutation scan below makes.
+      if (RtxOptions::ResidentScene::logStats()) {
+        static std::atomic<uint32_t> sLines { 0 };
+        constexpr uint32_t kMaxLines = 400;
+        if (sLines.fetch_add(1, std::memory_order_relaxed) < kMaxLines) {
+          uint32_t shared = 0;
+          uint32_t fresh = 0;
+          for (RtInstance* p : produced) {
+            if (std::find(rec->instances.begin(), rec->instances.end(), p) != rec->instances.end()) {
+              ++shared;
+            }
+            // RESPAWNED SINCE THE RECORD WAS BUILT. ord= established that these
+            // failures are NOT key collisions -- 99% of them carry ord=0, so the
+            // draw's identity is already unique. A uniquely identified draw that
+            // resolves to instances the record does not name means the instance
+            // set underneath changed, not that the key picked the wrong record.
+            // An instance created after the record was last seen is exactly that:
+            // the object was reaped and respawned, so the record names pointers
+            // that no longer exist. High fresh= makes these failures entry churn
+            // surfacing in residency rather than a residency defect.
+            if (p->m_frameCreated > rec->frameLastSeen) {
+              ++fresh;
+            }
+          }
+          Logger::info(str::format(
+            "[RsFailSize] key=0x", std::hex, key, std::dec,
+            " ord=", ordinal,
+            " recN=", static_cast<uint32_t>(rec->instances.size()),
+            " prodN=", static_cast<uint32_t>(produced.size()),
+            " delta=", static_cast<int32_t>(produced.size()) - static_cast<int32_t>(rec->instances.size()),
+            " shared=", shared,
+            " fresh=", fresh,
+            " recLastSeen=", rec->frameLastSeen));
+        }
+      }
       return false;
     }
     for (size_t i = 0; i < produced.size(); ++i) {
@@ -417,6 +500,127 @@ namespace dxvk {
         }
         m_stats.failMember += 1;
         m_stats.fail += 1;
+        // NV-DXVK [RsFailMember]: same count, not a permutation -- so the draw
+        // resolved to instances the record does not name. The counter cannot
+        // say HOW far off, and the two ends of that range are different bugs.
+        //
+        // shared=0 means the resolution landed on a completely different set:
+        // the key collided, or the identity behind it is not the one the record
+        // was built for. 0<shared<n means the lists PARTIALLY agree, which is
+        // the neighbour-bleed the ordinal was introduced to prevent and points
+        // at the same mechanism [RsFailSize] is testing. firstBad says where
+        // the two lists first diverge, so a list that agrees on a prefix and
+        // then slides is visible as such rather than as a flat mismatch.
+        if (RtxOptions::ResidentScene::logStats()) {
+          static std::atomic<uint32_t> sLines { 0 };
+          constexpr uint32_t kMaxLines = 400;
+          if (sLines.fetch_add(1, std::memory_order_relaxed) < kMaxLines) {
+            uint32_t shared = 0;
+            uint32_t fresh = 0;
+            for (RtInstance* p : produced) {
+              if (std::find(rec->instances.begin(), rec->instances.end(), p) != rec->instances.end()) {
+                ++shared;
+              }
+              // See the same field on [RsFailSize]: an instance created after
+              // the record was last seen was respawned since, so the record
+              // names pointers that are gone. That is entry churn showing up
+              // here, not the residency key choosing wrongly.
+              if (p->m_frameCreated > rec->frameLastSeen) {
+                ++fresh;
+              }
+            }
+            // WAS THE RECORD'S INSTANCE TAKEN, OR LEFT BEHIND? The two are
+            // opposite findings and shared=/fresh= cannot tell them apart.
+            //
+            // Every one of these failures reaches here with the record VALID,
+            // and invalidateFor is total -- an instance cannot be destroyed
+            // without going through removeInstance, which invalidates in the
+            // same call. So the instances the record names are all still ALIVE
+            // while the draw resolved to different ones, and the question is
+            // what happened to them this frame:
+            //
+            //   claimed   another draw updated it this frame. The record's
+            //             instances still belong to something, so this is a
+            //             re-batching or a key naming another object's record.
+            //   unclaimed nothing updated it. The draw that owned it spent its
+            //             resolution on a NEW instance instead -- a dedup miss
+            //             in findSimilarInstance -- and this one now ages out
+            //             while its replacement renders. That is the respawn
+            //             verdict the reap census already names, arriving here
+            //             through a different door.
+            //
+            // The current frame is taken off a produced instance rather than
+            // passed in: those were resolved by the full path moments ago, so
+            // their stamp IS this frame, and reading it costs no signature
+            // change through a header three files include.
+            const uint32_t curFrame = produced.empty()
+              ? rec->frameLastSeen
+              : produced[0]->getFrameLastUpdated();
+            uint32_t recClaimed = 0;
+            uint32_t recUnclaimed = 0;
+            uint32_t recAgeMax = 0;
+            for (const RtInstance* r : rec->instances) {
+              if (r == nullptr) {
+                continue;
+              }
+              const uint32_t upd = r->getFrameLastUpdated();
+              if (upd == curFrame) {
+                ++recClaimed;
+              } else {
+                ++recUnclaimed;
+                if (curFrame > upd && (curFrame - upd) > recAgeMax) {
+                  recAgeMax = curFrame - upd;
+                }
+              }
+            }
+            // WHICH DRAW, so the failing shaders can be named. Taken off a
+            // PRODUCED instance: those were resolved by the full path moments
+            // ago, so their entry is live -- unlike the record's, which is what
+            // isUnlinkedForGC guards against elsewhere in this file. Guarded
+            // anyway, because "freshly resolved" is an argument and the flag is
+            // evidence.
+            uint64_t vsHash = 0ull;
+            // DID THE GEOMETRY ENTRY CHANGE UNDER THE DRAW? This is the test
+            // that decides where the fix goes, and the record already carries
+            // the evidence.
+            //
+            // A predictHit requires o2wMatch, so the transform behind these
+            // draws is byte-identical to last frame's, and the material fold
+            // matched too. A stable transform and a stable material that still
+            // resolve to a DIFFERENT instance leaves the BlasEntry: if the draw
+            // was re-batched onto a new entry, findSimilarInstance searches that
+            // entry's linked instances, finds none, and mints a fresh one --
+            // while the old instance sits unclaimed on the old entry and ages
+            // out. That is entry churn arriving here rather than a residency
+            // fault, and blasSame=0 is what says so.
+            //
+            // builtBlas is compared as a raw address and never dereferenced,
+            // which is the contract it was stored under.
+            int blasSame = -1;
+            if (!produced.empty() && produced[0] != nullptr
+                && !produced[0]->isUnlinkedForGC()) {
+              if (const BlasEntry* pb = produced[0]->getBlas()) {
+                vsHash = static_cast<uint64_t>(
+                  pb->input.getTransformData().vertexShaderHash);
+                blasSame = (rec->builtBlas == static_cast<const void*>(pb)) ? 1 : 0;
+              }
+            }
+            Logger::info(str::format(
+              "[RsFailMember] key=0x", std::hex, key,
+              " vs=0x", vsHash, std::dec,
+              " blasSame=", blasSame,
+              " ord=", ordinal,
+              " n=", static_cast<uint32_t>(produced.size()),
+              " firstBad=", static_cast<uint32_t>(i),
+              " shared=", shared,
+              " fresh=", fresh,
+              " curF=", curFrame,
+              " recClaimed=", recClaimed,
+              " recUnclaimed=", recUnclaimed,
+              " recAgeMax=", recAgeMax,
+              " recLastSeen=", rec->frameLastSeen));
+          }
+        }
         return false;
       }
     }
@@ -425,6 +629,26 @@ namespace dxvk {
 
   bool ResidentScene::holdsInstance(const RtInstance* instance) const {
     if (instance == nullptr || instance->m_residentKey == 0ull) {
+      return false;
+    }
+    // AN INSTANCE WHOSE ENTRY IS ALREADY GONE CANNOT HOLD GEOMETRY ALIVE, and
+    // asking further questions about it reads freed memory.
+    //
+    // This runs from blasEntryGarbageCollection, inside the same
+    // SceneManager::garbageCollection pass that erases BlasEntries.
+    // markAsUnlinkedFromBlasEntryForGarbageCollection() sets this flag and
+    // leaves m_linkedBlas pointing at the erased entry, so the getBlas() below
+    // can return a dangling pointer that survives a null test -- and the content
+    // check dereferences it. The builtBlas comparison above it is NOT a guard
+    // against that: it compares pointer VALUES, and a stale pointer compares
+    // equal to the stale value the record recorded, so it passes exactly when it
+    // should not.
+    //
+    // Refusing is also the right answer rather than merely the safe one. The
+    // instance is already marked for collection, and residency's keep clause
+    // deliberately does not override that, because an instance must not outlive
+    // its geometry.
+    if (instance->isUnlinkedForGC()) {
       return false;
     }
     const Record* rec = find(instance->m_residentKey);

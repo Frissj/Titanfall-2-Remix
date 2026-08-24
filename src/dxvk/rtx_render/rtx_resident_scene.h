@@ -240,7 +240,7 @@ namespace dxvk {
     // agree. A disagreement is a FAIL -- the touch would have kept the wrong
     // instances alive and let the right ones retire, which is the "resident but
     // not refreshed" failure with nothing else to catch it.
-    bool score(uint64_t key, const std::vector<RtInstance*>& produced);
+    bool score(uint64_t key, const std::vector<RtInstance*>& produced, uint32_t ordinal);
 
     // Is this instance currently held resident? O(1).
     //
@@ -345,6 +345,33 @@ namespace dxvk {
       // largely residency being disabled rather than residency being wrong.
       uint32_t failLostErased = 0;
       uint32_t failLostNever  = 0;
+      // AND THE SPLIT THAT DECIDES WHETHER failSize IS A FAILURE AT ALL.
+      //
+      // The paragraph above says failSize + failMember "would have kept the
+      // wrong objects alive AND let the right ones retire". Those are two
+      // different errors and failSize does not separate them, but the sign of
+      // the count difference does, and touch() is what makes the sign mean
+      // something: it stamps every instance the RECORD names.
+      //
+      //   failSizeOver   the record names MORE than the draw produced, so the
+      //                  extra instances get stamped and survive a frame no
+      //                  draw touched them. That is the FEATURE, stated in
+      //                  rtx.residentScene.enable's own description, not a
+      //                  defect -- unless the record belongs to another object,
+      //                  which ord= and shared= are what rule out.
+      //   failSizeUnder  the record names FEWER, so instances the draw DID
+      //                  resolve to are never stamped -- and a gate hit skips
+      //                  the full path, so nothing else stamps them either.
+      //                  They age and retire. That is the real defect.
+      //
+      // COUNTED, NOT SUBTRACTED. realFail deliberately still includes both:
+      // narrowing a correctness gate is how a gate gets met without the bug
+      // being fixed. These exist so the decision to narrow it can be argued
+      // from numbers, and so it is somebody's decision rather than a silent
+      // redefinition. Measured 2026-08-23 before the split: 187 over against
+      // 210 under, on failures that were 99% ord=0 and ~95% overlapping.
+      uint32_t failSizeOver   = 0;
+      uint32_t failSizeUnder  = 0;
       // NOT A FAILURE, and it is outside `fail` on purpose -- see score(). The
       // record named the same instances in a different order, and touch()
       // consumes the list as a set, so the right objects are kept alive. It is

@@ -249,23 +249,6 @@ namespace {
     const XXH64_hash_t eInpPos = blas.input.getGeometryData().hashes[HashComponents::VertexPosition];
     const XXH64_hash_t dPos    = drawCall.getGeometryData().hashes[HashComponents::VertexPosition];
 
-    // NV-DXVK [KeyStab]: the CANDIDATE identity, reported and not acted on.
-    //
-    // THE QUESTION THIS ANSWERS. Every term above is derived from the vertex
-    // CONTENT, and this engine rewrites that content every frame, so all of them
-    // churn. engineDrawKey is derived from the engine's own buffer objects
-    // instead. If edkOK=1 on the population where shaderOK=1 matOK=1 geoOK=0 --
-    // the 5126 comparisons that are the entry churn -- then engineDrawKey is an
-    // identity that survives the rewrite, and it belongs in the geometry term.
-    // If edkOK=0 there too, it does not, and it must not be wired in.
-    //
-    // edkOK requires dEdk != 0: zero is "no vertex buffer bound, no identity",
-    // and two draws with no identity must not compare equal. That is the trap
-    // the geometry term itself fell into before b1928c19, when it compared 0
-    // against 0 and always passed.
-    const uint64_t dEdk = drawCall.engineDrawKey;
-    const uint64_t eEdk = blas.input.engineDrawKey;
-
     const XXH64_hash_t dBone = drawCall.getSkinningState().boneHash;
     const XXH64_hash_t eBone = blas.input.getSkinningState().boneHash;
     Logger::info(str::format(
@@ -295,7 +278,6 @@ namespace {
       " matOK=",  (dMat == eMat ? 1 : 0),
       " geoOK=",  (dGeo == eGeo ? 1 : 0),
       " boneOK=", (dBone == eBone ? 1 : 0),
-      " edkOK=", (dEdk != 0ull && dEdk == eEdk ? 1 : 0),
       " posInpVsMod=", (eInpPos == eModPos ? 1 : 0),
       " posDrawVsInp=", (dPos == eInpPos ? 1 : 0),
       " dMat=0x",  std::hex, static_cast<uint64_t>(dMat),
@@ -307,8 +289,6 @@ namespace {
       " eModPos=0x", static_cast<uint64_t>(eModPos),
       " dBone=0x", static_cast<uint64_t>(dBone),
       " eBone=0x", static_cast<uint64_t>(eBone),
-      " dEdk=0x", dEdk,
-      " eEdk=0x", eEdk,
       // Both sides of the shader term, so shaderOK above can be checked rather
       // than trusted. Same hash space on both -- getTransformData().vertexShaderHash
       // is DxvkShader::getHash() on the draw AND on the entry, so these two are

@@ -1100,16 +1100,30 @@ namespace dxvk {
       // 25,700-frame run. Divergence is the rare case, so testing it first turns
       // the common path into two loads and a not-taken branch. Same predicate,
       // same output, just no longer paid by every instance that cannot match.
+      // NV-DXVK 2026-08-23: the VS gate was the literal 0x2904d2163ef31a17, and
+      // that shader has never diverged -- zero lines in a 25,700-frame run. The
+      // probe was therefore aimed away from every shader under investigation.
+      // Driven by rtx.findSimilarProbeVsHashes now, which is the option this
+      // file already uses to point the other dedup probes at a shader without a
+      // rebuild, so the detector follows the investigation instead of one
+      // hardcoded hash. The original stays in the option's default set.
       if (m_stablePropId != 0
           && m_spatialCacheHash != static_cast<XXH64_hash_t>(m_stablePropId)
           && m_linkedBlas != nullptr
-          && m_linkedBlas->input.getTransformData().vertexShaderHash == 0x2904d2163ef31a17ull) {
+          && (m_linkedBlas->input.getTransformData().vertexShaderHash == 0x2904d2163ef31a17ull
+              || lookupHash(RtxOptions::findSimilarProbeVsHashes(),
+                            m_linkedBlas->input.getTransformData().vertexShaderHash))) {
         static thread_local uint32_t sOtcProbe = 0;
         if (sOtcProbe < 32 || (sOtcProbe & 0xFF) == 0) {
           Logger::warn(str::format(
             "[Otc2904] #", sOtcProbe,
-            " spatialCacheHash=0x", std::hex, m_spatialCacheHash, std::dec,
-            " stablePropId=0x", std::hex, m_stablePropId, std::dec,
+            // The tag predates the option gate and now covers whatever
+            // findSimilarProbeVsHashes names, so the shader has to be on the
+            // line or the output cannot be attributed.
+            " vs=0x", std::hex,
+              static_cast<uint64_t>(m_linkedBlas->input.getTransformData().vertexShaderHash),
+            " spatialCacheHash=0x", m_spatialCacheHash,
+            " stablePropId=0x", m_stablePropId, std::dec,
             " DIVERGENCE — about to erase old slot + insert new"));
         }
         sOtcProbe += 1;
@@ -2525,7 +2539,9 @@ namespace dxvk {
         for (const RtInstance* pInst : m_instances) {
           if (pInst == nullptr) continue;
           if (!pInst->testCategoryFlags(InstanceCategories::IgnoreAntiCulling)) continue;
-          const BlasEntry* pBl = pInst->getBlas();
+          // unlinked-for-GC: getBlas() is an ERASED entry and a null check cannot
+          // see that. Null the local so the checks below work. [ReapBlasUAF]
+          const BlasEntry* pBl = pInst->isUnlinkedForGC() ? nullptr : pInst->getBlas();
           if (pBl == nullptr) continue;
           const uint64_t h = static_cast<uint64_t>(
             pBl->input.getTransformData().vertexShaderHash);
@@ -2593,7 +2609,9 @@ namespace dxvk {
       uint32_t perInstIdx = 0;
       for (const RtInstance* pInst : m_instances) {
         if (pInst == nullptr) continue;
-        const BlasEntry* pBlasCensus = pInst->getBlas();
+        // unlinked-for-GC: getBlas() is an ERASED entry and a null check cannot
+        // see that. Null the local so the checks below work. [ReapBlasUAF]
+        const BlasEntry* pBlasCensus = pInst->isUnlinkedForGC() ? nullptr : pInst->getBlas();
         if (pBlasCensus == nullptr) continue;
         if (pBlasCensus->input.getTransformData().vertexShaderHash != 0x2904d2163ef31a17ull) continue;
 
@@ -2722,7 +2740,9 @@ namespace dxvk {
       uint32_t rMinBlas = 0xFFFFFFFFu, rMaxBlas = 0u;
       for (const RtInstance* pInst : m_instances) {
         if (pInst == nullptr) continue;
-        const BlasEntry* pBl = pInst->getBlas();
+        // unlinked-for-GC: getBlas() is an ERASED entry and a null check cannot
+        // see that. Null the local so the checks below work. [ReapBlasUAF]
+        const BlasEntry* pBl = pInst->isUnlinkedForGC() ? nullptr : pInst->getBlas();
         if (pBl == nullptr) continue;
         const uint64_t vs = static_cast<uint64_t>(pBl->input.getTransformData().vertexShaderHash);
         // NV-DXVK [HullCensus] re-widen: the VISIBLE ship the user stands in is
@@ -2996,7 +3016,9 @@ namespace dxvk {
       };
 
       for (RtInstance* pInst : m_instances) {
-        const BlasEntry* b = (pInst != nullptr) ? pInst->getBlas() : nullptr;
+        // unlinked-for-GC: getBlas() is an ERASED entry and a null check cannot
+        // see that. Null the local so the checks below work. [ReapBlasUAF]
+        const BlasEntry* b = (pInst != nullptr && !pInst->isUnlinkedForGC()) ? pInst->getBlas() : nullptr;
         if (b == nullptr) {
           continue;
         }
@@ -3077,7 +3099,17 @@ namespace dxvk {
       const bool enableGarbageCollection =
         !RtxOptions::AntiCulling::isObjectAntiCullingEnabled() || // It's always True if anti-culling is disabled
         (pInstance->m_isInsideFrustum) ||
-        (pInstance->getBlas()->input.getSkinningState().numBones > 0) ||
+        // NV-DXVK: guarded for the reason [ReapBlasUAF] below documents -- an
+        // unlinked-for-GC instance still points at the BlasEntry that
+        // onSceneObjectDestroyed erased earlier in THIS SceneManager GC pass,
+        // so the dereference reads freed memory. Reachable only with object
+        // anti-culling ON, because the clause above it short-circuits when it
+        // is off; that is why it has not fired, not because it is safe.
+        // An unreadable BLAS counts as not-skinned, which is the conservative
+        // side: such an instance is unlinked, so clauseMarked already removes
+        // it and this term cannot change its fate.
+        (!pInstance->isUnlinkedForGC() && pInstance->getBlas() != nullptr
+         && pInstance->getBlas()->input.getSkinningState().numBones > 0) ||
         (pInstance->m_isAnimated) ||
         (pInstance->m_isPlayerModel);
 
@@ -3089,7 +3121,9 @@ namespace dxvk {
       // loop didn't re-evaluate after a frame skip), and whether the
       // sticky-IgnoreAntiCulling preserve from updateInstance survived.
       {
-        const BlasEntry* pBlasInspect = pInstance->getBlas();
+        // unlinked-for-GC: getBlas() is an ERASED entry and a null check cannot
+        // see that. Null the local so the checks below work. [ReapBlasUAF]
+        const BlasEntry* pBlasInspect = pInstance->isUnlinkedForGC() ? nullptr : pInstance->getBlas();
         if (pBlasInspect != nullptr
             && pBlasInspect->input.getTransformData().vertexShaderHash == 0x2904d2163ef31a17ull) {
           static thread_local uint32_t sKeepProbeFrame = UINT32_MAX;
@@ -3107,7 +3141,14 @@ namespace dxvk {
               " inFrustum=", (pInstance->m_isInsideFrustum ? 1 : 0),
               " ignAntiCull=", (pInstance->testCategoryFlags(InstanceCategories::IgnoreAntiCulling) ? 1 : 0),
               " enableGC=", (enableGarbageCollection ? 1 : 0),
-              " skinned=", (pInstance->getBlas()->input.getSkinningState().numBones > 0 ? 1 : 0),
+              // NV-DXVK: same hazard as [ReapBlasUAF] below, in the same GC
+              // pass -- an unlinked-for-GC instance still points at the
+              // BlasEntry that onSceneObjectDestroyed erased, so this
+              // dereference reads freed memory. -1 rather than 0 because a
+              // probe must not report a value it could not read.
+              " skinned=", ((!pInstance->isUnlinkedForGC() && pInstance->getBlas() != nullptr)
+                            ? (pInstance->getBlas()->input.getSkinningState().numBones > 0 ? 1 : 0)
+                            : -1),
               " animated=", (pInstance->m_isAnimated ? 1 : 0),
               " playerMdl=", (pInstance->m_isPlayerModel ? 1 : 0),
               " markedGC=", (pInstance->m_isMarkedForGC ? 1 : 0),
@@ -3257,7 +3298,9 @@ namespace dxvk {
         // because an instance can outlive its geometry link, and only the counts
         // are read -- never the buffers, whose mapPtr is null for device-local
         // index data.
-        const BlasEntry* blas = pInstance->getBlas();
+        // unlinked-for-GC: getBlas() is an ERASED entry and a null check cannot
+        // see that. Null the local so the checks below work. [ReapBlasUAF]
+        const BlasEntry* blas = pInstance->isUnlinkedForGC() ? nullptr : pInstance->getBlas();
         const uint32_t idxCount = (blas != nullptr) ? blas->modifiedGeometryData.indexCount : 0u;
         const uint32_t vtxCount = (blas != nullptr) ? blas->modifiedGeometryData.vertexCount : 0u;
         const ResidentScene::Record* heldRec = m_residentScene.find(pInstance->m_residentKey);
@@ -3366,9 +3409,87 @@ namespace dxvk {
         uint32_t reapReusedSib = 0;   // siblings that pre-existed and were claimed this frame
         {
           const BlasEntry* pBlasJoin = pInstance->getBlas();
-          if (pBlasJoin != nullptr) {
+          // NV-DXVK [ReapBlasUAF]: this walk crashed, and the null check below
+          // cannot stop it. Symbolized from a 0xc0000005 at 06:02 on 2026-08-23:
+          // av=read target=0x278 with rax=0, faulting on sibling->m_frameLastUpdated
+          // (+0x278) on the CS thread, frame[8] = rtx_scene_manager.cpp:700.
+          //
+          // WHY THE POINTER IS BAD AND WHY nullptr DOES NOT CATCH IT. Within one
+          // SceneManager::garbageCollection, entries.erase() DESTROYS BlasEntries
+          // at rtx_scene_manager.cpp:438, and onSceneObjectDestroyed MARKS each
+          // linked instance rather than clearing its back-pointer. The instance
+          // GC then runs at line 700 of that same function, so getBlas() here
+          // returns a pointer to an erased entry -- non-null, so `!= nullptr`
+          // passes, and getLinkedInstances() reads freed memory. The zeros it
+          // read are where the null sibling came from.
+          //
+          // m_isUnlinkedForGC IS THE SIGNAL, and it is this class's own. It is
+          // set in exactly one place -- onSceneObjectDestroyed, beside the
+          // erase -- so it means "my entry is gone" and nothing else.
+          // isInstanceLinkedToBlas() at rtx_instance_manager.h:149 already
+          // refuses to touch the BLAS on it; this walk is a site that never got
+          // that guard, and adding it here is applying an existing invariant
+          // rather than inventing one.
+          //
+          // Testing a flag ON THE INSTANCE needs no access to the freed entry,
+          // which is the whole point -- a magic number or generation stamp on
+          // BlasEntry would have to read the very memory that is gone.
+          //
+          // NOT m_isMarkedForGC. That one is set at four sites: this one plus
+          // the viewModel, clone and virtual lifecycles, where the entry is
+          // alive and the walk is perfectly safe. Gating on it (as this probe
+          // first did, 2026-08-23) skipped ~7 walks per frame, most of them
+          // needlessly, and pushed every skipped instance into probeReapStarved
+          // because reapFreshSib stayed 0.
+          //
+          // THIS DOES NOT FIX THE DANGLING POINTER. It refuses to dereference
+          // it and says so. The invariant that wants restoring is that a
+          // back-pointer must not outlive its target, and that belongs in the
+          // destroy path, not here. The counter below is what says how often
+          // this is reached, so the repair can be measured rather than assumed.
+          //
+          // A skipped walk still leaves reapFreshSib at 0, so a skipped
+          // instance lands in probeReapStarved rather than probeReapRespawn.
+          // That is now confined to instances whose entry really is gone, whose
+          // sibling counts were never obtainable anyway, but read the # counter
+          // against the starved total before trusting it -- the totals above
+          // are meant to cover every reap.
+          if (pInstance->isUnlinkedForGC()) {
+            static thread_local uint32_t sReapUafSkips = 0;
+            if (sReapUafSkips < 32 || (sReapUafSkips & 0x3FF) == 0) {
+              Logger::warn(str::format(
+                "[ReapBlasUAF] #", sReapUafSkips,
+                " f=", currentFrame,
+                " instId=", pInstance->getId(),
+                " blas=0x", std::hex, reinterpret_cast<uintptr_t>(pBlasJoin), std::dec,
+                " instCreated=", pInstance->m_frameCreated,
+                " instLastUpdated=", pInstance->m_frameLastUpdated,
+                " | marked-for-GC instance: getBlas() may be an erased entry, sibling walk SKIPPED"));
+            }
+            sReapUafSkips += 1;
+          } else if (pBlasJoin != nullptr) {
             reapDraws = pBlasJoin->getDrawCount(currentFrame);
             for (const RtInstance* sibling : pBlasJoin->getLinkedInstances()) {
+              // SECOND NET, for any route to a bad list that is not the marked
+              // one above. A null element cannot come from the linking API --
+              // unlinkInstance swap-and-pops and linkInstance never pushes null
+              // -- so one appearing here means this list is not a live list, and
+              // the walk must stop rather than read the next element out of it.
+              if (sibling == nullptr) {
+                static thread_local uint32_t sReapUafNull = 0;
+                if (sReapUafNull < 32) {
+                  Logger::warn(str::format(
+                    "[ReapBlasUAF] NULL-SIBLING #", sReapUafNull,
+                    " f=", currentFrame,
+                    " instId=", pInstance->getId(),
+                    " blas=0x", std::hex, reinterpret_cast<uintptr_t>(pBlasJoin), std::dec,
+                    " linked=", static_cast<uint32_t>(pBlasJoin->getLinkedInstances().size()),
+                    " | UNMARKED instance with a null in its linked list -- the marked-GC"
+                    " explanation does NOT cover this one, walk ABANDONED"));
+                }
+                sReapUafNull += 1;
+                break;
+              }
               // Skip ourselves: by construction we were not updated this frame,
               // which is why we are being reaped.
               if (sibling == pInstance || sibling->m_frameLastUpdated != currentFrame) {
@@ -3390,7 +3511,9 @@ namespace dxvk {
 
         // Per-instance log for VS_2904d2: capture exactly what GC saw.
         {
-          const BlasEntry* pBlasGC = pInstance->getBlas();
+          // unlinked-for-GC: getBlas() is an ERASED entry and a null check cannot
+          // see that. Null the local so the checks below work. [ReapBlasUAF]
+          const BlasEntry* pBlasGC = pInstance->isUnlinkedForGC() ? nullptr : pInstance->getBlas();
           if (pBlasGC != nullptr
               && pBlasGC->input.getTransformData().vertexShaderHash == 0x2904d2163ef31a17ull) {
             thread_local uint32_t sGcVsProbe = 0;
@@ -3448,7 +3571,9 @@ namespace dxvk {
         const bool reapIsRespawn = (reapFreshSib > 0);
         if (reapIsRespawn
             && tf2::g_engineHookCaptureCount.load(std::memory_order_relaxed) > 16u) {
-          const BlasEntry* pBlasRs = pInstance->getBlas();
+          // unlinked-for-GC: getBlas() is an ERASED entry and a null check cannot
+          // see that. Null the local so the checks below work. [ReapBlasUAF]
+          const BlasEntry* pBlasRs = pInstance->isUnlinkedForGC() ? nullptr : pInstance->getBlas();
           const Vector3 posRs = pInstance->getWorldPosition();
           Logger::warn(str::format(
             "[Respawn] f=", currentFrame,
@@ -3475,7 +3600,9 @@ namespace dxvk {
           // now. A count that is the answer must not be clipped by the probe
           // that measures it.
           {
-            const BlasEntry* pBlasRp = pInstance->getBlas();
+            // unlinked-for-GC: getBlas() is an ERASED entry and a null check cannot
+            // see that. Null the local so the checks below work. [ReapBlasUAF]
+            const BlasEntry* pBlasRp = pInstance->isUnlinkedForGC() ? nullptr : pInstance->getBlas();
             const XXH64_hash_t vsRp = (pBlasRp != nullptr)
               ? pBlasRp->input.getTransformData().vertexShaderHash : 0ull;
             const Vector3 posRp = pInstance->getWorldPosition();
@@ -3579,7 +3706,9 @@ namespace dxvk {
         // 0-47), 32 named victims at the wave. vs/propId/pos identify the
         // population (dome? structure? camera-relative recon draws?).
         if (probeRemovedThisPass > 64u && probeRemovedThisPass <= 96u) {
-          const BlasEntry* pBlasWv = pInstance->getBlas();
+          // unlinked-for-GC: getBlas() is an ERASED entry and a null check cannot
+          // see that. Null the local so the checks below work. [ReapBlasUAF]
+          const BlasEntry* pBlasWv = pInstance->isUnlinkedForGC() ? nullptr : pInstance->getBlas();
           const XXH64_hash_t vsWv = (pBlasWv != nullptr)
             ? pBlasWv->input.getTransformData().vertexShaderHash : 0ull;
           const uint64_t matWv = (pBlasWv != nullptr)
@@ -3750,6 +3879,12 @@ namespace dxvk {
             " noRecLost=", rs.failNoRecLost,
             "(erased=", rs.failLostErased, " never=", rs.failLostNever, ")",
             " size=", rs.failSize,
+            // over/under split the size failures by SIGN, and the sign is what
+            // says whether a size failure is a defect at all: over= keeps extra
+            // instances alive (the feature), under= lets instances the draw
+            // resolved to retire (the defect). Both are still inside realFail
+            // on purpose -- see Stats::failSizeOver.
+            "(over=", rs.failSizeOver, " under=", rs.failSizeUnder, ")",
             " member=", rs.failMember, "}",
             // Outside fail{} because it is not one: same instances, different
             // order, and touch() consumes the list as a set.
@@ -6657,6 +6792,18 @@ namespace dxvk {
             " blasPtr=0x", std::hex, reinterpret_cast<uintptr_t>(&blas), std::dec,
             " spatialMapSize=", blas.getSpatialMap().size(),
             " linkedInst=", blas.getLinkedInstances().size(),
+            // WHICH GEOMETRY THIS ENTRY HOLDS, to settle what the pairing means.
+            //
+            // Every propId sampled for this shader appears exactly twice, once
+            // against each of exactly two blasPtr values, and the two carry
+            // different worldPos -- 765 units apart in one pair, 778,000 in
+            // another. That is equally consistent with one prop drawn into two
+            // views and with two distinct props colliding on one stablePropId,
+            // and the two want opposite fixes. Same geometry hash on both means
+            // one mesh in two entries; different hashes mean the ID is being
+            // reused across unrelated meshes and the producer is at fault.
+            " geoHash=0x", std::hex,
+              static_cast<uint64_t>(blas.input.getHash(RtxOptions::geometryAssetHashRule())), std::dec,
             " worldPos=(", worldPosition.x, ",", worldPosition.y, ",", worldPosition.z, ")"));
         }
         sExactMissProbe += 1;

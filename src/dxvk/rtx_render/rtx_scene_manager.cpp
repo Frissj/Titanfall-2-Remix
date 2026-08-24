@@ -4224,8 +4224,264 @@ namespace dxvk {
     if (RtxOptions::ResidentScene::enable() && drawCallState.residentKey != 0ull) {
       ResidentScene& residentScene = m_instanceManager.getResidentScene();
       if (RtxOptions::ResidentScene::verify() && drawCallState.residentPredictHit) {
-        residentScene.score(drawCallState.residentKey, sFanoutInstances);
+        residentScene.score(drawCallState.residentKey, sFanoutInstances, drawCallState.residentOrdinal);
       }
+
+      // NV-DXVK [RsPlace]: THE CANDIDATE DISCRIMINATOR, MEASURED BEFORE IT IS
+      // WIRED INTO A KEY.
+      //
+      // Every [RsFailSize] event measured on 2026-08-23 -- 298 of them, over=
+      // and under= alike -- has recN>1 AND prodN>1, and a produced list longer
+      // than one entry is reachable on ONE route: splitFanout, here and in the
+      // sharded phase. Both other routes push at most a single instance. So the
+      // entire size-failure population is the game-fanout batch, and 148 of the
+      // 155 under= events have shared==recN: the record is a strict SUBSET of
+      // what the draw just produced.
+      //
+      // The gate cannot see any of it. The fanout path assigns
+      // objectToWorld = identity, so the o2w term residentGateJudge folds is the
+      // SAME CONSTANT on every fanout draw -- the fold measured as separating
+      // 32% of colliding draws separates none of these -- and the placement list
+      // those draws carry is not in the key at all.
+      //
+      // TWO MECHANISMS PRODUCE THAT AND THEY WANT OPPOSITE FIXES. Nothing
+      // measured so far separates them, which is the only reason this exists:
+      //
+      //   the BATCH changed       instancesToObject is a different length than
+      //                           last frame -- props entered or left. The
+      //                           identity really is different and folding the
+      //                           placement set is the fix.
+      //   the RESOLUTION changed  the batch is the same length and the placement
+      //                           loop turned it into a different number of
+      //                           instances, by dropping a null or collapsing a
+      //                           collide. Folding the batch would then change
+      //                           NOTHING, because the term that moved is
+      //                           downstream of it.
+      //
+      // shortfall= is what tells them apart. nPlace holding while shortfall
+      // moves is the second mechanism, and no key term can reach it.
+      //
+      // AND THE COST OF THE WIDER FOLD, READ BEFORE THE CHANGE INSTEAD OF AFTER.
+      // pHash covers the placement BYTES, so it is the semantically correct
+      // answer to "is this draw asking for the same thing", and it goes dirty
+      // the instant any prop in the batch moves. nSamePDiff is exactly how often
+      // folding it would mint a fresh key and leave the batch with no record to
+      // serve. A high count there means fanout batches are not residency
+      // candidates at all and belong in skipUnsafe, not in the key.
+      if (RtxOptions::ResidentScene::logStats()
+          && drawCallState.getTransformData().isFanoutBatch
+          && drawCallState.getTransformData().instancesToObject != nullptr) {
+        const std::vector<Matrix4>& places = *drawCallState.getTransformData().instancesToObject;
+        const uint32_t nPlace = static_cast<uint32_t>(places.size());
+        const uint32_t nProd  = static_cast<uint32_t>(sFanoutInstances.size());
+        const uint64_t pHash  = places.empty()
+          ? 0ull
+          : XXH64(places.data(), places.size() * sizeof(Matrix4), 0ull);
+        const int32_t shortfall = static_cast<int32_t>(nPlace) - static_cast<int32_t>(nProd);
+
+        struct PlaceSlot {
+          uint32_t frame = 0xFFFFFFFFu;
+          uint32_t nPlace = 0u;
+          int32_t  shortfall = 0;
+          uint64_t pHash = 0ull;
+        };
+        // Same shape and same reason as [RsGroup]'s t_groups: a diagnostic map,
+        // bounded rather than swept, where a stale slot costs one wrong "did it
+        // change" answer and nothing else.
+        static thread_local std::unordered_map<uint64_t, PlaceSlot> t_places;
+        if (t_places.size() > 20000u) {
+          t_places.clear();
+        }
+        const uint32_t rsFrame = m_device->getCurrentFrameId();
+        PlaceSlot& ps = t_places[drawCallState.residentKey];
+        // CONTIGUITY IS THE PRECONDITION, not a detail. The gate only ever
+        // predicts on a key it judged LAST frame, so a slot from three frames
+        // ago answers a question nobody asked, and counting it would mix "the
+        // batch changed" with "the batch was away".
+        //
+        // SEEN AND CONTIGUOUS ARE SPLIT, and the first reading of this probe is
+        // why. It reported known=0 on 400 consecutive frames at ~185 fanout
+        // draws each, over a window that provably contained size failures --
+        // and a size failure only reaches score() on a predictHit, which is the
+        // frame thread asserting it judged that very key one frame earlier. One
+        // counter cannot hold both "this key is brand new" and "this key came
+        // back after a gap", and collapsing them is what made a broken probe
+        // read like a clean result.
+        const bool everSeen  = (ps.frame != 0xFFFFFFFFu);
+        const bool contiguous = everSeen && (ps.frame + 1u == rsFrame);
+        // SAME-FRAME IS ITS OWN ANSWER, not a kind of gap. The frame thread's
+        // contiguity test admits prevSeen == frameId as well as prevSeen + 1,
+        // so a key judged twice in ONE frame passes there and predicts a hit.
+        // This side must report that case separately or the two lines cannot be
+        // compared: lumping it into gap= is what made known=3 look like the key
+        // never repeating, when the repeat may simply be inside the frame.
+        const bool sameFrame = everSeen && (ps.frame == rsFrame);
+
+        // PER-FRAME TOTALS, because the per-draw lines below are capped and a
+        // capped sample has no denominator.
+        struct PlaceFrame {
+          uint32_t frame = 0xFFFFFFFFu;
+          uint32_t draws = 0, known = 0, fresh = 0, gap = 0, same = 0,
+                   samePredHit = 0, predHit = 0,
+                   shortNZ = 0, shortNZHit = 0,
+                   nDiffHit = 0, shortDiffHit = 0, pDiffHit = 0,
+                   nSame = 0, nDiff = 0,
+                   shortSame = 0, shortDiff = 0, pSame = 0, pDiff = 0,
+                   nSamePDiff = 0, nSameShortDiff = 0;
+        };
+        static thread_local PlaceFrame t_pf;
+        if (t_pf.frame != rsFrame) {
+          if (t_pf.frame != 0xFFFFFFFFu && t_pf.draws > 0u) {
+            static std::atomic<uint32_t> sFrameLines { 0 };
+            // 400 covered 28 seconds and expired three minutes before the
+            // failures this is meant to explain -- the same expiry that made an
+            // earlier probe in this tree theorise on stale data. One line per
+            // frame is cheap enough to cover a whole session instead.
+            constexpr uint32_t kMaxFrameLines = 3000;
+            if (sFrameLines.fetch_add(1, std::memory_order_relaxed) < kMaxFrameLines) {
+              Logger::info(str::format(
+                "[RsPlaceFrame] f=", t_pf.frame,
+                " tid=", std::this_thread::get_id(),
+                " mapN=", static_cast<uint32_t>(t_places.size()),
+                " draws=", t_pf.draws,
+                " fresh=", t_pf.fresh, " same=", t_pf.same,
+                " gap=", t_pf.gap, " known=", t_pf.known,
+                " predHit=", t_pf.predHit, " samePredHit=", t_pf.samePredHit,
+                " shortNZ=", t_pf.shortNZ, " shortNZHit=", t_pf.shortNZHit,
+                " hit{nDiff=", t_pf.nDiffHit, " shortDiff=", t_pf.shortDiffHit,
+                " pDiff=", t_pf.pDiffHit, "}",
+                " nSame=", t_pf.nSame, " nDiff=", t_pf.nDiff,
+                " shortSame=", t_pf.shortSame, " shortDiff=", t_pf.shortDiff,
+                " pSame=", t_pf.pSame, " pDiff=", t_pf.pDiff,
+                " nSamePDiff=", t_pf.nSamePDiff,
+                " nSameShortDiff=", t_pf.nSameShortDiff));
+            }
+          }
+          t_pf = PlaceFrame {};
+          t_pf.frame = rsFrame;
+        }
+        t_pf.draws += 1u;
+        if (drawCallState.residentPredictHit) {
+          t_pf.predHit += 1u;
+        }
+        if (!everSeen) {
+          t_pf.fresh += 1u;
+        } else if (sameFrame) {
+          t_pf.same += 1u;
+          if (drawCallState.residentPredictHit) {
+            t_pf.samePredHit += 1u;
+          }
+        } else if (!contiguous) {
+          t_pf.gap += 1u;
+        }
+
+        // WITHIN-DRAW, SO IT NEEDS NO CLOCK AND NO PAIRING. shortfall is
+        // nPlace - nProd for THIS draw: how many placements the fanout loop
+        // dropped, through a null instance or a collide. It is the term that
+        // decides a size failure without any cross-frame comparison at all, and
+        // it is counted over every draw rather than sampled.
+        if (shortfall != 0) {
+          t_pf.shortNZ += 1u;
+          if (drawCallState.residentPredictHit) {
+            t_pf.shortNZHit += 1u;
+          }
+        }
+
+        // HITS ONLY, for the reason the gate-side sample learned the hard way:
+        // an "or the first few draws of the frame" clause spends the whole cap
+        // in the opening frames, where there are no hits, and the sample then
+        // describes a window nobody is asking about. The per-frame counters
+        // above are the unconditioned coverage; this is the detail behind them.
+        const bool rawWanted = drawCallState.residentPredictHit;
+        if (rawWanted) {
+          static std::atomic<uint32_t> sLines { 0 };
+          constexpr uint32_t kMaxLines = 600;
+          if (sLines.fetch_add(1, std::memory_order_relaxed) < kMaxLines) {
+            Logger::info(str::format(
+              "[RsPlace] f=", rsFrame,
+              " psFrame=", ps.frame,
+              " key=0x", std::hex, drawCallState.residentKey, std::dec,
+              " ord=", drawCallState.residentOrdinal,
+              " everSeen=", (everSeen ? 1 : 0),
+              " contig=", (contiguous ? 1 : 0),
+              " nPlace=", nPlace, " prevNPlace=", ps.nPlace,
+              " nProd=", nProd,
+              " shortfall=", shortfall, " prevShortfall=", ps.shortfall,
+              " pSame=", (ps.pHash == pHash ? 1 : 0),
+              " predictHit=", (drawCallState.residentPredictHit ? 1 : 0)));
+          }
+        }
+
+        // COMPARED AGAINST THE LAST SIGHTING OF THE KEY, NOT AGAINST THE LAST
+        // FRAME, because this side has no usable frame clock.
+        //
+        // The frame thread stamps its frame id when it JUDGES a draw and this
+        // side stamps when it PROCESSES one, and a present can land between the
+        // two. Measured: of 600 draws the gate had already accepted as
+        // contiguous -- gap of exactly 1 there, on all 35,711 hits, with a gap
+        // of 0 never occurring -- this side read a gap of 2 on 598. Same clock,
+        // same key, different stamping instant. So the gap seen here carries no
+        // information about whether two sightings are consecutive, and gating
+        // the comparison on it discarded 99.5% of the data and reported the
+        // remainder as agreement.
+        //
+        // The gate has ALREADY established the pairing: a predictHit means this
+        // key was judged one frame earlier. Comparing consecutive sightings of
+        // the key is therefore the right comparison, and the frame id is only
+        // worth printing, never testing.
+        if (everSeen) {
+          t_pf.known += 1u;
+          const bool nSame     = (ps.nPlace == nPlace);
+          const bool shortSame = (ps.shortfall == shortfall);
+          const bool pSame     = (ps.pHash == pHash);
+          if (nSame) {
+            t_pf.nSame += 1u;
+          } else {
+            t_pf.nDiff += 1u;
+          }
+          if (shortSame) {
+            t_pf.shortSame += 1u;
+          } else {
+            t_pf.shortDiff += 1u;
+          }
+          if (pSame) {
+            t_pf.pSame += 1u;
+          } else {
+            t_pf.pDiff += 1u;
+          }
+          if (nSame && !pSame) {
+            t_pf.nSamePDiff += 1u;
+          }
+          if (nSame && !shortSame) {
+            t_pf.nSameShortDiff += 1u;
+          }
+          // RESTRICTED TO THE DRAWS THAT ACTUALLY GET SCORED, because only a
+          // predictHit reaches score() and only score() can raise a size
+          // failure. The unrestricted counters above rate-match the failure
+          // count almost exactly -- nDiff 2059/304392 against 203 failures on
+          // 29897 scored draws, both 0.68% -- but a global rate agreeing with a
+          // localized count is the coincidence this tree has been caught by
+          // before. These are the same two tests asked of the firing
+          // population, so the match can be confirmed rather than inferred.
+          if (drawCallState.residentPredictHit) {
+            if (!nSame) {
+              t_pf.nDiffHit += 1u;
+            }
+            if (!shortSame) {
+              t_pf.shortDiffHit += 1u;
+            }
+            if (!pSame) {
+              t_pf.pDiffHit += 1u;
+            }
+          }
+        }
+
+        ps.frame     = rsFrame;
+        ps.nPlace    = nPlace;
+        ps.shortfall = shortfall;
+        ps.pHash     = pHash;
+      }
+
       // An empty list is not a record. A draw that produced no instance has
       // nothing to keep alive, and filing it would make the gate serve an empty
       // touch forever -- which reads as a hit and does nothing, the worst of

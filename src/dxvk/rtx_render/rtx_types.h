@@ -1381,15 +1381,6 @@ struct DrawCallState {
   // hashes are one padding bug away from lying. 0 = no matsys bind seen on
   // this thread (non-matsys draw) — callers must then fall back to hashes.
   uint64_t engineMaterialPtr = 0;
-  // NV-DXVK [KeyStab]: the ENGINE-side geometry-stream identity for this draw --
-  // the game's D3D11 buffer objects and the range into them, minted in
-  // SubmitDrawDeferred. Zero when the draw has no vertex buffer bound.
-  //
-  // Read by a log and NOTHING ELSE. It is a candidate for exactMatch's geometry
-  // term, and per the standing rule in this investigation a candidate identity
-  // gets its cross-frame stability measured before it is wired in. See
-  // logExactMatchFailure's edkOK= in rtx_draw_call_cache.cpp.
-  uint64_t engineDrawKey = 0;
 
   // NV-DXVK [ResidentScene]: the frame thread's record key for this draw, and
   // the dirty fold it was judged against. See RESIDENT_SCENE_PLAN.md.
@@ -1405,6 +1396,13 @@ struct DrawCallState {
   // resident answer rather than an error: 0 is also the no-record sentinel on
   // RtInstance::m_residentKey and ResidentScene::build rejects it.
   uint64_t residentKey = 0ull;
+  // The occurrence ordinal this draw got WITHIN the narrowed identity, so a
+  // residency failure can be attributed. 0 means material and placement gave
+  // this draw its own key; >0 means it is still separated only by submission
+  // order, which is the population that shifts under culling. Reported by
+  // [RsFailSize] / [RsFailMember] -- without it those lines cannot say whether
+  // a failure came from the residual or from the separated majority.
+  uint32_t residentOrdinal = 0u;
   uint64_t residentGenHash = 0ull;
   // The engine buffers this draw was made of, as raw addresses. The record keeps
   // them so that ~D3D11Buffer freeing one can retire it -- a resident instance

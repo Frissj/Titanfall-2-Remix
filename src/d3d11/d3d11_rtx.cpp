@@ -10764,9 +10764,60 @@ namespace dxvk {
     kPropIdSrcCount = 4
   };
   static std::atomic<uint32_t> g_propIdSrcCounts[kPropIdSrcCount] = {};
-  static void notePropIdSrc(uint32_t which) {
+
+  // NV-DXVK [PropIdSrc.Vs]: WHICH SHADER USES WHICH PRODUCER.
+  //
+  // The counts above say a producer fired N times and nothing about whose draws
+  // those were, and that gap has now cost two wrong guesses in a row: the tsp
+  // clause was instrumented while its own census read tsp=0, and boneA was
+  // instrumented while the shader under investigation never appears in
+  // [BoneIdRaw]. Attributing a propId defect to a producer is not something to
+  // infer from grepping the clause that looks right.
+  //
+  // A fixed table rather than a map: this is on the draw path, the population is
+  // a handful of shaders, and an allocation here would cost more than the
+  // question is worth. Overflow is reported rather than silently dropped, since
+  // a full table would otherwise look like "no other shaders use this".
+  struct PropIdVsSlot {
+    std::atomic<uint64_t> vs { 0ull };
+    std::atomic<uint32_t> count { 0u };
+  };
+  static constexpr uint32_t kPropIdVsSlots = 24u;
+  static PropIdVsSlot g_propIdVs[kPropIdSrcCount][kPropIdVsSlots];
+  static std::atomic<uint32_t> g_propIdVsOverflow { 0u };
+
+  static void notePropIdVs(uint32_t which, uint64_t vsHash) {
+    if (which >= kPropIdSrcCount || vsHash == 0ull) {
+      return;
+    }
+    PropIdVsSlot* row = g_propIdVs[which];
+    for (uint32_t i = 0; i < kPropIdVsSlots; ++i) {
+      uint64_t seen = row[i].vs.load(std::memory_order_relaxed);
+      if (seen == vsHash) {
+        row[i].count.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+      if (seen == 0ull) {
+        // Claim the slot; a lost race just means the other thread's shader
+        // lands here and this one tries the next slot on its next draw.
+        uint64_t expected = 0ull;
+        if (row[i].vs.compare_exchange_strong(expected, vsHash, std::memory_order_relaxed)) {
+          row[i].count.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
+        if (row[i].vs.load(std::memory_order_relaxed) == vsHash) {
+          row[i].count.fetch_add(1, std::memory_order_relaxed);
+          return;
+        }
+      }
+    }
+    g_propIdVsOverflow.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  static void notePropIdSrc(uint32_t which, uint64_t vsHash = 0ull) {
     if (which >= kPropIdSrcCount) return;
     g_propIdSrcCounts[which].fetch_add(1, std::memory_order_relaxed);
+    notePropIdVs(which, vsHash);
     // Per-frame rollover, so the numbers are directly comparable to
     // [FindStage]'s per-frame withPropId. Emitted at most once every ~3s to
     // stay off the per-draw path in cost and out of the log in volume.
@@ -10793,6 +10844,27 @@ namespace dxvk {
         "  | CUMULATIVE. Compare the SHAPE against [FindStage] withPropId~63:"
         " subView~0 => the pre-reproject fix was never exercised (reading b),"
         " subView~63 => it was exercised and still misses (reading a)."));
+
+      // The per-shader attribution, on the same rollover so it cannot drift out
+      // of step with the totals above. One line per producer that fired.
+      static const char* const kSrcName[kPropIdSrcCount] =
+        { "boneA", "boneB", "tsp", "subView" };
+      for (uint32_t s = 0; s < kPropIdSrcCount; ++s) {
+        std::string row;
+        for (uint32_t i = 0; i < kPropIdVsSlots; ++i) {
+          const uint64_t vs = g_propIdVs[s][i].vs.load(std::memory_order_relaxed);
+          if (vs == 0ull) {
+            continue;
+          }
+          row += str::format(" 0x", std::hex, vs, std::dec,
+                             "=", g_propIdVs[s][i].count.load(std::memory_order_relaxed));
+        }
+        if (!row.empty()) {
+          Logger::warn(str::format("[PropIdSrc.Vs] f=", fid,
+                                   " src=", kSrcName[s], row,
+                                   " overflow=", g_propIdVsOverflow.load(std::memory_order_relaxed)));
+        }
+      }
     }
   }
 
@@ -29025,9 +29097,48 @@ namespace dxvk {
       {
         std::unique_lock<std::mutex> lk(mu);
         joinerWaiting.store(true, std::memory_order_release);
-        cvDone.wait(lk, [this, w]() {
-          return consumed.load(std::memory_order_acquire) >= w;
-        });
+        // NV-DXVK [XfJoinStall]: BOUNDED WAIT, SAME OUTCOME, EVIDENCE ON THE WAY.
+        //
+        // This was cvDone.wait(lk, pred) -- unbounded. On 2026-08-23 the frame
+        // thread parked here and never came back: 47 seconds of [ThreadCensus]
+        // with no d3d11 thread among the busy ones, so the worker was BLOCKED
+        // rather than slow, and the only trace of it anywhere was [StallWatch]
+        // naming this line. An unbounded wait on a cross-thread protocol emits
+        // nothing while it hangs, which is what made that unfixable.
+        //
+        // The semantics are unchanged: this still waits until consumed >= w,
+        // and wait_for re-checks the same predicate, so a timeout resumes
+        // waiting rather than proceeding. What it adds is a line per 2 seconds
+        // naming the counters that decide the diagnosis. consumed CLIMBING
+        // means the worker is slow and the draw at the head is expensive.
+        // consumed FROZEN means it is stuck inside that one slot, and slot=
+        // plus drawId= name the draw to go and look at.
+        //
+        // Cost when nothing is wrong: one predicate evaluation, because a
+        // satisfied predicate returns before the timeout can elapse.
+        uint32_t stallReports = 0;
+        while (!cvDone.wait_for(lk, std::chrono::seconds(2), [this, w]() {
+                 return consumed.load(std::memory_order_acquire) >= w;
+               })) {
+          const uint64_t cNow = consumed.load(std::memory_order_acquire);
+          const uint64_t pNow = published.load(std::memory_order_acquire);
+          // The slot the worker is on, and the draw inside it. Read without
+          // synchronisation on purpose: the worker owns this slot, these are
+          // plain integers, and a torn value costs a wrong number in a log
+          // line rather than anything the join depends on.
+          const XfChain::Slot& stuck = slots[cNow & kMask];
+          Logger::warn(str::format(
+            "[XfJoinStall] #", stallReports,
+            " waited=", (stallReports + 1) * 2, "s",
+            " published=", pNow, " consumed=", cNow, " target=", w,
+            " outstanding=", (pNow >= cNow ? pNow - cNow : 0ull),
+            " slot=", (cNow & kMask),
+            " drawId=", stuck.drawCallId,
+            " idxCount=", stuck.count,
+            " sleeping=", (sleeping.load(std::memory_order_acquire) ? 1 : 0),
+            " | consumed climbing = worker slow; consumed frozen = worker stuck in this slot"));
+          stallReports += 1;
+        }
         joinerWaiting.store(false, std::memory_order_release);
       }
       joinWaitNs.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -38643,23 +38754,21 @@ namespace dxvk {
 
     const uint64_t baseKey = XXH64(&k, sizeof(k), 0ull);
 
-    // AND THE PER-FRAME OCCURRENCE ORDINAL. See ResidentOccupancy in the header:
-    // several draws per frame share one IA identity, resolution is stateful
-    // within the frame, and keying without the ordinal lets draw 2 serve draw
-    // 1's record with full confidence. This is the defect pushInstanceRecords'
-    // verify pass surfaced as FAIL=3367.
-    const uint32_t frameId = m_context->m_device->getCurrentFrameId();
-    ResidentOccupancy& occ = m_residentOccupancy[baseKey];
-    if (occ.frame != frameId) {
-      occ.frame = frameId;
-      occ.counter = 0u;
-    }
-    const uint32_t ordinal = occ.counter++;
+    // THE OCCURRENCE ORDINAL USED TO BE FOLDED IN HERE. It moved to
+    // residentGateJudge on 2026-08-23, and this function now hands back the raw
+    // IA identity. See the note there for the measurement that moved it.
+    //
+    // The short version: the ordinal is a POSITION WITHIN THE FRAME, so it
+    // cannot survive culling changing which copies get submitted. Taking it
+    // here, over the IA identity alone, applied it to every draw that shared
+    // buffers and range. Taken downstream over a narrower identity it applies
+    // to far fewer, because material and placement have separated most of them
+    // by then.
+    m_rsDrawBaseKey = baseKey;   // [RsGroup] / the judge, which now folds the rest
 
-    const uint64_t key = XXH64(&ordinal, sizeof(ordinal), baseKey);
     // Never hand back the sentinel. A one-in-2^64 collision with 0 would
     // otherwise silently disable residency for that draw forever.
-    return (key == 0ull) ? 1ull : key;
+    return (baseKey == 0ull) ? 1ull : baseKey;
   }
 
   uint64_t D3D11Rtx::residentGeomGenFold() const {
@@ -39044,6 +39153,132 @@ namespace dxvk {
               cbContentMovedMask |= (1u << i);
             }
             ce.cbContentHash[i] = h;
+
+            // NV-DXVK [CbDwords]: WHICH DWORDS OF THE WINDOW ACTUALLY MOVE.
+            //
+            // WHY. cbContent reads dirty on 100% of judged draws for
+            // 0x2af9b90d63850ec3 -- 97,126 judged with the camera still and
+            // 98,341 with it moving, 100.0% both ways -- while o2w on those
+            // same draws reads cleanPct=100. The byte hash above and the
+            // decoded transform disagree completely, and since
+            // kCensusCameraSlotMask excludes only slot 2, slot 3 alone pins
+            // contentMoved true forever and cleanPct at 0. That shader carries
+            // the largest single share of the [RsFailMember] events.
+            //
+            // WHAT THIS DECIDES. Whether the moving bytes are the matrix or
+            // something else, which is the difference between a fix that is
+            // safe and one that is a guess:
+            //
+            //   first 16 dwords move, rest still   the 64 bytes of the matrix
+            //                                      are what churn. The decoded
+            //                                      o2w cancels it and is clean,
+            //                                      so judging on the decoded
+            //                                      transform loses nothing.
+            //   dwords past 16 move                something per-frame shares
+            //                                      the window. Declaring the
+            //                                      draw clean would drop it,
+            //                                      and it has to be identified
+            //                                      before the verdict changes.
+            //
+            // That second case is not hypothetical. filterDupSameDraws v1 made
+            // exactly this substitution, missed the bone palettes it did not
+            // hash, and shipped a visible viewmodel flicker.
+            //
+            // Aimed with rtx.findSimilarProbeVsHashes, which already exists and
+            // is settable without a rebuild. It currently names the sub-view
+            // shader; point it at the shader under investigation instead.
+            if (RtxOptions::ResidentScene::logStats()
+             && lookupHash(RtxOptions::findSimilarProbeVsHashes(),
+                           static_cast<XXH64_hash_t>(vsHash))) {
+              constexpr size_t kMaxDwords = 64;
+              constexpr size_t kMaxWatch = 8;
+              constexpr uint32_t kDwDumpFrames = 300u;
+              struct DwordWatch {
+                uint64_t vs = 0ull, model = 0ull;
+                uint32_t slot = 0u, dwords = 0u, cmp = 0u;
+                uint32_t prev[kMaxDwords] = {};
+                uint32_t chg[kMaxDwords] = {};
+                bool primed = false;
+              };
+              static std::mutex sDwMu;
+              static std::unordered_map<uint64_t, DwordWatch> sDw;
+              static uint32_t sDwLastDump = 0xFFFFFFFFu;
+
+              const uint64_t dwKey = vsHash
+                                   ^ (modelKey * 0x9E3779B97F4A7C15ull)
+                                   ^ (static_cast<uint64_t>(i) << 56);
+              const size_t nDw = std::min<size_t>(len / 4u, kMaxDwords);
+
+              std::lock_guard<std::mutex> dwLock(sDwMu);
+              auto dwIt = sDw.find(dwKey);
+              if (dwIt == sDw.end() && sDw.size() < kMaxWatch) {
+                dwIt = sDw.emplace(dwKey, DwordWatch{}).first;
+                dwIt->second.vs = vsHash;
+                dwIt->second.model = modelKey;
+                dwIt->second.slot = i;
+              }
+              if (dwIt != sDw.end() && nDw > 0u) {
+                DwordWatch& w = dwIt->second;
+                w.dwords = static_cast<uint32_t>(nDw);
+                // memcpy rather than a reinterpret_cast: the window is only
+                // guaranteed 16-byte aligned relative to staged, not that
+                // staged itself is aligned for a uint32_t load.
+                uint32_t curDw[kMaxDwords] = {};
+                std::memcpy(curDw, staged + off, nDw * sizeof(uint32_t));
+                if (w.primed) {
+                  w.cmp += 1u;
+                  for (size_t d = 0; d < nDw; ++d) {
+                    if (curDw[d] != w.prev[d]) {
+                      w.chg[d] += 1u;
+                    }
+                  }
+                }
+                std::memcpy(w.prev, curDw, nDw * sizeof(uint32_t));
+                w.primed = true;
+              }
+
+              if (sDwLastDump == 0xFFFFFFFFu) {
+                sDwLastDump = fid;
+              } else if (fid - sDwLastDump >= kDwDumpFrames) {
+                sDwLastDump = fid;
+                for (const auto& dwKv : sDw) {
+                  const DwordWatch& w = dwKv.second;
+                  if (w.cmp == 0u) {
+                    continue;
+                  }
+                  // One character per dword, so the shape of the moving region
+                  // is readable at a glance rather than reconstructed from 64
+                  // counters: '.' never moved, '#' moved on every comparison,
+                  // a digit is the decile in between.
+                  std::string shape;
+                  shape.reserve(w.dwords);
+                  uint32_t always = 0u, never = 0u;
+                  for (uint32_t d = 0; d < w.dwords; ++d) {
+                    if (w.chg[d] == 0u) {
+                      shape += '.';
+                      never += 1u;
+                    } else if (w.chg[d] >= w.cmp) {
+                      shape += '#';
+                      always += 1u;
+                    } else {
+                      const uint32_t decile =
+                        std::min<uint32_t>(9u, (10u * w.chg[d]) / w.cmp);
+                      shape += static_cast<char>('0' + decile);
+                    }
+                  }
+                  Logger::warn(str::format(
+                    "[CbDwords] f=", fid,
+                    " vs=0x", std::hex, w.vs,
+                    " model=0x", w.model, std::dec,
+                    " slot=", w.slot,
+                    " cmp=", w.cmp,
+                    " dwords=", w.dwords,
+                    " always=", always,
+                    " never=", never,
+                    " shape=", shape));
+                }
+              }
+            }
           }
         }
       }
@@ -39634,6 +39869,274 @@ namespace dxvk {
     m_rsDrawGens = residentGeomGenFold();
     m_rsDrawMat  = residentMaterialFold();
 
+    // NV-DXVK [MatChurnSlot]: WHICH ELEMENT OF THE MATERIAL FOLD ALTERNATES.
+    //
+    // THE MEASUREMENT THAT FORCED THIS. [RsIdent], standing still with both
+    // identities at 0% new: identHead recurs at gap1 on 49-61% of draws, and
+    // the moment the material fold is added (hdPlusMat) the SAME draws recur at
+    // gap2 on 51-61% instead. hdPlusMat and narrowed are within 0.2% of each
+    // other on every column, so the placement fold is innocent and the material
+    // fold is alternating with period 2.
+    //
+    // That is the dominant residency defect. The gate requires gap<=1, so a key
+    // that returns on alternate frames can never hit: it accounts for ~3,500 of
+    // the 3,568 key misses in a 4,816-draw window, and it is why missMat reads 0
+    // (an alternating material re-keys the draw before the material comparison
+    // is ever reached).
+    //
+    // WHAT THIS CONTRADICTS. residentMaterialFold's own header states its inputs
+    // "are engine objects created once and reused for the material's lifetime,
+    // so unlike the constant buffers above they do NOT churn per frame". One of
+    // them does. A shader-resource view bound to a double-buffered render target
+    // -- a refraction or framebuffer-copy texture, ping-ponged A/B/A/B -- would
+    // alternate exactly like this while the material is genuinely unchanged.
+    //
+    // WHY A PROBE AND NOT A NARROWING. The fix the gate's own missMat comment
+    // prescribes is "narrowing to what FillMaterialData actually reads", and it
+    // rejects doing so blind because "being wrong there means serving a stale
+    // material". Naming the alternating slot first turns that narrowing from a
+    // guess into a removal of one measured term.
+    //
+    // Keyed on m_rsDrawBaseKey -- set by censusRecordDraw above, and measured at
+    // 0-3% new while standing still -- so consecutive samples are the SAME
+    // object rather than two draws that merely share a pixel shader. Evaluated
+    // once per key per frame, the lesson the census block already records.
+    if (RtxOptions::ResidentScene::logStats() && m_rsDrawBaseKey != 0ull) {
+      constexpr uint32_t kSrvSlots = 128;
+      constexpr uint32_t kSampSlots = 16;
+      constexpr size_t kMatWatch = 8;
+      constexpr uint32_t kMatDumpFrames = 300u;
+      struct MatWatch {
+        uint32_t lastFrame = 0xFFFFFFFFu;
+        uint32_t cmp = 0u;
+        bool primed = false;
+        uint64_t prevPs = 0ull;
+        uint64_t prevSrv[kSrvSlots] = {};
+        uint64_t prevSamp[kSampSlots] = {};
+        uint64_t prevState[3] = {};
+        uint32_t chgPs = 0u;
+        uint32_t chgSrv[kSrvSlots] = {};
+        uint32_t chgSamp[kSampSlots] = {};
+        uint32_t chgState[3] = {};
+        // The fold value itself, so the dump can show WHETHER it is a two-state
+        // A/B/A/B flip or a walk through many values. Those want different
+        // fixes and the change count alone cannot tell them apart.
+        uint64_t matA = 0ull, matB = 0ull;
+        uint32_t matOther = 0u;
+        // Flip rate counted HERE rather than read back out of sMatSeen at dump
+        // time. sMatSeen is capped and cleared (it tracks every key, and reached
+        // 38,284 against a 40,000 cap), so the clear wiped the counters the dump
+        // was reading and every row printed matChg=0/0. This map is never
+        // cleared, so the count survives.
+        uint64_t prevMat = 0ull;
+        uint32_t matChg = 0u, matSamples = 0u;
+      };
+      static std::unordered_map<uint64_t, MatWatch> sMatW;
+      static uint32_t sMatLastDump = 0xFFFFFFFFu;
+
+      const uint32_t mfid = m_context->m_device->getCurrentFrameId();
+
+      // ADMIT ONLY KEYS WHOSE MATERIAL FOLD ACTUALLY ALTERNATES.
+      //
+      // The first version took the first eight base keys it saw. Two of them
+      // gathered real sample counts (cmp~1474) and both read ps=0, state=0/0/0,
+      // stable samplers and SRV slots 0-2 moving under 10% of frames -- i.e. it
+      // watched eight keys that are not in the alternating population, while
+      // [RsIdent] hdPlusMat proves something alternates on ~56% of draws. A
+      // watch set chosen before the property is known is a sample, and §6.1's
+      // rule applies: it expires on the wrong population.
+      //
+      // So detect first, then latch. This pre-pass is over EVERY key -- one
+      // compare and one store per key per frame -- and a key is admitted to the
+      // expensive component diff only after its fold has been seen to change
+      // between consecutive frames. matChg/matSamples travels into the dump so
+      // an admitted key's alternation rate is visible next to its slot shape.
+      struct MatSeen {
+        uint32_t lastFrame = 0xFFFFFFFFu;
+        uint64_t lastMat = 0ull;
+        uint32_t chg = 0u, samples = 0u;
+        bool primed = false;
+      };
+      static std::unordered_map<uint64_t, MatSeen> sMatSeen;
+      constexpr size_t kMatSeenCap = 40000;
+
+      bool alternates = false;
+      {
+        if (sMatSeen.size() > kMatSeenCap) {
+          sMatSeen.clear();
+        }
+        MatSeen& s = sMatSeen[m_rsDrawBaseKey];
+        if (s.lastFrame != mfid) {
+          s.lastFrame = mfid;
+          if (s.primed) {
+            s.samples += 1u;
+            if (s.lastMat != m_rsDrawMat) {
+              s.chg += 1u;
+            }
+          }
+          s.lastMat = m_rsDrawMat;
+          s.primed = true;
+        }
+        alternates = (s.chg > 0u);
+      }
+
+      auto mwIt = sMatW.find(m_rsDrawBaseKey);
+      if (mwIt == sMatW.end() && alternates && sMatW.size() < kMatWatch) {
+        mwIt = sMatW.emplace(m_rsDrawBaseKey, MatWatch{}).first;
+      }
+      // Record the first two fold values seen for an admitted key, and count the
+      // draws matching neither. matOther==0 with both A and B set is a clean
+      // two-state flip; a climbing matOther is a walk, and the two want
+      // different fixes.
+      if (mwIt != sMatW.end()) {
+        MatWatch& wSeen = mwIt->second;
+        if (wSeen.matA == 0ull) {
+          wSeen.matA = m_rsDrawMat;
+        } else if (m_rsDrawMat != wSeen.matA) {
+          if (wSeen.matB == 0ull) {
+            wSeen.matB = m_rsDrawMat;
+          } else if (m_rsDrawMat != wSeen.matB) {
+            wSeen.matOther += 1u;
+          }
+        }
+      }
+      if (mwIt != sMatW.end() && mwIt->second.lastFrame != mfid) {
+        MatWatch& w = mwIt->second;
+        w.lastFrame = mfid;
+
+        if (w.primed) {
+          w.matSamples += 1u;
+          if (w.prevMat != m_rsDrawMat) {
+            w.matChg += 1u;
+          }
+        }
+        w.prevMat = m_rsDrawMat;
+
+        const auto& psNow = m_context->m_state.ps;
+        const uint64_t psNowPtr = reinterpret_cast<uint64_t>(psNow.shader.ptr());
+        uint64_t srvNow[kSrvSlots] = {};
+        uint64_t sampNow[kSampSlots] = {};
+        for (uint32_t i = 0; i < kSrvSlots && i < psNow.shaderResources.views.size(); ++i) {
+          srvNow[i] = reinterpret_cast<uint64_t>(psNow.shaderResources.views[i].ptr());
+        }
+        for (uint32_t i = 0; i < kSampSlots && i < psNow.samplers.size(); ++i) {
+          sampNow[i] = reinterpret_cast<uint64_t>(psNow.samplers[i]);
+        }
+        const uint64_t stateNow[3] = {
+          reinterpret_cast<uint64_t>(m_context->m_state.om.cbState),
+          reinterpret_cast<uint64_t>(m_context->m_state.om.dsState),
+          reinterpret_cast<uint64_t>(m_context->m_state.rs.state),
+        };
+
+        if (w.primed) {
+          w.cmp += 1u;
+          if (psNowPtr != w.prevPs) {
+            w.chgPs += 1u;
+          }
+          for (uint32_t i = 0; i < kSrvSlots; ++i) {
+            if (srvNow[i] != w.prevSrv[i]) {
+              w.chgSrv[i] += 1u;
+            }
+          }
+          for (uint32_t i = 0; i < kSampSlots; ++i) {
+            if (sampNow[i] != w.prevSamp[i]) {
+              w.chgSamp[i] += 1u;
+            }
+          }
+          for (uint32_t i = 0; i < 3u; ++i) {
+            if (stateNow[i] != w.prevState[i]) {
+              w.chgState[i] += 1u;
+            }
+          }
+        }
+        w.prevPs = psNowPtr;
+        std::memcpy(w.prevSrv, srvNow, sizeof(srvNow));
+        std::memcpy(w.prevSamp, sampNow, sizeof(sampNow));
+        std::memcpy(w.prevState, stateNow, sizeof(stateNow));
+        w.primed = true;
+      }
+
+      if (sMatLastDump == 0xFFFFFFFFu) {
+        sMatLastDump = mfid;
+      } else if (mfid - sMatLastDump >= kMatDumpFrames) {
+        sMatLastDump = mfid;
+        // Report the population before the rows, so an empty or starved watch is
+        // visible instead of looking like "nothing alternates". seenAlt is how
+        // many keys the pre-pass found alternating; watched is how many of them
+        // the cap admitted.
+        uint32_t seenAlt = 0u;
+        for (const auto& sKv : sMatSeen) {
+          if (sKv.second.chg > 0u) {
+            seenAlt += 1u;
+          }
+        }
+        Logger::warn(str::format(
+          "[MatChurnSlot] f=", mfid,
+          " POPULATION tracked=", static_cast<uint32_t>(sMatSeen.size()),
+          " alternating=", seenAlt,
+          " watched=", static_cast<uint32_t>(sMatW.size()),
+          " cap=", static_cast<uint32_t>(kMatWatch)));
+        for (const auto& mwKv : sMatW) {
+          const MatWatch& w = mwKv.second;
+          if (w.cmp == 0u) {
+            continue;
+          }
+          // One character per SRV slot: '.' never changed, '#' changed on every
+          // frame-to-frame comparison, a digit for the deciles between. A single
+          // '#' or high digit in an otherwise '.' row names the slot to drop.
+          std::string srvShape;
+          srvShape.reserve(kSrvSlots);
+          uint32_t srvAlways = 0u, srvEver = 0u;
+          for (uint32_t i = 0; i < kSrvSlots; ++i) {
+            if (w.chgSrv[i] == 0u) {
+              srvShape += '.';
+            } else {
+              srvEver += 1u;
+              if (w.chgSrv[i] >= w.cmp) {
+                srvShape += '#';
+                srvAlways += 1u;
+              } else {
+                srvShape += static_cast<char>(
+                  '0' + std::min<uint32_t>(9u, (10u * w.chgSrv[i]) / w.cmp));
+              }
+            }
+          }
+          std::string sampShape;
+          sampShape.reserve(kSampSlots);
+          for (uint32_t i = 0; i < kSampSlots; ++i) {
+            if (w.chgSamp[i] == 0u) {
+              sampShape += '.';
+            } else if (w.chgSamp[i] >= w.cmp) {
+              sampShape += '#';
+            } else {
+              sampShape += static_cast<char>(
+                '0' + std::min<uint32_t>(9u, (10u * w.chgSamp[i]) / w.cmp));
+            }
+          }
+          // matChg/matSamples is the ADMISSION evidence: it says this key's fold
+          // really does alternate, so a row of all-dots below it is a finding
+          // (the fold changed while none of its inputs did) rather than a key
+          // that simply never churned.
+          const uint32_t mChg = w.matChg;
+          const uint32_t mSmp = w.matSamples;
+          Logger::warn(str::format(
+            "[MatChurnSlot] f=", mfid,
+            " base=0x", std::hex, mwKv.first, std::dec,
+            " cmp=", w.cmp,
+            " matChg=", mChg, "/", mSmp,
+            " matA=0x", std::hex, w.matA,
+            " matB=0x", w.matB, std::dec,
+            " matOther=", w.matOther,
+            " ps=", w.chgPs,
+            " state=", w.chgState[0], "/", w.chgState[1], "/", w.chgState[2],
+            " srvEver=", srvEver,
+            " srvAlways=", srvAlways,
+            " srv=", srvShape,
+            " samp=", sampShape));
+        }
+      }
+    }
+
     // The buffers this draw is made of, for the record's death signal. Read here
     // rather than at the judge because this is where the IA state is
     // unambiguously this draw's, and stored as plain addresses -- a reference
@@ -39641,6 +40144,113 @@ namespace dxvk {
     const auto& ia = m_context->m_state.ia;
     m_rsDrawSrcVb = reinterpret_cast<uint64_t>(ia.vertexBuffers[0].buffer.ptr());
     m_rsDrawSrcIb = reinterpret_cast<uint64_t>(ia.indexBuffer.buffer.ptr());
+  }
+
+  // NV-DXVK [RsGateFrame]: HOW MANY FANOUT DRAWS THIS SIDE JUDGES PER FRAME, as
+  // the denominator for the CS side's [RsPlaceFrame] draws=.
+  //
+  // It exists to test one explanation of a measured contradiction. [RsPlace]
+  // reads a gap of exactly 2 between consecutive CS-side sightings of a
+  // residentKey on 541 of 547 samples, while a predictHit requires a gap of 1 or
+  // 0 here -- and both sides read the same clock, since getCurrentFrameId() is
+  // QueuePresentCount and one site increments it. If this side judges a draw
+  // every frame while the CS side only processes it every other frame -- the
+  // filtering this function's own comment warns about, "a draw that filters out
+  // downstream of here never reaches the decision" -- then the gate predicts on
+  // a one-frame gap while the record actually served is two frames stale.
+  //
+  // Equal draws= on the two lines for one f= refutes that; roughly double
+  // confirms it.
+  //
+  // A FREE FUNCTION BECAUSE IT MUST BE CALLED FROM BOTH EXITS. The new-key path
+  // returns early, and counting only the draws that reach the far end of the
+  // function would drop exactly the population that has no history yet -- which
+  // is the one the comparison is about.
+  // A HISTOGRAM RATHER THAN A SAMPLE, and the first version's failure is the
+  // reason. It printed 600 raw per-draw lines gated on "predictHit or a low
+  // ordinal", and the ordinal clause spent the whole cap in the opening frames,
+  // where 1 draw of 600 was a hit -- while 677 of 2,877 frames carry hits, all
+  // of them later. The cap expired before the population it was aimed at, which
+  // is the second time in this investigation a capped probe has answered about
+  // the wrong window. Bucketing every draw costs four increments and cannot
+  // expire.
+  //
+  // WHAT THE BUCKETS DECIDE. residentGateJudge admits a key as contiguous on
+  //     (prevSeen + 1 == frameId) || (prevSeen == frameId)
+  // and those two are not the same claim. A gap of 1 is genuine frame-to-frame
+  // continuity, which is what the record store's one-frame freshness assumes. A
+  // gap of 0 means the key was ALREADY JUDGED EARLIER IN THIS FRAME, so the
+  // record it would serve was built by a sibling draw moments ago rather than by
+  // this object last frame. The fanout batch-record path guards that case
+  // explicitly -- see m_piMissSameFrame, whose comment records a verify run of
+  // FAIL=3367 with builtFrame == f on every line -- and residency has no such
+  // backstop.
+  //
+  // hitGap0 large is therefore not a detail of the counter: it would mean the
+  // gate's hits on this population rest on the same-frame clause, and the size
+  // failures are a record being scored against its own sibling.
+  static void rsGateFrameTally(uint32_t frameId, uint32_t prevSeen,
+                               bool everSeen, bool predictHit, bool contiguous) {
+    struct GateFrame {
+      uint32_t frame = 0xFFFFFFFFu;
+      uint32_t draws = 0, hit = 0, missKey = 0, fresh = 0;
+      uint32_t gap0 = 0, gap1 = 0, gap2 = 0, gap3p = 0;
+      uint32_t hitGap0 = 0, hitGap1 = 0, hitGapOther = 0;
+    };
+    static thread_local GateFrame t_gf;
+    if (t_gf.frame != frameId) {
+      if (t_gf.frame != 0xFFFFFFFFu && t_gf.draws > 0u) {
+        static std::atomic<uint32_t> sGateFrameLines { 0 };
+        constexpr uint32_t kMaxGateFrameLines = 3000;
+        if (sGateFrameLines.fetch_add(1, std::memory_order_relaxed) < kMaxGateFrameLines) {
+          Logger::info(str::format(
+            "[RsGateFrame] f=", t_gf.frame,
+            " tid=", std::this_thread::get_id(),
+            " draws=", t_gf.draws,
+            " fresh=", t_gf.fresh,
+            " hit=", t_gf.hit,
+            " missKey=", t_gf.missKey,
+            " gap{0=", t_gf.gap0, " 1=", t_gf.gap1,
+            " 2=", t_gf.gap2, " 3+=", t_gf.gap3p, "}",
+            " hitGap{0=", t_gf.hitGap0, " 1=", t_gf.hitGap1,
+            " other=", t_gf.hitGapOther, "}"));
+        }
+      }
+      t_gf = GateFrame {};
+      t_gf.frame = frameId;
+    }
+    t_gf.draws += 1u;
+    if (predictHit) {
+      t_gf.hit += 1u;
+    }
+    if (!contiguous) {
+      t_gf.missKey += 1u;
+    }
+    if (!everSeen) {
+      t_gf.fresh += 1u;
+      return;
+    }
+    // Unsigned and deliberately not clamped: prevSeen can only be <= frameId
+    // here, because it is stamped from this same counter on an earlier judging.
+    const uint32_t gap = frameId - prevSeen;
+    if (gap == 0u) {
+      t_gf.gap0 += 1u;
+    } else if (gap == 1u) {
+      t_gf.gap1 += 1u;
+    } else if (gap == 2u) {
+      t_gf.gap2 += 1u;
+    } else {
+      t_gf.gap3p += 1u;
+    }
+    if (predictHit) {
+      if (gap == 0u) {
+        t_gf.hitGap0 += 1u;
+      } else if (gap == 1u) {
+        t_gf.hitGap1 += 1u;
+      } else {
+        t_gf.hitGapOther += 1u;
+      }
+    }
   }
 
   void D3D11Rtx::residentGateJudge(DrawCallState& drawCallState) {
@@ -39686,8 +40296,8 @@ namespace dxvk {
     drawCallState.residentSrcIndexBuffer  = 0ull;
     drawCallState.residentPredictHit      = false;
 
-    const uint64_t key = m_rsDrawKey;
-    if (key == 0ull) {
+    const uint64_t baseKey = m_rsDrawKey;
+    if (baseKey == 0ull) {
       return;   // no identity, or the entry half is disabled
     }
     // CONSUME IT. One verdict per draw, and a stale key must never be judged
@@ -39695,22 +40305,368 @@ namespace dxvk {
     // "never reached here" at the next draw's entry.
     m_rsDrawKey = 0ull;
 
+    const uint32_t frameId = m_context->m_device->getCurrentFrameId();
+    const uint64_t o2w = XXH64(&drawCallState.transformData.objectToWorld, sizeof(Matrix4), 0ull);
+
+    // NARROW THE IDENTITY FIRST, THEN TAKE THE ORDINAL WITHIN IT.
+    //
+    // Two things are true at once and the old key served neither well. An
+    // ordinal separates draws perfectly INSIDE a frame and not at all ACROSS
+    // frames, because it is submission order and culling reorders it. Material
+    // and placement are derived from content, so they are stable across frames,
+    // but they do not separate every colliding draw.
+    //
+    // So do not choose. Fold the stable terms in first and let the ordinal
+    // handle only what they could not separate. Measured with [RsGroup] over
+    // 400 colliding draws: material alone separates 80%, placement alone 32%,
+    // the two together 88%. The geometry generation separates NOTHING here
+    // (genSame=1 on all 400), which is why it is not in this fold.
+    //
+    // The remaining ~12% still get an ordinal, over groups that are now much
+    // smaller. This shrinks the population that can suffer the cross-frame
+    // shift; it does not eliminate it. Watch [RsGroup] ord=: a line with n>=2
+    // and ord=0 is a group the fold separated, ord>0 is residual.
+    //
+    // TWO COSTS, STATED SO THEY ARE READ AS CHOICES.
+    //   o2w in the key makes o2wMatch below implied, so missO2w goes to 0 and
+    //   stops being a usable signal -- a moving object now misses on the key
+    //   instead. Same outcome, different attribution.
+    //   A moving object also mints a NEW KEY every frame instead of reusing
+    //   one, so its records churn. If newKeys climbs off its ~0 floor while
+    //   standing still, drop o2w from this fold and keep material: that is 80%
+    //   of the benefit with neither cost.
+    //
+    // THAT CONDITION WAS MEASURED AND MET, so the fold is dropped. 2026-08-24,
+    // [ResidentGate] bucketed by 100 frames against [MtnCam] mean per-frame
+    // camera travel:
+    //
+    //   standing still  f1700-2599, ~490,000 draws, mean|d1| = 0.0000
+    //                   newKeys 9.0% settling to 1.4-3.3% -- NOT the ~0 floor
+    //                   the note predicted, which is the stated trigger.
+    //   moving          f2600-3300, ~388,000 draws, mean|d1| 0.12-0.25
+    //                   newKeys 15.8-18.8%, and hit collapses from 425-1,963
+    //                   per bucket to 61-327.
+    //
+    // o2w is object-to-world and cannot legitimately track the camera, so the
+    // 5-12x climb is the byte-exact hash catching the per-frame wobble
+    // rtx_types.h already documents ("slightly different matrices each frame
+    // for the same static prop") -- amplified here because several paths
+    // RECONSTRUCT o2w camera-relatively (path 13 shifts by c_cameraOrigin,
+    // others compute invView * cb3Mat), so a moving camera perturbs the low
+    // bits of a matrix that is mathematically constant.
+    //
+    // THE ATTRIBUTION RESTS ON THE STILL/MOVING SPLIT ALONE, deliberately.
+    // o2w is the only camera-derived term in this fold -- material and source
+    // generation are not -- so a newKeys rate that tracks camera travel can
+    // only be entering through it. Do NOT reach for [RsGroup] to support this:
+    // its slot is reset every frame and compared against the FIRST DRAW OF THE
+    // SAME FRAME, so o2wSame/matSame measure within-frame SEPARATION between
+    // co-grouped draws, not whether a term survives a frame. Reading its
+    // o2wSame=0 rate as cross-frame churn is a misreading this comment exists
+    // to stop.
+    //
+    // WHAT THIS DOES AND DOES NOT BUY, so the next reader does not expect the
+    // wrong number to move. It does NOT create hits: a wobbling o2w now fails
+    // o2wMatch below instead of missing on the key, which is the note's "same
+    // outcome, different attribution". What it stops is RECORD CHURN -- the
+    // draw reuses its key instead of minting a fresh one every frame -- and
+    // newKeys is precisely the acceptance gate rtx.conf puts in front of
+    // raising numFramesToKeepInstances ("Stability FIRST, keep SECOND", with
+    // the [PropIdKeepLong attempt reverted] receipt attached). Driving newKeys
+    // to ~0 is what unblocks that, and the o2w wobble then becomes visible as
+    // missO2w -- a live counter for the first time -- to be addressed on its
+    // own evidence rather than hidden inside the key.
+    // THE MATERIAL IS OUT OF THE KEY. It is a DIRTY TEST, not an identity.
+    //
+    // RESIDENT_SCENE_PLAN §1.1 defines this key as IdentHead -- buffer pointers,
+    // offsets, stride, draw range, VS hash, input layout, index format, plus the
+    // occurrence ordinal -- and it contains no material and no transform. Its
+    // own measurement there is "zero new keys per frame on world geometry,
+    // camera moving". The material and o2w folds were added on top of that, and
+    // both belong to §1.2's dirty test instead: §7.8 states the exclusion
+    // criterion as a list of things to compare AFTER the record is found, not
+    // terms to put in the identity that finds it.
+    //
+    // MEASURED, [RsIdent], camera still, both identities at 0% new:
+    //
+    //   identHead   gap1=69158 (49%)   gap2=16906
+    //   hdPlusMat   gap1=12404 ( 9%)   gap2=71238 (51%)
+    //   narrowed    gap1=12388 ( 9%)   gap2=71129 (51%)
+    //
+    // hdPlusMat and narrowed agree to within 0.2% on every column, so the
+    // placement fold is innocent and the material fold is the alternator: it
+    // moves half the draws from gap1 to gap2 with period 2. The gate requires
+    // gap<=1, so those draws can never hit -- ~3,500 of the 3,568 key misses in
+    // a 4,816-draw window -- and it is why missMat reads 0, since an altered
+    // material re-keys the draw before the material comparison is reached.
+    //
+    // NOTHING IS LOST BY REMOVING IT. residentMaterialFold's header defends the
+    // fold with "a draw that changes only its material would pass a gate built
+    // from those two and be skipped -- leaving the old material resident with
+    // nothing to catch it". That is the argument for the material being in the
+    // DIRTY TEST, and it still is: matMatch below compares e.matHash and a
+    // mismatch scores missMat, so a material change refuses the serve exactly as
+    // before. Having it in BOTH places was redundant and cost the lookup.
+    uint64_t narrowed = baseKey;
+
+    // [RsIdent] candidate `hdPlusMat`: what the key USED to be, kept as a probe
+    // input so the alternation stays measured after being removed. If this keeps
+    // reading gap2 while `narrowed` reads gap1, the removal did what it should.
+    const uint64_t narrowedMatOnly = XXH64(&m_rsDrawMat, sizeof(m_rsDrawMat), baseKey);
+
+    // AND THE PLACEMENT COUNT, WHICH IS THE WHOLE OF failSize.
+    //
+    // A fanout draw carries N independent props in one draw call and assigns
+    // objectToWorld = identity, so the o2w term above is the SAME CONSTANT on
+    // every such draw and the placement list is the only thing that separates
+    // them. Nothing read the list, so a batch that gained or lost a prop kept
+    // its key, predicted a hit, and was scored against a record naming a
+    // different number of instances.
+    //
+    // MEASURED, on the population that actually fires. Over a 3,000-frame
+    // window: 45,585 scored draws, of which 180 had a placement count differing
+    // from the previous sighting of the same key -- against exactly 180
+    // [RsFailSize] events in that same window. Every size failure is one of
+    // these and there are no others. The collide path, which drops placements
+    // and was the other candidate, moved on 2.
+    //
+    // THE COUNT, NOT THE BYTES, and the difference was measured before choosing.
+    // Folding the placement bytes would also catch these, since bytes change
+    // when the count does, but it goes dirty whenever any prop MOVES: 51,849 of
+    // 547,318 draws, 9.5%, against 0.67% for the count. That is fourteen times
+    // the key churn to buy protection against movement, which is a staleness
+    // question and not this one. If held translucent or reflective fanout
+    // geometry ever shows movement artefacts, the bytes are the fold to reach
+    // for and 9.5% is the price already established.
+    //
+    // A CHANGED COUNT NOW MISSES INSTEAD OF SERVING WRONGLY. The batch really is
+    // a different request, so a miss is the correct answer, not a suppression:
+    // the draw takes the full path and rebuilds the record it will serve next
+    // frame. Watch newKeys -- it should rise by about 0.67% of fanout draws and
+    // no more. A larger climb means the count is unstable for a reason this did
+    // not measure, and the fold should come back out.
+    //
+    // Applied wherever a placement list exists rather than to fanout batches
+    // alone. A draw carrying N placements is asking for something different from
+    // one carrying M whichever producer filled the list, and for the paths not
+    // measured here the fold can only turn a wrong serve into a miss.
+    if (drawCallState.transformData.instancesToObject != nullptr) {
+      const uint32_t nPlace =
+        static_cast<uint32_t>(drawCallState.transformData.instancesToObject->size());
+      narrowed = XXH64(&nPlace, sizeof(nPlace), narrowed);
+    }
+
+    ResidentOccupancy& occ = m_residentOccupancy[narrowed];
+    if (occ.frame != frameId) {
+      occ.frame = frameId;
+      occ.counter = 0u;
+    }
+    const uint32_t rsOrdinal = occ.counter++;
+
+    uint64_t key = XXH64(&rsOrdinal, sizeof(rsOrdinal), narrowed);
+    if (key == 0ull) {
+      key = 1ull;   // never the no-record sentinel
+    }
+
+    // NV-DXVK [RsIdent]: DOES EACH CANDIDATE IDENTITY SURVIVE A FRAME.
+    //
+    // THE QUESTION. Dropping o2w from the fold moved newKeys standing still
+    // (1.4-3.3% flattening at ~1.5% -> decaying to 0.4%) and hits with it
+    // (2.0% -> 3.7%), but barely moved the camera-moving case: newKeys 17% ->
+    // 13.7%, with missO2w going live at only 572 against 53,377 new keys. So
+    // o2w was not carrying the churn, and the remaining camera-correlated term
+    // has to be found rather than guessed at -- six identity candidates have
+    // already been killed in this tree by guessing.
+    //
+    // AND A SEPARATE, LARGER ONE. In the same window, draws=4816 missKey=3568
+    // newKeys=70: only 70 of 3,568 key misses are new keys, so ~3,500 are keys
+    // that ARE in the gate and fail contiguity. That is a CADENCE failure, not
+    // an identity one, and no key change can touch it. This probe reports the
+    // gap distribution per candidate so the two stop being confused: `new` is
+    // identity churn, `gap2` is the cadence.
+    //
+    // WHAT EACH CANDIDATE ANSWERS.
+    //   identHead    the IA identity (buffers + draw range). If `new` tracks
+    //                camera travel, the engine is re-batching under culling and
+    //                the draw stream genuinely differs -- a ceiling no key
+    //                lifts, and the point at which to stop working on keys.
+    //   drawKey      the narrower downstream identity actually used as baseKey.
+    //   narrowed     drawKey + material + placement count, i.e. today's key
+    //                without the ordinal.
+    //   keyWithOrd   today's key. Compared against `narrowed` it prices the
+    //                ordinal exactly: any excess `new` is the ordinal sliding.
+    //   xfSnapshot   memoXfHash, the decoded draw-state hash [DrawRedund] uses.
+    //                Included because it is the obvious thing to reach for and
+    //                it should be measured rather than argued about -- note it
+    //                folds worldToView AND viewToProjection, so it is expected
+    //                to be ~100% new under any camera motion. If it is, that
+    //                settles it as a residency identity; it is built to detect
+    //                frame-to-frame redundancy INCLUDING the camera, which is
+    //                the opposite question.
+    //
+    // gap0 is counted apart from gap1: a candidate repeating inside one frame
+    // failed to SEPARATE two draws, which is a different defect from failing to
+    // survive to the next frame, and collapsing them would hide it.
+    //
+    // No lock. residentGateJudge runs on the frame thread -- the same property
+    // censusRecordO2w relies on one call site up -- so function-static state is
+    // single-threaded here. Do not copy this probe somewhere a worker reaches.
+    if (RtxOptions::ResidentScene::logStats()) {
+      constexpr uint32_t kVariants = 6;
+      constexpr size_t kMaxTracked = 100000;
+      constexpr uint32_t kIdentDumpFrames = 300u;
+      struct Recur {
+        std::unordered_map<uint64_t, uint32_t> lastFrame;
+        uint32_t nw = 0u, g0 = 0u, g1 = 0u, g2 = 0u, g3 = 0u;
+        uint32_t cleared = 0u;
+      };
+      static Recur sIdent[kVariants];
+      static uint32_t sIdentLastDump = 0xFFFFFFFFu;
+      static const char* const kIdentName[kVariants] =
+        { "identHead", "drawKey", "hdPlusMat", "narrowed", "keyWithOrd", "xfSnapshot" };
+
+      const uint64_t candId[kVariants] = {
+        m_rsDrawBaseKey,
+        baseKey,
+        narrowedMatOnly,
+        narrowed,
+        key,
+        memoXfHash(drawCallState.transformData)
+      };
+
+      for (uint32_t v = 0; v < kVariants; ++v) {
+        Recur& r = sIdent[v];
+        // Bounded rather than swept, and the clear is COUNTED: a candidate that
+        // overflows every window is one minting a fresh value per draw, which
+        // is itself the answer rather than a measurement problem.
+        if (r.lastFrame.size() > kMaxTracked) {
+          r.lastFrame.clear();
+          r.cleared += 1u;
+        }
+        auto rIt = r.lastFrame.find(candId[v]);
+        if (rIt == r.lastFrame.end()) {
+          r.nw += 1u;
+          r.lastFrame.emplace(candId[v], frameId);
+        } else {
+          const uint32_t gap = frameId - rIt->second;
+          if (gap == 0u) {
+            r.g0 += 1u;
+          } else if (gap == 1u) {
+            r.g1 += 1u;
+          } else if (gap == 2u) {
+            r.g2 += 1u;
+          } else {
+            r.g3 += 1u;
+          }
+          rIt->second = frameId;
+        }
+      }
+
+      if (sIdentLastDump == 0xFFFFFFFFu) {
+        sIdentLastDump = frameId;
+      } else if (frameId - sIdentLastDump >= kIdentDumpFrames) {
+        sIdentLastDump = frameId;
+        for (uint32_t v = 0; v < kVariants; ++v) {
+          Recur& r = sIdent[v];
+          const uint32_t tot = r.nw + r.g0 + r.g1 + r.g2 + r.g3;
+          if (tot == 0u) {
+            continue;
+          }
+          Logger::warn(str::format(
+            "[RsIdent] f=", frameId,
+            " cand=", kIdentName[v],
+            " draws=", tot,
+            " new=", r.nw, " (", (100u * r.nw) / tot, "%)",
+            " gap0=", r.g0,
+            " gap1=", r.g1,
+            " gap2=", r.g2,
+            " gap3plus=", r.g3,
+            " distinct=", static_cast<uint32_t>(r.lastFrame.size()),
+            " cleared=", r.cleared));
+          r.nw = r.g0 = r.g1 = r.g2 = r.g3 = 0u;
+        }
+      }
+    }
+
     // The key and the fold travel with the draw either way: on a hit the commit
     // collapses to a touch of this key, and on a miss the full path carries it
     // so the CS side can (re)build the record it will serve next frame. A draw
     // whose record is never built is a draw the gate can never hit.
     drawCallState.residentKey             = key;
+    drawCallState.residentOrdinal         = rsOrdinal;
     drawCallState.residentGenHash         = m_rsDrawGens;
     drawCallState.residentSrcVertexBuffer = m_rsDrawSrcVb;
     drawCallState.residentSrcIndexBuffer  = m_rsDrawSrcIb;
 
-    const uint32_t frameId = m_context->m_device->getCurrentFrameId();
-    const uint64_t o2w = XXH64(&drawCallState.transformData.objectToWorld, sizeof(Matrix4), 0ull);
+    // NV-DXVK [RsGroup]: WHAT DIFFERS BETWEEN DRAWS THAT SHARE ONE IA IDENTITY
+    // INSIDE ONE FRAME. Those draws are what the occurrence ordinal exists to
+    // separate, and the ordinal separates them by SUBMISSION ORDER, which is not
+    // stable across frames -- measured as [RsFailMember] 81% disjoint.
+    //
+    // Replacing the ordinal with objectToWorld was tried on 2026-08-23 and made
+    // it worse (2.2% -> 99.70% wrong), which proves these draws share a
+    // transform. It does NOT say what they do differ in, and that is the one
+    // fact a replacement discriminator has to be built on. This reports it
+    // rather than guessing again: for every draw after the first in a group,
+    // print whether it agrees with the FIRST draw of that group on each
+    // candidate, plus the raw values so the flags can be checked.
+    //
+    // Reading it: o2wSame=1 throughout means placement can never discriminate
+    // here, and the group is one object drawn several times (multi-pass, or a
+    // fanout whose DrawCallState carries only the first instance's transform).
+    // matSame=0 means the material fold already separates them and is a
+    // candidate. genSame=0 means the geometry generation does. All three
+    // reading 1 means nothing in hand distinguishes these draws and the
+    // discriminator has to come from render state that is not captured yet.
+    if (RtxOptions::ResidentScene::logStats() && m_rsDrawBaseKey != 0ull) {
+      struct GroupSlot {
+        uint32_t frame = 0xFFFFFFFFu;
+        uint32_t count = 0u;
+        uint64_t o2w = 0ull, mat = 0ull, gen = 0ull;
+      };
+      static thread_local std::unordered_map<uint64_t, GroupSlot> t_groups;
+      // Diagnostic map, bounded rather than swept: identities do not outlive a
+      // level and a stale slot only costs one wrong "first" comparison.
+      if (t_groups.size() > 20000u) {
+        t_groups.clear();
+      }
+      GroupSlot& g = t_groups[m_rsDrawBaseKey];
+      if (g.frame != frameId) {
+        g.frame = frameId;
+        g.count = 1u;
+        g.o2w = o2w;
+        g.mat = m_rsDrawMat;
+        g.gen = m_rsDrawGens;
+      } else {
+        g.count += 1u;
+        static std::atomic<uint32_t> sGroupLines { 0 };
+        constexpr uint32_t kMaxGroupLines = 400;
+        if (sGroupLines.fetch_add(1, std::memory_order_relaxed) < kMaxGroupLines) {
+          Logger::info(str::format(
+            "[RsGroup] f=", frameId,
+            " base=0x", std::hex, m_rsDrawBaseKey, std::dec,
+            " n=", g.count,
+            " ord=", rsOrdinal,
+            " o2wSame=", (o2w == g.o2w ? 1 : 0),
+            " matSame=", (m_rsDrawMat == g.mat ? 1 : 0),
+            " genSame=", (m_rsDrawGens == g.gen ? 1 : 0),
+            " o2w=0x", std::hex, o2w, " first_o2w=0x", g.o2w,
+            " mat=0x", m_rsDrawMat, " first_mat=0x", g.mat,
+            " gen=0x", m_rsDrawGens, " first_gen=0x", g.gen, std::dec));
+        }
+      }
+    }
 
     const auto it = m_residentGate.find(key);
     if (it == m_residentGate.end()) {
       m_rsNewKeys += 1;
       m_rsMissKey += 1;
+      // Counted here too -- a new key is a judged draw, and leaving it out would
+      // bias the denominator by exactly the population with no history.
+      if (RtxOptions::ResidentScene::logStats()
+          && drawCallState.transformData.isFanoutBatch) {
+        rsGateFrameTally(frameId, 0u, false, false, false);
+      }
       ResidentGateEntry& e = m_residentGate[key];
       e.srcGenHash    = m_rsDrawGens;
       e.matHash       = m_rsDrawMat;
@@ -39749,6 +40705,48 @@ namespace dxvk {
     } else {
       m_rsHit += 1;
       drawCallState.residentPredictHit = true;
+    }
+
+    // NV-DXVK [RsGate]: THE FRAME THREAD'S OWN VIEW OF THE SAME KEY, so the two
+    // sides can be compared instead of reasoned about.
+    //
+    // [RsPlace] on the CS side measures the gap between consecutive sightings of
+    // one residentKey as f - psFrame and reads EXACTLY 2 on 541 of 547 samples,
+    // including 520 of the 523 that carry predictHit=1. A predictHit requires
+    // contiguity HERE, which admits only a gap of 1 or 0. Both sides read the
+    // same clock -- getCurrentFrameId() is QueuePresentCount, incremented at one
+    // site -- so one of the two sightings the CS side pairs up is not the one
+    // this side paired, and no amount of reading the code has settled which.
+    //
+    // Printing prevSeen= raw rather than a derived flag, keyed on the same key=,
+    // makes the join offline: for one key, this side's frameId/prevSeen against
+    // that side's f/psFrame. Fanout only, because that is the population where
+    // the disagreement was measured.
+    if (RtxOptions::ResidentScene::logStats()
+        && drawCallState.transformData.isFanoutBatch) {
+      rsGateFrameTally(frameId, e.frameLastSeen, true,
+                       drawCallState.residentPredictHit, contiguous);
+
+      // HITS ONLY. The ordinal clause that used to share this cap spent all 600
+      // lines in the opening frames, where hits do not yet occur, and the raw
+      // sample then described a population nobody was asking about. The
+      // histogram above covers every draw; this exists solely to show the hits
+      // in full, so the buckets can be checked against the values behind them.
+      static std::atomic<uint32_t> sGateLines { 0 };
+      constexpr uint32_t kMaxGateLines = 600;
+      if (drawCallState.residentPredictHit
+          && sGateLines.fetch_add(1, std::memory_order_relaxed) < kMaxGateLines) {
+        Logger::info(str::format(
+          "[RsGate] f=", frameId,
+          " prevSeen=", e.frameLastSeen,
+          " key=0x", std::hex, key, std::dec,
+          " ord=", rsOrdinal,
+          " contig=", (contiguous ? 1 : 0),
+          " gens=", (gensMatch ? 1 : 0),
+          " o2w=", (o2wMatch ? 1 : 0),
+          " mat=", (matMatch ? 1 : 0),
+          " predictHit=", (drawCallState.residentPredictHit ? 1 : 0)));
+      }
     }
 
     e.srcGenHash    = m_rsDrawGens;
@@ -49717,7 +50715,7 @@ namespace dxvk {
           const uint64_t propId = MakeBoneStablePropId(nullptr);
           if (propId != 0) {
             dcs.transformData.stablePropId = propId;
-            notePropIdSrc(kPropIdSrcBoneA);   // [PropIdSrc] non-fanout bone draw
+            notePropIdSrc(kPropIdSrcBoneA, static_cast<uint64_t>(dcs.transformData.vertexShaderHash));   // [PropIdSrc] non-fanout bone draw
             static std::mutex sLogMu;
             static std::unordered_set<uint64_t> sLogged;
             bool first = false;
@@ -49758,7 +50756,7 @@ namespace dxvk {
           const uint64_t propId = MakeBoneStablePropId(nullptr);
           if (propId != 0) {
             dcs.transformData.stablePropId = propId;
-            notePropIdSrc(kPropIdSrcBoneA);   // [PropIdSrc] non-fanout bone draw
+            notePropIdSrc(kPropIdSrcBoneA, static_cast<uint64_t>(dcs.transformData.vertexShaderHash));   // [PropIdSrc] non-fanout bone draw
             static std::mutex sLogMu;
             static std::unordered_set<uint64_t> sLogged;
             bool first = false;
@@ -51081,7 +52079,7 @@ namespace dxvk {
         const uint64_t propId = MakeBoneStablePropId(&firstInst);
         if (propId != 0) {
           dcs.transformData.stablePropId = propId;
-          notePropIdSrc(kPropIdSrcBoneB);   // [PropIdSrc] path-10 fanout
+          notePropIdSrc(kPropIdSrcBoneB, static_cast<uint64_t>(dcs.transformData.vertexShaderHash));   // [PropIdSrc] path-10 fanout
           // NV-DXVK [perf] 2026-08-08: the [BonePropId path10-fanout] diagnostic
           // that lived here is DELETED, answer recorded 2026-08-05: this propId
           // names whichever prop is element [0] of the batch and ROTATES every
@@ -51173,7 +52171,7 @@ namespace dxvk {
         const uint64_t propId = MakeBoneStablePropId(nullptr);
         if (propId != 0) {
           dcs.transformData.stablePropId = propId;
-          notePropIdSrc(kPropIdSrcBoneB);   // [PropIdSrc] path-10 N-draw
+          notePropIdSrc(kPropIdSrcBoneB, static_cast<uint64_t>(dcs.transformData.vertexShaderHash));   // [PropIdSrc] path-10 N-draw
           static std::mutex sLogMu;
           static std::unordered_set<uint64_t> sLogged;
           bool first = false;
@@ -55811,7 +56809,7 @@ namespace dxvk {
     // game stays on one frame" moment. The A/B kill-switch gating on
     // rtx.skyAutoDetect is removed per user request to reproduce that
     // exact condition.
-    SetSkyCategoryFromCb2(dcs, pend);
+    SetSkyCategoryFromCb2(dcs, pend, start, base);
 
     // NV-DXVK [perf]: close the sky-classifier sub-split here. markStg measures
     // since the previous mark (commitBoneCap), which is the SetSkyCategoryFromCb2
@@ -55866,54 +56864,6 @@ namespace dxvk {
       // identity DrawCallCache matches on, not a probe). See
       // DrawCallState::engineMaterialPtr.
       dcs.engineMaterialPtr = t_matsysMatPtr;
-      // NV-DXVK [KeyStab]: mint the engine-side stream identity next to the
-      // material pointer, from the same record the [DrawName] block below reads.
-      //
-      // These are the GAME's D3D11Buffer objects. They are engine allocations
-      // made at level or entity spawn and reused for that entity's lifetime, so
-      // they survive the per-frame rewrite of the vertex CONTENT that defeats
-      // FullGeometryHash. That is the same reasoning, and the same inputs, as
-      // D3D11Rtx::residentDrawKey, which measured 0 new keys per frame on
-      // several draw populations with the camera moving.
-      //
-      // WHY NOT THE ONE exactMatch ALREADY TRIED. sameIaIdentity (removed
-      // 2026-08-22) compared RasterGeometry's buffers, which are DxvkBuffer --
-      // the VULKAN-side allocation, renamed on every dynamic map. It matched 31
-      // times against a population of 5126. Same idea, wrong side of the
-      // translation layer.
-      {
-        const auto& ksVb0 = drawVertexBuffer(0);
-        const auto& ksIb  = drawIndexBuffer();
-        if (ksVb0.buffer != nullptr) {
-          struct KeyStabHead {
-            uint64_t vbPtr;
-            uint64_t ibPtr;
-            uint64_t vsHash;
-            uint32_t vbOffset;
-            uint32_t vbStride;
-            uint32_t ibOffset;
-            uint32_t drawStart;
-            uint32_t drawCount;
-            int32_t  drawBase;
-            uint32_t indexed;
-            uint32_t pad;
-          };
-          static_assert(sizeof(KeyStabHead) == 56, "KeyStabHead must have no implicit padding");
-          KeyStabHead ks = { };
-          ks.vbPtr     = reinterpret_cast<uint64_t>(ksVb0.buffer.ptr());
-          ks.ibPtr     = (ksIb.buffer != nullptr)
-                       ? reinterpret_cast<uint64_t>(ksIb.buffer.ptr()) : 0ull;
-          ks.vsHash    = static_cast<uint64_t>(vsXxhRt);
-          ks.vbOffset  = ksVb0.offset;
-          ks.vbStride  = ksVb0.stride;
-          ks.ibOffset  = ksIb.offset;
-          ks.drawStart = c.start;
-          ks.drawCount = c.count;
-          ks.drawBase  = c.base;
-          ks.indexed   = c.indexed ? 1u : 0u;
-          dcs.engineDrawKey = XXH64(&ks, sizeof(ks), 0ull);
-        }
-      }
       // NV-DXVK [DrawName]: name the probe-VS draws with the matsys-Bind hook
       // ([MatBind] slot-0x80 -> t_matsysMatPtr, Option C) instead of inferring
       // what a VS draws from hashes or old comments. The bind happens on this
@@ -57980,10 +58930,11 @@ namespace dxvk {
             XXH64(&tspBufId, sizeof(tspBufId), 0xA11CEBABEull));
           if (tspPropId == 0ull) tspPropId = 1ull;
           dcs.transformData.stablePropId = tspPropId;
+
           // [PropIdSrc] third producer, and note it is ALSO a buffer-id hash
           // (tspBufId) -- the same shape as the bone producer whose in-tree
           // comment admits its pointers rotate per frame.
-          notePropIdSrc(kPropIdSrcTsp);
+          notePropIdSrc(kPropIdSrcTsp, static_cast<uint64_t>(dcs.transformData.vertexShaderHash));
 
           // One-shot per VS log so we can see in [Coverage] / log that
           // the propId is being written. After this lands, the stale-
@@ -59333,7 +60284,8 @@ namespace dxvk {
   //
   // Per-frame state resets in EndFrame; m_skyOriginLatched persists.
   bool D3D11Rtx::SetSkyCategoryFromCb2(DrawCallState& dcs,
-                                        const PendingDrawSlot& pend) {
+                                        const PendingDrawSlot& pend,
+                                        UINT startIndex, INT baseVertex) {
     // NV-DXVK [EngineCam-Skybox] kill-switch: when rtx.disableSkyTagging is
     // on, short-circuit the entire sky classifier so no draw gets tagged
     // as InstanceCategories::Sky. The user wants TF2's 3D-skybox geometry
@@ -60206,6 +61158,150 @@ namespace dxvk {
           propId = static_cast<uint64_t>(
             XXH64(&dcs.transformData.objectToWorld, sizeof(Matrix4), 0xA11CEBABEull));
 
+          // THE GEOMETRY IDENTITY IS FOLDED ON TOP OF THE MATRIX HASH.
+          //
+          // The block above claims this key is "unique per placement". It is
+          // not. objectToWorld here is the SUB-VIEW transform, which every prop
+          // drawn into that sub-view shares, so hashing it alone yields one id
+          // for the whole sub-view. Measured by [SubViewPropIdLife]: distinct=1
+          // on 1,490 of 1,500 frame lines while draws was 2 on 965 of them and
+          // 4 on 110 -- and by [SubViewPropIdSep], which caught a single propId
+          // shared by five draws spanning THREE different shaders in one frame,
+          // identical vb/ib/offsets, differing only in geometry extent.
+          //
+          // The consequence is the respawn this shader is on the candidate list
+          // for: getDataAtTransform is keyed on the propId, so the SpatialMap
+          // holds ONE instance for all of those draws, and every draw that does
+          // not win it mints a fresh instance which then ages out.
+          //
+          // WHY THESE TERMS, measured before folding rather than after.
+          // (vs, indexCount, vertexCount) fully separates 283 of 310 observed
+          // collision groups, and the whole run contains just 5 distinct tuples,
+          // each present in 151-162 of 162 frames -- so it separates within a
+          // frame and holds across them, which is what a key needs. The 27
+          // groups it does not split are the draws=10 case, one mesh submitted
+          // twice in a pass pair; collapsing those to a single instance is the
+          // correct outcome, not a shortfall.
+          //
+          // WHAT THIS DID NOT FIX, measured after the change and recorded here
+          // so the next reader does not assume otherwise. The collapse is gone
+          // -- [SubViewPropIdLife] now reads distinct=2 against draws=2 where it
+          // read distinct=1, with carried still equal to draws, so the key both
+          // separates within a frame and survives across them. The failures it
+          // was aimed at did NOT move: 0x2a729f16017d841b went from 22 of 50
+          // [RsFailMember] events to 20 of 74, same signature every time (every
+          // record instance unclaimed, every produced instance fresh), and
+          // [FindStage] propIdMiss went 0.86% -> 1.09% with the exact-hit rate
+          // flat at 65.7%. So the collision was a real defect and not the cause
+          // of the respawn on this shader.
+          //
+          // AND THE REASON, FOUND AFTERWARDS: objectToWorld IS NOT
+          // CAMERA-INDEPENDENT, WHICH IS THE CLAIM THIS KEY RESTS ON.
+          //
+          // The block above justifies hashing the pre-reproject matrix by
+          // asserting it "does not change when the player moves -- which is the
+          // entire failure this is fixing". Measured by [SubViewPropIdLife]
+          // after the fold: on 83 frames the carried count is not merely low, it
+          // is ZERO -- every propId for the shader is new at once -- and 81 of
+          // those 83 are 0x2a729f16017d841b, about one frame in nine of its
+          // draws. vs/indexCount/vertexCount are stable across the whole run (5
+          // distinct tuples), so the term flipping wholesale is the matrix.
+          //
+          // A wholesale flip orphans every instance filed under the old ids in
+          // the same frame, mints a fresh one for each draw, and leaves the old
+          // ones to age out untouched -- which is precisely the recUnclaimed +
+          // freshAll signature these failures carry. [Otc2904], aimed here for
+          // the first time, caught the transition directly: one line's
+          // spatialCacheHash equals the PREVIOUS line's stablePropId, i.e. an
+          // instance filed under the old id while the draw now computes a new
+          // one.
+          //
+          // WHAT THE REPAIR NEEDS, and why it is not done here. The matrix is
+          // doing two jobs: separating the sub-views (which it must) and
+          // identifying the prop (which it cannot, since it flips). Dropping it
+          // would merge the sub-views; keeping it keeps the flip. The fix is a
+          // stable sub-view IDENTITY -- an index or handle that names the view
+          // without encoding its current transform -- folded in place of the
+          // matrix. No such handle is in scope at this site, so adding one is a
+          // plumbing change rather than an edit here, and note the comment
+          // further up recording that this key was already "REVERTED to
+          // buffer-pointer hash" once: it has oscillated between two wrong
+          // answers before, and a third guess is not what it needs.
+          //
+          // FUTURE WORK, deliberately not done here: extent is a size proxy for
+          // identity, so two genuinely different meshes with identical vertex
+          // and index counts would still share an id. Nothing in this scene
+          // does. The stronger term is the draw's index range within the shared
+          // buffer, which locates the sub-allocation instead of describing its
+          // size. Worth doing if a collision reappears, and worth measuring the
+          // same way before folding it.
+          const uint64_t svVsHash =
+            static_cast<uint64_t>(dcs.transformData.vertexShaderHash);
+          const uint32_t svIdxCount = dcs.getGeometryData().indexCount;
+          const uint32_t svVtxCount = dcs.getGeometryData().vertexCount;
+
+          // THE MATRIX IS OUT OF THE KEY. It drifts, and that is the defect.
+          //
+          // Rebuilt from the identity terms only, then an occurrence ordinal
+          // within them -- the same shape residency uses, and for the same
+          // reason: fold what is stable first, and let an ordinal separate only
+          // what the stable terms could not.
+          //
+          // WHY NOT THE ENGINE'S OWN HANDLE. There is not one here. [MtnDraw2904]
+          // proposed the draw's slice (baseVertexLocation / startIndexLocation),
+          // on the reasoning that Source 1 selects a static prop by a slice into
+          // a shared VB/IB. Measured on this shader: startIdx and baseVtx are 0
+          // on every draw, and vb/ib are a single shared buffer renamed per
+          // draw, so the slice carries no identity at all. That matches this
+          // function's own older note -- an entity id "is discarded across two
+          // thread-hopping command queues; studiorender receives geometry, never
+          // identity".
+          //
+          // WHAT IS LEFT, and it is enough. (vs, indexCount, vertexCount)
+          // resolves to exactly 5 tuples across a whole run, each present in
+          // 151-162 of 162 frames, and it names the mesh. The only thing the
+          // matrix contributed beyond that was WHICH SUB-VIEW a draw belonged
+          // to: the same 5 meshes arrive twice per frame, once per view. That is
+          // an occurrence count, not a transform, so count it directly and leave
+          // the drifting matrix out entirely.
+          //
+          // THE RISK, stated because it is the one that killed the same shape
+          // elsewhere: an ordinal is submission order, and if the two sub-views
+          // ever swap order between frames the props swap ids -- the failure
+          // documented for the residency ordinal. It is bounded here in a way it
+          // was not there, because the ordinal only ever separates draws that
+          // already agree on shader and geometry, and the group is 2. The metric
+          // that decides it is [RsFailMember] for this shader: it falls to ~0 if
+          // the order is stable, and stays or worsens if it is not.
+          // NO OCCURRENCE ORDINAL. Both forms of it were measured and both are
+          // worse than the matrix they replaced, which is why this is back to
+          // folding the matrix with the geometry identity.
+          //
+          //   thread_local counter   this function is reached from
+          //                          SubmitDrawDeferred on a worker, so the two
+          //                          sub-views can land on different threads and
+          //                          each counter starts at zero: 394 duplicate
+          //                          propId groups over 151 frames, two draws
+          //                          sharing one id.
+          //   shared counter         removing the duplicates (394 -> 0) made the
+          //                          failures FOUR TIMES worse, 75 -> 317,
+          //                          because a counter incremented from racing
+          //                          threads orders by scheduling. A prop draws
+          //                          ord=0 one frame and ord=1 the next, so every
+          //                          id is unstable across frames.
+          //
+          // The second reading is the useful one: for this failure, STABILITY
+          // ACROSS FRAMES matters more than separation within a frame. The
+          // thread_local version collided the two sub-views and still scored
+          // better, because each prop at least kept one id. Any discriminator
+          // derived from submission order fails that test by construction.
+          //
+          // So the matrix stays in the key despite its drift. It is wrong on
+          // about one frame in nine and the ordinal was wrong on far more.
+          propId = static_cast<uint64_t>(XXH64(&svVsHash, sizeof(svVsHash), propId));
+          propId = static_cast<uint64_t>(XXH64(&svIdxCount, sizeof(svIdxCount), propId));
+          propId = static_cast<uint64_t>(XXH64(&svVtxCount, sizeof(svVtxCount), propId));
+
           // Force non-zero (0 means "use matrix hash" per the spatial map
           // convention). If XXH64 ever returns 0, bump to 1 â€” collision
           // probability with another non-zero hash is negligible.
@@ -60217,13 +61313,443 @@ namespace dxvk {
           // 0x292b6ba0d1854f28 (2026-08-05) the rotation period is exactly 3.
           // Suppressing restores matrix-bytes keying so that claim is testable
           // rather than accepted. See IsStablePropIdSuppressed().
+          // NV-DXVK [SubViewPropIdLife]: DO THESE IDS SURVIVE A FRAME.
+          //
+          // The key above is a hash of the PRE-reproject objectToWorld, and the
+          // block argues that matrix is camera-independent and therefore steady
+          // for a static prop. That has never been measured directly, and the
+          // one measurement that looks like it confirms the matrix is steady is
+          // measuring a DIFFERENT matrix: residency's gate reads objectToWorld
+          // in the SubmitDraw tail, after `objectToWorld = T_reproject *
+          // objectToWorld` has been applied, so its byte-identical o2w is the
+          // POST-reproject value. Pre and post are not interchangeable here.
+          //
+          // [FindSim] shows a fresh propId on every sampled draw, but its
+          // samples are 1024 calls apart and therefore different props -- it
+          // cannot distinguish "this prop got a new id" from "these are simply
+          // different props". A set carried across frames can: for a static
+          // scene, nearly every id this frame should have existed last frame.
+          //
+          //   carried ~ draws   the ids are stable and the exact-stage misses
+          //                     are somewhere other than this producer.
+          //   carried ~ 0       every prop is minting a new id per frame, which
+          //                     is the respawn directly, and the pre-reproject
+          //                     matrix is not the invariant this block assumes.
+          //
+          // THAT SECOND READING DOES NOT FOLLOW, and the map below is why. It is
+          // thread_local while this function runs on several workers, so `prev`
+          // holds only the draws THIS thread saw last frame and carried=0 means
+          // "this thread saw a different set", not "the ids changed". Read
+          // [PropIdCensus] instead; it answers the same question globally.
+          if (RtxOptions::ResidentScene::logStats()) {
+            // NV-DXVK [PropIdCensus]: THE GLOBAL, RUN-LENGTH ID CENSUS.
+            //
+            // WHY THIS EXISTS. [SubViewPropIdLife] below keeps its state in
+            // `static thread_local t_life`, and this function is reached from
+            // SubmitDrawDeferred on a WORKER -- the same fact that broke the
+            // thread_local occurrence ordinal. Its `carried` therefore counts
+            // "ids THIS THREAD also saw last frame", not "ids that survived the
+            // frame". Measured in the 2026-08-23 log: 529 of 971 (frame,vs)
+            // keys are reported TWICE, once per worker, and 89 of those pairs
+            // DISAGREE. f=8870 vs=0x298be343f6622c9f reads carried=2 on one
+            // thread and carried=0 on the other -- same frame, same shader. A
+            // thread that handled a different pair of draws this frame than
+            // last frame reads carried=0 while the ids are globally unchanged,
+            // and that is exactly the signature that was read as "every propId
+            // for the shader is new at once". Do not act on `carried` unless the
+            // numbers below agree with it.
+            //
+            // WHAT THIS MEASURES INSTEAD. One SHARED table keyed by
+            // (vs, indexCount, vertexCount) -- the identity terms already folded
+            // into the key -- holding every propId ever minted under it and the
+            // frame each was FIRST seen. That makes the deciding numbers
+            // independent of which thread ran the draw:
+            //
+            //   distinct   cumulative distinct ids for this key. A key whose
+            //              matrix flips wholesale climbs all run; a stable key
+            //              saturates at one id per sub-view and stops.
+            //   newWin     ids minted in this window -- the minting RATE, and
+            //              the direct replacement for `carried`. A stable key
+            //              reads 0 after the opening frames.
+            //   carryWin   draws whose id was first seen on an EARLIER frame.
+            //              firstFrame < thisFrame is a property of the ID, so
+            //              two draws colliding on one id inside a frame cannot
+            //              inflate it the way a set-membership test does.
+            //
+            // It is a histogram rather than a sample, so it cannot expire before
+            // the population it was aimed at. It is bounded by kMaxIds per key
+            // and kMaxKeys total with an overflow counter, because "it hit the
+            // cap" is itself the answer.
+            {
+              struct IdInfo { uint32_t firstFrame; uint32_t lastFrame; uint32_t count; };
+              struct CensusEntry {
+                uint64_t vs = 0ull;
+                uint32_t idxCount = 0u, vtxCount = 0u;
+                std::unordered_map<uint64_t, IdInfo> ids;
+                uint64_t draws = 0ull;
+                uint32_t frames = 0u;
+                uint32_t lastFrame = 0xFFFFFFFFu;
+                uint32_t overflow = 0u;
+                uint32_t winFrames = 0u, winDraws = 0u, winNew = 0u, winCarried = 0u;
+
+                // THE CANDIDATE KEY, scored beside the live one and never used.
+                // Same three numbers, so the two are read off one line and the
+                // choice is measured rather than argued.
+                std::unordered_map<uint64_t, IdInfo> candIds;
+                uint32_t candNew = 0u, candCarried = 0u, candOverflow = 0u;
+                // Availability of the content hash, which is served by a Future
+                // and may not be resolved this early in the submit. A candidate
+                // that is only sometimes computable is not a candidate.
+                uint32_t vposHave = 0u, vposMiss = 0u;
+                // WITHIN-FRAME SEPARATION for the candidate, which is the half
+                // the content hash is expected to fail: the same mesh drawn once
+                // per sub-view has one content hash, so T_reproject has to do the
+                // separating. A merged frame is one where the candidate produced
+                // fewer distinct ids than there were draws.
+                uint32_t frameNo = 0xFFFFFFFFu;
+                uint32_t frameDraws = 0u;
+                std::unordered_set<uint64_t> frameCandIds;
+                uint32_t candFrames = 0u, candFramesMerged = 0u;
+              };
+              constexpr size_t kMaxIds = 8192;
+              constexpr size_t kMaxKeys = 64;
+              constexpr uint32_t kDumpEveryFrames = 300u;
+
+              static std::mutex sCensusMu;
+              static std::unordered_map<uint64_t, CensusEntry> sCensus;
+              static uint32_t sCensusLastDump = 0xFFFFFFFFu;
+
+              const uint64_t cVs = static_cast<uint64_t>(dcs.transformData.vertexShaderHash);
+              const uint32_t cIdx = dcs.getGeometryData().indexCount;
+              const uint32_t cVtx = dcs.getGeometryData().vertexCount;
+              const uint32_t cFrame = m_context->m_device->getCurrentFrameId();
+
+              uint64_t cKey = XXH64(&cVs, sizeof(cVs), 0x9E3779B97F4A7C15ull);
+              cKey = XXH64(&cIdx, sizeof(cIdx), cKey);
+              cKey = XXH64(&cVtx, sizeof(cVtx), cKey);
+
+              // THE CANDIDATE: content x sub-view, with no pre-reproject matrix
+              // in it anywhere.
+              //
+              // WHY THESE TWO TERMS. The key needs to say WHICH PROP and WHICH
+              // SUB-VIEW, and the pre-reproject objectToWorld is currently doing
+              // both jobs while being fit for neither.
+              //
+              //   VertexPosition   names the prop by its CONTENT. It cannot move
+              //                    with the camera and it does not care that the
+              //                    vertex buffer is renamed per draw, which is
+              //                    what defeated the buffer-pointer key.
+              //   T_reproject      names the sub-view, and is camera-independent
+              //                    BY CONSTRUCTION rather than by assumption:
+              //                    its translation is -scale * anchor once the
+              //                    anchor is valid, and the derivation above
+              //                    shows mainCam cancelling out of it exactly.
+              //                    That is the property the pre-reproject matrix
+              //                    was asserted to have and does not.
+              //
+              // Scored only. Nothing downstream reads cCand, so a bad result
+              // costs a log line rather than a regression. The two open
+              // questions it answers are whether the content hash is resolved
+              // this early (vposHave/vposMiss) and whether T_reproject actually
+              // separates the sub-views (candFramesMerged).
+              const XXH64_hash_t cVpos =
+                dcs.geometryData.hashes[HashComponents::VertexPosition];
+              const bool cVposOk = (cVpos != kEmptyHash);
+              uint64_t cCand = XXH64(&T_reproject, sizeof(Matrix4), 0xCA11DA7Aull);
+              cCand = XXH64(&cVpos, sizeof(cVpos), cCand);
+
+              std::lock_guard<std::mutex> censLock(sCensusMu);
+
+              auto censIt = sCensus.find(cKey);
+              if (censIt == sCensus.end() && sCensus.size() < kMaxKeys) {
+                censIt = sCensus.emplace(cKey, CensusEntry{}).first;
+                censIt->second.vs = cVs;
+                censIt->second.idxCount = cIdx;
+                censIt->second.vtxCount = cVtx;
+              }
+              if (censIt != sCensus.end()) {
+                CensusEntry& ent = censIt->second;
+                if (ent.lastFrame != cFrame) {
+                  ent.frames += 1u;
+                  ent.winFrames += 1u;
+                  ent.lastFrame = cFrame;
+                }
+                ent.draws += 1ull;
+                ent.winDraws += 1u;
+
+                auto idIt = ent.ids.find(propId);
+                if (idIt == ent.ids.end()) {
+                  if (ent.ids.size() < kMaxIds) {
+                    ent.ids.emplace(propId, IdInfo { cFrame, cFrame, 1u });
+                    ent.winNew += 1u;
+                  } else {
+                    ent.overflow += 1u;
+                  }
+                } else {
+                  if (idIt->second.firstFrame < cFrame) {
+                    ent.winCarried += 1u;
+                  }
+                  idIt->second.lastFrame = cFrame;
+                  idIt->second.count += 1u;
+                }
+
+                // --- the candidate, same accounting -------------------------
+                if (cVposOk) {
+                  ent.vposHave += 1u;
+                } else {
+                  ent.vposMiss += 1u;
+                }
+
+                // Close out the previous frame's within-frame separation before
+                // this draw joins the new one.
+                if (ent.frameNo != cFrame) {
+                  if (ent.frameDraws > 0u) {
+                    ent.candFrames += 1u;
+                    if (ent.frameCandIds.size() < ent.frameDraws) {
+                      ent.candFramesMerged += 1u;
+                    }
+                  }
+                  ent.frameCandIds.clear();
+                  ent.frameDraws = 0u;
+                  ent.frameNo = cFrame;
+                }
+                ent.frameDraws += 1u;
+                ent.frameCandIds.insert(cCand);
+
+                auto candIt = ent.candIds.find(cCand);
+                if (candIt == ent.candIds.end()) {
+                  if (ent.candIds.size() < kMaxIds) {
+                    ent.candIds.emplace(cCand, IdInfo { cFrame, cFrame, 1u });
+                    ent.candNew += 1u;
+                  } else {
+                    ent.candOverflow += 1u;
+                  }
+                } else {
+                  if (candIt->second.firstFrame < cFrame) {
+                    ent.candCarried += 1u;
+                  }
+                  candIt->second.lastFrame = cFrame;
+                  candIt->second.count += 1u;
+                }
+              }
+
+              // Dumped under the SAME lock the counters are incremented under,
+              // so a worker cannot add to a window between reading it and
+              // clearing it.
+              if (sCensusLastDump == 0xFFFFFFFFu) {
+                sCensusLastDump = cFrame;
+              } else if (cFrame - sCensusLastDump >= kDumpEveryFrames) {
+                sCensusLastDump = cFrame;
+                for (auto& censKv : sCensus) {
+                  CensusEntry& ent = censKv.second;
+                  if (ent.winDraws == 0u) {
+                    continue;
+                  }
+                  // The four busiest ids, so a saturated key shows WHICH ids it
+                  // settled on and not merely how many there are.
+                  uint64_t topId[4] = {};
+                  uint32_t topN[4] = {};
+                  // ORPHANS, and this is the failure signature itself. An id the
+                  // key has stopped producing is an instance left to age out
+                  // untouched, which is what recUnclaimed counts downstream.
+                  // distinct == aliveRecent means every id the key ever minted
+                  // is still in use and nothing was orphaned; distinct much
+                  // larger than aliveRecent means the key moved on and left
+                  // instances behind.
+                  //
+                  // Recency window rather than lastFrame == cFrame: the dump
+                  // fires on the FIRST draw that crosses the threshold, so the
+                  // rest of this frame's ids have not been seen yet and an
+                  // equality test would report almost everything as orphaned.
+                  constexpr uint32_t kAliveWindowFrames = 4u;
+                  uint32_t aliveRecent = 0u;
+                  for (const auto& idkv : ent.ids) {
+                    if (cFrame - idkv.second.lastFrame <= kAliveWindowFrames) {
+                      aliveRecent += 1u;
+                    }
+                    for (int si = 0; si < 4; ++si) {
+                      if (idkv.second.count > topN[si]) {
+                        for (int q = 3; q > si; --q) {
+                          topN[q] = topN[q - 1];
+                          topId[q] = topId[q - 1];
+                        }
+                        topN[si] = idkv.second.count;
+                        topId[si] = idkv.first;
+                        break;
+                      }
+                    }
+                  }
+                  Logger::warn(str::format(
+                    "[PropIdCensus] f=", cFrame,
+                    " vs=0x", std::hex, ent.vs, std::dec,
+                    " idx=", ent.idxCount,
+                    " vtx=", ent.vtxCount,
+                    " draws=", ent.draws,
+                    " frames=", ent.frames,
+                    " distinct=", static_cast<uint32_t>(ent.ids.size()),
+                    " aliveRecent=", aliveRecent,
+                    " overflow=", ent.overflow,
+                    " winFrames=", ent.winFrames,
+                    " winDraws=", ent.winDraws,
+                    " newWin=", ent.winNew,
+                    " carryWin=", ent.winCarried,
+                    " top=0x", std::hex, topId[0], std::dec, ":", topN[0],
+                    ",0x", std::hex, topId[1], std::dec, ":", topN[1],
+                    ",0x", std::hex, topId[2], std::dec, ":", topN[2],
+                    ",0x", std::hex, topId[3], std::dec, ":", topN[3],
+                    // The candidate, read against the three columns above.
+                    // candNewWin near 0 while newWin is large is the result that
+                    // justifies switching; candMerged near candFrames says
+                    // T_reproject failed to separate the sub-views and the
+                    // candidate is not usable as-is.
+                    " | candDistinct=", static_cast<uint32_t>(ent.candIds.size()),
+                    " candNewWin=", ent.candNew,
+                    " candCarryWin=", ent.candCarried,
+                    " candOverflow=", ent.candOverflow,
+                    " candMerged=", ent.candFramesMerged, "/", ent.candFrames,
+                    " vposHave=", ent.vposHave,
+                    " vposMiss=", ent.vposMiss));
+                  ent.winFrames = 0u;
+                  ent.winDraws = 0u;
+                  ent.winNew = 0u;
+                  ent.winCarried = 0u;
+                  ent.candNew = 0u;
+                  ent.candCarried = 0u;
+                }
+              }
+            }
+
+            struct SubViewIdLife {
+              uint32_t frame = 0xFFFFFFFFu;
+              uint32_t draws = 0, carried = 0;
+              std::unordered_set<uint64_t> cur;
+              std::unordered_set<uint64_t> prev;
+            };
+            // Per VS, because the three shaders on this producer need telling
+            // apart -- attributing one shader's churn to another is the mistake
+            // [PropIdSrc.Vs] was just added to stop.
+            static thread_local std::unordered_map<uint64_t, SubViewIdLife> t_life;
+            const uint64_t lifeVs = static_cast<uint64_t>(dcs.transformData.vertexShaderHash);
+            SubViewIdLife& lf = t_life[lifeVs];
+            const uint32_t lifeFrame = m_context->m_device->getCurrentFrameId();
+            if (lf.frame != lifeFrame) {
+              if (lf.frame != 0xFFFFFFFFu && lf.draws > 0u) {
+                static std::atomic<uint32_t> sLifeLines { 0 };
+                constexpr uint32_t kMaxLifeLines = 1500;
+                if (sLifeLines.fetch_add(1, std::memory_order_relaxed) < kMaxLifeLines) {
+                  Logger::warn(str::format(
+                    "[SubViewPropIdLife] f=", lf.frame,
+                    " vs=0x", std::hex, lifeVs, std::dec,
+                    " draws=", lf.draws,
+                    " distinct=", static_cast<uint32_t>(lf.cur.size()),
+                    " carried=", lf.carried,
+                    " prevDistinct=", static_cast<uint32_t>(lf.prev.size())));
+                }
+              }
+              lf.prev = std::move(lf.cur);
+              lf.cur.clear();
+              lf.draws = 0;
+              lf.carried = 0;
+              lf.frame = lifeFrame;
+            }
+            lf.draws += 1u;
+            // Membership read BEFORE the insert, or every id looks carried.
+            if (lf.prev.count(propId) != 0u) {
+              lf.carried += 1u;
+            }
+            lf.cur.insert(propId);
+
+            // NV-DXVK [SubViewPropIdSep]: WHAT SEPARATES THE COLLIDING DRAWS.
+            //
+            // Measured: distinct=1 on 1,490 of 1,500 frame lines while draws is
+            // 2 on 965 of them and 4 on 110. The producer's own comment claims
+            // this key is "unique per placement"; it is not, and that is the
+            // half the SpatialMap depends on -- one entry per shader for two to
+            // four competing draws, so the draws that lose mint fresh instances.
+            //
+            // The repair needs a term that differs BETWEEN those draws, and the
+            // rule that has held all session is to log the candidates per draw,
+            // group them, and count distinct values before folding any of them
+            // into a key. objectToWorld is printed alongside so its constancy
+            // can be confirmed from the same line rather than assumed, and the
+            // buffer and index-range terms are the obvious separators to test.
+            // Whichever column shows two values where o2w shows one is the
+            // discriminator; if ALL of them show one value, these draws are
+            // genuinely identical at this point and the separator has to come
+            // from state not captured here.
+            {
+              static std::atomic<uint32_t> sSepLines { 0 };
+              constexpr uint32_t kMaxSepLines = 1200;
+              if (sSepLines.fetch_add(1, std::memory_order_relaxed) < kMaxSepLines) {
+                const auto& sepIa = m_context->m_state.ia;
+                uint64_t sepVb = 0ull;
+                uint32_t sepVbOff = 0u;
+                if (!sepIa.vertexBuffers.empty() && sepIa.vertexBuffers[0].buffer != nullptr) {
+                  sepVb    = reinterpret_cast<uint64_t>(sepIa.vertexBuffers[0].buffer.ptr());
+                  sepVbOff = sepIa.vertexBuffers[0].offset;
+                }
+                const uint64_t sepIb = (sepIa.indexBuffer.buffer != nullptr)
+                  ? reinterpret_cast<uint64_t>(sepIa.indexBuffer.buffer.ptr())
+                  : 0ull;
+                const uint32_t sepIbOff = (sepIa.indexBuffer.buffer != nullptr)
+                  ? sepIa.indexBuffer.offset : 0u;
+                Logger::warn(str::format(
+                  "[SubViewPropIdSep] f=", lifeFrame,
+                  " vs=0x", std::hex, lifeVs,
+                  " propId=0x", propId,
+                  " vb=0x", sepVb, " ib=0x", sepIb, std::dec,
+                  " vbOff=", sepVbOff, " ibOff=", sepIbOff,
+                  " idxCount=", dcs.getGeometryData().indexCount,
+                  " vtxCount=", dcs.getGeometryData().vertexCount,
+                  // THE SLICE, and it decides whether it can REPLACE the matrix
+                  // in the key or only join it. Source 1 selects a static prop
+                  // by its slice into a shared VB/IB, so this is the engine's
+                  // own per-prop handle and it does not drift the way the
+                  // sub-view matrix does. Two questions the same column answers:
+                  // whether the draws colliding on one propId carry DIFFERENT
+                  // slices (so the slice separates props), and whether the two
+                  // sub-views of one prop carry the SAME slice (in which case
+                  // replacing the matrix outright would merge the sub-views and
+                  // the matrix, or something else view-shaped, still has to
+                  // contribute).
+                  " startIdx=", startIndex,
+                  " baseVtx=", baseVertex,
+                  // SPLIT THE MATRIX INTO ITS TWO HALVES, because only one of
+                  // them is known to drift and the ordinal that replaced it is
+                  // now the residual defect.
+                  //
+                  // The documented drift is sub_pos -- a TRANSLATION that moves
+                  // "by tens of units" over long loops. The 3x3 basis is scale
+                  // and rotation of the sub-view reproject and has never been
+                  // measured separately here, though this tree already keeps the
+                  // distinction elsewhere ([FanoutSplit] tracks basisStable apart
+                  // from mtxStable for exactly this reason).
+                  //
+                  // ANSWERED 2026-08-23, and the answer was the second branch:
+                  // the basis is not a view signature either. Over 151 frames
+                  // one mesh carried 87 distinct basisHash values against 25
+                  // distinct transHash -- the basis is LESS stable than the
+                  // translation, not more. So neither half of this matrix
+                  // identifies the sub-view across frames, and any fix built on
+                  // hashing part of it is dead. Kept emitting because the two
+                  // columns are what proves that, and the next person to reach
+                  // for "just hash the basis" needs the counter-evidence.
+                  " basisHash=0x", std::hex,
+                    XXH64(&dcs.transformData.objectToWorld, sizeof(Vector4) * 3, 0ull),
+                  " transHash=0x",
+                    XXH64(&dcs.transformData.objectToWorld[3], sizeof(Vector4), 0ull),
+                  std::dec));
+              }
+            }
+          }
+
           if (!IsStablePropIdSuppressed()) {
             dcs.transformData.stablePropId = propId;
             // [PropIdSrc] the sub-view producer -- the one whose key changed to
             // the pre-reproject matrix hash. If this counter stays near zero
             // while [FindStage] withPropId sits at ~63, that change was never
             // exercised and the misses belong to the bone producer instead.
-            notePropIdSrc(kPropIdSrcSubView);
+            notePropIdSrc(kPropIdSrcSubView, static_cast<uint64_t>(dcs.transformData.vertexShaderHash));
           }
 
           // NV-DXVK [PropIdHashInputs.Mtn2904]: expanded per-draw probe for
