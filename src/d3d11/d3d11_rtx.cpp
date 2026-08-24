@@ -39918,6 +39918,43 @@ namespace dxvk {
         uint32_t chgSrv[kSrvSlots] = {};
         uint32_t chgSamp[kSampSlots] = {};
         uint32_t chgState[3] = {};
+        // THE UNDERLYING RESOURCE, beside the view pointer, because those are
+        // different questions and only one of them is a material change.
+        // residentMaterialFold hashes views[i].ptr() -- the D3D11 view WRAPPER
+        // the game created. If the game destroys and recreates a view over the
+        // same texture, the wrapper pointer moves while the material is
+        // identical, which is the vbPtr rotation this tree already documents,
+        // one layer up. srv=# with img=. is that case and says to fold the
+        // resource instead; srv=# with img=# means a genuinely different
+        // texture is bound each frame and the fold is reporting the truth.
+        uint64_t prevImg[kSrvSlots] = {};
+        uint32_t chgImg[kSrvSlots] = {};
+        // THE CONTENT HASH, which is what decides whether this is a bug.
+        //
+        // RtxTextureManager keys its bindless cache on TextureRef::getUniqueKey,
+        // and for a game texture (no replacement, no explicit key) that is
+        // handleOrUniqueKey -> XXH3_64bits(VkImageView handle). The HANDLE, not
+        // the content. Destroy and recreate the same texture and the identity
+        // changes, which mints a bindless slot (texNew), a material (matNew) and
+        // a new residentMaterialFold, and nothing frees the old one (texFree=0
+        // over 639 frames while texTotal went 363 -> 2039).
+        //
+        //   img=# with hash=.   handle and D3D11 object churn while the CONTENT
+        //                       is identical. Confirmed defect, and the fix is
+        //                       to key the cache on the content hash -- the same
+        //                       lesson as vbPtr and the cbuffer generations, one
+        //                       layer further out.
+        //   img=# with hash=#   the texture genuinely differs each frame, the
+        //                       fold is telling the truth, and the residency
+        //                       ceiling is real.
+        //
+        // hashZero is counted apart because getHash() is a plain stored member:
+        // if it was never set for game textures it reads 0 for everything, and a
+        // column of dots would then mean "never populated" rather than "stable".
+        // Those two must not be confused.
+        uint64_t prevHash[kSrvSlots] = {};
+        uint32_t chgHash[kSrvSlots] = {};
+        uint32_t hashZero = 0u, hashSeen = 0u;
         // The fold value itself, so the dump can show WHETHER it is a two-state
         // A/B/A/B flip or a walk through many values. Those want different
         // fixes and the change count alone cannot tell them apart.
@@ -39930,6 +39967,29 @@ namespace dxvk {
         // cleared, so the count survives.
         uint64_t prevMat = 0ull;
         uint32_t matChg = 0u, matSamples = 0u;
+        // HOW MANY DRAWS SHARE THIS identHead IN ONE FRAME.
+        //
+        // The deciding number, and it decides whether the material fold is
+        // churning at all. img=# tracks srv=# on every row, so the underlying
+        // ID3D11Resource really is different each frame -- the view is not being
+        // recreated over a stable texture. With matOther=162 of cmp=173, ~164
+        // distinct materials have appeared under ONE identHead, which is not one
+        // object changing texture but many objects sharing a mesh identity.
+        //
+        //   perFrame == 1   one object per identHead. The material genuinely
+        //                   churns and residency cannot serve these draws.
+        //   perFrame >  1   identHead names a MESH, not an instance. This probe
+        //                   samples the first draw each frame, so it compares
+        //                   different objects, and so does the gate whenever the
+        //                   ordinal assigns them differently. The churn is an
+        //                   artefact of identity, not a property of the material.
+        // Its own frame stamp: lastFrame belongs to the once-per-frame component
+        // diff, and this counter has to roll over on the FIRST draw of a frame,
+        // before that block has run.
+        uint32_t perFrameFrame = 0xFFFFFFFFu;
+        uint32_t perFrameCur = 0u, perFrameMax = 0u;
+        uint64_t perFrameSum = 0ull;
+        uint32_t perFrameFrames = 0u;
       };
       static std::unordered_map<uint64_t, MatWatch> sMatW;
       static uint32_t sMatLastDump = 0xFFFFFFFFu;
@@ -39990,6 +40050,23 @@ namespace dxvk {
       // different fixes.
       if (mwIt != sMatW.end()) {
         MatWatch& wSeen = mwIt->second;
+
+        // Per DRAW, and rolled over here rather than in the component-diff block
+        // below, because that block runs only on the first draw of a frame and
+        // the count it would close out is this frame's, not the last one's.
+        if (wSeen.perFrameFrame != mfid) {
+          if (wSeen.perFrameCur > 0u) {
+            wSeen.perFrameSum += wSeen.perFrameCur;
+            wSeen.perFrameFrames += 1u;
+            if (wSeen.perFrameCur > wSeen.perFrameMax) {
+              wSeen.perFrameMax = wSeen.perFrameCur;
+            }
+          }
+          wSeen.perFrameCur = 0u;
+          wSeen.perFrameFrame = mfid;
+        }
+        wSeen.perFrameCur += 1u;
+
         if (wSeen.matA == 0ull) {
           wSeen.matA = m_rsDrawMat;
         } else if (m_rsDrawMat != wSeen.matA) {
@@ -40015,9 +40092,34 @@ namespace dxvk {
         const auto& psNow = m_context->m_state.ps;
         const uint64_t psNowPtr = reinterpret_cast<uint64_t>(psNow.shader.ptr());
         uint64_t srvNow[kSrvSlots] = {};
+        uint64_t imgNow[kSrvSlots] = {};
+        uint64_t hashNow[kSrvSlots] = {};
         uint64_t sampNow[kSampSlots] = {};
         for (uint32_t i = 0; i < kSrvSlots && i < psNow.shaderResources.views.size(); ++i) {
-          srvNow[i] = reinterpret_cast<uint64_t>(psNow.shaderResources.views[i].ptr());
+          auto* srvP = psNow.shaderResources.views[i].ptr();
+          srvNow[i] = reinterpret_cast<uint64_t>(srvP);
+          if (srvP != nullptr) {
+            // The DxvkImage content hash behind this view, which is the term the
+            // texture cache does NOT key on. Null for buffer SRVs, which stay 0
+            // and read as dots.
+            const Rc<DxvkImageView> ivNow = srvP->GetImageView();
+            if (ivNow != nullptr && ivNow->image() != nullptr) {
+              hashNow[i] = static_cast<uint64_t>(ivNow->image()->getHash());
+              w.hashSeen += 1u;
+              if (hashNow[i] == 0ull) {
+                w.hashZero += 1u;
+              }
+            }
+            // GetResource AddRefs; released immediately. Once per watched key
+            // per frame over at most eight keys, so the refcount traffic is
+            // negligible and it avoids reaching into DXVK view internals.
+            ID3D11Resource* resNow = nullptr;
+            srvP->GetResource(&resNow);
+            imgNow[i] = reinterpret_cast<uint64_t>(resNow);
+            if (resNow != nullptr) {
+              resNow->Release();
+            }
+          }
         }
         for (uint32_t i = 0; i < kSampSlots && i < psNow.samplers.size(); ++i) {
           sampNow[i] = reinterpret_cast<uint64_t>(psNow.samplers[i]);
@@ -40037,6 +40139,12 @@ namespace dxvk {
             if (srvNow[i] != w.prevSrv[i]) {
               w.chgSrv[i] += 1u;
             }
+            if (imgNow[i] != w.prevImg[i]) {
+              w.chgImg[i] += 1u;
+            }
+            if (hashNow[i] != w.prevHash[i]) {
+              w.chgHash[i] += 1u;
+            }
           }
           for (uint32_t i = 0; i < kSampSlots; ++i) {
             if (sampNow[i] != w.prevSamp[i]) {
@@ -40050,6 +40158,8 @@ namespace dxvk {
           }
         }
         w.prevPs = psNowPtr;
+        std::memcpy(w.prevImg, imgNow, sizeof(imgNow));
+        std::memcpy(w.prevHash, hashNow, sizeof(hashNow));
         std::memcpy(w.prevSrv, srvNow, sizeof(srvNow));
         std::memcpy(w.prevSamp, sampNow, sizeof(sampNow));
         std::memcpy(w.prevState, stateNow, sizeof(stateNow));
@@ -40101,6 +40211,36 @@ namespace dxvk {
               }
             }
           }
+          // Same encoding, same slot order, so srv= and img= line up character
+          // for character and the comparison is positional.
+          std::string imgShape;
+          imgShape.reserve(kSrvSlots);
+          uint32_t imgAlways = 0u;
+          for (uint32_t i = 0; i < kSrvSlots; ++i) {
+            if (w.chgImg[i] == 0u) {
+              imgShape += '.';
+            } else if (w.chgImg[i] >= w.cmp) {
+              imgShape += '#';
+              imgAlways += 1u;
+            } else {
+              imgShape += static_cast<char>(
+                '0' + std::min<uint32_t>(9u, (10u * w.chgImg[i]) / w.cmp));
+            }
+          }
+          std::string hashShape;
+          hashShape.reserve(kSrvSlots);
+          uint32_t hashAlways = 0u;
+          for (uint32_t i = 0; i < kSrvSlots; ++i) {
+            if (w.chgHash[i] == 0u) {
+              hashShape += '.';
+            } else if (w.chgHash[i] >= w.cmp) {
+              hashShape += '#';
+              hashAlways += 1u;
+            } else {
+              hashShape += static_cast<char>(
+                '0' + std::min<uint32_t>(9u, (10u * w.chgHash[i]) / w.cmp));
+            }
+          }
           std::string sampShape;
           sampShape.reserve(kSampSlots);
           for (uint32_t i = 0; i < kSampSlots; ++i) {
@@ -40124,6 +40264,9 @@ namespace dxvk {
             " base=0x", std::hex, mwKv.first, std::dec,
             " cmp=", w.cmp,
             " matChg=", mChg, "/", mSmp,
+            " perFrameAvg=", (w.perFrameFrames > 0u
+                              ? static_cast<uint32_t>(w.perFrameSum / w.perFrameFrames) : 0u),
+            " perFrameMax=", w.perFrameMax,
             " matA=0x", std::hex, w.matA,
             " matB=0x", w.matB, std::dec,
             " matOther=", w.matOther,
@@ -40131,7 +40274,12 @@ namespace dxvk {
             " state=", w.chgState[0], "/", w.chgState[1], "/", w.chgState[2],
             " srvEver=", srvEver,
             " srvAlways=", srvAlways,
+            " imgAlways=", imgAlways,
+            " hashAlways=", hashAlways,
+            " hashZero=", w.hashZero, "/", w.hashSeen,
             " srv=", srvShape,
+            " img=", imgShape,
+            " hash=", hashShape,
             " samp=", sampShape));
         }
       }
@@ -40512,7 +40660,7 @@ namespace dxvk {
     // censusRecordO2w relies on one call site up -- so function-static state is
     // single-threaded here. Do not copy this probe somewhere a worker reaches.
     if (RtxOptions::ResidentScene::logStats()) {
-      constexpr uint32_t kVariants = 6;
+      constexpr uint32_t kVariants = 7;
       constexpr size_t kMaxTracked = 100000;
       constexpr uint32_t kIdentDumpFrames = 300u;
       struct Recur {
@@ -40522,13 +40670,38 @@ namespace dxvk {
       };
       static Recur sIdent[kVariants];
       static uint32_t sIdentLastDump = 0xFFFFFFFFu;
+      // hdPlusO2w SEPARATES THE LAST TWO READINGS OF THE MATERIAL CHURN.
+      //
+      // [MatChurnSlot] established that a single identHead, drawn exactly once
+      // per frame (perFrameAvg=1, perFrameMax=1), binds a different underlying
+      // ID3D11Resource every frame -- img=# tracking srv=#, ~135 distinct over
+      // 142 frames -- while [MatChurn] reports the game creating only 2 textures
+      // a frame. The resources already exist; something picks a different one.
+      // Either it is the SAME object with an animating material, in which case
+      // missMat is correct and those draws are simply not residency candidates
+      // (§7.8: exclude when the OUTPUT differs), or it is a DIFFERENT object
+      // reusing a pooled buffer slice, in which case identHead names a slot
+      // rather than an object and is stable without identifying anything.
+      //
+      // The transform decides it, because an object keeps its objectToWorld and
+      // a different object does not:
+      //
+      //   hdPlusO2w at gap1   the transform holds while the material churns =>
+      //                       same object, animating material.
+      //   hdPlusO2w new/gap2  the transform moves with the material => a
+      //                       different object in the same slice, and identHead
+      //                       is not an identity for this population.
+      //
+      // It is measured here rather than in residentGateBegin because o2w is not
+      // final until the tail -- the same reason censusRecordO2w is taken there.
       static const char* const kIdentName[kVariants] =
-        { "identHead", "drawKey", "hdPlusMat", "narrowed", "keyWithOrd", "xfSnapshot" };
+        { "identHead", "drawKey", "hdPlusMat", "hdPlusO2w", "narrowed", "keyWithOrd", "xfSnapshot" };
 
       const uint64_t candId[kVariants] = {
         m_rsDrawBaseKey,
         baseKey,
         narrowedMatOnly,
+        XXH64(&o2w, sizeof(o2w), baseKey),
         narrowed,
         key,
         memoXfHash(drawCallState.transformData)
