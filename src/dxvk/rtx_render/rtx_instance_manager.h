@@ -309,6 +309,10 @@ uint32_t getFirstBillboardIndex() const { return m_firstBillboard; }
   bool isUnlinkedForGC() const { return m_isUnlinkedForGC; }
 
   PrimInstanceOwner& getPrimInstanceOwner() { return m_primInstanceOwner; }
+  // Const overload: the match-eligibility predicate shared by findSimilarInstance's
+  // stages reads isSubPrim() through a `const RtInstance*` and cannot use the
+  // mutable accessor above. Same member, no mutation.
+  const PrimInstanceOwner& getPrimInstanceOwner() const { return m_primInstanceOwner; }
   
   void printDebugInfo() const;
 
@@ -796,6 +800,29 @@ private:
     // probe, which is harmless and needs no special case.
     Matrix4 prevObjectToWorld;
     bool hasPrevObjectToWorld = false;
+
+    // NV-DXVK [PrevFarHit] 2026-08-25: THE BATCH THIS PLACEMENT CAME FROM,
+    // for one question and nothing else.
+    //
+    // The far history hits resolve to a point ~6,000 units away in Y at a
+    // BIT-IDENTICAL Z, and both ends look like static ROWS of five props rather
+    // than one object on a path: the near row at x -3201..-3384 and the far row
+    // at x -3307..-3439, repeating to within a unit or two across bursts more
+    // than 900 frames apart. Two readings remain and they want opposite fixes:
+    //
+    //   the far row is PRESENT in this same batch right now
+    //       the history is naming a live sibling, so it is a mispairing and the
+    //       fix is to stop trusting the engine's byte-48 block for this shader.
+    //   nothing in this batch is near the history's position
+    //       the prop really was there and moved, the history is correct, and
+    //       [ReFile] dR1k is legitimate -- which retires this whole lead.
+    //
+    // Position alone cannot separate them, which is why this pointer exists:
+    // only the batch can say whether the object the history names is on screen.
+    // READ ONLY inside the far-hit probe, which fires ~0.03 times per frame, so
+    // the O(batch) scan it enables is never on a hot path. Not owned; the
+    // DrawCallState outlives the placement loop that sets it.
+    const std::vector<Matrix4>* batchTransforms = nullptr;
   };
 
   // NV-DXVK [fanout prev-transform identity]: how often the engine's history
@@ -821,6 +848,21 @@ private:
   // Counted only on an exact miss with no stablePropId, so it shares a
   // denominator with the other two.
   std::atomic<uint32_t> m_fanoutPrevNullCount { 0 };
+
+  // NV-DXVK [MatchEligible] 2026-08-25: histories the stage found and REFUSED,
+  // split by which of the two checks refused it. Both fall through to the
+  // nearest search and are also counted in prevMiss, which is what keeps the
+  // "miss= equals prevMiss" invariant intact -- so these two are a breakdown OF
+  // prevMiss, not a fourth bucket beside it.
+  //
+  //   prevRejMat  the instance failed instanceIsEligibleMatch: wrong material,
+  //               already claimed this frame, or a replacement sub-prim. The
+  //               nearest stage has always rejected these; the history stage
+  //               used to accept them.
+  //   prevRejFar  eligible, but the history sat further away than an object can
+  //               travel in a frame.
+  std::atomic<uint32_t> m_fanoutPrevRejMatCount { 0 };
+  std::atomic<uint32_t> m_fanoutPrevRejFarCount { 0 };
 
   // ================================================================
   // NV-DXVK [MapLedger] 2026-08-24b: the WRITE-SIDE verdict on every history
@@ -1052,7 +1094,9 @@ private:
   // as computed by the exact stage -- or 0 when that stage keyed on stablePropId
   // instead and no matrix hash was taken. Written on every path, hit or miss, so
   // the caller can feed it to SpatialKeyHint regardless of the outcome.
-  RtInstance* findSimilarInstance(BlasEntry& blas, const MaterialData& material, const Matrix4& firstInstanceObjectToWorld, CameraType::Enum cameraType, const RayPortalManager& rayPortalManager, uint64_t stablePropId = 0, DrawCallCache* drawCallCache = nullptr, const Matrix4* prevObjectToWorld = nullptr, XXH64_hash_t* outQueryMatrixHash = nullptr);
+  RtInstance* findSimilarInstance(BlasEntry& blas, const MaterialData& material, const Matrix4& firstInstanceObjectToWorld, CameraType::Enum cameraType, const RayPortalManager& rayPortalManager, uint64_t stablePropId = 0, DrawCallCache* drawCallCache = nullptr, const Matrix4* prevObjectToWorld = nullptr, XXH64_hash_t* outQueryMatrixHash = nullptr,
+                                  // [PrevFarHit] probe only -- see FanoutSplit::batchTransforms.
+                                  const std::vector<Matrix4>* batchTransforms = nullptr);
 
   // NV-DXVK [perf] 2026-08-07: the per-DRAW inputs an instance update needs.
   //

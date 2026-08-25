@@ -295,6 +295,42 @@ namespace dxvk {
   extern float g_veCamPx, g_veCamPy, g_veCamPz, g_veCamDx, g_veCamDy, g_veCamDz, g_veCamFov;
   extern std::atomic<uint32_t> g_veCamFrame;
 
+  // NV-DXVK [MatchEligible] 2026-08-25: THE SCENE'S DEFINITION OF "THIS INSTANCE
+  // IS A VALID MATCH FOR THIS DRAW", in one place, applied by every stage.
+  //
+  // WHY IT EXISTS. findSimilarInstance has three stages and until now only ONE
+  // of them applied these clauses. getNearestData took them as a filter lambda;
+  // getDataAtTransform -- which serves both the exact stage and the fanout
+  // HISTORY stage -- takes no filter at all and returns whatever sits in the
+  // hash slot. So whether a match was allowed depended on which stage happened
+  // to find it, and the history stage, which is also the only stage that can
+  // reach past uniqueObjectDistance, was the permissive one.
+  //
+  // WHAT THAT ADMITTED, measured on [PrevFarHit] over 1,792 frames with the
+  // camera stationary (confirmed by the user, not inferred):
+  //   * 13 of 73 steady-state far hits resolved onto an instance with a
+  //     DIFFERENT MATERIAL. A prop does not change material by moving. The
+  //     nearest stage rejects exactly this and the history stage did not.
+  //   * every one of those 73 had the history's X-axis rotated away from the
+  //     current one -- never below 10 degrees, mean 56, up to 137 -- while also
+  //     1,000 to 6,000 units away. No prop rotates 56 degrees and travels
+  //     thousands of units in one frame, so these are wrong-object matches, not
+  //     fast movers.
+  //
+  // The clauses themselves are unchanged and are NOT new policy: they are the
+  // three the nearest stage has always applied. This only stops one stage from
+  // being exempt from them. Two verbatim copies already existed -- the filter
+  // lambda and debugClosestPassingDistSqr's -- carrying a comment warning that
+  // they must not drift; adding a third copy at the history stage would have
+  // made that worse, so all of them now call this.
+  static bool instanceIsEligibleMatch(const RtInstance* instance,
+                                      const MaterialData& material,
+                                      uint32_t currentFrameIdx) {
+    return instance->getFrameLastUpdated() != currentFrameIdx
+        && instance->getMaterialHash() == material.getHash()
+        && !instance->getPrimInstanceOwner().isSubPrim();
+  }
+
   static bool isMirrorTransform(const Matrix4& m) {
     // Note: Identify if the winding is inverted by checking if the z axis is ever flipped relative to what it's expected to be for clockwise vertices in a lefthanded space
     // (x cross y) through the series of transformations
@@ -4373,6 +4409,7 @@ namespace dxvk {
   // regression shipped because it went live first, and its 100% idStable was
   // meaningless on a key whose value space was 0..255.
   //
+
   // NV-DXVK [FanoutSplit]: one line per fanout VS per frame — the readout for the
   // whole fanout-split fix.
   //
@@ -4719,7 +4756,9 @@ namespace dxvk {
           const uint32_t hits = m_fanoutPrevHitCount.exchange(0, std::memory_order_relaxed);
           const uint32_t misses = m_fanoutPrevMissCount.exchange(0, std::memory_order_relaxed);
           const uint32_t nulls = m_fanoutPrevNullCount.exchange(0, std::memory_order_relaxed);
-          if (hits != 0u || misses != 0u || nulls != 0u) {
+          const uint32_t rejMat = m_fanoutPrevRejMatCount.exchange(0, std::memory_order_relaxed);
+          const uint32_t rejFar = m_fanoutPrevRejFarCount.exchange(0, std::memory_order_relaxed);
+          if (hits != 0u || misses != 0u || nulls != 0u || rejMat != 0u || rejFar != 0u) {
             // NV-DXVK [perf] 2026-08-07: the ~200-character explanation that used
             // to be concatenated into every one of these lines now lives here.
             // This emits ONCE PER FRAME (1054 lines in a 100 s capture), and the
@@ -4733,12 +4772,22 @@ namespace dxvk {
             //   prevNull the exact stage missed and the draw carried NO history
             //            to retry with, so the retry never ran. High here means
             //            the plumb does not reach this draw at all, which is a
-            //            different fault from a history that misses.
+            //            different fault from a history that misses. A history
+            //            block rejected by fanoutZeroBasis12 does NOT land here:
+            //            the producer substitutes the current transform, so it
+            //            reads as a prevMiss.
+            //   prevRejMat/prevRejFar
+            //            a breakdown OF prevMiss: histories the stage found and
+            //            refused, by material/frame/sub-prim and by reach.
+            //            Read prevRejFar against [ReFile] dR1k -- that is the
+            //            population it exists to remove.
             Logger::info(str::format(
               "[FanoutPrev] f=", st.frame,
               " prevHit=", hits,
               " prevMiss=", misses,
-              " prevNull=", nulls));
+              " prevNull=", nulls,
+              " prevRejMat=", rejMat,
+              " prevRejFar=", rejFar));
           }
           // NV-DXVK [MapLedger]: the write-side census for the SAME frame,
           // emitted here so prevHit/prevMiss sit next to it in the log.
@@ -5015,6 +5064,7 @@ namespace dxvk {
             split.prevObjectToWorld = drawObjectToWorld * (*prevTransforms)[placement];
           }
           split.hasPrevObjectToWorld = true;
+          split.batchTransforms = transforms;
         }
 
         // NV-DXVK [FastPathOrder] 2026-08-25: IS THIS INSTANCE THE ONE THAT
@@ -5194,6 +5244,7 @@ namespace dxvk {
           split.prevObjectToWorld = drawObjectToWorld * (*prevTransforms)[placement];
         }
         split.hasPrevObjectToWorld = true;
+        split.batchTransforms = transforms;
       }
 
       // NV-DXVK [perf] 2026-08-07 -- EVERYTHING FROM HERE TO THE END OF THE HEALTH
@@ -5638,6 +5689,7 @@ namespace dxvk {
           split.prevObjectToWorld = drawObjectToWorld * (*prevTransforms)[placement];
         }
         split.hasPrevObjectToWorld = true;
+        split.batchTransforms = transforms;
       }
       RtInstance* instance = processSceneObjectImpl(cameraManager, rayPortalManager, blas, drawCall,
                                                     materialData, nullptr, drawCallCache, &split, drawState);
@@ -5905,7 +5957,8 @@ namespace dxvk {
       const Matrix4* prevO2W = (split != nullptr && split->hasPrevObjectToWorld)
         ? &split->prevObjectToWorld
         : nullptr;
-      currentInstance = findSimilarInstance(blas, materialData, firstInstanceObjectToWorld, drawCall.cameraType, rayPortalManager, lookupStablePropId, drawCallCache, prevO2W, &queryMatrixHash);
+      currentInstance = findSimilarInstance(blas, materialData, firstInstanceObjectToWorld, drawCall.cameraType, rayPortalManager, lookupStablePropId, drawCallCache, prevO2W, &queryMatrixHash,
+                                           (split != nullptr) ? split->batchTransforms : nullptr);
 
       // NV-DXVK [Phase2b]: findSimilarInstance raised the defer sentinel (full
       // miss, portal teleport, or migration candidate) — this draw/placement is
@@ -6956,7 +7009,8 @@ namespace dxvk {
     // NOTE: In the future we could extend this with heuristics as needed...
   }
 
-  RtInstance* InstanceManager::findSimilarInstance(BlasEntry& blas, const MaterialData& material, const Matrix4& firstInstanceObjectToWorld, CameraType::Enum cameraType, const RayPortalManager& rayPortalManager, uint64_t stablePropId, DrawCallCache* drawCallCache, const Matrix4* prevObjectToWorld, XXH64_hash_t* outQueryMatrixHash) {
+  RtInstance* InstanceManager::findSimilarInstance(BlasEntry& blas, const MaterialData& material, const Matrix4& firstInstanceObjectToWorld, CameraType::Enum cameraType, const RayPortalManager& rayPortalManager, uint64_t stablePropId, DrawCallCache* drawCallCache, const Matrix4* prevObjectToWorld, XXH64_hash_t* outQueryMatrixHash,
+                                                 const std::vector<Matrix4>* batchTransforms) {
     // NV-DXVK [perf] handoff v7 sec 4a: cleared up front so every early return
     // below leaves it defined. The exact stage overwrites it unconditionally a
     // few dozen lines down, before any of them can be taken; 0 is the safe value
@@ -7365,6 +7419,193 @@ namespace dxvk {
       }
       if (prevObjectToWorld != nullptr && stablePropId == 0ull) {
         result = const_cast<RtInstance*>(blas.getSpatialMap().getDataAtTransform(*prevObjectToWorld, 0ull));
+
+        // NV-DXVK [MatchEligible] 2026-08-25: THE HISTORY STAGE STOPS BEING
+        // EXEMPT. Two rejections, and neither is new policy.
+        //
+        // ELIGIBILITY. instanceIsEligibleMatch is the predicate the nearest
+        // stage has always applied; see its definition for why one stage being
+        // exempt made the outcome depend on which stage ran first. Measured:
+        // 13 of 73 steady-state far hits resolved onto an instance with a
+        // DIFFERENT MATERIAL, which a prop cannot acquire by moving.
+        //
+        // REACH. The block above argues this stage should hit "at any speed,
+        // with no distance tolerance", and that unbounded reach is what makes a
+        // wrong history catastrophic instead of harmless. The argument assumed
+        // hits past uniqueObjectDistance are fast movers. They are not, and that
+        // is now measured rather than assumed: across 73 of 73 steady-state far
+        // hits, WITH THE CAMERA CONFIRMED STATIONARY, the history's X-axis is
+        // rotated away from the current one by NEVER LESS THAN 10 DEGREES --
+        // mean 56, up to 137 -- while also sitting 1,000 to 6,000 units away.
+        // Nothing rotates 56 degrees and travels thousands of units in one
+        // frame. The exemption admits wrong matches only, and removing it costs
+        // 0.06 rejections per frame against 111 legitimate prevHits.
+        //
+        // uniqueObjectDistance and not a new number: its own documentation is
+        // this exact predicate, "the distance an object can move in a single
+        // frame before it is no longer considered the same object", and every
+        // other stage already trusts it.
+        //
+        // A REJECTED HISTORY IS A MISS, deliberately. It falls into the existing
+        // miss path below, reaching the nearest search -- bounded, and now
+        // filtered by the same predicate -- exactly as a miss always has, so the
+        // "miss= must equal prevMiss" invariant the [MapLedger] census rests on
+        // still holds. The counters say WHY without disturbing that.
+        //
+        // PRE-REGISTERED, so it is not reinterpreted afterwards:
+        //   prevRejFar > 0 and [ReFile] dR1k -> 0
+        //       confirmed; the far hits were the wrong-object matches.
+        //   prevRejFar large and prevHit falls with it
+        //       this game DOES have props that outrun uniqueObjectDistance, the
+        //       bound is wrong, and the fix is to derive it from frame time --
+        //       not to restore the exemption.
+        //   prevRejMat > 0 while dR1k stays
+        //       the material mismatch and the far reach are separate faults.
+        if (result != nullptr) {
+          const Vector3 histDelta = firstInstanceObjectToWorld[3].xyz()
+                                  - (*prevObjectToWorld)[3].xyz();
+          const bool withinReach = (lengthSqr(histDelta) <= uniqueObjectDistanceSqr);
+          const bool eligible = instanceIsEligibleMatch(result, material, currentFrameIdx);
+          if (!eligible) {
+            ++m_fanoutPrevRejMatCount;
+          } else if (!withinReach) {
+            ++m_fanoutPrevRejFarCount;
+          }
+          // NV-DXVK [PrevFarHit] 2026-08-25: PRINT THE HISTORY THAT REACHED,
+          // AT THE MOMENT IT REACHES.
+          //
+          // WHY THIS AND NOT ANOTHER PRODUCER DUMP. [T31Struct] sampled frames
+          // 6378-6384 and burned its 240-line budget in seven frames, because
+          // ~14 fanout VSes at 4 placements each spend it immediately. Every
+          // [ReFile] dR1k event in that same log is at frame 6558 or later. So
+          // the zero-basis history block that dump found is a LOAD-frame shape,
+          // and reading it as the cause of a steady-state population was the
+          // load-frame error this file already catalogues. fanoutZeroBasis12 is
+          // still right -- a singular matrix is not a transform -- but it does
+          // not address dR1k and this probe exists because nothing yet does.
+          //
+          // A HIT, NOT A MISS. The population characterised so far was
+          // [FanoutPrevMiss], which is harmless: a missed history falls through
+          // to the nearest search. dR1k counts RE-FILES, which require the
+          // history to HIT, and only a hit can drag an instance across the map
+          // and hand its surface a motion vector to match. Those are different
+          // populations and conflating them is what sent the last two passes at
+          // the wrong one.
+          //
+          // WHAT DECIDES IT, and it is basisSame rather than the distance:
+          //   basisSame=1  the history is this prop's own orientation with a
+          //                displaced translation -- so the translation is being
+          //                corrupted (a rebase, a stale origin, a wrong space)
+          //                and the fix is in how prev's translation is composed.
+          //   basisSame=0  the history describes a DIFFERENT object. Then the
+          //                engine's byte-48 block is not this placement's, and
+          //                the fix is to stop trusting it, not to repair it.
+          // Both full matrices are printed so that verdict can be re-derived
+          // from the line rather than taken on trust.
+          //
+          // AND THE THREE FILTERS THIS STAGE DOES NOT APPLY. getDataAtTransform
+          // is a raw hash lookup with no filter argument at all, while the
+          // NEAREST stage below refuses an instance that (a) has already been
+          // updated this frame, (b) carries a different material, or (c) is a
+          // replacement sub-prim. Two of the three matching stages therefore
+          // disagree about what a valid match is, and the history stage is the
+          // permissive one. alreadyUpd= and matSame= report the first two at the
+          // moment of the hit:
+          //   alreadyUpd=1  this instance was already claimed THIS FRAME by
+          //                 another placement, so the hit is taking it away from
+          //                 an owner that is on screen right now. The nearest
+          //                 stage would have refused it outright. That is a
+          //                 defect in the stage, not in the engine's data.
+          //   alreadyUpd=0  the instance was free. Then the history is merely
+          //                 pointing somewhere far away and basisSame decides
+          //                 whether it is a displaced translation or a different
+          //                 object.
+          // Do NOT act on either reading before this line has been read. The two
+          // previous passes at this population each acted on an inference and
+          // each was aimed at the wrong thing.
+          //
+          // UNCAPPED, and its placement is why that is safe: it now fires only
+          // where the gate above REFUSED a history, which the measurements put
+          // at ~0.06 per frame. rej= names which check refused it, so a run can
+          // be split by cause without re-deriving it from the other fields.
+          if (!eligible || !withinReach) {
+            {
+              const float dSqr = lengthSqr(histDelta);
+              const Matrix4& c = firstInstanceObjectToWorld;
+              const Matrix4& p = *prevObjectToWorld;
+              const bool basisSame =
+                (std::memcmp(&c[0], &p[0], sizeof(Vector4) * 3u) == 0);
+
+              // IS THE OBJECT THE HISTORY NAMES ON SCREEN RIGHT NOW?
+              //
+              // The one question the position cannot answer. Scans this
+              // placement's own batch for the entry nearest the history's
+              // translation. Raw distance, no threshold, no classification --
+              // the distribution decides, not a gate.
+              //
+              //   batchNearD ~ 0    the far row IS in this batch. The history is
+              //                     naming a live sibling, so it is a mispairing
+              //                     and the engine's byte-48 block cannot be
+              //                     trusted for this shader.
+              //   batchNearD large  nothing here is near it. The prop really was
+              //                     there and moved; the history is correct and
+              //                     dR1k is legitimate.
+              //
+              // batchExact is the stricter form: a full 64-byte match means a
+              // sibling is standing on exactly the key this hit resolved, which
+              // is the same test [PrevAlias] ran per-placement and got 0 on. It
+              // is repeated here ONLY at the far hits, where that earlier test
+              // could not distinguish "no collision" from "the sibling moved
+              // this frame and is filed under last frame's transform".
+              float batchNearD = -1.f;
+              int   batchNearIdx = -1;
+              int   batchExact = 0;
+              const int batchN = (batchTransforms != nullptr)
+                               ? static_cast<int>(batchTransforms->size()) : -1;
+              if (batchTransforms != nullptr) {
+                float bestSqr = FLT_MAX;
+                for (size_t k = 0; k < batchTransforms->size(); ++k) {
+                  const Matrix4& t = (*batchTransforms)[k];
+                  const Vector3 d2 = t[3].xyz() - p[3].xyz();
+                  const float sqr = lengthSqr(d2);
+                  if (sqr < bestSqr) {
+                    bestSqr = sqr;
+                    batchNearIdx = static_cast<int>(k);
+                  }
+                  if (std::memcmp(&t, &p, sizeof(Matrix4)) == 0) {
+                    batchExact = 1;
+                  }
+                }
+                batchNearD = (bestSqr == FLT_MAX) ? -1.f : std::sqrt(bestSqr);
+              }
+
+              Logger::info(str::format(
+                "[PrevFarHit] f=", currentFrameIdx,
+                " rej=", (!eligible ? "mat" : "far"),
+                " vs=0x", std::hex, static_cast<uint64_t>(vsHashProbe), std::dec,
+                " d=", std::sqrt(dSqr),
+                " basisSame=", (basisSame ? 1 : 0),
+                " alreadyUpd=", (result->m_frameLastUpdated == currentFrameIdx ? 1 : 0),
+                " matSame=", (result->m_materialHash == material.getHash() ? 1 : 0),
+                " subPrim=", (result->m_primInstanceOwner.isSubPrim() ? 1 : 0),
+                " batchN=", batchN,
+                " batchNearD=", batchNearD,
+                " batchNearIdx=", batchNearIdx,
+                " batchExact=", batchExact,
+                " curT=(", c[3][0], ",", c[3][1], ",", c[3][2], ")",
+                " prevT=(", p[3][0], ",", p[3][1], ",", p[3][2], ")",
+                " curC0=(", c[0][0], ",", c[0][1], ",", c[0][2], ")",
+                " curC1=(", c[1][0], ",", c[1][1], ",", c[1][2], ")",
+                " curC2=(", c[2][0], ",", c[2][1], ",", c[2][2], ")",
+                " prevC0=(", p[0][0], ",", p[0][1], ",", p[0][2], ")",
+                " prevC1=(", p[1][0], ",", p[1][1], ",", p[1][2], ")",
+                " prevC2=(", p[2][0], ",", p[2][1], ",", p[2][2], ")"));
+            }
+            // REFUSED: fall into the miss path below, which reaches the nearest
+            // search -- bounded, and filtered by the same predicate.
+            result = nullptr;
+          }
+        }
         if (result != nullptr) {
           // Counter only — the claim this rests on is that the engine's history
           // is bit-exact, and this is the number that proves or refutes it in
@@ -7372,6 +7613,8 @@ namespace dxvk {
           // the history is not reproducing last frame's key and I should say so
           // rather than leave a dead branch in the hot path.
           ++m_fanoutPrevHitCount;
+
+
           result->m_claimStage = RtInstance::ClaimStage::History;
           result->m_claimFrame = currentFrameIdx;
           return result;
@@ -7720,7 +7963,7 @@ namespace dxvk {
             if (okFrame && okMat && okSub) probePassedFilter += 1;
             return okFrame && okMat && okSub;
           }
-          return instance->m_frameLastUpdated != currentFrameIdx && instance->m_materialHash == material.getHash() && !instance->m_primInstanceOwner.isSubPrim();
+          return instanceIsEligibleMatch(instance, material, currentFrameIdx);
         }
       ));
       // See RtInstance::m_claimStage. A nearest claim is the only one decided by
@@ -7754,9 +7997,7 @@ namespace dxvk {
           const float dbgPassDistSqr =
             blas.getSpatialMap().debugClosestPassingDistSqr(worldPosition,
               [&] (const RtInstance* instance) {
-                return instance->m_frameLastUpdated != currentFrameIdx
-                    && instance->m_materialHash == material.getHash()
-                    && !instance->m_primInstanceOwner.isSubPrim();
+                return instanceIsEligibleMatch(instance, material, currentFrameIdx);
               }, dbgPassPos);
           // Identify who owns the far-away entry. If its VS differs from ours,
           // two different draws are sharing one BlasEntry and evicting each

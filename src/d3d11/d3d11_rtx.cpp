@@ -189,13 +189,53 @@ static inline bool fanoutAllFinite12(const float* m) {
       _mm_and_si128(_mm_castps_si128(_mm_loadu_ps(m + 8)), expMask), expMask));
   return _mm_movemask_epi8(bad) == 0;
 }
-static inline bool fanoutAllZero12(const float* m) {
+// NV-DXVK [PrevZeroBasis] 2026-08-25: "THE ENGINE HAS NO HISTORY FOR THIS
+// PLACEMENT", tested on the BASIS rather than on all twelve floats.
+//
+// This replaces fanoutAllZero12, which required all 12 floats of the history
+// block to be zero. That is not the shape the engine actually writes, and
+// [T31Struct] settled it in raw bytes over 240 sampled g_modelInst entries:
+//
+//   populated basis (a real previous transform)                217   90.4%
+//   all 12 floats zero            -- fanoutAllZero12 caught it   15    6.2%
+//   ZERO BASIS, translation NON-zero -- it did NOT                8    3.3%
+//
+// The third shape is a 3x3 of exact zeros with the translation column holding
+// -cameraOrigin, i.e. the world origin expressed camera-relative. Frame 3640 of
+// VS 0x2AF9B90D63850EC3 shows all four sampled placements carrying the identical
+// block (0,0,0, 845.658 / 0,0,0, 9279.33 / 0,0,0, -7356.08) against a main
+// camera at (-845.658,-9279.33,7356.03), while the neighbouring frames 3641-3645
+// carry a correct basis and a translation matching the current one to 0.1 units.
+// Four placements cannot share one previous position, so this is not history.
+//
+// WHAT IT COST. The old guard passed it through, the block below then composed
+// (-cameraOrigin) + prevCameraOrigin -- the world origin for a still camera --
+// and findSimilarInstance used that as an EXACT key with no distance bound. That
+// is the 1,000-16,000 unit population: [ReFile] dR1k, 69 re-files over 2,082
+// frames with maxD 6,119, each one dragging an RtInstance across the map and
+// giving its surface a motion vector to match. The two shaders that produce the
+// shape are 0x2AF9B90D63850EC3 and 0x29AA034553107F54, and the first is the same
+// one that carries 88% of [FanoutPrevMiss].
+//
+// WHY THE BASIS AND NOT A DISTANCE. A zero basis is a singular matrix. It is not
+// a transform that happens to be far away, it is not a transform at all -- it
+// collapses the mesh to a point and cannot be inverted. Rejecting it is a
+// statement about the data being malformed, not a judgement about how far a prop
+// may travel in a frame. It also subsumes the all-zero case, whose basis is zero
+// too, which is why this REPLACES the old predicate instead of joining it.
+//
+// The current-matrix path already refuses a degenerate basis one row at a time
+// (fanoutZeroRow4 below, on row 0). This closes the same hole on the history,
+// which had no basis check at all.
+//
+// Lanes 0..2 of each load are the basis; lane 3 is the translation column and is
+// deliberately excluded -- it is exactly the part that is NOT zero here.
+static inline bool fanoutZeroBasis12(const float* m) {
   const __m128 z = _mm_setzero_ps();
-  const __m128 eq = _mm_and_ps(
-      _mm_and_ps(_mm_cmpeq_ps(_mm_loadu_ps(m + 0), z),
-                 _mm_cmpeq_ps(_mm_loadu_ps(m + 4), z)),
-      _mm_cmpeq_ps(_mm_loadu_ps(m + 8), z));
-  return _mm_movemask_ps(eq) == 0xF;
+  const int r0 = _mm_movemask_ps(_mm_cmpeq_ps(_mm_loadu_ps(m + 0), z));
+  const int r1 = _mm_movemask_ps(_mm_cmpeq_ps(_mm_loadu_ps(m + 4), z));
+  const int r2 = _mm_movemask_ps(_mm_cmpeq_ps(_mm_loadu_ps(m + 8), z));
+  return ((r0 & r1 & r2) & 0x7) == 0x7;
 }
 static inline bool fanoutZeroRow4(const float* m) {
   return _mm_movemask_ps(_mm_cmpeq_ps(_mm_loadu_ps(m), _mm_setzero_ps())) == 0xF;
@@ -17439,8 +17479,8 @@ namespace dxvk {
                     float pm[12];
                     std::memcpy(pm, t31Read + t31Off + 48, 48);
                     // NV-DXVK [Perf.InstLoop]: vectorized, exact-same-verdict
-                    // checks (see fanoutAllZero12 / fanoutAllFinite12).
-                    if (!fanoutAllZero12(pm) && fanoutAllFinite12(pm)) {
+                    // checks (see fanoutZeroBasis12 / fanoutAllFinite12).
+                    if (!fanoutZeroBasis12(pm) && fanoutAllFinite12(pm)) {
                       const float pTx = pm[3]  + prevCamOrigin[0];
                       const float pTy = pm[7]  + prevCamOrigin[1];
                       const float pTz = pm[11] + prevCamOrigin[2];
@@ -17711,8 +17751,8 @@ namespace dxvk {
                 float pm[12];
                 std::memcpy(pm, t31Read + t31Off + 48, 48);
                 // NV-DXVK [Perf.InstLoop]: vectorized, exact-same-verdict
-                // checks (see fanoutAllZero12 / fanoutAllFinite12).
-                if (!fanoutAllZero12(pm) && fanoutAllFinite12(pm)) {
+                // checks (see fanoutZeroBasis12 / fanoutAllFinite12).
+                if (!fanoutZeroBasis12(pm) && fanoutAllFinite12(pm)) {
                   // Identical arithmetic to the current block above — same order,
                   // same operands — so a static prop reproduces last frame's
                   // absolute matrix bit-for-bit rather than merely closely.
