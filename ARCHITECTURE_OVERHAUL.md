@@ -268,9 +268,23 @@ worth building without one.
 Not an ECS. Not components, not archetypes, not a generic render world. One
 concrete record, TF2-shaped, sized to what this tree already needs:
 
-```cpp
-struct RenderObjectId { uint32_t index; uint32_t generation; };
+**THREE LEVELS, AND THE MIDDLE ONE IS FORCED BY THE MEASUREMENT.** An earlier
+draft of this section had one flat record owning a single `GeometryId` and a
+single `MaterialId`. That cannot hold, and the plan's own number says why:
+`[Join]` reads gate calls **64-137 per frame** against draws **403-577 per
+frame** (RESIDENT_SCENE_PLAN §7.2). Four to six draws per renderable. A studio
+model is many meshes and many materials, each submitted as its own draw.
 
+So the moment identity becomes the engine handle (slice 2), one object maps to
+many `(geometry, material)` pairs, and a flat record would have to either pick
+one of them or grow a variant per draw — which is the draw abstraction coming
+back in through the door this whole document exists to close.
+
+```cpp
+struct RenderObjectId    { uint32_t index; uint32_t generation; };
+struct RenderPrimitiveId { uint32_t index; uint32_t generation; };
+
+// ONE per engine handle. Identity, lifetime, pose, liveness. Nothing else.
 struct RenderObject {
   RenderObjectId   id;
 
@@ -280,8 +294,6 @@ struct RenderObject {
   DrawIdentity     iaIdentity;     // KeyHead. always available, from the draw
   uint32_t         occurrence;     // ONLY while engineHandle is absent
 
-  GeometryId       geometry;       // -> DrawCallCache / BlasEntry
-  MaterialId       material;       // -> SparseUniqueCache slot
   Matrix4          objectToWorld;
   Matrix4          prevObjectToWorld;
   AABB             worldBounds;
@@ -289,14 +301,38 @@ struct RenderObject {
   uint32_t         frameLastObserved;   // a draw or an enumeration touched it
   uint32_t         frameLastChanged;    // an OUTPUT test said it differed
   ObjectFlags      flags;               // skipUnsafe, everMoved, seenCameraMask
-  InstanceRef      instances;           // what ResidentScene::Record holds today
+
+  SmallVector<RenderPrimitiveId> primitives;   // 4-6 for a studio model, 1 for world
+};
+
+// ONE per (geometry, material) the object draws with. This is the unit the
+// geometry and material caches are already keyed on.
+struct RenderPrimitive {
+  RenderPrimitiveId id;
+  RenderObjectId    owner;
+
+  GeometryId        geometry;    // -> DrawCallCache / BlasEntry
+  MaterialId        material;    // -> SparseUniqueCache slot
+  uint32_t          frameLastChanged;
+
+  InstanceRef       instances;   // what ResidentScene::Record holds today
 };
 ```
 
-`ResidentScene::Record` is 90% of this already — it holds instances, a validity
-bit, a camera mask, source buffer addresses and `skipUnsafe`. **The migration is
-to give that record an identity that is not a draw key, and then let everything
-else point at it.** That is a rename plus a resolver, not a rewrite.
+`ResidentScene::Record` is 90% of `RenderPrimitive` already — it holds instances,
+a validity bit, a camera mask, source buffer addresses and `skipUnsafe`. **The
+migration is to give that record an identity that is not a draw key, and hang a
+thin `RenderObject` above it that owns the pose and the lifetime.** That is a
+rename, a resolver, and one owning vector — not a rewrite.
+
+It also fixes something §1.4 states loosely: *"one mesh in 15 draws -> one
+geometry decision"* is a claim about the PRIMITIVE, not the object. An object
+with six primitives still makes six geometry decisions, and should.
+
+**Still not an ECS.** Two record types and an owning vector. The third level —
+`GPUInstance`, the surface slot and TLAS entry — already exists as `RtInstance`
+plus its `m_reorderedSurfaces` slot; §5.1 is what gives that slot a stable
+identity. No fourth level, and no components.
 
 ### 1.4 The inversion, stated as a rule you can check code against
 
@@ -649,6 +685,144 @@ still become runnable, and the node array's generation must catch any handle tha
 outlived its node. If either needs a call-site check to hold, the contract is not
 in the graph yet.
 
+### 4.2.2 THE NODE CONTRACT, WRITTEN OUT
+
+§4.2 and §4.2.1 give the primitives and the lifetime rule. This is the whole
+contract in one place, because everything above — carrier chains, transform
+jobs, geometry shards, surface staging, TLAS work — is one particular graph
+built out of it and nothing else.
+
+```
+node exists
+  -> node has N unresolved dependencies
+  -> node becomes runnable at N == 0
+  -> node executes ANYWHERE (worker, or inline on the enqueuer)
+  -> node signals completion EXACTLY ONCE, on every exit path
+  -> each dependent decrements; the 0 transition enqueues it
+  -> repeat
+```
+
+**A node means "a named piece of state is now valid", not "a function ran".**
+That is the distinction that makes the graph worth having:
+
+```
+Transform(P)   ->  P.objectToWorld, P.prevObjectToWorld, P.owner.worldBounds valid
+Material(P)    ->  P.material, its surface record valid
+Geometry(P)    ->  P.geometry's BLAS input valid
+Instance(P)    ->  P's TLAS instance record valid
+```
+
+`Transform(P)` and `Material(P)` name disjoint state, so they carry no edge
+between them and run at the same time. Today they are separated by a phase
+boundary for no reason other than that a phase boundary is the only thing the
+pool can express.
+
+**The counter is the composable unit, not the node.** A fan-out attaches its
+consumer to the COUNTER, so the consumer can be wired before the child count is
+known:
+
+```
+GeometryGather(P)
+       │
+       ▼
+   Counter G  (pending set when the gather discovers 384 shards)
+    ╱  ╱  │  ╲  ╲
+  c0 c1  c2 ... c383
+    ╲  ╲  │  ╱  ╱
+       ▼
+   Instance(P)      depends on G, never on c0..c383 individually
+```
+
+`Instance(P).dependsOn(G)` is written once. Wiring 384 individual edges would
+mean the scheduler had to know the count at graph-build time, which is precisely
+what a gather cannot supply.
+
+**Zero children is the same event.** `parallelFor(0, ...)` must mean
+`counter.completeImmediately()`, never `return`. This tree has roughly twenty
+zero-work paths — no bones, no fanout, no instances, a replay hit, a filtered
+draw — and each one that returns early instead of completing is a permanently
+unreachable dependent. They are also why `SubmitDrawDeferred` is 9,922 lines: in
+a phase system every one of them is a special case, and in a graph they are all
+the same case.
+
+**Cancellation is completion, not a state.** From a dependent's point of view a
+cancelled node means *"this node will produce no useful work, AND this node is
+done"*. Any design where the dependent can observe the difference has
+reintroduced the deadlock in §4.2.1.
+
+### 4.2.3 EDGES SHOULD BE DECLARED AS READS AND WRITES — AND HALF OF THIS IS BUILT
+
+`A must finish before B` is a weaker statement than `A writes Transform[1842]`
+and `B reads Transform[1842]`, and the weaker one has to be maintained by hand.
+Every time a new site starts touching an existing piece of state, somebody has to
+remember to add an edge, and forgetting is silent.
+
+**This tree has already built the expensive half of the stronger version.**
+`ShardedInstancePhase` (`rtx_instance_manager.h:535`) partitions draws by
+`BlasEntry` and runs each shard "with exclusive BLAS ownership". That IS
+`writes Blas[k]`, expressed as a partition rather than as an edge. Draws it
+cannot prove shard-safe set `deferredThisDraw` and fall to an ordered
+single-threaded tail, and the CS-domain work each draw wanted to do — buffer
+binds, billboards, OMM, portals, spatial-map writes — is queued into a
+`PendingInstanceOps` sidecar and replayed later.
+
+Read that list again: **the sidecar and the deferral list are both consequences
+of not being able to express a write.** A draw is deferred because its write set
+might overlap another shard's and the partition cannot say; the sidecar exists
+because a shard worker may not write CS-owned resources. With declared read/write
+sets both become ordinary edges:
+
+```
+declare:  Transform(P)   writes  Object[o].objectToWorld, Object[o].worldBounds
+          Bounds(o)      reads   Object[o].objectToWorld
+          Instance(P)    writes  Blas[k].instances, SpatialMap[k]
+          SurfaceStage(P) writes Surface[slot]
+
+derive:   every edge, mechanically, including the ones nobody remembered
+```
+
+So this is not a new layer bolted on top — it **replaces** the deferral list and
+the sidecar, which is the subtractive test §6 applies to everything else. It also
+converts I2's whole failure class from a rule people follow into a thing the
+graph checks: a node that reads `Instance[i]` while another creates or destroys
+it is a declared conflict, not a use-after-free found in a crash dump.
+
+**Scope it to the resources that already have identity.** `Object`, `Primitive`,
+`Geometry`, `Material`, `Buffer` slot, `Surface` slot, `Blas`. Seven, all of
+which slices 1-3 and 8 give stable ids anyway. Not a general resource system.
+
+### 4.2.4 WHAT THIS DOES NOT BUY, AND THE MEASUREMENT THAT SAYS SO
+
+**Cross-frame pipelining is not the prize, and pursuing it would be a mistake.**
+The tempting next step after a graph is "run frame N+1's CPU work while frame N's
+GPU work executes". Two things say no.
+
+**DXVK already pipelines.** The frame thread, `DxvkCsThread` and the GPU are
+already three stages — `SynchronizeCsThread` exists because CS is asynchronous.
+And `[Perf.CsSplit]` puts dxvk-cs at **99.6% of wall time**. Pipelining does not
+help a pipeline whose bottleneck is a single stage; it buys latency, not
+throughput. The answer to a 99.6% stage is to shorten it, which is slices 7-9.
+
+**And the RT scene state cannot be double-buffered cheaply.** The Phase 2B
+contract at `d3d11_rtx.cpp:34800` depends on the opposite property:
+
+> *"until Phase C emits, the RT scene state (instances, spatial maps, caches,
+> BlasEntries) belongs exclusively to this thread and its shard workers. Strict
+> alternation, no finer-grained synchronization anywhere else."*
+
+The only cross-frame copies in the tree are `Tlas::previousAccelStructure` and
+`RtInstance::m_previousSurfaceIndex`/`Count` — motion-vector history, not scene
+history. Everything else is one copy mutated in place and cross-referenced by raw
+pointers. Double-buffering it means double-buffering `InstanceManager`,
+`SpatialMap`, `DrawCallCache`, `BlasEntry` and `ResidentScene` together, and it
+would reintroduce every use-after-free class this tree has just closed.
+
+**What IS available, and is worth taking once slices 4 and 5 land:** pipeline the
+OBSERVE-AND-RESOLVE half only. `DrawObservation -> RenderObjectId -> dirty test`
+is pure by slice 5's own gate and touches no RT state, so it can run for frame
+N+1 while CS is still committing frame N. That is a subset of the idea, it is
+cheap, and it does not require a second copy of anything.
+
 ### 4.3 The explicit ordering key, and why to add it now
 
 RE Engine's published approach (Capcom, GDC 2019) is worth taking almost
@@ -902,8 +1076,10 @@ sequencing preference; §1.2 is the reason.
 | **4** | **Observe/derive split** — `SubmitDraw` captures and enqueues, derives nothing | `d3d11_rtx.cpp` | no live D3D11 read past capture; `XfLiveSite` escape counts all 0 |
 | **5** | **`ExtractTransforms` -> pure classifier** — `CaptureTransformInputs()` then `TransformClassifier(input) -> result`, deterministic, no hidden cross-draw state | `d3d11_rtx.cpp` | same inputs -> same output, run twice, bit-identical |
 | **5b** | **`ExistenceSource` / `VisibilitySource` types** (§3.1) — invalidation takes the first only | `rtx_resident_scene.*`, enumeration hooks | a post-cull source cannot compile against the retirement path. Do this BEFORE RESIDENT_SCENE_PLAN slice D is wired |
-| **6** | **Job graph: counters + graph-owned `JobHandle` + composable parallel-for + exactly-once completion** (§4.2, §4.2.1) | `util_threadpool.h`, new graph, `d3d11_rtx.cpp` | undersized-queue + injected-cancellation run completes every dependent; `SynchronizeCsThread(SynchronizeAll)` removed from the flush; carrier groups are edges |
-| **7** | **Dirty-object jobs** — the graph is fed by the changed set, not the draw list | `d3d11_rtx.cpp`, resolver | one mesh in 15 draws -> one geometry decision |
+| **6** | **Job graph: counters + graph-owned `JobHandle` + composable parallel-for + exactly-once completion** (§4.2, §4.2.1, §4.2.2) | `util_threadpool.h`, new graph, `d3d11_rtx.cpp` | undersized-queue + injected-cancellation run completes every dependent; `SynchronizeCsThread(SynchronizeAll)` removed from the flush; carrier groups are edges |
+| **6b** | **Declared read/write sets** (§4.2.3) — over the seven resources that have ids | graph, `rtx_instance_manager.*` | `deferredThisDraw` and the `PendingInstanceOps` sidecar DELETED, not merely unused. If they survive, the declaration is incomplete |
+| **7** | **Dirty-primitive jobs** — the graph is fed by the changed set, not the draw list | `d3d11_rtx.cpp`, resolver | one PRIMITIVE in 15 draws -> one geometry decision (§1.3: per primitive, not per object) |
+| **7b** | Pipeline observe-and-resolve one frame ahead (§4.2.4) — the pure half only | `d3d11_rtx.cpp` | frame N+1 resolve overlaps frame N commit; **no** second copy of any RT scene state |
 | **8** | **Persistent `m_reorderedSurfaces` slots, then delta upload** (§5.1) | `rtx_accel_manager.cpp` | `m_reorderedSurfaces.clear()` gone; `[SurfaceIndexStability]` sort deleted; stationary scene uploads ~0 surface bytes/frame |
 | **9** | **GPU scene cull generalised from PointInstancer** (§5.3) | `rtx_point_instancer_system.*`, `rtx_accel_manager.cpp` | `sceneCull` CPU loop gone; culled set matches the CPU verdict exactly under verify |
 | **10** | **SER: un-stub, measure, then hint** (§5.4) | `geometry_resolver_state.slangh` | G-buffer ms, with the RayQuery-vs-ray-pipeline A/B taken first |
@@ -932,10 +1108,23 @@ record. Phase 2B's chunk packing survives as the job system's batching policy.
 The Titanfall-specific reversing in `CULLING_BIBLE.md` is the expensive part and
 none of it is touched.
 
-**Not id Tech 8's renderer.** Visibility buffers, deferred texturing and compute
-material dispatch are a rasteriser's answer to a problem a path tracer solves
-with SER and a well-built TLAS. Take the *principle* — the CPU says what changed,
-the GPU decides what needs processing — and skip the pipeline.
+**Not id Tech 8's renderer, and not in that order.** Take the principle — the CPU
+says what changed, the GPU decides what needs processing — and note that slices 9
+and 10 ARE that principle: GPU instance masking answers "which of these matter to
+this view", and SER answers "group the divergent work". Both are already in the
+build order under different names.
+
+The one genuinely additional id Tech idea is the visibility-buffer / deferred-
+material split, and its position matters more than its merit. **Classifying
+pixels by material and dispatching per class is the software implementation of
+what SER does in hardware.** Building it before un-stubbing SER means building a
+workaround for a feature that is switched off. It stays at slice 12, gated on
+slice 10 leaving a measured divergence problem. Do not promote it.
+
+**Not a fifth abstraction layer.** A separate "resource graph" tier restates what
+§4.2.3's declared read/write sets already give, and §4.2.3 earns its place by
+DELETING the deferral list and the sidecar. A layer that only adds a box is the
+thing `rules/subtractive-engineering.md` exists to stop.
 
 **Not another round of per-draw micro-optimisation inside `SubmitDraw`.** This is
 the one the measurements are loudest about: engine culling took 1338 draws to 538
