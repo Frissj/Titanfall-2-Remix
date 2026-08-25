@@ -454,6 +454,60 @@ Every stage lands with a verify mode that runs both paths and scores the
 prediction, and nothing is skipped until FAIL reads 0 across a full pitch-and-yaw
 sweep. This tree has used it four times and it has caught something every time.
 
+**I9 — Only a proven pre-cull source may assert that an object is dead.**
+Existence and visibility are two different claims and the code must not be able
+to confuse them. See §3.1 — this is the one invariant here that can empty a
+scene, and RESIDENT_SCENE_PLAN as written walks into it.
+
+### 3.1 EXISTENCE AUTHORITY vs VISIBILITY OBSERVATION
+
+**The hazard, stated exactly.** RESIDENT_SCENE_PLAN §7.3 measured
+`sub_1801A8350`'s return as **post-cull** — Gate 1, the view-direction-dependent
+leaf-frustum test, runs INSIDE it, so its output list is what survived culling.
+§7.5 slice D then specifies *"`onFrameEnd` touches every record whose handle is
+listed, draw or no draw, and **absent handles invalidate**"*.
+
+Those two sentences in the same document are a scene-emptying bug. Wire slice D
+to a post-cull list and every off-screen object is retired every frame: residency
+inverted into a faster version of the exact starvation it was built to fix. And
+because it happens through the RETIREMENT path rather than the reap path,
+`[ReapJoin] starved` — the plan's own headline acceptance gate — would read
+**improved** while the scene drained.
+
+**A verification step is not sufficient, and that is the important part.**
+"We confirmed the list is pre-cull" is a fact about one capture, on one map, at
+one position. RESIDENT_SCENE_PLAN §0.0 already names a sixth cull with no flag at
+all — `sub_1802EAD60`'s position-keyed area order list, 30 of 179 areas — which
+no configuration defeats and whose behaviour is not uniform across maps. A
+discipline that has to be re-established per map is a discipline that will be
+skipped once.
+
+**So the distinction is carried by the type, and only one of them is wired to
+invalidation:**
+
+```
+ExistenceSource     may assert ALIVE     may assert DEAD        requires a PROVEN pre-cull list
+VisibilitySource    may assert VISIBLE   MAY NEVER assert DEAD  post-cull lists get this, only this
+```
+
+An enumeration hook declares which it is at its construction site. Invalidation
+takes an `ExistenceSource` and nothing else, so a post-cull list physically
+cannot reach the retirement path — the §2.1 lesson applied again: *find the place
+where the question answers itself* rather than writing a rule somebody has to
+remember.
+
+**The promotion gate is the one slice B already has.** `listed=` FLAT across a
+fixed-position pitch-and-yaw sweep is what promotes a source from
+`VisibilitySource` to `ExistenceSource`. Until it passes on the map under test,
+the source stays a `VisibilitySource` and residency keeps whatever liveness it
+had.
+
+**Do not discard a post-cull source — type it and use it.** A `VisibilitySource`
+is the engine's own visibility answer, which is strictly better information than
+`sceneCull`'s frustum-and-light-influence test (§1.4: `culled=0`, because
+`lightAllKeep` covers all 1298 off-screen instances). Feed it to slice 9 as a
+culling input. It is worth having; it is just not allowed to kill anything.
+
 ---
 
 ## 4. THE CPU HALF — FROM PHASES TO A DEPENDENCY GRAPH
@@ -532,6 +586,69 @@ Draw202 ─┘
 That is the change that makes the worker count matter. Today adding cores adds
 nothing past the widest phase.
 
+### 4.2.1 THE LIFETIME CONTRACT, AND WHY THE POOL CANNOT SUPPLY IT
+
+**The counters are right and `Future` cannot carry them.** The existing pool is a
+bounded task ring with recycled ids, and a `Future` is a raw pointer into it:
+
+```
+util_threadpool.h:362   TaskId taskId = m_taskId++ & (m_taskCount - 1);   // wrapping ring index
+util_threadpool.h:259   mutable Task* task = nullptr;                     // Future IS a raw slot pointer
+util_threadpool.h:158   result.reset();                                   // capture() clears hasResult
+util_threadpool.h:229   valid() { return task != nullptr && task->valid(); }
+```
+
+`m_taskCount` is `NumTasksPerThread * numThreads` rounded up to a power of two.
+`capture()` placement-news the lambda into the slot's inline storage and calls
+`result.reset()`, which clears `hasResult` — under any holder still sitting in
+`get()`. `valid()` cannot detect that the slot was re-issued, because there is no
+generation on the `Task`.
+
+**So a retained `Future` is I2 being violated inside the primitive the graph
+would be built on.** It is safe today only by accident: `flushGeometryBatch`
+schedules ~worker-count chunks and joins them immediately, so `m_taskId` never
+advances a full `m_taskCount` between capture and get. A graph that holds
+completion tokens across phases — which is the entire point of §4.2 — removes
+that accident.
+
+**Two more, and both are silent deadlocks rather than corruption.**
+
+*Cancellation never completes.* `cancel()` sets `isDisposed = true`
+(`util_threadpool.h:107`) and the capture thunk is
+`if (!result.disposed()) { ... result.set(...) }` (`:145`). A cancelled task
+never calls `set()`. A dependency counter decremented inside `set()` never fires,
+and every job waiting on it is unreachable. The pool's own destructor uses this
+path — `m_tasks[taskId].cancel(); m_tasks[taskId]();` at `:335` — so shutdown
+with a live graph hangs.
+
+*A full queue never completes either.* `Schedule` returns a default-constructed
+`Future` when `isFull()`: `valid()` is false and there is no task at all.
+`flushGeometryBatch` survives only because the CALL SITE checks `f.valid()` and
+runs the range inline (`d3d11_rtx.cpp:34787`). A graph that assumes `Schedule`
+yields a token that will complete deadlocks the first time a worker queue fills.
+
+**The contract, therefore, and it is graph-owned rather than pool-owned:**
+
+```cpp
+struct JobHandle { uint32_t index; uint32_t generation; };   // into a graph-owned node array
+
+// Every node completes its dependents EXACTLY ONCE, on every exit path:
+//   ran to completion · cancelled · threw · ran inline because the queue was full
+struct NodeScope {
+  ~NodeScope() { node.signalComplete(); }   // decrement + release waiters, idempotent
+};
+```
+
+`Task` / `Future` are demoted to "a way to get a worker to run this node's body".
+Nothing outside the pool holds a `Future` across a phase boundary. Enqueue-or-run-
+inline moves INTO the graph rather than being re-implemented at each call site.
+
+**Gate:** run the graph with a deliberately undersized queue (`NumTasksPerThread`
+forced low) and with cancellation injected at random nodes. Every dependent must
+still become runnable, and the node array's generation must catch any handle that
+outlived its node. If either needs a call-site check to hold, the contract is not
+in the graph yet.
+
 ### 4.3 The explicit ordering key, and why to add it now
 
 RE Engine's published approach (Capcom, GDC 2019) is worth taking almost
@@ -566,19 +683,44 @@ renderer.
 
 ## 5. THE GPU HALF
 
-### 5.1 Delta-upload the GPU scene — a prerequisite, not an optimisation
+### 5.1 The changed set must reach the TOP of the accel chain, not the upload
 
-`rtx_accel_manager.cpp:7799-7946` fills `surfacesGPUData` for every entry of
-`m_reorderedSurfaces` and uploads the whole array. 256 B/surface. Same story for
-`m_transformBuffer` at `:2718`.
+The obvious statement of this item is "delta-upload the surface buffer". That is
+true and it is not enough, because the upload is the LAST of four O(scene) steps
+and the three above it would rebuild what the delta was meant to preserve.
 
-With engine culling on and no residency, the array is the visible set and this
-is affordable. With residency finished, the array is **the whole level**, and the
-serial CPU fill loop plus the full upload scale with it. That is the mechanism by
-which a correct residency reads as a regression, and it is not in
-RESIDENT_SCENE_PLAN.
+```
+mergeInstancesIntoBlas   walks the full instance table        rtx_accel_manager.cpp:899, :1129
+                         m_reorderedSurfaces.clear()          :964   <- rebuilt from scratch
+                         partition + stable_sort              :1082-1140
+prepareSceneData         consumes m_mergedInstances           :3310
+uploadSurfaceData        fills + uploads EVERY surface        :7799, :7946
+buildTlas                MODE_BUILD_KHR                       :9380
+```
 
-The change is the one the `RenderObject` makes possible:
+**A changed-object set that is introduced at `prepareSceneData` is introduced
+one step too late.** The surface array it would delta against has already been
+cleared and rebuilt by `mergeInstancesIntoBlas`, so "which slot did this object
+occupy last frame" has no answer by then. The delta has to start at the walk.
+
+**And the tree has already hit this and worked around it.**
+`[SurfaceIndexStability]` at `rtx_accel_manager.cpp:1082` exists to make the
+ORDER of a per-frame-rebuilt array reproducible frame to frame — a stable-ORDER
+substitute for stable SLOTS, implemented as a partition plus a `stable_sort` over
+the tagged block, with its own comment noting that the naive version sorted "all
+15.5k pointers every frame to order 63 of them".
+
+That is the RESIDENT_SCENE_PLAN §0.2 buffer-tape bug one level up: a slot index
+that means "position i in this frame's array". It is the **third** instance of
+the same shape in this tree — the input-byte object key, the `m_bufferCache`
+tape, and now the surface array — and it was papered over with a sort rather than
+fixed, because at the time nothing needed a surface slot to outlive its frame.
+Residency does.
+
+**So the change is not an uploader change.** `m_reorderedSurfaces` becomes a
+`BufferSlotTable`-shaped persistent array: one stable slot per `RenderObject`,
+allocated on first appearance, freed on evidence rather than on frame age, and
+carrying a generation (I2). Once it is:
 
 ```
 per object:  frameLastChanged  vs  frameLastUploaded
@@ -586,15 +728,20 @@ per object:  frameLastChanged  vs  frameLastUploaded
              different  -> stage it into a coalesced dirty-range upload
 ```
 
-This needs I2 (a stable surface slot with a generation) and I7 (name what else
-counts frames on a surface slot). It also needs the surface slot to stop being
-"position i in this frame's reordered array" — which is the identical fix
-`BufferSlotTable` already received for buffer indices in RESIDENT_SCENE_PLAN
-§0.2, applied one level up. Read that section before designing this one; it is
-the same bug.
+and the clear-and-rebuild at `:964`, the partition-and-sort at `:1082-1140` and
+the whole-array upload at `:7946` all fall out together. The sort exists only to
+make an unstable thing look stable; with real slots there is nothing to stabilise.
 
-**Gate:** a stationary scene must upload ~0 surface bytes per frame. If it
-cannot, the output test is wrong, not the uploader.
+**One stale comment to ignore while reading that function.**
+`prepareSceneData`'s header comment says `rtx.logTlasSet` and
+`rtx.debugInstanceUploadProbe` "default to TRUE" and do work proportional to the
+instance count on every frame. They no longer default true — `rtx_options.h:4106`
+and `:3984` are both `false`, and the live conf pins them False with the ~4.8 ms
+measurement recorded beside them. That one is closed; the comment predates the
+fix. The structural O(scene) work above it is what remains.
+
+**Gate:** a stationary scene must upload ~0 surface bytes per frame AND must not
+clear `m_reorderedSurfaces`. If it cannot do the second, the first is unreachable.
 
 ### 5.2 TLAS refit
 
@@ -754,9 +901,10 @@ sequencing preference; §1.2 is the reason.
 | **3** | Slot generation on `BufferSlotTable` (§0.1 item 4) | `rtx_utils.h` | `[StaleTape] dead` becomes unreachable, not merely zero |
 | **4** | **Observe/derive split** — `SubmitDraw` captures and enqueues, derives nothing | `d3d11_rtx.cpp` | no live D3D11 read past capture; `XfLiveSite` escape counts all 0 |
 | **5** | **`ExtractTransforms` -> pure classifier** — `CaptureTransformInputs()` then `TransformClassifier(input) -> result`, deterministic, no hidden cross-draw state | `d3d11_rtx.cpp` | same inputs -> same output, run twice, bit-identical |
-| **6** | **Job counters + composable parallel-for + empty completion** (§4.2) | `util_threadpool.h`, `d3d11_rtx.cpp` | `SynchronizeCsThread(SynchronizeAll)` removed from the flush; carrier groups are edges |
+| **5b** | **`ExistenceSource` / `VisibilitySource` types** (§3.1) — invalidation takes the first only | `rtx_resident_scene.*`, enumeration hooks | a post-cull source cannot compile against the retirement path. Do this BEFORE RESIDENT_SCENE_PLAN slice D is wired |
+| **6** | **Job graph: counters + graph-owned `JobHandle` + composable parallel-for + exactly-once completion** (§4.2, §4.2.1) | `util_threadpool.h`, new graph, `d3d11_rtx.cpp` | undersized-queue + injected-cancellation run completes every dependent; `SynchronizeCsThread(SynchronizeAll)` removed from the flush; carrier groups are edges |
 | **7** | **Dirty-object jobs** — the graph is fed by the changed set, not the draw list | `d3d11_rtx.cpp`, resolver | one mesh in 15 draws -> one geometry decision |
-| **8** | **Delta surface + transform upload** (§5.1) | `rtx_accel_manager.cpp` | stationary scene uploads ~0 surface bytes/frame |
+| **8** | **Persistent `m_reorderedSurfaces` slots, then delta upload** (§5.1) | `rtx_accel_manager.cpp` | `m_reorderedSurfaces.clear()` gone; `[SurfaceIndexStability]` sort deleted; stationary scene uploads ~0 surface bytes/frame |
 | **9** | **GPU scene cull generalised from PointInstancer** (§5.3) | `rtx_point_instancer_system.*`, `rtx_accel_manager.cpp` | `sceneCull` CPU loop gone; culled set matches the CPU verdict exactly under verify |
 | **10** | **SER: un-stub, measure, then hint** (§5.4) | `geometry_resolver_state.slangh` | G-buffer ms, with the RayQuery-vs-ray-pipeline A/B taken first |
 | **11** | TLAS refit where legal (§5.2) | `rtx_accel_manager.cpp` | traversal cost not worse; build cost lower |
@@ -835,6 +983,23 @@ list. It is still an I4 violation; it may not be an urgent one.
 props until §7 slices F and H, which is ~80% of the draw stream, and engine culling
 perturbs it by construction. `FAIL=0` has to be re-established across a full sweep
 after every slice here, not once at the start.
+
+**7. Which enumeration source, if any, is ever promotable.** §3.1 makes a post-cull
+list harmless, and that is a safety property, not a solution — a `VisibilitySource`
+supplies no positive liveness, so residency keeps eviction-by-output-test and
+§7.8's population problem stays open. RESIDENT_SCENE_PLAN §7.5 lists three
+candidate sites for a genuine pre-cull list and all three are unproven. **If none
+of them is promotable, the architecture still works** — §7.8's four output tests
+are the eviction rule and three of the four need no object — but slice E (poses
+without draws) and the precise death signal do not arrive, and the plan should say
+so rather than assume a pre-cull list exists. Settle this before slices 1 and 2
+decide how much weight `engineHandle` carries in the resolver.
+
+**8. Whether the task ring is already being overrun.** §4.2.1 argues it is safe
+today by accident. That is an argument, not a measurement, and it is cheap to
+settle: add a monotonic per-slot capture counter and assert that no `Future::get()`
+observes a slot whose counter moved since `capture()`. If it fires today, slice 6
+is a bug fix before it is an architecture change.
 
 ---
 
