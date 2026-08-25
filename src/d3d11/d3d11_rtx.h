@@ -1479,7 +1479,14 @@ namespace dxvk {
     // t30 are bound (caller should leave stablePropId at its existing
     // default in that case so spatial-map dedup falls back to matrix
     // bytes).
-    uint64_t MakeBoneStablePropId(const Matrix4* firstInstanceObjectToWorld) const;
+    // vertexCount/indexCount are the MESH's own dimensions, from
+    // dcs.geometryData. They are the identity inputs that survive TF2's
+    // transient buffer arena: [PropIdRotate] measured vbPtr and ibPtr taking 38
+    // distinct values for VS 0x292b6ba0d1854f28 while the mesh itself never
+    // changed. See the identity block in the definition for why the pointers
+    // could not simply be kept.
+    uint64_t MakeBoneStablePropId(const Matrix4* firstInstanceObjectToWorld,
+                                  uint32_t vertexCount, uint32_t indexCount) const;
 
     // NV-DXVK [suppressStablePropIdVsHashes]: true when the currently bound
     // vertex shader is on rtx.suppressStablePropIdVsHashes, i.e. every propId

@@ -10868,7 +10868,8 @@ namespace dxvk {
     }
   }
 
-  uint64_t D3D11Rtx::MakeBoneStablePropId(const Matrix4* firstInstanceObjectToWorld) const {
+  uint64_t D3D11Rtx::MakeBoneStablePropId(const Matrix4* firstInstanceObjectToWorld,
+                                          uint32_t vertexCount, uint32_t indexCount) const {
     // NV-DXVK [BoneStablePropId]: per-DCS prop identity for bone-animated
     // draws. The four sites that set objectToWorld for bone-animated
     // content all leave the rendered matrix varying per frame (either
@@ -11123,10 +11124,19 @@ namespace dxvk {
 
     // No identity available â€” return 0 so caller leaves stablePropId
     // at its default and SpatialMap dedup falls back to matrix bytes
-    // (existing pre-fix behaviour). Defensive: in practice at least
-    // one of vbPtr / ibPtr / bonePalettePtr is always non-zero for the
-    // four call sites (path-11/12/10 all require IA + bones bound).
-    if (vbPtr == 0 && ibPtr == 0 && bonePalettePtr == 0) {
+    // (existing pre-fix behaviour).
+    //
+    // NV-DXVK [MeshStableId]: the test now asks whether a MESH identity exists,
+    // because that is what the hash is built from. It used to ask whether any
+    // buffer pointer was bound, and those pointers no longer contribute -- so
+    // left unchanged it would have admitted a draw with no dimensions at all and
+    // hashed a run of zeros into one shared propId for every such draw, which is
+    // the collision this function exists to avoid.
+    //
+    // A geometry with no vertices is not something to identify. indexCount is
+    // allowed to be zero because non-indexed draws are legitimate; vertexCount
+    // is not.
+    if (vertexCount == 0) {
       return 0;
     }
 
@@ -11183,16 +11193,27 @@ namespace dxvk {
     const bool boneNonFanout = (firstInstanceObjectToWorld == nullptr);
 
     struct BoneId {
-      uint64_t vbPtr;
-      uint64_t ibPtr;
+      // The IA buffer POINTERS are deliberately gone rather than zeroed-in-place
+      // under their old names: they rotate with the transient arena (38 distinct
+      // values measured for VS 0x292b6ba0d1854f28) and keeping named fields that
+      // always hold 0 invites someone to "restore" them. See [MeshStableId].
       uint64_t bonePalettePtr;
-      uint32_t vbOffset;
+      uint32_t vertexCount;
       uint32_t vbStride;
-      uint32_t ibOffset;
+      uint32_t indexCount;
       int32_t  fanoutTx;
       int32_t  fanoutTy;
       int32_t  fanoutTz;
+      // TWO pad words, and the count is load-bearing. The members above total
+      // 8 + 4*6 = 32 bytes, and the uint64_t forces 8-byte alignment, so one pad
+      // word would leave sizeof at 40 with the last 4 bytes never written --
+      // and XXH64 hashes sizeof(id), so those uninitialised bytes would go into
+      // the propId and make it nondeterministic. Two pad words land the members
+      // exactly on 40 with no trailing padding. The existing static_assert only
+      // checks size % 8, which 40 satisfies either way, so it cannot catch this;
+      // if you add or remove a field here, recount.
       uint32_t _pad;
+      uint32_t _pad2;
     // MEASURED 2026-08-15 by [BoneIdRaw], and it inverts the claim above.
     // Same draw slot, three consecutive frames, VS 0x28f7ff684a0de327:
     //   f=2414 vb=0x4f87b32aa0 ib=0x4f87b333a0 t30=0x10a29c370
@@ -11212,14 +11233,57 @@ namespace dxvk {
     // capture -- two draws of one entity in different passes shared them
     // (correctly collapsing to one propId) while different entities differed,
     // which is exactly the behaviour the SpatialMap wants.
-    } id { fanoutPosOnly ? 0ull : vbPtr,
-           fanoutPosOnly ? 0ull : ibPtr,
-           (fanoutPosOnly || boneNonFanout) ? 0ull : bonePalettePtr,
-           fanoutPosOnly ? 0u : vbOffset,
+    //
+    // NV-DXVK [MeshStableId] 2026-08-25: AND THAT MEASUREMENT DOES NOT
+    // GENERALISE. [PropIdRotate], aimed at VS 0x292b6ba0d1854f28 over a full
+    // run, counted the distinct values each input took:
+    //
+    //   bonePalettePtr   3      (already dropped for non-fanout, correctly)
+    //   vbPtr           38      ROTATES
+    //   ibPtr           38      ROTATES
+    //   vbStride/vbOffset/ibOffset  1 each -- constant, so they cannot
+    //                           discriminate between two sub-meshes at all
+    //
+    // So for THIS population vb and ib rotate as well, and the surviving hash is
+    // fresh every frame. That is why this shader is on
+    // rtx.suppressStablePropIdVsHashes rather than fixed: with propId poisoned
+    // the fallback is matrix bytes, and [ReFileJit] shows those wobble too --
+    // objectToWorld is bone 0 (path 3), which the game writes as near-identity
+    // with per-frame float noise (basis +-2^-25, translation ~2^-11). Both keys
+    // therefore miss 100% of the time and the object re-resolves by distance
+    // every frame.
+    //
+    // THE FIX: identify the MESH, not the buffers that happen to hold it this
+    // frame. vertexCount and indexCount are properties of the geometry, so the
+    // arena can hand out whatever pointers it likes without touching them.
+    //
+    // WHY THIS IS NOT A NEW TRADEOFF. The block above already accepted exactly
+    // this one -- "ibPtr identifies a MODEL, not an entity. Two characters
+    // sharing one model would now share a propId" -- so mesh-level identity is
+    // the level this producer already operates at. The change makes it
+    // dependable rather than contingent on the engine keeping a buffer alive.
+    //
+    // KNOWN RISK, same shape and same symptom as the one already documented:
+    // two entities sharing a model and NOT distinguished by the fanout
+    // translation collide on one propId, and the symptom is a prop VANISHING
+    // (two objects collapsing into one instance), not flicker. The detector is
+    // unambiguous and already in place: SpatialMap::insert logs [SpatialBump]
+    // when two live entries want one key, and it currently reads ZERO lines
+    // across a whole run. Non-zero after this change names the collision
+    // immediately, and this is the change to revert.
+    //
+    // vbStride is kept although it is constant here: it costs nothing and it
+    // separates two meshes that coincidentally share both counts but use
+    // different vertex formats.
+    } id { (fanoutPosOnly || boneNonFanout) ? 0ull : bonePalettePtr,
+           vertexCount,
            vbStride,
-           fanoutPosOnly ? 0u : ibOffset,
-           fanoutTx, fanoutTy, fanoutTz, 0u };
+           indexCount,
+           fanoutTx, fanoutTy, fanoutTz, 0u, 0u };
+    // Size AND member total, because % 8 alone cannot see trailing padding --
+    // see the two-pad-word note in the struct.
     static_assert(sizeof(BoneId) % 8 == 0, "BoneId must have no trailing padding");
+    static_assert(sizeof(BoneId) == 40, "BoneId gained or lost a field; recount the pad words");
 
     uint64_t hash = static_cast<uint64_t>(XXH64(&id, sizeof(id), 0xA11CEBABEull));
     if (hash == 0) hash = 1;  // 0 reserved as "use matrix hash"; force non-zero
@@ -52196,7 +52260,7 @@ namespace dxvk {
         // and visible viewmodel jitter. Anchor identity to the stable
         // buffer pointers instead. Non-fanout draw â†’ firstInstance=null.
         {
-          const uint64_t propId = MakeBoneStablePropId(nullptr);
+          const uint64_t propId = MakeBoneStablePropId(nullptr, dcs.geometryData.vertexCount, dcs.geometryData.indexCount);
           if (propId != 0) {
             dcs.transformData.stablePropId = propId;
             notePropIdSrc(kPropIdSrcBoneA, static_cast<uint64_t>(dcs.transformData.vertexShaderHash));   // [PropIdSrc] non-fanout bone draw
@@ -52237,7 +52301,7 @@ namespace dxvk {
         // frame, contributing to the stale-pixel surface churn.
         // Non-fanout draw â†’ firstInstance=null.
         {
-          const uint64_t propId = MakeBoneStablePropId(nullptr);
+          const uint64_t propId = MakeBoneStablePropId(nullptr, dcs.geometryData.vertexCount, dcs.geometryData.indexCount);
           if (propId != 0) {
             dcs.transformData.stablePropId = propId;
             notePropIdSrc(kPropIdSrcBoneA, static_cast<uint64_t>(dcs.transformData.vertexShaderHash));   // [PropIdSrc] non-fanout bone draw
@@ -53560,7 +53624,7 @@ namespace dxvk {
       if (m_currentInstancesToObject != nullptr
           && !m_currentInstancesToObject->empty()) {
         const Matrix4& firstInst = (*m_currentInstancesToObject)[0];
-        const uint64_t propId = MakeBoneStablePropId(&firstInst);
+        const uint64_t propId = MakeBoneStablePropId(&firstInst, dcs.geometryData.vertexCount, dcs.geometryData.indexCount);
         if (propId != 0) {
           dcs.transformData.stablePropId = propId;
           notePropIdSrc(kPropIdSrcBoneB, static_cast<uint64_t>(dcs.transformData.vertexShaderHash));   // [PropIdSrc] path-10 fanout
@@ -53652,7 +53716,7 @@ namespace dxvk {
       // instancesToObject in the N-draw variant â€” each draw IS a single
       // entity). Buffer-pointer identity alone disambiguates entities.
       {
-        const uint64_t propId = MakeBoneStablePropId(nullptr);
+        const uint64_t propId = MakeBoneStablePropId(nullptr, dcs.geometryData.vertexCount, dcs.geometryData.indexCount);
         if (propId != 0) {
           dcs.transformData.stablePropId = propId;
           notePropIdSrc(kPropIdSrcBoneB, static_cast<uint64_t>(dcs.transformData.vertexShaderHash));   // [PropIdSrc] path-10 N-draw
