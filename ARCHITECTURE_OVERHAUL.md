@@ -210,13 +210,48 @@ worth doing first. See §6.
 
 ### Not verifiable here
 
-**10. The SER claim.** The recollection is that "RE Engine restructured to use
-SER and path tracing went 14 ms → 3 ms". I cannot confirm that figure or that
-engine and will not repeat it. The well-published case is Cyberpunk 2077's
-RT: Overdrive mode, where NVIDIA reported roughly 44% faster path tracing from
-Shader Execution Reordering — a large win, and one that came from restructuring
-so there was divergent work *after* the reorder point and useful coherence hints
-*at* it, not from switching a flag on.
+**10. The SER claim — SOURCED 2026-08-25, AND IT SAYS THE OPPOSITE OF WHAT WAS
+REPORTED.** The claim in circulation is that RE Engine restructured for SER and
+path tracing dropped from ~17.7 ms to ~13.3 ms, after a static-SRV to bindless
+conversion took the shader from 24,000 instructions back to 12,000 and removed a
+35% instruction-cache stall.
+
+The primary source is Hitoshi Mishima (CAPCOM), *Implementing Real-Time Path
+Tracing in RE ENGINE for 'Resident Evil Requiem' and 'PRAGMATA'*, GDC 2026,
+12 March 2026. **None of those numbers are in it.** SER appears once, on the
+Future work slide (p. 58):
+
+> *"ShaderGraph for Closest Hit Shader and Any Hit Shader — **We tried Shader
+> Execution Reordering. Currently, it is not enough of a performance gain**"*
+
+and in the speaker note: *"We plan to use ShaderGraph in a sparse configuration
+with ClosestHitShader or AnyHitShader. **Since SER has not yet been fully
+validated for these purposes**, achieving better performance will enable more
+flexible material representation."*
+
+Every load-bearing part of the circulating account is contradicted:
+
+| claim | slides |
+|---|---|
+| SER shipped, 17.7 -> 13.3 ms, +3.4 ms net | unshipped future work with a NEGATIVE result |
+| 12,000 -> 24,000 instructions | no instruction counts appear anywhere |
+| 35% of render time stalled on instruction cache | no cache-stall figure appears |
+| two passes merged into one `DispatchRays` | p. 9: *"Both Ray Tracing and Path Tracing use **RayQuery**"* — inline. There is no DispatchRays |
+| the fix was converting to bindless | p. 9: *"Same Material evaluation using **Bindless Resources**"* — already bindless |
+| NVIDIA's Calvin Hsu was involved | TRUE, he is a listed co-contributor. The one real detail |
+
+The performance slide (p. 57) is a table of absolute path-trace cost per GPU,
+measured 2025-12-12: RTX 3060 29.95 ms, RTX 4060 Ti 24.20 ms, RTX 4070 Ti
+13.64 ms, RTX 5060 Ti 8.78 ms at 1080p. The circulating figures appear to be
+mined out of that table and given a causal story they do not have.
+
+**Useful as calibration:** 13.64 ms on a 4070 Ti and 8.78 ms on a 5060 Ti is what
+a whole shipping path tracer costs at 1080p. That is the yardstick for §5.
+
+The genuinely comparable published SER result remains Cyberpunk 2077's
+RT: Overdrive mode, where NVIDIA reported roughly 44% faster path tracing — a
+large win that came from restructuring so there was divergent work *after* the
+reorder point and useful coherence hints *at* it, not from switching a flag on.
 
 **The actionable half is in this tree, and it is not a flag.**
 `rtx.enableShaderExecutionReorderingInPathtracerGbuffer` is set `True` in the
@@ -236,8 +271,13 @@ the divergence problem, never calls `ReorderThread`. Only `PathState::shouldReor
 two coherence-hint bits: separate-unordered-approximations-active, and
 `isNrcUpdate`. Neither is a material or a hit/miss classification.
 
-See §5.4. This is the highest-value GPU item in the document and it is one
-predicate function, not a rewrite.
+See §5.4. **It is the CHEAPEST GPU measurement available — one predicate
+function — and it is no longer the highest-value item.** RE Engine is RayQuery-
+based with bindless material evaluation and everything inlined, which is exactly
+our position, and it reports SER as not paying. Their stated path is to move
+material evaluation into ClosestHit/AnyHit shaders FIRST and revisit SER after.
+That reverses the ordering this document originally argued; §5.4 and §7 now
+follow it.
 
 ---
 
@@ -448,7 +488,7 @@ Concretely, three things violate that today and are the slice-7 work list:
                         TLAS  (refit where legal)
                                  │
                                  ▼
-                        PATH TRACE  (SER re-enabled, §5.4)
+                        PATH TRACE  (SER re-enabled, §5.4.1)
 ```
 
 Three boundaries, and they are the whole design:
@@ -941,18 +981,69 @@ fix. The structural O(scene) work above it is what remains.
 **Gate:** a stationary scene must upload ~0 surface bytes per frame AND must not
 clear `m_reorderedSurfaces`. If it cannot do the second, the first is unreachable.
 
-### 5.2 TLAS refit
+### 5.2 Move the BVH build to async compute — and prefer this over a refit
 
-`buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR`
-(`rtx_accel_manager.cpp:9380`) — full rebuild, every frame, per TLAS type. The
-BLAS path already knows how to update (`:2635`, `:3057`), so the machinery and
-the flags discipline exist.
+**Sourced from the RE ENGINE talk (§0.1 item 10), p. 55, and it is a better
+answer than the one this section originally gave:**
 
-A full rebuild is correct and sometimes the right choice; a refit is legal only
-if the instance set has not changed topologically. With a persistent scene it
-usually has not. Worth a measurement before a change: refit quality degrades and
-a degraded TLAS costs traversal, so this is a trade, not a win. **Lower priority
-than 5.1 and 5.4.** Listed so it is not rediscovered as free.
+> *"BVH Construction — Build BLAS / TLAS using **Async Compute**. Run in the
+> background alongside Visibility Buffer, G-Buffer, and Shadow Casting passes."*
+
+Our build sits inside `injectRTX` on the graphics queue, in line with everything
+else. Overlapping it onto a compute queue costs **no traversal quality**, which
+is the thing a refit does cost. That makes it strictly the better first move.
+
+Two details from the same slide worth taking with it:
+
+- **BVH memory suballocated from committed resources** — *"No Resource Barriers
+  required, can be allocated with 256-byte alignment."* Our accel manager
+  creates a buffer per BLAS with full barrier tracking (`rtx_accel_manager.cpp`
+  around `:2547`, `:3032`), and the barrier traffic is proportional to the BLAS
+  count, which residency is about to grow.
+- **Frame generation contends with async compute** (p. 56): concurrent use
+  breaks parallel execution and idles the direct queue. Their fix was creating
+  paired direct and compute queues sharing a `CreatorID`. Only relevant with
+  DLFG on, and it is a nasty failure to find unaided — noted here so it is not
+  rediscovered as "async compute made things worse".
+
+**The refit stays on the list, below this.** `buildInfo.mode =
+VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR` (`rtx_accel_manager.cpp:9380`)
+is a full rebuild every frame, per TLAS type, and the BLAS path already knows how
+to update (`:2635`, `:3057`). A refit is legal only if the instance set has not
+changed topologically, which with a persistent scene it usually has not — but
+refit quality degrades and a degraded TLAS costs traversal. That is a trade, not
+a win, and it is worth taking only after the overlap above has been measured.
+
+### 5.2.1 The any-hit cost, and an answer that is not OMM
+
+`rtx.opacityMicromap.enable` defaults true (`rtx_options.h:2933`) and the live
+conf sets `enableBinding = True`, so alpha-tested surfaces that do not get an
+OMM pay full any-hit traversal. **Measure the bind-to-request ratio before
+assuming that is the problem**; this document does not have a verified coverage
+number and the figure in circulation came from a source it could not check.
+
+If it does turn out to be low, the RE ENGINE talk offers an answer that is not
+"raise OMM coverage" (p. 51-52). They hit the same wall — *"Any-hit shaders are
+not efficient with complex shaders"* — and replaced the any-hit test for shadow
+rays with a **screen-space alpha test**, described as the inverse of a shadow
+map: project the hit position into the rasteriser's depth buffer and reject the
+hit if it is occluded.
+
+```hlsl
+float4 pos = mul(getBVHMatrix(InstanceIndex()), float4(hit_pos, 1));
+pos = mul(pos, viewProjMat);  pos.xyz /= pos.w;
+if (all(abs(pos.xy) < 1.f)) {
+  float depth = readDepth(pos.xy);
+  if (pos.z > depth + ScreenSpaceAlphaTestDepthBias)
+    IgnoreHit();
+}
+```
+
+**We are unusually well placed to try this, because the game rasterises a depth
+buffer for us and we already intercept it.** Two honest caveats: it is a
+screen-space approximation, so it is wrong for anything outside the frustum or
+behind an occluder the depth buffer does not carry; and Capcom scoped it to
+shadow rays specifically. Investigate, do not port.
 
 ### 5.3 Generalise the PointInstancer culling to the resident set
 
@@ -980,35 +1071,107 @@ TLAS             resident ∩ visible
 Do this AFTER 5.1. Delta upload is what makes the GPU's copy of the scene
 authoritative enough to cull against.
 
-### 5.4 SER: un-stub the G-buffer predicate — the highest-value GPU item
+### 5.4 THE G-BUFFER SHADER FOOTPRINT — MEASURED, AND IT COMES BEFORE SER
+
+**Measured 2026-08-25 from the built artifacts in `_Comp64Release/src/dxvk/rtx_shaders`,
+disassembled with `external/spirv_tools/spirv-dis.exe`:**
+
+```
+gbuffer_rayquery_nrc_wboit_opaque_translucent_occ256.spv  2,188,708 B  136,995 in-function instrs
+gbuffer_rayquery.spv                                      2,013,408 B  125,259
+gbuffer_material_opaque_translucent_closestHit.spv        1,954,576 B  121,517
+
+for scale   imgui_fragment.spv   684 B / 171 words
+            216 shaders, 139 MB of SPIR-V, 27 over 1.5 MB, 67 gbuffer permutations
+```
+
+**`gbuffer_material_opaque_translucent_closestHit` contains exactly ONE
+`OpFunction`.** The whole resolve, material evaluation and lighting path is
+inlined flat into `main` — 121,516 instructions in a single body. Its opcode
+histogram:
+
+```
+OpStore     20,979      OpFMul  2,797
+OpLoad      19,778      OpFAdd  1,754      ~7,000 arithmetic ops total
+OpVariable  12,680  <-  OpFSub  1,625      against ~41,000 load/store
+OpLabel     11,320
+```
+
+Twelve thousand local declarations in one function, forty thousand load/stores
+against seven thousand arithmetic ops. That is the signature of full inlining
+producing enormous scalar temporaries, and it matches the downstream evidence
+exactly: **255 registers — the architectural ceiling — and 144 B of spill.**
+
+**Read this carefully rather than as a conclusion.** SPIR-V is pre-optimisation
+IR; the driver backend runs SROA and mem2reg and will collapse a large share of
+those `OpVariable`s. The IR is evidence of *where the pressure comes from*, not a
+machine instruction count. What says the backend did not fully succeed is the
+255-register / 144 B-spill measurement.
+
+**Register pressure and instruction-cache pressure produce IDENTICAL high-level
+symptoms and prescribe OPPOSITE fixes.** "Latency-bound, ~17% occupancy, SM 19%,
+RT cores 12.7%, L2 48.8%" is consistent with either. Smaller code fixes one; less
+live state fixes the other. So the first GPU measurement is the Nsight Compute
+warp-stall breakdown:
+
+```
+instruction-fetch stalls high      -> code size    -> the material split (5.4.2)
+stall_long_scoreboard + local mem  -> spill        -> register pressure
+```
+
+### 5.4.1 SER: un-stub the predicate — cheapest measurement, no longer the headline
 
 Both G-buffer payload states return `false` unconditionally
 (`geometry_resolver_state.slangh:182` and `:366`). The option that appears to
-control this is `True` in the live conf and inert. So the pass with the
-divergence problem — one uber-shader carrying opaque, translucent, WBOIT, NRC,
-PSR and portal paths — never reorders.
+control this is `True` in the live conf and inert
+(`rtx_options.h:2628`, *"Note: Hard disabled in shader code"*). Only
+`PathState::shouldReorder` (`path_state.slangh:487`, integrate-indirect) returns
+true, and it emits at most two coherence-hint bits — unordered-approximations-
+active and `isNrcUpdate`. Neither is a material or hit/miss classification.
 
-The work is not "return true". SER pays when there is divergent work *after* the
-reorder point and a hint that predicts it. So:
+**Do it, because it is one line and the cheapest number on the GPU side. Do not
+sequence anything behind it.** §0.1 item 10 is why: RE ENGINE is RayQuery-based
+with bindless material evaluation and everything inlined — our position exactly —
+and reports SER as *"not enough of a performance gain"*, with the stated plan
+being to move material evaluation into ClosestHit/AnyHit shaders first and
+revisit SER after.
 
-1. **Un-stub it and measure with zero hints first.** Even `numCoherenceHints=0`
-   reorders by hit/miss and by hit-group, which is most of the primary-ray
-   divergence. This is the baseline and it costs one line.
-2. **Then add hints, in the order the payload can cheaply compute them:** surface
-   material class (opaque / alpha-tested / translucent), then PSR-vs-primary,
-   then portal-crossed. Two to four bits.
-3. **Then, and only then, consider the material-class split.** Classifying pixels
-   into per-material dispatches is the same idea implemented in software, and it
-   is a much larger change. Reordering may make it unnecessary — measure before
-   building it.
+1. **Un-stub and measure with zero hints.** Even `numCoherenceHints=0` reorders
+   by hit/miss and hit-group. One line.
+2. **Read the stall breakdown, not just frame time.** If the shader is
+   fetch-stalled, a null result here is footprint, not SER, and attributing it to
+   SER is the wrong conclusion about a feature that was switched off.
+3. **Then hints**, in the order the payload can compute them cheaply: material
+   class, then PSR-vs-primary, then portal-crossed. Two to four bits.
 
-There is a hard precondition and it is why this is not already done: SER lives
-under `#if defined(RAY_PIPELINE)`, so it does nothing in the RayQuery/compute
-G-buffer mode. `rtx.renderPassGBufferRaytraceMode` defaults to `RayQuery`
-(`rtx_options.h:1568`) and the live conf sets `2`. **Confirm which enumerator `2`
-is before spending any time here** — if the G-buffer is running as compute, step
-1 is inert and the honest first move is the A/B between the compute and
-ray-pipeline G-buffer, not the predicate.
+**Hard precondition.** SER lives under `#if defined(RAY_PIPELINE)`, so it does
+nothing in RayQuery/compute mode. `rtx.renderPassGBufferRaytraceMode` defaults to
+`RayQuery` (`rtx_options.h:1568`) and the live conf sets `2`. **Resolve which
+enumerator `2` is before spending any time here** (§9 item 2) — if the G-buffer
+runs as compute, step 1 is inert.
+
+### 5.4.2 The material split — promoted, and for a different reason than divergence
+
+This document originally gated the material-class split on SER leaving a
+divergence problem. **Two independent lines of evidence now put it first
+instead:**
+
+- **§5.4's measurement.** 121,517 instructions in one inlined `main`, 12,680
+  local variables, 255 registers, 144 B spill. Whatever SER does, that shader is
+  too large and too register-hungry, and the split shrinks both — smaller
+  resident footprint per dispatch, and less live state per path.
+- **The RE ENGINE ordering.** Their next step is ShaderGraph over ClosestHit /
+  AnyHit shaders *in a sparse configuration*, i.e. per-material hit shaders,
+  and only then SER. Same architecture, same conclusion, arrived at
+  independently.
+
+Note what the artifacts already say about the obvious shortcut: the
+per-hit-group build did **not** shrink anything.
+`gbuffer_material_opaque_translucent_closestHit` is 121,517 instructions against
+the monolithic RayQuery build's 125,259. **Splitting into SBT entries alone buys
+nothing here** — the material evaluation code is inlined into every hit shader.
+The split has to reduce what each variant *contains*, not merely how the variants
+are dispatched.
 
 ### 5.5 What NOT to do to the GPU half
 
@@ -1061,8 +1224,8 @@ The procedure, which is the fence procedure from `rules/simple.md`:
 5. **Cannot determine why it exists → keep.** An unexplained part is a fence.
 
 Expect to remove most of what you look at, per the rule. Do this **before** the
-splits in slices 4-7, because splitting a function that is 40% dead
-instrumentation carries the instrumentation into both halves.
+splits in slices 4-7, because splitting a function that is ~15% probe code
+carries the probes into both halves and doubles what the next pass has to read.
 
 ### 6.2 Options
 
@@ -1122,12 +1285,24 @@ sequencing preference; §1.2 is the reason.
 | **7b** | Pipeline observe-and-resolve one frame ahead (§4.2.4) — the pure half only | `d3d11_rtx.cpp` | frame N+1 resolve overlaps frame N commit; **no** second copy of any RT scene state |
 | **8** | **Persistent `m_reorderedSurfaces` slots, then delta upload** (§5.1) | `rtx_accel_manager.cpp` | `m_reorderedSurfaces.clear()` gone; `[SurfaceIndexStability]` sort deleted; stationary scene uploads ~0 surface bytes/frame |
 | **9** | **GPU scene cull generalised from PointInstancer** (§5.3) | `rtx_point_instancer_system.*`, `rtx_accel_manager.cpp` | `sceneCull` CPU loop gone; culled set matches the CPU verdict exactly under verify |
-| **10** | **SER: un-stub, measure, then hint** (§5.4) | `geometry_resolver_state.slangh` | G-buffer ms, with the RayQuery-vs-ray-pipeline A/B taken first |
-| **11** | TLAS refit where legal (§5.2) | `rtx_accel_manager.cpp` | traversal cost not worse; build cost lower |
-| **12** | G-buffer material-class split | shaders | **only** if 10 leaves a divergence problem |
+| **G0** | **The GPU measurement** (§5.4) — Nsight warp-stall breakdown + the `renderPassGBufferRaytraceMode = 2` enum lookup | none | fetch-stall vs `stall_long_scoreboard` decided. **Nothing in G1-G4 is orderable before this** |
+| **G1** | **SER: un-stub, measure, then hint** (§5.4.1) | `geometry_resolver_state.slangh` | one line; read the stall breakdown, not just frame time. Nothing sequenced behind it |
+| **G2** | **BVH build on async compute** (§5.2) + committed-resource suballocation | `rtx_accel_manager.cpp` | build overlaps G-buffer/lighting; watch DLFG queue contention (`CreatorID` pairing) |
+| **G3** | **G-buffer material split** (§5.4.2) — reduce what each variant CONTAINS, not how variants dispatch | shaders | instruction count and register count down. **Promoted above SER's outcome**, not gated on it |
+| **G4** | Any-hit cost: measure OMM bind ratio, then consider the screen-space alpha test (§5.2.1) | shaders | measure first — this document has no verified coverage number |
+| **G5** | TLAS refit where legal (§5.2) | `rtx_accel_manager.cpp` | traversal cost not worse; build cost lower. **After G2** — overlap costs no quality, refit does |
+
+**Two independent tracks.** Numbered slices are the CPU/scene side and are
+strictly ordered — each consumes the one before. `G`-slices are the GPU side and
+depend on the numbered track only at two points: **G3 wants slice 0's probe cull
+first** (the shader permutation matrix is easier to reason about once the
+diagnostic options are gone), and **G2/G5 want slice 8** (a persistent surface
+table changes what the BVH build is being asked to do). Otherwise the two tracks
+can run in parallel, and **G0 is takeable today** — it is two measurements and no
+code.
 
 Slices 0 and 0b are first for a reason and it is not tidiness: slices 4, 5 and 7
-are surgery on the five functions that §6.1 is removing 40% of.
+are surgery on the five functions §6.1 is thinning.
 
 `rtx_options.h` is touched **once**, at slice 0b, with every option this work
 will ever need. It is included nearly everywhere and any touch is a ~20 minute
@@ -1148,18 +1323,28 @@ record. Phase 2B's chunk packing survives as the job system's batching policy.
 The Titanfall-specific reversing in `CULLING_BIBLE.md` is the expensive part and
 none of it is touched.
 
-**Not id Tech 8's renderer, and not in that order.** Take the principle — the CPU
-says what changed, the GPU decides what needs processing — and note that slices 9
-and 10 ARE that principle: GPU instance masking answers "which of these matter to
-this view", and SER answers "group the divergent work". Both are already in the
-build order under different names.
+**Not id Tech 8's renderer — but the material split is now ahead of SER, not
+behind it.** An earlier version of this section argued the opposite: that
+classifying pixels by material is the software implementation of what SER does in
+hardware, so building it before un-stubbing SER means working around a switched-
+off feature. **That argument is withdrawn**, on two pieces of evidence that
+arrived after it was written:
 
-The one genuinely additional id Tech idea is the visibility-buffer / deferred-
-material split, and its position matters more than its merit. **Classifying
-pixels by material and dispatching per class is the software implementation of
-what SER does in hardware.** Building it before un-stubbing SER means building a
-workaround for a feature that is switched off. It stays at slice 12, gated on
-slice 10 leaving a measured divergence problem. Do not promote it.
+- §5.4's measurement — 121,517 instructions in one inlined `main`, 12,680 local
+  variables, 255 registers, 144 B spill. That shader is too large and too
+  register-hungry independently of what reordering does.
+- §0.1 item 10 — RE ENGINE, same RayQuery-plus-bindless architecture, reports SER
+  as *"not enough of a performance gain"* and plans per-material hit shaders
+  first, SER after.
+
+So the id Tech principle to take is not the visibility buffer. It is that
+**reducing what each shader invocation CONTAINS comes before reordering the
+invocations.** G3 is that, and it is no longer gated on G1's outcome.
+
+What still holds from the original: do not build a visibility buffer, do not
+build deferred texturing. A path tracer's primary rays already hit exactly what
+is visible; there are no hidden pixels to avoid shading. The problem is footprint
+and divergence at the hit point, and G3 addresses footprint directly.
 
 **Not a fifth abstraction layer.** A separate "resource graph" tier restates what
 §4.2.3's declared read/write sets already give, and §4.2.3 earns its place by
@@ -1172,8 +1357,8 @@ and 57.99 ms to 19.97 ms by changing the *population*, not the per-item cost.
 Reducing what enters the pipeline is worth more than any amount of shaving inside
 it, and it is what §1 through §5 are for.
 
-**Not a class-keyed exclusion anywhere.** I6. It will be tempting at slices 7, 9
-and 12 and it is wrong at all three.
+**Not a class-keyed exclusion anywhere.** I6. It will be tempting at slices 7 and 9
+and at G3, and it is wrong at all three.
 
 ---
 
@@ -1190,8 +1375,19 @@ RESIDENT_SCENE_PLAN §7.6 item 1 says exactly this. Read `noTail` before believi
 any coverage number from slices 1, 2 or 7.
 
 **2. The G-buffer raytrace mode.** `rtx.renderPassGBufferRaytraceMode = 2` in the
-conf against a `RayQuery` default. If that resolves to a compute mode, §5.4 step 1
-is inert and slice 10 changes shape entirely. One enum lookup; take it first.
+conf against a `RayQuery` default. If that resolves to a compute mode, §5.4.1
+step 1 is inert and G1 changes shape entirely. One enum lookup; it is half of G0.
+
+**2b. Which stall the G-buffer is actually taking.** §5.4 shows the footprint and
+shows that register pressure and instruction-cache pressure are indistinguishable
+from the symptoms currently on record. Nsight Compute separates them and the
+answer picks the fix. **This is G0 and everything on the GPU side is unorderable
+without it** — including whether G3 is worth its size.
+
+**2c. The OMM bind ratio.** §5.2.1 reasons about any-hit cost without a verified
+coverage number; the figure in circulation came from a source this document could
+not check. Count requested binds against OMMs actually bound over a fixed capture
+before touching either OMM generation or the screen-space alpha test.
 
 **3. The PinDefer measurement.** `CbRange::srcPtr` exists to settle whether the CB
 byte copy can become a pointer. Until it is run, "make capture cheaper by
