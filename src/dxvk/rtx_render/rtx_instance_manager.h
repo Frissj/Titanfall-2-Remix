@@ -149,7 +149,10 @@ public:
     if (m_isCreatedByRenderer || !m_linkedBlas || m_isUnlinkedForGC || m_spatialCacheHash == kEmptyHash) {
       return;
     }
-    m_linkedBlas->getSpatialMap().erase(m_spatialCacheHash);
+    // [MapLedger]: the frame is what turns "this key is absent" into "this key
+    // was destroyed at frame F", and only the second form is something a verdict
+    // against a stationary prop can act on.
+    m_linkedBlas->getSpatialMap().erase(m_spatialCacheHash, m_frameLastUpdated);
     m_spatialCacheHash = kEmptyHash;
   }
 
@@ -311,9 +314,12 @@ uint32_t getFirstBillboardIndex() const { return m_firstBillboard; }
 
 private:
 
-  Matrix4 calcFirstInstanceObjectToWorld() {
+  // const because it only reads. Marked so a diagnostic holding a
+  // `const RtInstance*` can ask what matrix the WRITE side files this instance
+  // under, which is the comparison [MapLedger]'s `none` verdict turns on.
+  Matrix4 calcFirstInstanceObjectToWorld() const {
     if (surface.instancesToObject) {
-      return surface.objectToWorld * (*surface.instancesToObject)[0]; 
+      return surface.objectToWorld * (*surface.instancesToObject)[0];
     }
     return surface.objectToWorld;
   }
@@ -374,6 +380,39 @@ private:
   // an instance can legitimately be in both, and sharing the field would make
   // either invalidation silently clear the other's claim.
   mutable uint64_t m_residentKey = 0ull;
+
+  // WHICH STAGE OF findSimilarInstance CLAIMED THIS INSTANCE THIS FRAME, and it
+  // exists to decide one question that no existing counter can reach.
+  //
+  // The nearest stage refuses any instance already updated this frame, so a
+  // placement can lose its own partner to whichever placement resolved first and
+  // mint a fresh instance beside it. Whether that is a DEFECT depends entirely
+  // on how the winner claimed it:
+  //
+  //   exact / history  the winner had a position-independent right to it, so the
+  //                    loser genuinely has no partner and minting is correct.
+  //                    Nothing to fix in the matcher.
+  //   nearest          both placements were guessing by distance and submission
+  //                    order decided it. Resolving every exact and history claim
+  //                    across the whole batch BEFORE any distance claim would
+  //                    give the instance to whoever actually owns it.
+  //
+  // Diagnostic only, read by the [FindSim] blockedBy= histogram.
+  //
+  // THE FRAME IS PART OF THE VALUE, and leaving it out made the first version of
+  // this probe report nonsense. An instance can be updated this frame WITHOUT
+  // going through findSimilarInstance at all -- the caller skips the whole
+  // search when it already knows the instance (`if (currentInstance == nullptr)`)
+  // -- so m_frameLastUpdated being current does NOT imply the stage below was
+  // written this frame. Without the frame stamp those instances carry whatever
+  // stage last claimed them, however many frames ago, and the histogram counts
+  // ancient Exact and Nearest stamps as if they were this frame's decision.
+  //
+  // With it, a stage older than the current frame reads as None, which is the
+  // honest answer: updated this frame, but not by the matcher.
+  enum class ClaimStage : uint8_t { None = 0, Exact = 1, History = 2, Nearest = 3 };
+  mutable ClaimStage m_claimStage = ClaimStage::None;
+  mutable uint32_t m_claimFrame = kInvalidFrameIndex;
 
   Flags<CameraType::Enum> m_seenCameraTypes;  // Camera types with which the instance has been originally rendered with
 
@@ -770,6 +809,79 @@ private:
   // draw-processing threads, and a torn counter would misreport the verdict.
   std::atomic<uint32_t> m_fanoutPrevHitCount { 0 };
   std::atomic<uint32_t> m_fanoutPrevMissCount { 0 };
+  // AND THE THIRD OUTCOME, WHICH THE TWO ABOVE CANNOT REPORT. Both are
+  // incremented inside the history retry, so a draw that never carried a
+  // previous transform at all increments NEITHER and reads as "the stage was
+  // not needed" rather than "the stage could not run".
+  //
+  // That distinction is the whole diagnosis when a placement mints a fresh
+  // instance: prevNull high means the history is not being plumbed to this draw
+  // and the fix is at the producer; prevMiss high means it IS plumbed and is not
+  // reproducing last frame's key, and the fix is in how the key is composed.
+  // Counted only on an exact miss with no stablePropId, so it shares a
+  // denominator with the other two.
+  std::atomic<uint32_t> m_fanoutPrevNullCount { 0 };
+
+  // ================================================================
+  // NV-DXVK [MapLedger] 2026-08-24b: the WRITE-SIDE verdict on every history
+  // miss, counted per frame. Answers residency handoff §5.5 — "why does a
+  // stationary prop's exact lookup miss when its transform has not changed" —
+  // which the handoff states explicitly must NOT be answered from the read side,
+  // because two read-side theories have already been refuted against it.
+  //
+  // PRE-REGISTERED READING. Decide what each outcome means here, before the
+  // capture, because that is the only thing that made §5.2 and §5.3 stick as
+  // refutations rather than turning into an argument:
+  //
+  //   none large      the key was NEVER written on this map. The writer files
+  //                   under a key the reader never forms, so the fault is in key
+  //                   COMPOSITION and the fix belongs at the write site. Read
+  //                   `evicted` on the same line first — a displaced record also
+  //                   reads none, and it is the one false positive available.
+  //   refile large    §5.5's own candidate, CONFIRMED: move() took the entry off
+  //                   this key and put it on another. The detail line names the
+  //                   new key, the frame, and whether the owner that vacated is
+  //                   the instance sitting next to the query.
+  //   ins large       the ledger says the entry is filed here and nothing
+  //                   removed it, and the lookup still missed. Then the fault is
+  //                   in the CACHE, not in the matcher and not in the writer;
+  //                   `bumped` on the detail line separates the collision-orphan
+  //                   case from a flat-cache defect.
+  //   erase large     the entry was destroyed between the write and the read, so
+  //                   this is a LIFETIME question and `frame` says how stale.
+  //
+  // AND THE SPLIT THAT DECIDES WHETHER §5.4 ASKED THE RIGHT QUESTION. §5.4
+  // argues the history retry "queries a matrix byte-identical to the one the
+  // exact stage just tried, so it must miss identically" — but the moved=0 it
+  // rests on compares TRANSLATIONS ONLY. A prop whose rotation or scale drifts
+  // reads moved=0 and still forms a different key, and then the retry is not a
+  // no-op at all and the premise is false. sameBytes memcmps the whole matrix:
+  //
+  //   sameBytes ~ miss   §5.4 holds. The retry genuinely cannot help a
+  //                      stationary prop and the ledger verdict is the answer.
+  //   diffBytes large    §5.4 does NOT hold. The matrices differ in a component
+  //                      moved= cannot see, the retry was never a no-op, and
+  //                      §5.5's question is differently shaped than it is stated.
+  //
+  // miss= must equal [FanoutPrev] prevMiss on the same frame. It is emitted
+  // beside that line on purpose, so the flip frames — 124 frames carrying 27,319
+  // of the session's 33,214 history misses, against 5,895 spread over 605
+  // ordinary frames — can be separated at read time instead of being averaged
+  // into the steady state, which is trap §6.2 made once already.
+  struct MapLedgerAgg {
+    std::atomic<uint32_t> miss      { 0 };
+    std::atomic<uint32_t> sameBytes { 0 };
+    std::atomic<uint32_t> sameNone  { 0 };
+    std::atomic<uint32_t> sameIns   { 0 };
+    std::atomic<uint32_t> sameRefile{ 0 };
+    std::atomic<uint32_t> sameErase { 0 };
+    std::atomic<uint32_t> diffNone  { 0 };
+    std::atomic<uint32_t> diffIns   { 0 };
+    std::atomic<uint32_t> diffRefile{ 0 };
+    std::atomic<uint32_t> diffErase { 0 };
+    std::atomic<uint32_t> evicted   { 0 };
+  };
+  MapLedgerAgg m_mapLedgerAgg;
 
   ResourceCache* m_pResourceCache;
 

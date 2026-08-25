@@ -3129,6 +3129,33 @@ namespace dxvk {
     // memory is ~31% of SubmitDraw when unbounded, and this is a diagnostic.
     static constexpr size_t kCensusCbContentCap = 256u;
 
+    // THE IA IDENTITY, FIELD BY FIELD -- what residentDrawKey hashes into the
+    // base key. Hoisted out of that function so [RsChurn] can name the field
+    // that moved; the key itself is a hash and answers "different", never
+    // "different HOW".
+    //
+    // Every field is an engine-owned allocation or a draw parameter, so the
+    // struct is camera- and animation-invariant by construction. Offsets and
+    // stride are in because TF2 sub-allocates many meshes out of one pooled
+    // buffer and the pointer alone would merge them; the draw range is in for
+    // the same reason.
+    struct ResidentKeyHead {
+      uint64_t vbPtr;
+      uint64_t ibPtr;
+      uint64_t vsHash;
+      uint64_t ilPtr;
+      uint32_t vbOffset;
+      uint32_t vbStride;
+      uint32_t ibOffset;
+      uint32_t ibFormat;
+      uint32_t drawStart;
+      uint32_t drawCount;
+      int32_t  drawBase;
+      uint32_t indexed;
+    };
+    static_assert(sizeof(ResidentKeyHead) == 64, "ResidentKeyHead must have no implicit padding");
+    static constexpr uint32_t kResidentKeyFields = 12u;
+
     struct ResidentGateEntry {
       uint64_t srcGenHash    = 0ull;
       uint32_t frameLastSeen = 0u;
@@ -3173,6 +3200,25 @@ namespace dxvk {
       // hold the old material resident with nothing to catch it, which is trap
       // 4's shape exactly: alive, and not refreshed. See residentMaterialFold().
       uint64_t matHash = 0ull;
+      // THE PLACEMENT COUNT, AND IT IS A DIRTY TEST RATHER THAN A KEY TERM --
+      // the distinction this whole gate turns on. A fanout draw carries N props
+      // in one call and assigns objectToWorld = identity, so o2w is the same
+      // constant on every such draw and only the placement list separates them.
+      //
+      // FOLDED INTO THE KEY IT COSTS HITS. Measured under motion: 6,359 draws
+      // pushed out of gap1 and gap3plus more than doubled, because the count is
+      // stable standing still and unstable moving, so the fold minted a fresh
+      // key exactly when the camera moved. Compared HERE the key is untouched:
+      // a batch that gained or lost a prop keeps its identity, misses, and
+      // rebuilds the record it will serve next frame.
+      //
+      // AND THE JUDGE DOES NOT COVER THIS. ResidentScene::score() compares
+      // rec->instances.size() against produced.size(), but score() runs only
+      // under rtx.residentScene.verify. The live path is touch(), which has no
+      // produced list and no size test, so an unchecked count mismatch there is
+      // a skipped draw whose record names the wrong number of props -- a gained
+      // prop never gets an instance, a lost one keeps being stamped.
+      uint32_t nPlace = 0u;
       uint32_t cbMovedMaskAcc = 0u;   // which slots have EVER moved for this model
       uint32_t cbBoundMaskAcc = 0u;   // which slots this model has ever bound
       uint64_t modelKey = 0ull;   // identity WITHOUT the draw range or ordinal
@@ -3367,6 +3413,7 @@ namespace dxvk {
     uint32_t m_rsNoTail    = 0;
     uint32_t m_rsMissO2w   = 0;  // key and geometry clean, derived transform moved
     uint32_t m_rsMissMat   = 0;  // key, geometry and transform clean, material moved
+    uint32_t m_rsMissPlace = 0;  // all of the above clean, the fanout batch gained or lost a prop
 
     // THE GATE'S PER-DRAW STASH. The verdict needs both halves and they become
     // available at different points: the key and the two cheap folds come off
@@ -3383,6 +3430,25 @@ namespace dxvk {
     // needs it to group the draws that share one IA identity within a frame,
     // and XXH64(ordinal, baseKey) cannot be run backwards to recover it.
     uint64_t m_rsDrawBaseKey = 0ull;
+    // [RsChurn]: the FIELDS m_rsDrawBaseKey was hashed from, kept so the churn
+    // probe can say WHICH one moved. A hash cannot be run backwards, and the
+    // number this exists to explain -- ~1.3 brand-new identities a frame in a
+    // settled scene -- is the difference between a bounded record set and one
+    // that grows until the eviction sweep takes it.
+    //
+    // Written only when rtx.residentScene.logStats is on, so a probe-off run
+    // pays one branch rather than a 64-byte copy per draw.
+    ResidentKeyHead m_rsDrawKeyHead = { };
+    // [RsVbClass]: how the draw's vertex buffer is declared, and whether the CPU
+    // has ever written it. The two candidate exclusions for the vbOffset churn
+    // read these and nothing else -- Usage==DYNAMIC is the narrow one, a
+    // non-zero map generation the broad one -- and the point of carrying both is
+    // that the population where they DISAGREE is the whole decision.
+    //
+    // Written only under rtx.residentScene.logStats, beside m_rsDrawKeyHead and
+    // for the same reason.
+    uint32_t m_rsDrawVbUsage = 0u;
+    uint64_t m_rsDrawVbGen = 0ull;
     uint64_t m_rsDrawGens = 0ull;
     uint64_t m_rsDrawMat  = 0ull;
     uint64_t m_rsDrawSrcVb = 0ull;

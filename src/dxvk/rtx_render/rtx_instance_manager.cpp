@@ -25,6 +25,7 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <algorithm>
+#include <cstring>
 // NV-DXVK [Perf.Report]: [Perf.SceneObj]'s four estMsPerFrame values feed the
 // dxvk-cs half of the assembled breakdown.
 #include "rtx_perf_report.h"
@@ -743,7 +744,24 @@ namespace dxvk {
       // holding alive fall back to retiring on numFramesToKeepInstances with
       // nothing reporting why. Left at 0, a clone simply owns no record until
       // some draw genuinely resolves to it, which is the truth.
-      static_assert(RtInstanceSize == 960, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+      // 960 -> 968 on 2026-08-24: added ClaimStage m_claimStage + uint32_t
+      // m_claimFrame ([FindSim] blockedBy= — which stage of findSimilarInstance
+      // claimed this instance, and on which frame). 5 bytes of payload, 3 of
+      // alignment padding.
+      //
+      // DIAGNOSTIC ONLY, and the only members here that are. They exist to
+      // answer whether a placement that lost its partner lost it to a stage with
+      // a real right to it (exact/history) or to another distance guess
+      // (nearest), which decides whether the batch resolution needs restructuring
+      // or the matcher is behaving correctly.
+      //
+      // COPY CTOR: DELIBERATELY NOT COPIED, and here it is the trivial case
+      // rather than a correctness argument. The pair means "the matcher claimed
+      // me, this frame". A clone was produced by createInstanceCopy, which no
+      // stage of findSimilarInstance ran for, so None/kInvalidFrameIndex is
+      // simply true. Inheriting the source's stage would report the clone as
+      // having blocked a search it never took part in.
+      static_assert(RtInstanceSize == 968, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }
@@ -1014,11 +1032,125 @@ namespace dxvk {
       // hash exactly as before. Any mismatch (a WorldMatte offset, a differently
       // composed instancesToObject) falls through to hashing, which is the old
       // path with a memcmp in front of it.
-      const XXH64_hash_t precomputedMatrixHash =
-        (keyHint.isUsable()
-         && memcmp(keyHint.matrix->data, firstInstanceObjectToWorld.data, sizeof(Matrix4)) == 0)
-        ? keyHint.hash
-        : 0;
+      const bool hintUsable = keyHint.isUsable();
+      const bool hintMatches =
+        hintUsable
+        && memcmp(keyHint.matrix->data, firstInstanceObjectToWorld.data, sizeof(Matrix4)) == 0;
+      const XXH64_hash_t precomputedMatrixHash = hintMatches ? keyHint.hash : 0;
+
+      // NV-DXVK [KeyDiverge] 2026-08-25: COUNT WHAT THE MEMCMP ABOVE DECIDES.
+      //
+      // The comparison already existed, as a correctness guard for reusing the
+      // lookup's hash. Nobody ever counted its outcome, and its outcome is the
+      // whole diagnosis: `keyHint.matrix` is the matrix findSimilarInstance
+      // QUERIED with this frame, and `firstInstanceObjectToWorld` is the matrix
+      // this write is about to FILE under. When they differ, the entry lands on
+      // a key the lookup cannot form, so that placement's exact stage misses
+      // every frame from now on — permanently, not occasionally.
+      //
+      // WHAT THE LOG ALREADY ESTABLISHES, so this probe only has to name the
+      // cause rather than prove the effect:
+      //   - [MapSupply]: no non-empty map ever runs a query deficit, so there
+      //     are enough instances to match.
+      //   - [MapLedger]: none=95.5% of history misses, evicted=0, ins=0 — the
+      //     queried key was never written on that map, and that is not a
+      //     displacement artifact or a cache defect.
+      //   - [FanoutPrevMiss]: sameBytes=1 and moved=0 on the sampled misses, so
+      //     the READER's matrix is byte-identical frame to frame.
+      //   - [SpatialMove]/[SpatialErase]: ~40 re-filings a frame with
+      //     [ReapJoin] removed=0, and ledgEntries/mapSz ratios up to 324x, so
+      //     the WRITER files a fresh key every frame for a stable population.
+      //
+      // PRE-REGISTERED READING:
+      //   diff ~ the re-file rate   CONFIRMED. The two sides compose different
+      //       matrices for the same instance in the same frame, and the fix is
+      //       to make them compose one matrix — not to change the matcher, and
+      //       not to widen the distance search that is currently papering over
+      //       it. dT/dR below say which part of the transform differs.
+      //   diff ~ 0 while re-files stay ~40
+      //       The divergence is NOT between the lookup and the write. The
+      //       writer's own matrix is drifting BETWEEN frames instead, and the
+      //       question moves to what mutates surface.objectToWorld each frame.
+      //   noHint dominant
+      //       This comparison cannot speak for the failing population at all —
+      //       split placements pass an empty hint deliberately (see the
+      //       processSceneObjectFanout call site) — and the probe has to move to
+      //       the write sites that serve splits before any of this is readable.
+      {
+        struct KeyDivergeAgg {
+          // Starts at 0 rather than the usual kInvalidFrameIndex sentinel because
+          // the rollover below is a MONOTONIC test — see the note on sDivFrame.
+          std::atomic<uint32_t> frame  { 0u };
+          std::atomic<uint32_t> same   { 0 };
+          std::atomic<uint32_t> diff   { 0 };
+          std::atomic<uint32_t> noHint { 0 };
+        };
+        static KeyDivergeAgg sKeyDiverge;
+        const uint32_t nowFrame = m_frameLastUpdated;
+
+        if (!hintUsable) {
+          sKeyDiverge.noHint.fetch_add(1, std::memory_order_relaxed);
+        } else if (hintMatches) {
+          sKeyDiverge.same.fetch_add(1, std::memory_order_relaxed);
+        } else {
+          sKeyDiverge.diff.fetch_add(1, std::memory_order_relaxed);
+          // Capped per frame, and computed only for logged lines. dT is the
+          // translation delta and dR the largest basis-column delta: a pure dT
+          // with dR ~ 0 is a positional offset applied on one side only, which
+          // is what nearestToPrev clustering at a constant ~39 units across
+          // props at unrelated world positions already hints at.
+          // MONOTONIC, not just "different". The frame here is the INSTANCE's
+          // m_frameLastUpdated, and instances reach this function carrying
+          // different values, so a plain inequality test would flip the window
+          // back and forth between two frame numbers and reset the cap on every
+          // alternation — spending far more than four lines a frame, which is
+          // trap §6.1 in a new place.
+          static std::atomic<uint32_t> sDivFrame { 0u };
+          static std::atomic<uint32_t> sDivLines { 0 };
+          uint32_t seen = sDivFrame.load(std::memory_order_relaxed);
+          if (nowFrame > seen
+              && sDivFrame.compare_exchange_strong(seen, nowFrame, std::memory_order_relaxed)) {
+            sDivLines.store(0, std::memory_order_relaxed);
+          }
+          if (sDivLines.fetch_add(1, std::memory_order_relaxed) < 4u) {
+            const Matrix4& q = *keyHint.matrix;
+            const Matrix4& w = firstInstanceObjectToWorld;
+            const Vector3 dT = w[3].xyz() - q[3].xyz();
+            float dR = 0.f;
+            for (uint32_t c = 0; c < 3u; ++c) {
+              for (uint32_t r = 0; r < 3u; ++r) {
+                dR = std::max(dR, std::abs(w[c][r] - q[c][r]));
+              }
+            }
+            Logger::info(str::format(
+              "[KeyDiverge] f=", nowFrame,
+              " vs=0x", std::hex,
+                static_cast<uint64_t>(m_linkedBlas != nullptr
+                  ? m_linkedBlas->input.getTransformData().vertexShaderHash : 0), std::dec,
+              " propId=0x", std::hex, static_cast<uint64_t>(m_stablePropId), std::dec,
+              " instToObj=", (surface.instancesToObject
+                                ? static_cast<uint32_t>(surface.instancesToObject->size()) : 0u),
+              " dT=(", dT.x, ",", dT.y, ",", dT.z, ")",
+              " dTlen=", std::sqrt(dT.x * dT.x + dT.y * dT.y + dT.z * dT.z),
+              " dRmax=", dR,
+              " qT=(", q[3][0], ",", q[3][1], ",", q[3][2], ")",
+              " wT=(", w[3][0], ",", w[3][1], ",", w[3][2], ")"));
+          }
+        }
+
+        uint32_t seenFrame = sKeyDiverge.frame.load(std::memory_order_relaxed);
+        if (nowFrame > seenFrame
+            && sKeyDiverge.frame.compare_exchange_strong(seenFrame, nowFrame, std::memory_order_relaxed)) {
+          const uint32_t s = sKeyDiverge.same.exchange(0, std::memory_order_relaxed);
+          const uint32_t d = sKeyDiverge.diff.exchange(0, std::memory_order_relaxed);
+          const uint32_t n = sKeyDiverge.noHint.exchange(0, std::memory_order_relaxed);
+          if (seenFrame != 0u && (s | d | n) != 0u) {
+            Logger::info(str::format(
+              "[KeyDiverge] f=", seenFrame,
+              " same=", s, " diff=", d, " noHint=", n));
+          }
+        }
+      }
 
       // NV-DXVK [perf]: THE CENTROID IS NOW LAZY.
       //
@@ -1049,6 +1181,81 @@ namespace dxvk {
       const Vector3 newPos = (newKey != m_spatialCacheHash)
         ? getBlas()->input.getGeometryData().boundingBox.getTransformedCentroid(firstInstanceObjectToWorld)
         : Vector3();
+
+      // NV-DXVK [ReFileJit] 2026-08-25: NAME THE OBJECT THAT JITTERS, AND SAY
+      // WHICH PART OF ITS TRANSFORM MOVES.
+      //
+      // WHAT IS ESTABLISHED. [ReFile] counts ~9 re-filings a frame, on 75% of
+      // frames, where the centroid moved less than 0.001 units. Those are not
+      // animation: 3,428 events landed on only 395 distinct positions, single
+      // positions recurring over 100 times each, so the value OSCILLATES back to
+      // values it already held. Y and Z were bit-identical on every sample and
+      // only X moved, across about four quantised values spanning 4e-4. Every
+      // wobble rewrites the XXH64 over the matrix bytes, so the key changes and
+      // that object's exact lookup can never hit again.
+      //
+      // WHY IT IS LOGGED HERE rather than in SpatialMap, where the magnitude
+      // test is natural: SpatialMap is templated over T and cannot ask for a
+      // shader hash or a prop id, so its version could only ever report that
+      // "something" jitters. debugCentroidOf hands the old centroid out so the
+      // same test runs here with the identity attached.
+      //
+      // READ THE TRANSFORM FIELDS, not the distance -- the distance is already
+      // known and is not the question:
+      //   T moves, basis bit-stable
+      //       a translation is being perturbed. Combined with X-only motion,
+      //       something adds a varying X offset to this object's world position
+      //       every frame. Chase the producer of that offset.
+      //   basis moves, T bit-stable
+      //       a rotation or scale is being recomposed each frame, and the
+      //       centroid shift is that recomposition leaking through the bounding
+      //       box. Chase the composition, not the position.
+      //   both move
+      //       the whole matrix is being rebuilt from parameters rather than
+      //       carried, and the fix is to carry it.
+      //
+      // propId is on the line because a non-zero one would make this moot: the
+      // key would be the prop id and the matrix bytes would stop mattering.
+      // instToObj is there because a populated instancesToObject means the write
+      // composes objectToWorld * instancesToObject[0], which is a second place
+      // the wobble could enter.
+      if (newKey != m_spatialCacheHash && m_linkedBlas != nullptr) {
+        Vector3 oldC;
+        if (m_linkedBlas->getSpatialMap().debugCentroidOf(m_spatialCacheHash, oldC)) {
+          const Vector3 dv = newPos - oldC;
+          const float d = std::sqrt(dv.x * dv.x + dv.y * dv.y + dv.z * dv.z);
+          if (d > 0.f && d < 0.001f) {
+            static std::atomic<uint32_t> sJitFrame { 0u };
+            static std::atomic<uint32_t> sJitLines { 0 };
+            uint32_t seen = sJitFrame.load(std::memory_order_relaxed);
+            if (m_frameLastUpdated > seen
+                && sJitFrame.compare_exchange_strong(seen, m_frameLastUpdated,
+                                                     std::memory_order_relaxed)) {
+              sJitLines.store(0, std::memory_order_relaxed);
+            }
+            if (sJitLines.fetch_add(1, std::memory_order_relaxed) < 6u) {
+              const Matrix4& m = firstInstanceObjectToWorld;
+              Logger::info(str::format(
+                "[ReFileJit] f=", m_frameLastUpdated,
+                " vs=0x", std::hex,
+                  static_cast<uint64_t>(m_linkedBlas->input.getTransformData().vertexShaderHash),
+                  std::dec,
+                " propId=0x", std::hex, static_cast<uint64_t>(m_stablePropId), std::dec,
+                " instToObj=", (surface.instancesToObject
+                                  ? static_cast<uint32_t>(surface.instancesToObject->size()) : 0u),
+                " isRenderer=", (m_isCreatedByRenderer ? 1 : 0),
+                " d=", d,
+                " dv=(", dv.x, ",", dv.y, ",", dv.z, ")",
+                " T=(", m[3][0], ",", m[3][1], ",", m[3][2], ")",
+                " c0=(", m[0][0], ",", m[0][1], ",", m[0][2], ")",
+                " c1=(", m[1][0], ",", m[1][1], ",", m[1][2], ")",
+                " c2=(", m[2][0], ",", m[2][1], ",", m[2][2], ")",
+                " oldKey=0x", std::hex, static_cast<uint64_t>(m_spatialCacheHash),
+                " newKey=0x", static_cast<uint64_t>(newKey), std::dec));
+            }
+          }
+        }
+      }
 
       // NV-DXVK [Phase2b]: on a worker during the sharded instance phase, the
       // spatial-map write is RECORDED, not applied. During that phase every
@@ -1157,7 +1364,7 @@ namespace dxvk {
       const XXH64_hash_t oldKey = m_spatialCacheHash;
       m_spatialCacheHash = m_linkedBlas->getSpatialMap().move(
           m_spatialCacheHash, newPos, firstInstanceObjectToWorld, this, m_stablePropId,
-          precomputedMatrixHash);
+          precomputedMatrixHash, m_frameLastUpdated);
       // NV-DXVK [MapGate] write-side proof; [MapWrite] below is denylisted in
       // log.cpp so the counter is the only signal that survives to the log.
       mapWriteAccount(/*isInsert*/ false, static_cast<uint32_t>(m_linkedBlas->getSpatialMap().size()));
@@ -1257,7 +1464,7 @@ namespace dxvk {
       // See the note at the move() site: log after the call so the resulting
       // cache key is available for an exact join against [MapDump2].
       m_spatialCacheHash = m_linkedBlas->getSpatialMap().insert(
-          centroid, firstInstanceObjectToWorld, this, m_stablePropId);
+          centroid, firstInstanceObjectToWorld, this, m_stablePropId, m_frameLastUpdated);
       // NV-DXVK [MapGate] write-side proof; see the move() site.
       mapWriteAccount(/*isInsert*/ true, static_cast<uint32_t>(m_linkedBlas->getSpatialMap().size()));
 
@@ -4511,7 +4718,8 @@ namespace dxvk {
           sPrevStatFrame = currentFrameIdx;
           const uint32_t hits = m_fanoutPrevHitCount.exchange(0, std::memory_order_relaxed);
           const uint32_t misses = m_fanoutPrevMissCount.exchange(0, std::memory_order_relaxed);
-          if (hits != 0u || misses != 0u) {
+          const uint32_t nulls = m_fanoutPrevNullCount.exchange(0, std::memory_order_relaxed);
+          if (hits != 0u || misses != 0u || nulls != 0u) {
             // NV-DXVK [perf] 2026-08-07: the ~200-character explanation that used
             // to be concatenated into every one of these lines now lives here.
             // This emits ONCE PER FRAME (1054 lines in a 100 s capture), and the
@@ -4522,10 +4730,55 @@ namespace dxvk {
             //            the current transform missed. Compare it against
             //            nInst-mtxStable in [FanoutSplit] (rtx.logFanoutSplitStats).
             //   prevMiss falls through to the nearest search exactly as before.
+            //   prevNull the exact stage missed and the draw carried NO history
+            //            to retry with, so the retry never ran. High here means
+            //            the plumb does not reach this draw at all, which is a
+            //            different fault from a history that misses.
             Logger::info(str::format(
               "[FanoutPrev] f=", st.frame,
               " prevHit=", hits,
-              " prevMiss=", misses));
+              " prevMiss=", misses,
+              " prevNull=", nulls));
+          }
+          // NV-DXVK [MapLedger]: the write-side census for the SAME frame,
+          // emitted here so prevHit/prevMiss sit next to it in the log.
+          //
+          // That adjacency is the point. 82% of this session's history misses
+          // (27,319 of 33,214) fall on 124 "flip" frames where prevHit drops to
+          // 0 and the entire population misses at once, against 5,895 spread
+          // over 605 ordinary frames. An average over both is an average over
+          // two different phenomena — §5.4's 643 stationary misses were drawn
+          // from exactly that mixture — and only 9 of 162 [RsFailMember] frames
+          // are flip frames, so the failure still open is mostly NOT the flip.
+          // Reading prevHit on the neighbouring line separates them for free;
+          // any aggregate taken without that split is trap §6.2 repeated.
+          //
+          // miss= must equal prevMiss above. A disagreement means a miss took a
+          // path that skipped the census, and every ratio below it is then
+          // measured against the wrong denominator.
+          {
+            const uint32_t lmiss   = m_mapLedgerAgg.miss.exchange(0, std::memory_order_relaxed);
+            const uint32_t lsame   = m_mapLedgerAgg.sameBytes.exchange(0, std::memory_order_relaxed);
+            const uint32_t sNone   = m_mapLedgerAgg.sameNone.exchange(0, std::memory_order_relaxed);
+            const uint32_t sIns    = m_mapLedgerAgg.sameIns.exchange(0, std::memory_order_relaxed);
+            const uint32_t sRefile = m_mapLedgerAgg.sameRefile.exchange(0, std::memory_order_relaxed);
+            const uint32_t sErase  = m_mapLedgerAgg.sameErase.exchange(0, std::memory_order_relaxed);
+            const uint32_t dNone   = m_mapLedgerAgg.diffNone.exchange(0, std::memory_order_relaxed);
+            const uint32_t dIns    = m_mapLedgerAgg.diffIns.exchange(0, std::memory_order_relaxed);
+            const uint32_t dRefile = m_mapLedgerAgg.diffRefile.exchange(0, std::memory_order_relaxed);
+            const uint32_t dErase  = m_mapLedgerAgg.diffErase.exchange(0, std::memory_order_relaxed);
+            const uint32_t levict  = m_mapLedgerAgg.evicted.exchange(0, std::memory_order_relaxed);
+            if (lmiss != 0u) {
+              Logger::info(str::format(
+                "[MapLedger] f=", st.frame,
+                " miss=", lmiss,
+                " sameBytes=", lsame,
+                " same{none=", sNone, " ins=", sIns, " refile=", sRefile, " erase=", sErase, "}",
+                " diff{none=", dNone, " ins=", dIns, " refile=", dRefile, " erase=", dErase, "}",
+                // Non-zero invalidates every none= on this line: a displaced
+                // record is indistinguishable from a key never written.
+                " evicted=", levict));
+            }
           }
         }
       }
@@ -4762,6 +5015,106 @@ namespace dxvk {
             split.prevObjectToWorld = drawObjectToWorld * (*prevTransforms)[placement];
           }
           split.hasPrevObjectToWorld = true;
+        }
+
+        // NV-DXVK [FastPathOrder] 2026-08-25: IS THIS INSTANCE THE ONE THAT
+        // BELONGS AT THIS PLACEMENT?
+        //
+        // This line pairs piRec->instances[placement] with transforms[placement]
+        // positionally. The safety note above establishes that the two lists are
+        // the same LENGTH; it does not establish that index i names the same
+        // object in both. Those are different claims and only the first is
+        // checked.
+        //
+        // score() measures how often they disagree and calls it a pass:
+        // m_stats.memberPerm counts "same instances, different order" and
+        // returns true, on the stated grounds that "the list is consumed as a
+        // SET" by touch(). That is true OF touch(). This site is the other
+        // consumer, and it is positional. [ResidentScene] reads memberPerm 35.6
+        // per 10-frame window, non-zero in 91% of windows, and 99 windows carry
+        // it while realFail=0 -- so the acceptance test passes precisely while
+        // the property this line depends on is violated.
+        //
+        // THE MEASUREMENT. inst->surface.objectToWorld still holds LAST frame's
+        // transform here, because updateInstance has not run yet. For a
+        // stationary prop -- and every sampled miss reads moved=0 with
+        // sameBytes=1, so this scene's fanout props are stationary -- the
+        // correctly matched instance sees a delta of exactly zero. A mismatched
+        // one sees the distance to whichever placement it was given instead.
+        //
+        // PRE-REGISTERED READING:
+        //   d0 ~ all           the pairing is correct and this whole line of
+        //                      inquiry is dead. memberPerm is then genuinely
+        //                      benign and the churn comes from somewhere else.
+        //   dFar non-zero      instances are being handed another placement's
+        //                      transform. That is a wrong position AND a wrong
+        //                      motion vector -- surface.prevObjectToWorld will
+        //                      name the previous placement -- so it is a visible
+        //                      defect, not a bookkeeping one, and the fix is to
+        //                      make the record's order authoritative or to stop
+        //                      consuming it positionally.
+        //   dNear non-zero     genuine small motion; compare against dFar rather
+        //                      than reading either alone.
+        //
+        // The bucket boundaries are deliberately raw distances, not a threshold
+        // on a derived score: this is the first look at this quantity and a
+        // classifier here would hide the distribution that decides it.
+        {
+          struct FastOrderAgg {
+            std::atomic<uint32_t> frame { 0u };
+            std::atomic<uint32_t> n     { 0 };
+            std::atomic<uint32_t> d0    { 0 };   // exactly byte-identical
+            std::atomic<uint32_t> dTiny { 0 };   // < 1 unit
+            std::atomic<uint32_t> dNear { 0 };   // 1 .. 100
+            std::atomic<uint32_t> dFar  { 0 };   // > 100
+            std::atomic<uint32_t> maxD  { 0 };   // largest delta, whole units
+          };
+          static FastOrderAgg sFastOrder;
+          const uint32_t nowFrame = currentFrameIdx;
+
+          const Vector3 prevT = inst->surface.objectToWorld[3].xyz();
+          const Vector3 curT  = split.objectToWorld[3].xyz();
+          const Vector3 dv    = curT - prevT;
+          const float   d     = std::sqrt(dv.x * dv.x + dv.y * dv.y + dv.z * dv.z);
+
+          sFastOrder.n.fetch_add(1, std::memory_order_relaxed);
+          if (memcmp(inst->surface.objectToWorld.data, split.objectToWorld.data,
+                     sizeof(Matrix4)) == 0) {
+            sFastOrder.d0.fetch_add(1, std::memory_order_relaxed);
+          } else if (d < 1.f) {
+            sFastOrder.dTiny.fetch_add(1, std::memory_order_relaxed);
+          } else if (d <= 100.f) {
+            sFastOrder.dNear.fetch_add(1, std::memory_order_relaxed);
+          } else {
+            sFastOrder.dFar.fetch_add(1, std::memory_order_relaxed);
+          }
+          const uint32_t dWhole = static_cast<uint32_t>(d);
+          uint32_t prevMax = sFastOrder.maxD.load(std::memory_order_relaxed);
+          while (dWhole > prevMax
+                 && !sFastOrder.maxD.compare_exchange_weak(prevMax, dWhole,
+                                                           std::memory_order_relaxed)) {
+          }
+
+          // Monotonic rollover, same reason as [KeyDiverge]: the frame here is
+          // shared across placements but the emitting thread is not, and a plain
+          // inequality would let two frame numbers alternate.
+          uint32_t seenFrame = sFastOrder.frame.load(std::memory_order_relaxed);
+          if (nowFrame > seenFrame
+              && sFastOrder.frame.compare_exchange_strong(seenFrame, nowFrame,
+                                                          std::memory_order_relaxed)) {
+            const uint32_t en = sFastOrder.n.exchange(0, std::memory_order_relaxed);
+            const uint32_t e0 = sFastOrder.d0.exchange(0, std::memory_order_relaxed);
+            const uint32_t et = sFastOrder.dTiny.exchange(0, std::memory_order_relaxed);
+            const uint32_t ee = sFastOrder.dNear.exchange(0, std::memory_order_relaxed);
+            const uint32_t ef = sFastOrder.dFar.exchange(0, std::memory_order_relaxed);
+            const uint32_t em = sFastOrder.maxD.exchange(0, std::memory_order_relaxed);
+            if (seenFrame != 0u && en != 0u) {
+              Logger::info(str::format(
+                "[FastPathOrder] f=", seenFrame,
+                " n=", en, " d0=", e0, " dTiny=", et, " dNear=", ee, " dFar=", ef,
+                " maxDelta=", em));
+            }
+          }
         }
 
         // Empty hint ON PURPOSE. SpatialKeyHint::isUsable() is false when
@@ -6699,6 +7052,173 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [MapSupply] 2026-08-25: PER-BLASENTRY supply, per frame.
+    //
+    // THE QUESTION THIS FILE HAS ASKED AND NEVER ANSWERED. The [FindSim] note
+    // below records "98 queries against a map holding at most 63 instances, so
+    // ~35 draws per frame CANNOT match anything no matter how good the matcher
+    // is", and then says outright what it could not settle: "What that count
+    // cannot say is whether the 98 hit ONE BlasEntry." Every count in this
+    // function is either per-VS or per-frame-global, and a per-frame total
+    // cannot be compared against a per-map size — the misses on any one frame
+    // are spread across several BlasEntries, so pairing a frame's miss total
+    // with one line's mapSz overstates the shortfall. This pairs them per map.
+    //
+    // PRE-REGISTERED READING, written before the capture:
+    //   deficit <= 0 on the maps carrying the misses
+    //       No pigeonhole. Every placement COULD have matched, so the failures
+    //       are ordering and claim defects — §5.1's greedy first-come-first-
+    //       served claim at the nearest stage — and the fix belongs in the
+    //       matcher. This is the branch that justifies restructuring batch
+    //       resolution, which §5.3 refused on different evidence.
+    //   deficit > 0 on those maps
+    //       The pigeonhole is real and the matcher is exonerated: that many
+    //       placements have no instance to find, so no matching rule can serve
+    //       them. The fix is upstream — either instances for this mesh are being
+    //       split across sibling BlasEntries (drawCallCache routing) or they are
+    //       never created — and `linked` says which, because the spatial map and
+    //       the linked-instance list agree by construction when routing is sane.
+    //
+    // AND THE FIELD THAT SEPARATES THOSE TWO UPSTREAM CAUSES. `linked` is the
+    // BlasEntry's own instance list. [FindSim] already reads spatialMapSize ==
+    // linkedInst in 145 of 145 samples, so a deficit is NOT the map losing what
+    // the BLAS holds; it means the BLAS itself holds too few, and then the
+    // question is which BlasEntry has the rest.
+    //
+    // COST. One masked probe and three relaxed increments per lookup, ~351
+    // lookups a frame. No string is built except the single emission line.
+    struct MapSupplyAgg {
+      // Sized well above the ~850 live BlasEntries so the probe run stays short;
+      // power of two so the index is a mask. Overflow is counted, never silent.
+      //
+      // An ENUMERATOR, not a static constexpr member: this struct is local to
+      // findSimilarInstance and a local class may not have static data members
+      // (C2246). An enumerator with an explicit size_t underlying type gives the
+      // same constant with the same type and no conversion warnings under /WX.
+      enum : size_t { kSlots = 2048 };
+      struct Slot {
+        std::atomic<uintptr_t> blas   { 0 };
+        std::atomic<uint32_t>  q      { 0 };  // lookups against this map
+        std::atomic<uint32_t>  n      { 0 };  // lookups that reached the nearest search
+        std::atomic<uint32_t>  sz     { 0 };  // spatial map size at query time
+        std::atomic<uint32_t>  linked { 0 };  // instances linked to this BlasEntry
+      };
+      std::atomic<uint32_t> frame { 0xFFFFFFFFu };
+      std::atomic<uint32_t> overflow { 0 };
+      Slot slots[kSlots];
+    };
+    static MapSupplyAgg sMapSupply;
+
+    // Frame rollover: one thread emits the worst maps and clears the table.
+    // Same election shape as [FindStage] above, and the same tolerance — a late
+    // straggler from the old frame lands in the new frame's counts, which moves
+    // a deficit by ones and never by the tens the verdict turns on.
+    {
+      uint32_t seenFrame = sMapSupply.frame.load(std::memory_order_relaxed);
+      if (seenFrame != currentFrameIdx
+          && sMapSupply.frame.compare_exchange_strong(seenFrame, currentFrameIdx, std::memory_order_relaxed)) {
+        if (seenFrame != 0xFFFFFFFFu) {
+          // Rank by deficit, not by query count: a map serving 300 lookups from
+          // 300 entries is healthy and a map serving 40 from 8 is not, and
+          // sorting by traffic would put the healthy one at the top every frame.
+          struct Worst { uint32_t q, n, sz, linked; };
+          Worst worst[6] = { };
+          int32_t worstDef[6] = { };
+          uint32_t maps = 0, deficitMaps = 0, totalQ = 0, totalDeficit = 0;
+          for (size_t i = 0; i < MapSupplyAgg::kSlots; ++i) {
+            MapSupplyAgg::Slot& s = sMapSupply.slots[i];
+            const uint32_t q = s.q.exchange(0, std::memory_order_relaxed);
+            if (q == 0u) {
+              s.blas.store(0, std::memory_order_relaxed);
+              continue;
+            }
+            const uint32_t n  = s.n.exchange(0, std::memory_order_relaxed);
+            const uint32_t sz = s.sz.load(std::memory_order_relaxed);
+            const uint32_t lk = s.linked.load(std::memory_order_relaxed);
+            s.blas.store(0, std::memory_order_relaxed);
+            ++maps;
+            totalQ += q;
+            const int32_t def = static_cast<int32_t>(q) - static_cast<int32_t>(sz);
+            if (def > 0) {
+              ++deficitMaps;
+              totalDeficit += static_cast<uint32_t>(def);
+            }
+            for (int32_t w = 0; w < 6; ++w) {
+              if (def > worstDef[w]) {
+                for (int32_t k = 5; k > w; --k) {
+                  worstDef[k] = worstDef[k - 1];
+                  worst[k] = worst[k - 1];
+                }
+                worstDef[w] = def;
+                worst[w] = Worst { q, n, sz, lk };
+                break;
+              }
+            }
+          }
+          const uint32_t ovf = sMapSupply.overflow.exchange(0, std::memory_order_relaxed);
+          if (maps != 0u) {
+            std::string worstStr;
+            for (int32_t w = 0; w < 6 && worstDef[w] > 0; ++w) {
+              worstStr += str::format(
+                " [q=", worst[w].q, " sz=", worst[w].sz, " linked=", worst[w].linked,
+                " nearest=", worst[w].n, " deficit=", worstDef[w], "]");
+            }
+            Logger::info(str::format(
+              "[MapSupply] f=", seenFrame,
+              " maps=", maps,
+              " queries=", totalQ,
+              " deficitMaps=", deficitMaps,
+              " deficitTotal=", totalDeficit,
+              // Non-zero means some map's lookups were dropped from the census
+              // entirely, so deficitTotal is a lower bound on that frame.
+              " overflow=", ovf,
+              " worst:", worstStr.empty() ? std::string(" none") : worstStr));
+          }
+        }
+      }
+    }
+
+    // Claim this BlasEntry's slot. Returns kSlots on overflow, which is counted
+    // rather than folded into a neighbouring map's numbers — a census that
+    // silently attributed one map's queries to another would invent exactly the
+    // deficit it is meant to measure.
+    size_t mapSupplySlot = MapSupplyAgg::kSlots;
+    {
+      const uintptr_t blasKey = reinterpret_cast<uintptr_t>(&blas);
+      // Pointer bits 0-3 are always zero for a heap object of this size, so the
+      // low bits alone would collide every allocation onto few buckets.
+      size_t idx = static_cast<size_t>((blasKey >> 4) * 0x9E3779B97F4A7C15ull >> 48)
+                 & (MapSupplyAgg::kSlots - 1);
+      for (uint32_t probe = 0; probe < 16u; ++probe) {
+        std::atomic<uintptr_t>& owner = sMapSupply.slots[idx].blas;
+        uintptr_t cur = owner.load(std::memory_order_relaxed);
+        if (cur == blasKey) {
+          mapSupplySlot = idx;
+          break;
+        }
+        if (cur == 0u && owner.compare_exchange_strong(cur, blasKey, std::memory_order_relaxed)) {
+          mapSupplySlot = idx;
+          break;
+        }
+        if (cur == blasKey) {           // lost the race to another worker, same map
+          mapSupplySlot = idx;
+          break;
+        }
+        idx = (idx + 1u) & (MapSupplyAgg::kSlots - 1);
+      }
+      if (mapSupplySlot != MapSupplyAgg::kSlots) {
+        MapSupplyAgg::Slot& s = sMapSupply.slots[mapSupplySlot];
+        s.q.fetch_add(1, std::memory_order_relaxed);
+        // Last writer wins. Both are stable within a frame — Phase2b applies
+        // every map write in the ordered tail, after this phase — so there is
+        // nothing for a racing store to smear.
+        s.sz.store(static_cast<uint32_t>(blas.getSpatialMap().size()), std::memory_order_relaxed);
+        s.linked.store(static_cast<uint32_t>(blas.getLinkedInstances().size()), std::memory_order_relaxed);
+      } else {
+        sMapSupply.overflow.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+
     RtInstance* pSimilar = nullptr;
     float nearestDistSqr = FLT_MAX;
 
@@ -6760,6 +7280,12 @@ namespace dxvk {
       // onTransformChanged, so the hash is just as reusable on a miss.
       result = const_cast<RtInstance*>(blas.getSpatialMap().getDataAtTransform(firstInstanceObjectToWorld, stablePropId, outQueryMatrixHash));
       const bool exactHit = (result != nullptr);
+      // See RtInstance::m_claimStage. Stamped at the claim rather than at the
+      // caller, because only here is it known WHICH stage produced the match.
+      if (exactHit) {
+        result->m_claimStage = RtInstance::ClaimStage::Exact;
+        result->m_claimFrame = currentFrameIdx;
+      }
 
       // NV-DXVK [FindStage]: the whole census, at the one point that decides it.
       // A non-zero propId that missed here is the round-robin signature: the key
@@ -6830,6 +7356,13 @@ namespace dxvk {
       // next frame's history lines up with next frame's key, and a static prop's
       // key still never changes — which keeps SpatialMap::move() a no-op for it
       // rather than forcing an erase+insert per instance per frame.
+      if (prevObjectToWorld == nullptr && stablePropId == 0ull) {
+        // THE STAGE COULD NOT RUN. Counted apart from prevMiss because the two
+        // prescribe opposite fixes -- see m_fanoutPrevNullCount. Without this,
+        // a draw carrying no history is indistinguishable from one that never
+        // needed the retry, and both read as silence.
+        ++m_fanoutPrevNullCount;
+      }
       if (prevObjectToWorld != nullptr && stablePropId == 0ull) {
         result = const_cast<RtInstance*>(blas.getSpatialMap().getDataAtTransform(*prevObjectToWorld, 0ull));
         if (result != nullptr) {
@@ -6839,9 +7372,248 @@ namespace dxvk {
           // the history is not reproducing last frame's key and I should say so
           // rather than leave a dead branch in the hot path.
           ++m_fanoutPrevHitCount;
+          result->m_claimStage = RtInstance::ClaimStage::History;
+          result->m_claimFrame = currentFrameIdx;
           return result;
         }
         ++m_fanoutPrevMissCount;
+
+        // NV-DXVK [MapLedger] 2026-08-24b: THE WRITE-SIDE VERDICT, on every
+        // miss rather than on the sampled few. See MapLedgerAgg in the header
+        // for what each bucket means; that reading is pre-registered there and
+        // is not to be revised after seeing the numbers.
+        //
+        // UNCAPPED ON PURPOSE, and it is the counters that make that safe: this
+        // is ten integer increments and one O(1) table probe, with no string
+        // built and nothing to sample. The capped detail line below carries the
+        // fields that cost something. Trap §6.2 was an UNCAPPED probe aggregated
+        // without binning; the fix for it is to bin, not to cap, and emitting
+        // this census per frame beside [FanoutPrev] bins it by construction.
+        {
+          // The key the EXACT stage formed and missed on. computeKey reuses the
+          // hash that stage already paid for when it is in hand, so this is a
+          // compare and a select rather than a second XXH64 over 64 bytes.
+          const XXH64_hash_t queryKey = BlasEntry::InstanceMap::computeKey(
+              firstInstanceObjectToWorld, stablePropId,
+              (outQueryMatrixHash != nullptr) ? *outQueryMatrixHash : 0);
+          const auto rec = blas.getSpatialMap().debugLedgerLookup(queryKey);
+          // WHOLE MATRIX, not the translation. See the header: moved= compares
+          // translations only, and §5.4's premise needs byte identity.
+          const bool sameBytes = (std::memcmp(&firstInstanceObjectToWorld, prevObjectToWorld,
+                                              sizeof(Matrix4)) == 0);
+          using LedgerOp = BlasEntry::InstanceMap::LedgerOp;
+          m_mapLedgerAgg.miss.fetch_add(1, std::memory_order_relaxed);
+          if (sameBytes) {
+            m_mapLedgerAgg.sameBytes.fetch_add(1, std::memory_order_relaxed);
+          }
+          std::atomic<uint32_t>* bucket = nullptr;
+          switch (rec.op) {
+            case LedgerOp::Inserted:
+              bucket = sameBytes ? &m_mapLedgerAgg.sameIns : &m_mapLedgerAgg.diffIns; break;
+            case LedgerOp::Refiled:
+              bucket = sameBytes ? &m_mapLedgerAgg.sameRefile : &m_mapLedgerAgg.diffRefile; break;
+            case LedgerOp::Erased:
+              bucket = sameBytes ? &m_mapLedgerAgg.sameErase : &m_mapLedgerAgg.diffErase; break;
+            case LedgerOp::None:
+              bucket = sameBytes ? &m_mapLedgerAgg.sameNone : &m_mapLedgerAgg.diffNone; break;
+          }
+          bucket->fetch_add(1, std::memory_order_relaxed);
+          // Carried to the verdict line rather than read there: a none= count is
+          // meaningless without it, and the two must not be able to drift apart.
+          if (blas.getSpatialMap().debugLedgerEvicted() != 0ull) {
+            m_mapLedgerAgg.evicted.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+
+        // AND HOW FAR OFF THE HISTORY WAS, because the count alone cannot say
+        // which of two opposite things went wrong and they want opposite fixes.
+        //
+        // getDataAtTransform is a hash of the matrix bytes, so one changed bit
+        // and a completely wrong matrix miss identically. The translation
+        // distance separates them:
+        //
+        //   dist ~ 0      the prop barely moved, so last frame's key and this
+        //                 frame's history describe the same placement and the
+        //                 BYTES still differ -- the transform is being
+        //                 recomposed rather than carried, and the fix is at the
+        //                 composition.
+        //   dist large    the history genuinely describes a different placement
+        //                 than the one filed last frame, so the engine's
+        //                 previous-transform array is not paired with its
+        //                 current one, and the fix is at the producer.
+        //
+        // AND WHETHER THE INSTANCE IS SITTING RIGHT THERE UNDER A DIFFERENT KEY,
+        // which is the test that separates the two failure modes the verdict
+        // line shows and the distance alone cannot.
+        //
+        // [FanoutPrev] reads prevHit=113 prevMiss=0 in steady state and then, on
+        // isolated frames, prevHit=0 prevMiss=113 -- the entire population
+        // flipping at once rather than a few placements drifting. An all-or-
+        // nothing flip is not per-placement noise, and the two candidate causes
+        // want different fixes:
+        //
+        //   nearest ~ 0        the instance IS in the map, a frame's worth of
+        //                      motion away from where the history says it was.
+        //                      The history is STALE BY A FRAME -- it points at
+        //                      T(n-2) while the instance was filed under T(n-1)
+        //                      -- so the producer skipped an advance and the fix
+        //                      is at the phase, not at the matcher.
+        //   nearest large      the instance genuinely is not there, so this is
+        //                      new geometry entering view and a miss is correct.
+        //
+        // ownerFrame is printed beside it because "close" only means "the same
+        // prop" if the entry was refreshed recently.
+        //
+        // PER FRAME, NOT PER SESSION. The first version of this used one session
+        // cap of 200 and spent every line during load, on a cold SpatialMap
+        // (mapSz=11..20 against 113 placements) where a miss is meaningless --
+        // the same mistake the [RsGate] note in d3d11_rtx.cpp already records,
+        // made again. A small per-frame cap samples the steady state instead.
+        {
+          static std::atomic<uint32_t> sPrevMissFrame { 0xFFFFFFFFu };
+          static std::atomic<uint32_t> sPrevMissLines { 0 };
+          constexpr uint32_t kMaxPrevMissPerFrame = 4u;
+          uint32_t seen = sPrevMissFrame.load(std::memory_order_relaxed);
+          if (seen != currentFrameIdx
+              && sPrevMissFrame.compare_exchange_strong(seen, currentFrameIdx, std::memory_order_relaxed)) {
+            sPrevMissLines.store(0, std::memory_order_relaxed);
+          }
+          if (sPrevMissLines.fetch_add(1, std::memory_order_relaxed) < kMaxPrevMissPerFrame) {
+            const Vector3 curT = firstInstanceObjectToWorld[3].xyz();
+            const Vector3 prvT = (*prevObjectToWorld)[3].xyz();
+            const Vector3 d = curT - prvT;
+            // The map is keyed on the transformed CENTROID, not the translation,
+            // so the query has to be composed the same way the entries were or
+            // the distance is measured against the wrong point. Computed after
+            // the cap so only logged lines pay for it.
+            const Vector3 prevCentroid =
+              blas.input.getGeometryData().boundingBox.getTransformedCentroid(*prevObjectToWorld);
+            Vector3 nearPos { 0.f, 0.f, 0.f };
+            const RtInstance* nearOwner = nullptr;
+            const float nearSqr =
+              blas.getSpatialMap().debugClosestCachedDistSqr(prevCentroid, nearPos, &nearOwner);
+
+            // NV-DXVK [MapLedger]: the sampled detail behind the census above.
+            //
+            // ledgSame= IS THE FIELD THAT CLOSES §5.5. §5.4 established that the
+            // instance is not gone — 566 of 643 stationary misses had a live
+            // neighbour 1-50 units away, clustered around 25 units across props
+            // at unrelated world positions, which is systematic rather than
+            // coincidence. The open question was who vacated the key. If the
+            // ledger says Refiled and ledgSame=1, the instance sitting right
+            // there IS the one that vacated it, and ledgOther= is the key it
+            // went to: the prop's own instance was re-filed while the reader
+            // kept querying the old key. ledgSame=0 on a Refiled says a
+            // DIFFERENT instance took the slot, which is the mover-steals-the-
+            // slot mechanism §5.5 names as its candidate.
+            //
+            // The pointer is compared and printed, never dereferenced: a ledger
+            // record outlives the instance it names by design.
+            const XXH64_hash_t queryKey = BlasEntry::InstanceMap::computeKey(
+                firstInstanceObjectToWorld, stablePropId,
+                (outQueryMatrixHash != nullptr) ? *outQueryMatrixHash : 0);
+            const auto rec = blas.getSpatialMap().debugLedgerLookup(queryKey);
+            using LedgerOp = BlasEntry::InstanceMap::LedgerOp;
+            const char* ledgOpName =
+                (rec.op == LedgerOp::Inserted) ? "ins"
+              : (rec.op == LedgerOp::Refiled)  ? "refile"
+              : (rec.op == LedgerOp::Erased)   ? "erase"
+                                               : "none";
+
+            // The neighbour's side of the comparison, hoisted because
+            // calcFirstInstanceObjectToWorld returns by value and the address of
+            // a temporary cannot be taken. Everything below is a read of a live
+            // instance found by walking the cache this frame, not of a ledger
+            // record, so dereferencing it is safe.
+            const bool  nearValid  = (nearOwner != nullptr);
+            const Matrix4 nearWriteMtx = nearValid ? nearOwner->calcFirstInstanceObjectToWorld()
+                                                   : Matrix4();
+            const XXH64_hash_t nearKey = nearValid ? nearOwner->m_spatialCacheHash : 0;
+            const auto  nearRec    = nearValid ? blas.getSpatialMap().debugLedgerLookup(nearKey)
+                                               : BlasEntry::InstanceMap::LedgerRec { };
+            const char* nearKeyOp  = !nearValid                             ? "n/a"
+              : (nearRec.op == LedgerOp::Inserted) ? "ins"
+              : (nearRec.op == LedgerOp::Refiled)  ? "refile"
+              : (nearRec.op == LedgerOp::Erased)   ? "erase"
+                                                   : "none";
+            Logger::info(str::format(
+              "[FanoutPrevMiss] f=", currentFrameIdx,
+              " queryKey=0x", std::hex, static_cast<uint64_t>(queryKey), std::dec,
+              " ledgOp=", ledgOpName,
+              " ledgFrame=", rec.frame,
+              " ledgWrites=", rec.writes,
+              " ledgBumped=", static_cast<uint32_t>(rec.bumped),
+              " ledgOther=0x", std::hex, static_cast<uint64_t>(rec.otherKey), std::dec,
+              " ledgSame=", (rec.data != nullptr && rec.data == nearOwner ? 1 : 0),
+              // NV-DXVK [MapLedger] 2026-08-25: WHICH KEY THE NEIGHBOUR IS FILED
+              // UNDER, which is the question `none` leaves open.
+              //
+              // [MapSupply] has now shown supply is adequate — in steady state
+              // no non-empty map ever runs a deficit — while this census reads
+              // none=95.5%. Those two are only jointly consistent if the map
+              // holds the instances under keys the reader never forms. These
+              // fields test that directly instead of inferring it.
+              //
+              //   nearKey != queryKey with nearKeyOp=ins
+              //       CONFIRMED. The instance is in this map, filed and live,
+              //       under a different key. The exact stage cannot reach it at
+              //       any distance, so every such lookup falls to the greedy
+              //       nearest search permanently, not occasionally.
+              //   nearPropId != 0
+              //       AND THE MECHANISM IS COMPLETE. This site is reached only
+              //       when the LOOKUP passed stablePropId == 0 (the enclosing
+              //       condition), so the reader keyed on the matrix hash. If the
+              //       WRITE filed under a propId override, the two keyspaces can
+              //       never intersect and no matrix will ever match. That is a
+              //       key-composition fault at the write site, and the fix is to
+              //       make the two agree rather than to touch the matcher.
+              //   nearMtxSame=1 with different keys
+              //       the matrices agree byte for byte and the keys still differ,
+              //       which leaves the override as the only way to produce it.
+              //   nearKey == queryKey
+              //       the neighbour IS filed under the key we asked for, so the
+              //       cache lookup itself failed — but ins=0 across every census
+              //       line already argues against that, so treat a hit here as a
+              //       reason to re-examine the census, not as a new lead.
+              " nearKey=0x", std::hex, static_cast<uint64_t>(nearKey), std::dec,
+              " nearPropId=0x", std::hex,
+                static_cast<uint64_t>(nearValid ? nearOwner->m_stablePropId : 0), std::dec,
+              " nearKeyOp=", nearKeyOp,
+              // The matrix the WRITE side actually files this instance under,
+              // against the one the READ side just queried with. These are two
+              // different functions — RtInstance::calcFirstInstanceObjectToWorld
+              // versus the draw call's — and the SpatialKeyHint comment in the
+              // header already lists three ways they compose differently. It
+              // wrote that as a safety argument for reusing the hash; the
+              // consequence nobody drew is that a divergence files the entry
+              // under a key the lookup can never form.
+              //
+              // nearInstToObj names the branch: non-zero means the write went
+              // through `objectToWorld * instancesToObject[0]` while a split
+              // placement's read used that placement's own transform, so the two
+              // agree only for element 0 of the batch.
+              " nearMtxSame=", (nearValid
+                && std::memcmp(&nearWriteMtx, &firstInstanceObjectToWorld,
+                               sizeof(Matrix4)) == 0 ? 1 : 0),
+              " nearInstToObj=", (nearValid && nearOwner->surface.instancesToObject
+                                    ? static_cast<uint32_t>(nearOwner->surface.instancesToObject->size())
+                                    : 0u),
+              " ledgEvicted=", blas.getSpatialMap().debugLedgerEvicted(),
+              " ledgEntries=", blas.getSpatialMap().debugLedgerEntries(),
+              // Whole-matrix identity, beside the translation-only moved= that
+              // §5.4 read as byte identity. If these two disagree, moved= was
+              // never evidence of byte identity and §5.4's premise is false.
+              " sameBytes=", (std::memcmp(&firstInstanceObjectToWorld, prevObjectToWorld,
+                                          sizeof(Matrix4)) == 0 ? 1 : 0),
+              " vs=0x", std::hex, uint64_t(vsHashProbe), std::dec,
+              " moved=", std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z),
+              " nearestToPrev=", (nearSqr == FLT_MAX ? -1.f : std::sqrt(nearSqr)),
+              " ownerFrame=", (nearOwner != nullptr ? nearOwner->m_frameLastUpdated : 0u),
+              " cur=(", curT.x, ",", curT.y, ",", curT.z, ")",
+              " prev=(", prvT.x, ",", prvT.y, ",", prvT.z, ")",
+              " mapSz=", blas.getSpatialMap().size()));
+          }
+        }
       }
 
       // NV-DXVK [perf] 2026-08-07: the centroid is computed HERE, not at function
@@ -6852,6 +7624,15 @@ namespace dxvk {
       // Unconditional within this block by design; see the declaration's invariant.
       worldPosition =
         blas.input.getGeometryData().boundingBox.getTransformedCentroid(firstInstanceObjectToWorld);
+
+      // NV-DXVK [MapSupply]: both exact stages have missed, so this lookup is
+      // now competing for an instance by distance. Counted against the SAME map
+      // its query was counted against, which is the pairing the whole probe
+      // exists to make — nearest= above sz= on one map is the pigeonhole, and
+      // nearest= well below sz= on that map is a matcher problem instead.
+      if (mapSupplySlot != MapSupplyAgg::kSlots) {
+        sMapSupply.slots[mapSupplySlot].n.fetch_add(1, std::memory_order_relaxed);
+      }
 
       // NV-DXVK [FindSim2904 exact-miss]: log propId we looked up. Pair
       // against [PropIdTrace] at the same frame to see if lookup propId
@@ -6896,6 +7677,10 @@ namespace dxvk {
       // Probe: count how many instances passed/failed each filter clause.
       uint32_t probeNumCellInstances = 0;
       uint32_t probeRejFrameUpdated  = 0;
+      uint32_t probeBlockExact = 0;
+      uint32_t probeBlockHist  = 0;
+      uint32_t probeBlockNear  = 0;
+      uint32_t probeBlockNone  = 0;
       uint32_t probeRejMaterialHash  = 0;
       uint32_t probeRejSubPrim       = 0;
       uint32_t probePassedFilter     = 0;
@@ -6910,7 +7695,26 @@ namespace dxvk {
             const bool okFrame = (instance->m_frameLastUpdated != currentFrameIdx);
             const bool okMat   = (instance->m_materialHash == material.getHash());
             const bool okSub   = !instance->m_primInstanceOwner.isSubPrim();
-            if (!okFrame) probeRejFrameUpdated += 1;
+            if (!okFrame) {
+              probeRejFrameUpdated += 1;
+              // WHO TOOK IT, AND BY WHAT RIGHT -- see RtInstance::m_claimStage.
+              //
+              // The stage counts only if it was written THIS frame. An instance
+              // the caller already knew is updated without any lookup running,
+              // so m_frameLastUpdated being current says nothing about whether
+              // the matcher decided it; a stage from an older frame is exactly
+              // that case and belongs in none=.
+              const RtInstance::ClaimStage blockStage =
+                (instance->m_claimFrame == currentFrameIdx)
+                  ? instance->m_claimStage
+                  : RtInstance::ClaimStage::None;
+              switch (blockStage) {
+                case RtInstance::ClaimStage::Exact:   probeBlockExact += 1; break;
+                case RtInstance::ClaimStage::History: probeBlockHist  += 1; break;
+                case RtInstance::ClaimStage::Nearest: probeBlockNear  += 1; break;
+                default:                              probeBlockNone  += 1; break;
+              }
+            }
             if (!okMat)   probeRejMaterialHash += 1;
             if (!okSub)   probeRejSubPrim      += 1;
             if (okFrame && okMat && okSub) probePassedFilter += 1;
@@ -6919,6 +7723,12 @@ namespace dxvk {
           return instance->m_frameLastUpdated != currentFrameIdx && instance->m_materialHash == material.getHash() && !instance->m_primInstanceOwner.isSubPrim();
         }
       ));
+      // See RtInstance::m_claimStage. A nearest claim is the only one decided by
+      // submission order, so it is the only one whose loser has a grievance.
+      if (result != nullptr) {
+        result->m_claimStage = RtInstance::ClaimStage::Nearest;
+        result->m_claimFrame = currentFrameIdx;
+      }
       if (isProbeVS) {
         // Throttle raised from 8 to 256: the mapSz>0 exact-misses — the only
         // interesting case — all landed past #8 and were never logged.
@@ -7035,7 +7845,42 @@ namespace dxvk {
             " maxDistSqr=", uniqueObjectDistanceSqr,
             " spatialMapSize=", blas.getSpatialMap().size(),
             " cellInsts=", probeNumCellInstances,
+            // DID THIS PLACEMENT HAVE ENGINE HISTORY TO RETRY WITH, and it is
+            // the last link in the chain rather than another column.
+            //
+            // The nearest stage is a greedy claim -- rejFrame counts instances
+            // refused for having been updated already this frame -- so a
+            // placement that reaches it can lose its own partner to whichever
+            // placement resolved first, and mint a fresh instance beside it.
+            // That is the [RsFailMember] event: 167 of 207 failing frames carry
+            // a nearest-stage miss against ~70 expected by chance.
+            //
+            // The history retry above exists to resolve movers by exact hash
+            // BEFORE this search is reached, and it works where it is plumbed --
+            // [FanoutPrev] reads prevHit=113 prevMiss=0 in steady state. But
+            // rtx_types.h states its own limit: prevInstancesToObject is "only
+            // ever populated for isFanoutBatch draws", and prevNull counts
+            // 13-25 placements a frame arriving here with nothing to retry.
+            //
+            // hadPrev=0 on the misses says those two facts are the same fact,
+            // and the fix is to plumb the history rather than to rewrite the
+            // matcher. hadPrev=1 says the history was present, was tried, and
+            // the placement still lost the race -- and then the greedy claim
+            // itself is what needs replacing.
+            " hadPrev=", (prevObjectToWorld != nullptr ? 1 : 0),
             " rejFrame=", probeRejFrameUpdated,
+            // THE FIX-SHAPE FIELD. near= high means the blockers were themselves
+            // resolved by distance, so submission order decided an ownership
+            // question neither placement had a claim to, and settling every
+            // exact and history claim across the batch before any distance claim
+            // removes it. exact=/hist= high means the winners owned those
+            // instances outright and the loser correctly has none -- then this
+            // is not a matcher defect and the residency failure wants a
+            // different explanation entirely.
+            " blockedBy{exact=", probeBlockExact,
+            " hist=", probeBlockHist,
+            " near=", probeBlockNear,
+            " none=", probeBlockNone, "}",
             " rejMat=", probeRejMaterialHash,
             " rejSub=", probeRejSubPrim,
             " passed=", probePassedFilter,
@@ -7321,7 +8166,8 @@ namespace dxvk {
         const Vector3 newCentroid =
           blas.input.getGeometryData().boundingBox.getTransformedCentroid(firstInstanceObjectToWorld);
         migrated->m_spatialCacheHash =
-          blas.getSpatialMap().insert(newCentroid, firstInstanceObjectToWorld, migrated, stablePropId);
+          blas.getSpatialMap().insert(newCentroid, firstInstanceObjectToWorld, migrated, stablePropId,
+                                      currentFrameIdx);
         if (isProbeVS) {
           static thread_local uint32_t sRelinkProbe = 0;
           if (sRelinkProbe < 64 || (sRelinkProbe & 0x3FF) == 0) {
@@ -7505,12 +8351,12 @@ namespace dxvk {
       case DeferredSpatialOp::Kind::kMove:
         inst->m_spatialCacheHash = op.targetBlas->getSpatialMap().move(
             inst->m_spatialCacheHash, op.centroid, op.transform, inst, op.stablePropId,
-            op.precomputedMatrixHash);
+            op.precomputedMatrixHash, inst->m_frameLastUpdated);
         mapWriteAccount(/*isInsert*/ false, static_cast<uint32_t>(op.targetBlas->getSpatialMap().size()));
         break;
       case DeferredSpatialOp::Kind::kInsert:
         inst->m_spatialCacheHash = op.targetBlas->getSpatialMap().insert(
-            op.centroid, op.transform, inst, op.stablePropId);
+            op.centroid, op.transform, inst, op.stablePropId, inst->m_frameLastUpdated);
         mapWriteAccount(/*isInsert*/ true, static_cast<uint32_t>(op.targetBlas->getSpatialMap().size()));
         break;
       case DeferredSpatialOp::Kind::kDecalOrder:

@@ -10902,7 +10902,49 @@ namespace dxvk {
     // caller already does the right thing — leave stablePropId at 0 and let
     // SpatialMap dedup key on the transform bytes. Gated first so the SRV probe
     // and buffer reads below are skipped entirely.
-    if (IsStablePropIdSuppressed()) {
+    // NV-DXVK [PropIdRotate] 2026-08-25: WHICH IDENTITY INPUT ACTUALLY ROTATES.
+    //
+    // rtx.suppressStablePropIdVsHashes' own doc measured the period-3 round
+    // robin on VS 0x292b6ba0d1854f28 and attributed it to vbPtr/ibPtr/vbOffset/
+    // ibOffset rotating through TF2's three-deep transient buffer arena. It then
+    // suppressed the propId so dedup falls back to matrix bytes, on the stated
+    // premise that "the transform for these draws IS byte-stable".
+    //
+    // THAT PREMISE IS FALSE. [ReFileJit] measures this exact shader re-filing
+    // every frame on a translation that is identity plus a residue quantised to
+    // 2^-14 in X and 2^-11 in Z -- the float ulps of the CAMERA origin, not the
+    // object's. The world translation is rebuilt as camera-relative + camera
+    // origin, the viewmodel sits AT the camera origin so those terms cancel, and
+    // the cancellation residue is the wobble. T=(0,0,0) on 545 samples is the
+    // intended result; the rest are the misses. So both keyings are broken for
+    // this shader and it has no stable identity at all.
+    //
+    // The doc also says where the fix goes: "the FIX belongs at the propId
+    // producer (stabilise the identity against the rotating arena)". Doing that
+    // needs to know WHICH of the four inputs rotates and which is invariant --
+    // bonePalettePtr is gathered from a different source than the IA buffers and
+    // may well be stable. Guessing wrong here re-runs the same mistake, so this
+    // measures instead.
+    //
+    // READ IT AS: over a window, the count of DISTINCT values each input took
+    // for one shader.
+    //   vb/ib rotate (2-3 values), bonePalette stable (1)
+    //       build the identity from bonePalette (plus geometry) and drop the IA
+    //       pointers. That is the fix, and it needs no new option.
+    //   bonePalette also rotates
+    //       nothing currently gathered survives the arena; the identity has to
+    //       come from something else entirely (geometry/material hash), and that
+    //       is a bigger change worth knowing about before starting it.
+    //   nothing rotates
+    //       the round robin has since been fixed elsewhere and the suppress
+    //       entry is stale -- remove it from rtx.conf and re-measure.
+    //
+    // COST WHEN OFF IS UNCHANGED. The early return still fires first unless the
+    // tag is enabled, so the SRV probe and buffer reads below stay skipped for
+    // suppressed shaders exactly as before.
+    const bool propIdSuppressed = IsStablePropIdSuppressed();
+    const bool propIdRotateDiag = propIdSuppressed && !Logger::tagDenied("[PropIdRotate]");
+    if (propIdSuppressed && !propIdRotateDiag) {
       return 0;
     }
 
@@ -10958,6 +11000,112 @@ namespace dxvk {
           }
         }
       }
+    }
+
+    // NV-DXVK [PropIdRotate]: emit the gathered inputs, then honour the
+    // suppression. Placed here because this is the first point where all four
+    // exist; the hash below is deliberately not reached, so behaviour for a
+    // suppressed shader is unchanged (still returns 0).
+    if (propIdSuppressed) {
+      static std::atomic<uint32_t> sRotFrame { 0u };
+      static std::atomic<uint32_t> sRotLines { 0 };
+      const uint32_t nowFrame = m_context->m_device->getCurrentFrameId();
+
+      // NV-DXVK [PathMix] 2026-08-25: IS THE o2w PATH STABLE FOR THESE DRAWS?
+      //
+      // Path 3 sets objectToWorld from bone 0 of the palette; path 11 sets it to
+      // EXACT identity. Those are different matrices, so a draw that flips
+      // between them across frames changes its SpatialMap key and re-files --
+      // which is the churn [ReFile] measures and the reason this shader's exact
+      // dedup never hits.
+      //
+      // The capped sample above already shows the per-frame mix moving (3 3 3 3
+      // one frame, 3 3 11 11 the next), but four capped lines cannot distinguish
+      // "the classification is unstable" from "I happened to sample different
+      // sub-meshes". These counters are uncapped and per frame, so they can:
+      //
+      //   counts constant frame to frame (e.g. always 6 and 3)
+      //       the split is BY SUB-MESH and legitimate. Some meshes have bone
+      //       data and some do not, each is consistent about it, and the churn
+      //       is not here -- go back to bone 0's own contents.
+      //   counts vary frame to frame
+      //       the SAME draws are changing path, so objectToWorld flips between
+      //       bone 0 and identity for one object. That is the defect, and the
+      //       fix is to make path selection independent of whether the bone
+      //       buffer happened to be readable this frame.
+      //
+      // p3+p11 must also equal the total; a shortfall means a third path is
+      // taking some of these draws and the two-way reading above is incomplete.
+      {
+        struct PathMixAgg {
+          std::atomic<uint32_t> frame { 0u };
+          std::atomic<uint32_t> total { 0 };
+          std::atomic<uint32_t> p3    { 0 };
+          std::atomic<uint32_t> p11   { 0 };
+          std::atomic<uint32_t> pOther{ 0 };
+        };
+        static PathMixAgg sPathMix;
+        sPathMix.total.fetch_add(1, std::memory_order_relaxed);
+        if (m_lastO2wPathId == 3u) {
+          sPathMix.p3.fetch_add(1, std::memory_order_relaxed);
+        } else if (m_lastO2wPathId == 11u) {
+          sPathMix.p11.fetch_add(1, std::memory_order_relaxed);
+        } else {
+          sPathMix.pOther.fetch_add(1, std::memory_order_relaxed);
+        }
+        uint32_t pmSeen = sPathMix.frame.load(std::memory_order_relaxed);
+        if (nowFrame > pmSeen
+            && sPathMix.frame.compare_exchange_strong(pmSeen, nowFrame, std::memory_order_relaxed)) {
+          const uint32_t t = sPathMix.total.exchange(0, std::memory_order_relaxed);
+          const uint32_t a = sPathMix.p3.exchange(0, std::memory_order_relaxed);
+          const uint32_t b = sPathMix.p11.exchange(0, std::memory_order_relaxed);
+          const uint32_t c = sPathMix.pOther.exchange(0, std::memory_order_relaxed);
+          if (pmSeen != 0u && t != 0u) {
+            Logger::info(str::format(
+              "[PathMix] f=", pmSeen, " draws=", t,
+              " p3=", a, " p11=", b, " pOther=", c));
+          }
+        }
+      }
+      uint32_t seen = sRotFrame.load(std::memory_order_relaxed);
+      if (nowFrame > seen
+          && sRotFrame.compare_exchange_strong(seen, nowFrame, std::memory_order_relaxed)) {
+        sRotLines.store(0, std::memory_order_relaxed);
+      }
+      if (sRotLines.fetch_add(1, std::memory_order_relaxed) < 4u) {
+        // Resolved the same way IsStablePropIdSuppressed resolves it, so the
+        // hash on the line is provably the one the suppress list matched
+        // against rather than a second, differently-derived value.
+        uint64_t vsHashDiag = 0ull;
+        {
+          const auto& vsDiag = drawVertexShaderCom();
+          if (vsDiag != nullptr && vsDiag->GetCommonShader() != nullptr) {
+            const auto& shDiag = vsDiag->GetCommonShader()->GetShader();
+            if (shDiag != nullptr) {
+              vsHashDiag = static_cast<uint64_t>(shDiag->getHash());
+            }
+          }
+        }
+        Logger::info(str::format(
+          "[PropIdRotate] f=", nowFrame,
+          " vs=0x", std::hex, vsHashDiag, std::dec,
+          // WHICH o2w PATH THIS DRAW TOOK. I have twice called these draws "the
+          // viewmodel" from their near-origin positions without checking, and
+          // the branch that mints this propId sets objectToWorld to EXACT
+          // identity while the measured matrix is identity-plus-residue -- so
+          // the assumption is not just unverified, it disagrees with the data.
+          // pathId settles it: 12 is the viewmodel (o2w = inverse(mainW2v)) and
+          // pairs with [W2vStable]; anything else means that probe is aimed at
+          // the wrong path and the residue enters somewhere I have not looked.
+          " pathId=", m_lastO2wPathId,
+          " vbPtr=0x", std::hex, vbPtr, std::dec,
+          " vbOff=", vbOffset,
+          " vbStride=", vbStride,
+          " ibPtr=0x", std::hex, ibPtr, std::dec,
+          " ibOff=", ibOffset,
+          " bonePalettePtr=0x", std::hex, bonePalettePtr, std::dec));
+      }
+      return 0;
     }
 
     // Fanout-only: include rounded i2o[0] translation so two distinct
@@ -38700,6 +38848,44 @@ namespace dxvk {
       return 0ull;
     }
 
+    // AND NEITHER DOES A DRAW OUT OF A BUFFER THE CPU REWRITES. Same clause as
+    // the one above and the same answer, for a reason that had to be measured
+    // rather than assumed.
+    //
+    // [RsChurn] found ALL of the identity churn in one field, vbOffset, on a
+    // shader that appends transient geometry into two rolling dynamic vertex
+    // buffers -- 30 to 42 vertices, drawStart and drawBase always 0, offsets
+    // cycling 10,288..45,968. The offset there names a SLOT IN A RING, not an
+    // object, so a fresh identity is minted every time the ring moves and the
+    // record set grows without bound. maxIdentPerAnchor reached 2,558 on one
+    // anchor and was still climbing.
+    //
+    // NOTHING IS LOST, AND THAT IS MEASURED, NOT ARGUED. [RsVbClass] over four
+    // settled 300-frame windows:
+    //
+    //   IMMUTABLE.virgin  draws=118005  hit=72456  missGen=17  newIdent=0
+    //   DYNAMIC.mapped    draws=5400    hit=0      missGen=2   newIdent=374
+    //
+    // hit=0 on every window: not one draw out of a dynamic buffer has ever
+    // passed the gate, because its identity recurs too rarely to be contiguous.
+    // So this cell is pure churn with no coverage in it, and the other six cells
+    // are empty -- TF2 uses exactly two buffer classes on this path.
+    //
+    // THE OTHER CANDIDATE TEST WAS GetMapGeneration() != 0, and the probe was
+    // built to price the population where the two disagree. It reads
+    // delta{draws=0 hit=0 newIdent=0} in every window: with no DEFAULT buffers
+    // and no mapped IMMUTABLE ones, the two predicates select the same set here.
+    // Usage is the one written because it states the intent the game declared
+    // rather than inferring it from a counter's semantics.
+    //
+    // Returning 0 routes these down the full path forever, which is what they
+    // already did -- the difference is that they no longer mint a gate entry or
+    // a record on the way. Watch [ResidentGate] noKey= rise to ~18/frame and
+    // newKeys fall to ~0, with hitPct and liveInst unmoved.
+    if (vb0.buffer->Desc()->Usage == D3D11_USAGE_DYNAMIC) {
+      return 0ull;
+    }
+
     // THE OBJECT IDENTITY KEY -- the same inputs drawSplitKeys' IdentHead uses,
     // and for the same measured reason: these are engine-owned allocations made
     // at level/entity spawn and reused for the entity's lifetime, so they are
@@ -38714,23 +38900,9 @@ namespace dxvk {
     // Read straight off m_context->m_state, NOT off a DrawSnapshot: the whole
     // point of the gate is to run BEFORE captureDrawSnapshot, which is itself
     // 2.11 ms/frame of what we are trying not to pay.
-    struct KeyHead {
-      uint64_t vbPtr;
-      uint64_t ibPtr;
-      uint64_t vsHash;
-      uint64_t ilPtr;
-      uint32_t vbOffset;
-      uint32_t vbStride;
-      uint32_t ibOffset;
-      uint32_t ibFormat;
-      uint32_t drawStart;
-      uint32_t drawCount;
-      int32_t  drawBase;
-      uint32_t indexed;
-    };
-    static_assert(sizeof(KeyHead) == 64, "KeyHead must have no implicit padding");
-
-    KeyHead k = { };
+    // The field list and its no-padding assertion live on the class now, so
+    // [RsChurn] can name the field that moved. See ResidentKeyHead.
+    ResidentKeyHead k = { };
     k.vbPtr    = reinterpret_cast<uint64_t>(vb0.buffer.ptr());
     k.vbOffset = vb0.offset;
     k.vbStride = vb0.stride;
@@ -38765,6 +38937,16 @@ namespace dxvk {
     // to far fewer, because material and placement have separated most of them
     // by then.
     m_rsDrawBaseKey = baseKey;   // [RsGroup] / the judge, which now folds the rest
+
+    // [RsChurn] reads this in the judge, where the population matches
+    // [RsIdent] cand=identHead exactly. Taking it here is the only place the
+    // fields exist; taking it under the gate keeps a probe-off run free.
+    if (RtxOptions::ResidentScene::logStats()) {
+      m_rsDrawKeyHead = k;
+      // vb0.buffer is non-null here -- the no-vertex-buffer case returned above.
+      m_rsDrawVbUsage = static_cast<uint32_t>(vb0.buffer->Desc()->Usage);
+      m_rsDrawVbGen   = vb0.buffer->GetMapGeneration();
+    }
 
     // Never hand back the sentinel. A one-in-2^64 collision with 0 would
     // otherwise silently disable residency for that draw forever.
@@ -39830,6 +40012,9 @@ namespace dxvk {
           // prescribe opposite responses -- see residentGateJudge.
           " missO2w=", m_rsMissO2w,
           " missMat=", m_rsMissMat,
+          // Read against [ResidentScene] failSize -- they count the same
+          // fanout batches from opposite sides. See the branch that sets it.
+          " missPlace=", m_rsMissPlace,
           " newKeys=", m_rsNewKeys,
           " noKey=", m_rsNoKey,
           // Draws that got a key and never reached the judge. This is the
@@ -39864,7 +40049,7 @@ namespace dxvk {
           " | newKeys ~0 = key stable; newKeys high = DO NOT ARM"));
         m_rsDraws = m_rsHit = m_rsMissKey = m_rsMissGen = 0u;
         m_rsNewKeys = m_rsNoKey = 0u;
-        m_rsMissO2w = m_rsMissMat = m_rsNoTail = 0u;
+        m_rsMissO2w = m_rsMissMat = m_rsMissPlace = m_rsNoTail = 0u;
       }
 
       // PRUNE, AND IT IS NOT OPTIONAL. Both maps are keyed on engine buffer
@@ -39896,13 +40081,26 @@ namespace dxvk {
       //
       // ONLY WHEN OVER THE CAP. Not on a fixed period: the walk is O(map), and
       // the map is the thing we are trying not to pay for.
+      //
+      // BOUNDED BY THE OVERAGE, NOT BY THE RUNG -- same correction as the
+      // record store's pass 2, and it was the same missing test. The rung says
+      // which entries MAY go, the cap says HOW MANY, and without the size test
+      // in the inner loop one rung removes every entry past it.
+      //
+      // Cheaper here than there, because a swept gate entry costs a miss rather
+      // than an object: the draw takes the full path and re-files. It is still
+      // not free -- measured 2026-08-24, gateSize 11996 -> 6969 in one sweep
+      // (aged 2751 -> 7855), and every swept key returned as a fresh one, so
+      // newKeys spiked to 294/10 frames and hitPct fell 50 -> 42 for the ~100
+      // frames it took to refill.
       const size_t kGateCap = RtxOptions::ResidentScene::maxRecords();
       if (kGateCap != 0u && m_residentGate.size() > kGateCap) {
         m_rsSweeps += 1;
         static constexpr uint32_t kAgeRungs[] = { 300u, 60u, 8u, 2u };
         for (uint32_t r = 0; r < std::size(kAgeRungs) && m_residentGate.size() > kGateCap; ++r) {
           const uint32_t maxAge = kAgeRungs[r];
-          for (auto it = m_residentGate.begin(); it != m_residentGate.end(); ) {
+          for (auto it = m_residentGate.begin();
+               it != m_residentGate.end() && m_residentGate.size() > kGateCap; ) {
             if (fid > it->second.frameLastSeen && fid - it->second.frameLastSeen > maxAge) {
               it = m_residentGate.erase(it);
               m_rsAged += 1;
@@ -40814,6 +41012,24 @@ namespace dxvk {
     // there is no mask.
     const uint64_t o2w = XXH64(&drawCallState.transformData.objectToWorld, sizeof(Matrix4), 0ull);
 
+    // THE PLACEMENT COUNT, FOR THE DIRTY TEST BELOW. See ResidentGateEntry's
+    // nPlace for why it is compared rather than folded, and why the judge on
+    // the CS side does not already cover it.
+    //
+    // THE COUNT, NOT THE BYTES, and the difference was measured before choosing.
+    // Hashing the placement matrices would also catch a changed count, but it
+    // goes dirty whenever any prop MOVES: 51,849 of 547,318 draws against 0.67%
+    // for the count. That is fourteen times the miss rate to buy protection
+    // against movement, which is a staleness question and not this one. If held
+    // fanout geometry ever shows movement artefacts, the bytes are what to reach
+    // for and 9.5% is the price already established.
+    //
+    // Zero when there is no placement list, which is every non-fanout draw, so
+    // the comparison is free for that population and cannot make it miss.
+    const uint32_t nPlace = (drawCallState.transformData.instancesToObject != nullptr)
+      ? static_cast<uint32_t>(drawCallState.transformData.instancesToObject->size())
+      : 0u;
+
     // NARROW THE IDENTITY FIRST, THEN TAKE THE ORDINAL WITHIN IT.
     //
     // Two things are true at once and the old key served neither well. An
@@ -41127,6 +41343,13 @@ namespace dxvk {
     // No lock. residentGateJudge runs on the frame thread -- the same property
     // censusRecordO2w relies on one call site up -- so function-static state is
     // single-threaded here. Do not copy this probe somewhere a worker reaches.
+    // [RsVbClass] needs "was this identity new" from [RsChurn] inside the block
+    // below, and "did it hit" from the gate comparison further down. Those two
+    // facts are established at opposite ends of this function, so the first is
+    // carried in a local rather than recomputed -- recomputing it would give the
+    // two probes their own seen-map and let them disagree about which draws they
+    // are describing.
+    bool rsVbCellNewIdent = false;
     if (RtxOptions::ResidentScene::logStats()) {
       constexpr uint32_t kVariants = 7;
       constexpr size_t kMaxTracked = 100000;
@@ -41326,15 +41549,14 @@ namespace dxvk {
         }
       }
 
-      // The removed placement fold, rebuilt HERE rather than beside the key, so
-      // a term no longer in the key costs no hash on the frame thread when the
-      // probe is off. See the removal note at the fold site.
-      uint64_t narrowedWithPlace = narrowed;
-      if (drawCallState.transformData.instancesToObject != nullptr) {
-        const uint32_t nPlace =
-          static_cast<uint32_t>(drawCallState.transformData.instancesToObject->size());
-        narrowedWithPlace = XXH64(&nPlace, sizeof(nPlace), narrowed);
-      }
+      // The placement fold as it would look IN THE KEY, off the same count the
+      // dirty test compares. Only the hash is behind the probe gate -- keeping
+      // the candidate priced costs no work on the frame thread when the probe is
+      // off, which is the whole reason it lives here and not at the key site.
+      const uint64_t narrowedWithPlace =
+        (drawCallState.transformData.instancesToObject != nullptr)
+          ? XXH64(&nPlace, sizeof(nPlace), narrowed)
+          : narrowed;
 
       const uint64_t candId[kVariants] = {
         m_rsDrawBaseKey,
@@ -41410,6 +41632,243 @@ namespace dxvk {
           r.nw = r.g0 = r.g1 = r.g2 = r.g3 = 0u;
         }
       }
+
+      // NV-DXVK [RsChurn]: WHICH FIELD OF THE IA IDENTITY MOVES.
+      //
+      // THE NUMBER THIS EXISTS TO EXPLAIN. [RsIdent] cand=identHead reads ~1.3
+      // brand-new identities a frame in a settled scene, decaying across a
+      // session (18.1 -> 2.8 -> 1.84 -> 1.38 -> 1.27) but with the ratio between
+      // successive windows climbing toward 1, so it is flattening at a non-zero
+      // rate rather than reaching zero. Nothing retires a record below the cap,
+      // so that rate IS the record set's growth, and the record set growing is
+      // what eventually calls the eviction sweep that costs geometry.
+      //
+      // A HASH CANNOT ANSWER "DIFFERENT HOW", which is why the fields are
+      // stashed. Six identity candidates have already been killed in this tree
+      // by guessing at the churning term, and the field list is short enough to
+      // simply ask: twelve names, one of which is doing it.
+      //
+      // THE ANCHOR IS THE FOUR POINTERS -- vertex buffer, index buffer, vertex
+      // shader, input layout. Those are engine allocations made at level or
+      // entity spawn and reused for the object's lifetime, so they name the
+      // OBJECT while the offsets and the draw range name the slice of it being
+      // drawn. A new identity whose anchor is already known is therefore the
+      // same object asking differently, and the differing field says how.
+      //
+      // anchorNew IS NOT A FAILURE OF THE PROBE, IT IS THE OTHER ANSWER. If the
+      // churn is in the pointers themselves -- a pooled buffer rotating, a
+      // shader recompiled, a layout re-created -- the anchor misses by
+      // construction, and that population prints its full field set raw so the
+      // rotating pointer is visible against everything that held still. Read
+      // anchorNew against anchorHit before reading the field histogram at all:
+      // a high anchorNew means the histogram is describing a minority.
+      {
+        struct AnchorSlot {
+          ResidentKeyHead head = { };
+          uint32_t frame = 0u;
+          // HOW MANY DISTINCT IDENTITIES THIS ONE OBJECT HAS MINTED, and it is
+          // what separates the two readings a differing field cannot.
+          //
+          // field=drawStart on an anchor with nIdent=3 is an object with three
+          // sub-meshes, drawn out of one pooled buffer, each legitimately its
+          // own identity -- a finite set that stops growing. The same field on
+          // an anchor with nIdent=400 and climbing is a ring buffer sliding, so
+          // the "object" mints a fresh identity forever and its records are
+          // orphaned as fast as they are built. Same field name, opposite
+          // findings, and only the count tells them apart.
+          uint32_t identCount = 0u;
+        };
+        static const char* const kFieldName[kResidentKeyFields] = {
+          "vbPtr", "ibPtr", "vsHash", "ilPtr",
+          "vbOffset", "vbStride", "ibOffset", "ibFormat",
+          "drawStart", "drawCount", "drawBase", "indexed"
+        };
+        // Bounded for the same reason [RsIdent]'s maps are, and with the same
+        // reporting: a cleared map reads every key as new and would print a
+        // burst that looks exactly like the churn it exists to measure, so the
+        // clear has to be visible as `cleared=` rather than inferred.
+        constexpr size_t kMaxSeen = 200000;
+        constexpr size_t kMaxAnchors = 100000;
+        constexpr uint32_t kChurnDumpFrames = 300u;
+        // PER WINDOW, NOT PER SESSION, and that is the correction the [RsGate]
+        // note in this file already paid for: a session-wide cap spends every
+        // line in the opening frames, where the population is the load burst
+        // and not the steady-state churn this exists to name. Reset with the
+        // counters below, so each window carries its own raw sample.
+        constexpr uint32_t kMaxChurnLines = 40u;
+        static std::unordered_map<uint64_t, uint32_t> sSeenIdent;
+        static std::unordered_map<uint64_t, AnchorSlot> sAnchors;
+        static uint32_t sField[kResidentKeyFields] = { };
+        static uint32_t sNewIdent = 0u, sAnchorHit = 0u, sAnchorNew = 0u;
+        static uint32_t sSameHead = 0u, sMulti = 0u, sCleared = 0u, sLines = 0u;
+        static uint32_t sMaxIdentPerAnchor = 0u;
+        static uint32_t sChurnLastDump = 0xFFFFFFFFu;
+
+        const ResidentKeyHead& kh = m_rsDrawKeyHead;
+        // The anchor over the four pointers, written out rather than taken as a
+        // prefix of the struct so it does not depend on member order.
+        const uint64_t anchorParts[4] = { kh.vbPtr, kh.ibPtr, kh.vsHash, kh.ilPtr };
+        const uint64_t anchor = XXH64(anchorParts, sizeof(anchorParts), 0ull);
+
+        const bool isNewIdent = (sSeenIdent.find(m_rsDrawBaseKey) == sSeenIdent.end());
+        rsVbCellNewIdent = isNewIdent;   // [RsVbClass], below the gate comparison
+        if (isNewIdent) {
+          sNewIdent += 1u;
+          const auto aIt = sAnchors.find(anchor);
+          if (aIt == sAnchors.end()) {
+            sAnchorNew += 1u;
+            if (sLines < kMaxChurnLines) {
+              sLines += 1u;
+              Logger::info(str::format(
+                "[RsChurn] f=", frameId, " ident=0x", std::hex, m_rsDrawBaseKey,
+                " anchor=NEW vb=0x", kh.vbPtr, " ib=0x", kh.ibPtr,
+                " vs=0x", kh.vsHash, " il=0x", kh.ilPtr, std::dec,
+                " vbOff=", kh.vbOffset, " stride=", kh.vbStride,
+                " ibOff=", kh.ibOffset, " fmt=", kh.ibFormat,
+                " start=", kh.drawStart, " count=", kh.drawCount,
+                " base=", kh.drawBase, " indexed=", kh.indexed));
+            }
+          } else {
+            sAnchorHit += 1u;
+            const ResidentKeyHead& p = aIt->second.head;
+            // Bits 0-3 CANNOT be set on an anchor hit -- they are the anchor.
+            // Compared anyway: a non-zero one is an anchor hash collision, and a
+            // collision quietly attributing one object's churn to another is
+            // exactly the shape of [O2wDelta] v1's defect.
+            uint32_t diffMask = 0u;
+            if (p.vbPtr     != kh.vbPtr)     { diffMask |= 1u << 0; }
+            if (p.ibPtr     != kh.ibPtr)     { diffMask |= 1u << 1; }
+            if (p.vsHash    != kh.vsHash)    { diffMask |= 1u << 2; }
+            if (p.ilPtr     != kh.ilPtr)     { diffMask |= 1u << 3; }
+            if (p.vbOffset  != kh.vbOffset)  { diffMask |= 1u << 4; }
+            if (p.vbStride  != kh.vbStride)  { diffMask |= 1u << 5; }
+            if (p.ibOffset  != kh.ibOffset)  { diffMask |= 1u << 6; }
+            if (p.ibFormat  != kh.ibFormat)  { diffMask |= 1u << 7; }
+            if (p.drawStart != kh.drawStart) { diffMask |= 1u << 8; }
+            if (p.drawCount != kh.drawCount) { diffMask |= 1u << 9; }
+            if (p.drawBase  != kh.drawBase)  { diffMask |= 1u << 10; }
+            if (p.indexed   != kh.indexed)   { diffMask |= 1u << 11; }
+
+            uint32_t nDiff = 0u;
+            uint32_t only = 0u;
+            for (uint32_t f = 0; f < kResidentKeyFields; ++f) {
+              if ((diffMask & (1u << f)) != 0u) {
+                nDiff += 1u;
+                only = f;
+              }
+            }
+
+            const auto fieldStr = [](const ResidentKeyHead& h, uint32_t f) -> std::string {
+              switch (f) {
+                case 0:  return str::format("0x", std::hex, h.vbPtr, std::dec);
+                case 1:  return str::format("0x", std::hex, h.ibPtr, std::dec);
+                case 2:  return str::format("0x", std::hex, h.vsHash, std::dec);
+                case 3:  return str::format("0x", std::hex, h.ilPtr, std::dec);
+                case 4:  return str::format(h.vbOffset);
+                case 5:  return str::format(h.vbStride);
+                case 6:  return str::format(h.ibOffset);
+                case 7:  return str::format(h.ibFormat);
+                case 8:  return str::format(h.drawStart);
+                case 9:  return str::format(h.drawCount);
+                case 10: return str::format(h.drawBase);
+                default: return str::format(h.indexed);
+              }
+            };
+
+            if (nDiff == 0u) {
+              // The stored head is byte-identical and the key is still new,
+              // which the hash makes impossible. Reaching here means sSeenIdent
+              // dropped the key -- read cleared= on the same line.
+              sSameHead += 1u;
+            } else if (nDiff == 1u) {
+              sField[only] += 1u;
+              if (sLines < kMaxChurnLines) {
+                sLines += 1u;
+                Logger::info(str::format(
+                  "[RsChurn] f=", frameId, " ident=0x", std::hex, m_rsDrawBaseKey, std::dec,
+                  " anchor=hit field=", kFieldName[only],
+                  " old=", fieldStr(p, only), " new=", fieldStr(kh, only),
+                  " nIdent=", aIt->second.identCount + 1u,
+                  " anchorAgeF=", (frameId > aIt->second.frame
+                                    ? frameId - aIt->second.frame : 0u),
+                  " vs=0x", std::hex, kh.vsHash, " vb=0x", kh.vbPtr, std::dec,
+                  " start=", kh.drawStart, " count=", kh.drawCount,
+                  " base=", kh.drawBase, " vbOff=", kh.vbOffset));
+              }
+            } else {
+              sMulti += 1u;
+              if (sLines < kMaxChurnLines) {
+                sLines += 1u;
+                std::string names;
+                for (uint32_t f = 0; f < kResidentKeyFields; ++f) {
+                  if ((diffMask & (1u << f)) != 0u) {
+                    names += kFieldName[f];
+                    names += " ";
+                  }
+                }
+                Logger::info(str::format(
+                  "[RsChurn] f=", frameId, " ident=0x", std::hex, m_rsDrawBaseKey, std::dec,
+                  " anchor=hit nDiff=", nDiff, " fields={ ", names, "}",
+                  " nIdent=", aIt->second.identCount + 1u,
+                  " anchorAgeF=", (frameId > aIt->second.frame
+                                    ? frameId - aIt->second.frame : 0u),
+                  " vs=0x", std::hex, kh.vsHash, std::dec,
+                  " start=", p.drawStart, "->", kh.drawStart,
+                  " count=", p.drawCount, "->", kh.drawCount,
+                  " base=", p.drawBase, "->", kh.drawBase,
+                  " vbOff=", p.vbOffset, "->", kh.vbOffset));
+              }
+            }
+          }
+        }
+
+        if (sSeenIdent.size() >= kMaxSeen) {
+          sSeenIdent.clear();
+          sCleared += 1u;
+        }
+        if (sAnchors.size() >= kMaxAnchors) {
+          sAnchors.clear();
+          sCleared += 1u;
+        }
+        sSeenIdent[m_rsDrawBaseKey] = frameId;
+        AnchorSlot& slot = sAnchors[anchor];
+        if (isNewIdent) {
+          slot.identCount += 1u;
+          if (slot.identCount > sMaxIdentPerAnchor) {
+            sMaxIdentPerAnchor = slot.identCount;
+          }
+        }
+        slot.head = kh;
+        slot.frame = frameId;
+
+        if (sChurnLastDump == 0xFFFFFFFFu) {
+          sChurnLastDump = frameId;
+        } else if (frameId - sChurnLastDump >= kChurnDumpFrames) {
+          sChurnLastDump = frameId;
+          std::string hist;
+          for (uint32_t f = 0; f < kResidentKeyFields; ++f) {
+            hist += str::format(" ", kFieldName[f], "=", sField[f]);
+            sField[f] = 0u;
+          }
+          Logger::warn(str::format(
+            "[RsChurn] f=", frameId, " window=", kChurnDumpFrames,
+            " newIdent=", sNewIdent,
+            " anchorHit=", sAnchorHit,
+            " anchorNew=", sAnchorNew,
+            " multi=", sMulti,
+            " same=", sSameHead,
+            " idents=", static_cast<uint32_t>(sSeenIdent.size()),
+            " anchors=", static_cast<uint32_t>(sAnchors.size()),
+            // The worst offender's lifetime count, NOT a per-window figure --
+            // it is a ceiling on how far one object has run away, and resetting
+            // it each window would hide exactly the unbounded case it names.
+            " maxIdentPerAnchor=", sMaxIdentPerAnchor,
+            " cleared=", sCleared,
+            " |", hist,
+            " | anchorNew high = the POINTERS churn; one field high = that field"));
+          sNewIdent = sAnchorHit = sAnchorNew = sMulti = sSameHead = sLines = 0u;
+        }
+      }
     }
 
     // The key and the fold travel with the draw either way: on a hit the commit
@@ -41481,6 +41940,108 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [RsVbClass]: PRICE BOTH CANDIDATE EXCLUSIONS BEFORE APPLYING ONE.
+    //
+    // [RsChurn] named vbOffset as the whole of the identity churn, on a shader
+    // that appends transient geometry into a rolling dynamic vertex buffer. Two
+    // tests would refuse an identity for that population and they are not the
+    // same set:
+    //
+    //   narrow   Desc()->Usage == D3D11_USAGE_DYNAMIC. "The CPU rewrites this
+    //            buffer", declared by the game at creation.
+    //   broad    GetMapGeneration() != 0. residentGeomGenFold's own invariant --
+    //            immutable and static buffers stay pinned at 0 for life -- so a
+    //            non-zero generation means the buffer has been written at least
+    //            once, whatever it was declared as.
+    //
+    // THE DECISION IS THE POPULATION WHERE THEY DISAGREE, which is a buffer that
+    // has been mapped but is not declared dynamic: a DEFAULT buffer filled once
+    // at load is stable geometry residency should keep, and broad would throw it
+    // away. delta= on the second line is exactly that set, and its hit= is what
+    // it would cost.
+    //
+    // A cell with draws high and hit=0 costs nothing to exclude however large it
+    // is; a cell with hit high is coverage, and no churn figure offsets losing
+    // it.
+    //
+    // SPANNING THE VERDICT, AND THAT IS WHY THE STATE IS OUT HERE. The draw and
+    // the identity are known now; the hit is decided in the branches below, and
+    // the unknown-key path RETURNS before reaching them. Counting draws here and
+    // hits there is what makes newIdent= right -- a new identity usually carries
+    // a new gate key too, so a probe that sat past the early return would report
+    // near-zero for the population it exists to measure.
+    //
+    // The dump runs BEFORE this draw is counted, so a draw contributes its draws
+    // and its hit to the same window rather than straddling two.
+    struct VbCell {
+      uint32_t draws = 0u, hit = 0u, missGen = 0u, newIdent = 0u;
+    };
+    static constexpr uint32_t kVbUsages = 4u;          // DEFAULT, IMMUTABLE, DYNAMIC, STAGING
+    static constexpr uint32_t kVbCells = kVbUsages * 2u;  // x { gen==0, gen!=0 }
+    static VbCell sVbCells[kVbCells];
+    static uint32_t sVbClassLastDump = 0xFFFFFFFFu;
+    VbCell* rsVbCell = nullptr;
+
+    if (RtxOptions::ResidentScene::logStats()) {
+      constexpr uint32_t kVbClassDumpFrames = 300u;
+      static const char* const kUsageName[kVbUsages] =
+        { "DEFAULT", "IMMUTABLE", "DYNAMIC", "STAGING" };
+
+      if (sVbClassLastDump == 0xFFFFFFFFu) {
+        sVbClassLastDump = frameId;
+      } else if (frameId - sVbClassLastDump >= kVbClassDumpFrames) {
+        sVbClassLastDump = frameId;
+        std::string cells;
+        VbCell narrow, broad, delta;
+        for (uint32_t u = 0; u < kVbUsages; ++u) {
+          for (uint32_t m = 0; m < 2u; ++m) {
+            const VbCell& c = sVbCells[u * 2u + m];
+            cells += str::format(
+              " ", kUsageName[u], (m != 0u ? ".mapped{" : ".virgin{"),
+              "draws=", c.draws, " hit=", c.hit,
+              " missGen=", c.missGen, " newIdent=", c.newIdent, "}");
+            const auto add = [&c](VbCell& acc) {
+              acc.draws    += c.draws;
+              acc.hit      += c.hit;
+              acc.missGen  += c.missGen;
+              acc.newIdent += c.newIdent;
+            };
+            const bool isDynamic = (u == 2u);
+            if (isDynamic) {
+              add(narrow);
+            }
+            if (m != 0u) {
+              add(broad);
+              if (!isDynamic) {
+                add(delta);
+              }
+            }
+          }
+        }
+        Logger::warn(str::format(
+          "[RsVbClass] f=", frameId, " window=", kVbClassDumpFrames, cells));
+        Logger::warn(str::format(
+          "[RsVbClass] f=", frameId,
+          " narrowExcl{draws=", narrow.draws, " hit=", narrow.hit,
+          " newIdent=", narrow.newIdent, "}",
+          " broadExcl{draws=", broad.draws, " hit=", broad.hit,
+          " newIdent=", broad.newIdent, "}",
+          " delta{draws=", delta.draws, " hit=", delta.hit,
+          " newIdent=", delta.newIdent, "}",
+          " | delta.hit=0 => broad costs no more than narrow; delta.hit high => take narrow"));
+        for (uint32_t c = 0; c < kVbCells; ++c) {
+          sVbCells[c] = VbCell();
+        }
+      }
+
+      const uint32_t usage = (m_rsDrawVbUsage < kVbUsages) ? m_rsDrawVbUsage : 0u;
+      rsVbCell = &sVbCells[usage * 2u + (m_rsDrawVbGen != 0ull ? 1u : 0u)];
+      rsVbCell->draws += 1u;
+      if (rsVbCellNewIdent) {
+        rsVbCell->newIdent += 1u;
+      }
+    }
+
     const auto it = m_residentGate.find(key);
     if (it == m_residentGate.end()) {
       m_rsNewKeys += 1;
@@ -41495,6 +42056,7 @@ namespace dxvk {
       e.srcGenHash    = m_rsDrawGens;
       e.matHash       = m_rsDrawMat;
       e.o2wHash       = o2w;
+      e.nPlace        = nPlace;
       e.frameLastSeen = frameId;
       return;
     }
@@ -41510,6 +42072,7 @@ namespace dxvk {
     const bool gensMatch  = (e.srcGenHash == m_rsDrawGens);
     const bool matMatch   = (e.matHash == m_rsDrawMat);
     const bool o2wMatch   = (e.o2wHash == o2w);
+    const bool placeMatch = (e.nPlace == nPlace);
 
     // Counted apart because they prescribe different responses. missGen high
     // with newKeys ~0 is the GOOD failure: identity is stable and the geometry
@@ -41522,6 +42085,11 @@ namespace dxvk {
       m_rsMissKey += 1;
     } else if (!gensMatch) {
       m_rsMissGen += 1;
+      // [RsVbClass]: the reason a CPU-written buffer can never hit, attributed
+      // to the buffer class that caused it.
+      if (rsVbCell != nullptr) {
+        rsVbCell->missGen += 1u;
+      }
     } else if (!o2wMatch) {
       m_rsMissO2w += 1;
     } else if (!matMatch) {
@@ -41533,9 +42101,26 @@ namespace dxvk {
       // not fire. Read material churn from [MatChurnSlot] matChg and [MatChurn]
       // matNew, neither of which depends on the key.
       m_rsMissMat += 1;
+    } else if (!placeMatch) {
+      // THE ONLY MISS THAT NAMES A CHANGED REQUEST RATHER THAN A CHANGED INPUT.
+      // The other four say some input the record was built from moved. This one
+      // says the draw is asking for a different NUMBER of objects, so the record
+      // cannot describe it however clean its inputs read.
+      //
+      // Expect it at roughly 1/frame in TF2 and read it against [RsFailSize]:
+      // the two count the same population from opposite sides, so missPlace
+      // rising is what drives failSize to zero. If it climbs far past failSize's
+      // pre-change rate the count is unstable for a reason this did not measure,
+      // and the comparison -- not the key -- is what to reconsider.
+      m_rsMissPlace += 1;
     } else {
       m_rsHit += 1;
       drawCallState.residentPredictHit = true;
+      // [RsVbClass]: the coverage an exclusion would take. This is the only
+      // column that can argue against cutting a cell.
+      if (rsVbCell != nullptr) {
+        rsVbCell->hit += 1u;
+      }
     }
 
     // NV-DXVK [RsGate]: THE FRAME THREAD'S OWN VIEW OF THE SAME KEY, so the two
@@ -41583,6 +42168,7 @@ namespace dxvk {
     e.srcGenHash    = m_rsDrawGens;
     e.matHash       = m_rsDrawMat;
     e.o2wHash       = o2w;
+    e.nPlace        = nPlace;
     e.frameLastSeen = frameId;
   }
 
@@ -51412,6 +51998,73 @@ namespace dxvk {
         }
         if (haveMainW2v) {
           dcs.transformData.objectToWorld = inverse(mainW2v);
+
+          // NV-DXVK [W2vStable] 2026-08-25: DOES THE ENGINE FEED NOISE, OR DO WE
+          // ADD IT?
+          //
+          // [ReFileJit] measures draws whose objectToWorld is identity plus a
+          // residue that changes every frame while the scene is still, which
+          // rewrites their SpatialMap key every frame and permanently breaks
+          // their exact-stage dedup. inverse() is deterministic -- identical
+          // bytes in give identical bytes out -- so if o2w wobbles at rest then
+          // mainW2v wobbled first, and the defect is upstream of this file.
+          //
+          // WHY THIS IS THE RIGHT SPLIT AND NOT ANOTHER KEY EXPERIMENT. The
+          // obvious fix, keying on the camera-relative value instead of the
+          // world value, is WRONG: a stationary world prop's camera-relative
+          // position changes whenever the camera moves, so it would re-file the
+          // whole scene every frame the player turns. A camera-attached object's
+          // world transform is SUPPOSED to change when the camera moves, and
+          // re-filing then is correct. The only thing that is wrong is movement
+          // reported while the camera is at rest, which is what this measures.
+          //
+          // READ IT AS:
+          //   w2vSame=1 o2wSame=0
+          //       impossible from inverse() alone -- o2w is being sourced or
+          //       mutated somewhere other than this line, and that place is the
+          //       defect. Find the other writer.
+          //   w2vSame=0 with dT tiny (~1e-4) while standing still
+          //       the engine's world-to-view is not bit-stable at rest. The fix
+          //       is at the hook, or here by reusing the previous o2w when the
+          //       incoming matrix is bit-identical.
+          //   w2vSame=0 with dT large
+          //       the camera genuinely moved; this frame is not evidence of
+          //       anything and must be excluded before reading the others.
+          //   w2vSame=1 o2wSame=1 on still frames
+          //       this path is clean and the jittering draws are NOT path 12 --
+          //       believe [PropIdRotate]'s pathId over my assumption.
+          {
+            static std::atomic<uint32_t> sW2vFrame { 0u };
+            static uint64_t s_prevW2vHash = 0ull;
+            static uint64_t s_prevO2wHash = 0ull;
+            static float    s_prevW2vT[3] = { 0.f, 0.f, 0.f };
+            const uint32_t nowFrame = m_context->m_device->getCurrentFrameId();
+            uint32_t seen = sW2vFrame.load(std::memory_order_relaxed);
+            if (nowFrame > seen
+                && sW2vFrame.compare_exchange_strong(seen, nowFrame, std::memory_order_relaxed)) {
+              const Matrix4& o2wNow = dcs.transformData.objectToWorld;
+              const uint64_t w2vHash = XXH64(&mainW2v, sizeof(Matrix4), 0);
+              const uint64_t o2wHash = XXH64(&o2wNow, sizeof(Matrix4), 0);
+              // The camera's own translation, so a still frame can be told from
+              // a moving one without guessing from the hash alone.
+              const float tx = mainW2v[3][0], ty = mainW2v[3][1], tz = mainW2v[3][2];
+              const float dx = tx - s_prevW2vT[0];
+              const float dy = ty - s_prevW2vT[1];
+              const float dz = tz - s_prevW2vT[2];
+              Logger::info(str::format(
+                "[W2vStable] f=", nowFrame,
+                " w2vSame=", (w2vHash == s_prevW2vHash ? 1 : 0),
+                " o2wSame=", (o2wHash == s_prevO2wHash ? 1 : 0),
+                " w2vT=(", tx, ",", ty, ",", tz, ")",
+                " dT=", std::sqrt(dx * dx + dy * dy + dz * dz),
+                " o2wT=(", o2wNow[3][0], ",", o2wNow[3][1], ",", o2wNow[3][2], ")",
+                " w2vHash=0x", std::hex, w2vHash,
+                " o2wHash=0x", o2wHash, std::dec));
+              s_prevW2vHash = w2vHash;
+              s_prevO2wHash = o2wHash;
+              s_prevW2vT[0] = tx; s_prevW2vT[1] = ty; s_prevW2vT[2] = tz;
+            }
+          }
         } else {
           // Fallback: inverse of this draw's worldToView (bad scale but
           // better than nothing).

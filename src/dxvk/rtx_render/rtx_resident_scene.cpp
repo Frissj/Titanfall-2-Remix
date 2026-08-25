@@ -962,11 +962,33 @@ namespace dxvk {
       }
     };
 
+    // AND THE SWEEP IS BOUNDED BY THE OVERAGE, NOT BY THE RUNG. The rung says
+    // WHICH records may go; the cap says HOW MANY. Without the size test in the
+    // inner loop the first rung that fires removes EVERY record past it,
+    // however far under the cap that lands -- and the paragraph above, which
+    // claims the ladder "stops the moment it is under" and "cannot produce a
+    // cliff", described that intent rather than the code.
+    //
+    // AN EVICTION HERE DESTROYS GEOMETRY, which is what makes the overshoot a
+    // defect rather than a cache inefficiency. dropRecord() zeroes
+    // m_residentKey, holdsInstance() then refuses, and with engine culling on
+    // nothing redraws an off-screen object to rebuild the record -- so the
+    // instances starve on numFramesToKeepInstances and do not come back.
+    //
+    // MEASURED, 2026-08-24, cap 12000:
+    //   f=8214  records=12000  invalidated=0  evicted=0     liveInst=14057
+    //   f=8216  [ReapJoin] removed=12265 starved=12265      liveInst=1790
+    //   f=8224  records=5920   invalidated=0  evicted=6133  liveInst=1787
+    // The store crossed the cap by about one record and lost 6,133, taking 87%
+    // of the resident scene with it, permanently. invalidated=0 across the
+    // window is what fixes the direction: the records went first and the
+    // instances starved after, not the reverse.
     if (maxRecords != 0u && m_records.size() > maxRecords) {
       static constexpr uint32_t kAgeRungs[] = { 300u, 60u, 8u, 2u };
       for (uint32_t r = 0; r < std::size(kAgeRungs) && m_records.size() > maxRecords; ++r) {
         const uint32_t maxAge = kAgeRungs[r];
-        for (auto it = m_records.begin(); it != m_records.end(); ) {
+        for (auto it = m_records.begin();
+             it != m_records.end() && m_records.size() > maxRecords; ) {
           if (it->second.frameLastSeen != kInvalidFrameIndex
               && frame > it->second.frameLastSeen
               && (frame - it->second.frameLastSeen) > maxAge) {
@@ -983,8 +1005,12 @@ namespace dxvk {
       // Still over after the tightest rung means the cap's worth of records
       // were ALL touched within 2 frames -- a working set that genuinely
       // exceeds the cap rather than churn. A wipe is then the honest answer:
-      // it costs one frame of rebuilding, and silently keeping an unbounded map
-      // would trade a frame-time bug for a memory one. m_stats.wiped reading
+      // silently keeping an unbounded map would trade a frame-time bug for a
+      // memory one. It does NOT cost "one frame of rebuilding", which is what
+      // this said before the measurement above: only the records whose draws
+      // arrive get rebuilt, and the off-screen set has no draw to rebuild it.
+      // A wipe is the cliff at full width, so raise maxRecords rather than
+      // letting it fire. m_stats.wiped reading
       // non-zero means maxRecords is too small for the scene, which is a
       // DIFFERENT finding from key churn and wants the opposite response.
       if (m_records.size() > maxRecords) {

@@ -21,8 +21,11 @@
 */
 
 #pragma once
+#include <atomic>
+#include <cmath>
 #include <functional>
 #include <unordered_map>
+#include <vector>
 
 #include "util_matrix.h"
 #include "util_vector.h"
@@ -55,6 +58,64 @@ namespace dxvk {
     // std::unordered_map.
     using Cache = fast_flat_cache<Entry>;
   public:
+    // ================================================================
+    // NV-DXVK [MapLedger] 2026-08-24b: the WRITE-SIDE record of what happened to
+    // a key.
+    //
+    // WHY THIS EXISTS. The residency handoff's remaining failure is a stationary
+    // prop whose exact lookup misses even though its transform has not changed.
+    // Two read-side theories have already been refuted against it, and both were
+    // refuted because the read side can only ever observe that a key is absent —
+    // it cannot say whether the key was never written or was written and then
+    // vacated, and those two prescribe opposite fixes. Only the writer knows.
+    //
+    // ARMED FROM BIRTH, AND THAT IS THE WHOLE SOUNDNESS ARGUMENT. A SpatialMap
+    // starts empty, so a ledger that begins recording at construction has seen
+    // every write that map has ever taken. `None` therefore means "never written
+    // on this map", not "not written since logging was switched on" — which is
+    // what a ledger armed by a runtime flag mid-session would actually mean, and
+    // it would report `None` for every prop filed before the flag flipped. That
+    // failure mode would look exactly like the finding we are hunting.
+    //
+    // Read `debugLedgerEvicted()` before trusting any `None`: an evicted record
+    // reports as never-written and is the one false positive this can produce.
+    enum class LedgerOp : uint8_t {
+      None     = 0,  // no record: this key has never been written on this map
+      Inserted = 1,  // an entry was filed here and nothing has removed it since
+      Refiled  = 2,  // move() erased it from here and re-filed it at `otherKey`
+      Erased   = 3,  // erase() removed it outright (unlink, destroy, migrate out)
+    };
+
+    // Callers that have no frame to report pass this and the record still lands;
+    // the verdict line then shows kNoFrame and the reader knows the event is
+    // real but unplaced in time, rather than being told it happened at frame 0.
+    //
+    // Declared ABOVE LedgerRec because that struct uses it as a default member
+    // initializer, and a nested class's complete-class context is the nested
+    // class itself — it does not extend to members of the enclosing class
+    // declared later.
+    static constexpr uint32_t kNoFrame = 0xFFFFFFFFu;
+
+    struct LedgerRec {
+      // Occupancy is `op != LedgerOp::None`, NOT `key != 0`. XXH64 is entitled
+      // to return 0 and an overrideHash of 0 already means "no override", so a
+      // zero key is a legal key here and using it as the empty marker would make
+      // one real prop permanently invisible to the ledger.
+      XXH64_hash_t key      = 0;
+      XXH64_hash_t otherKey = 0;  // Refiled: the key the entry moved TO
+      // The owner at the time of the event. NEVER DEREFERENCED — compared and
+      // printed as an address only. A ledger record outlives the instance it
+      // names by design (that is the point of a ledger), so dereferencing it
+      // would be a use-after-free of exactly the kind the GC-walk crash in
+      // getImageHash already cost this project a session to.
+      const T*  data    = nullptr;
+      uint32_t  frame   = kNoFrame;  // frame the event was recorded on
+      uint32_t  writes  = 0;         // times this key has been written, ever
+      LedgerOp  op      = LedgerOp::None;
+      uint8_t   bumped  = 0;         // insert() had to probe past a collision
+    };
+
+  public:
     SpatialMap(float cellSize) : m_cellSize(cellSize) {
       if (m_cellSize <= 0) {
         ONCE(Logger::err("Invalid cell size in SpatialMap. cellSize must be greater than 0."));
@@ -66,6 +127,14 @@ namespace dxvk {
       m_cellSize = other.m_cellSize;
       m_cells = std::move(other.m_cells);
       m_cache = std::move(other.m_cache);
+      // [MapLedger] travels with the entries it describes. Leaving it behind
+      // would hand the moved-to map a ledger that has never seen a write, and
+      // every verdict against it would read None — the finding we are hunting,
+      // manufactured by the move.
+      m_ledger = std::move(other.m_ledger);
+      m_ledgerCount = other.m_ledgerCount;
+      m_ledgerEvicted = other.m_ledgerEvicted;
+      other.m_ledgerCount = 0;
       return *this;
     }
 
@@ -150,10 +219,17 @@ namespace dxvk {
     // overrideHash semantics match getDataAtTransform: when non-zero, used
     // as the cache key in place of XXH64(matrix). Caller must thread the
     // SAME overrideHash through subsequent move/erase for this entry.
-    XXH64_hash_t insert(const Vector3& centroid, const Matrix4& transform, const T* data, uint64_t overrideHash = 0) {
+    XXH64_hash_t insert(const Vector3& centroid, const Matrix4& transform, const T* data, uint64_t overrideHash = 0,
+                        uint32_t frame = kNoFrame) {
       XXH64_hash_t transformHash = (overrideHash != 0)
                                    ? static_cast<XXH64_hash_t>(overrideHash)
                                    : XXH64(&transform, sizeof(transform), 0);
+      // [MapLedger]: the key BEFORE any collision bump, because that is the key
+      // a future lookup will form. An entry parked at origHash+N is unreachable
+      // by every subsequent query, so the ledger must file it under the key that
+      // was asked for, not the slot it settled in.
+      const XXH64_hash_t ledgerKey = transformHash;
+      bool ledgerBumped = false;
       {
         // NV-DXVK [SpatialBump trace]: log every time we hit a collision
         // and bump the hash. With overrideHash (per-prop identity dedup),
@@ -182,6 +258,7 @@ namespace dxvk {
           }
           // assert(false);
           transformHash++;
+          ledgerBumped = true;
         }
       }
       const bool success = m_cache.insert(transformHash, Entry(data, centroid, transformHash));
@@ -192,10 +269,24 @@ namespace dxvk {
       }
       m_cells[getCellPos(centroid)].emplace_back(data, centroid, transformHash);
       ++m_dbgInserts;
+      ledgerRecord(ledgerKey, LedgerOp::Inserted, frame, data, /*otherKey*/ 0, ledgerBumped);
       return transformHash;
     }
 
-    void erase(const XXH64_hash_t& transformHash) {
+    void erase(const XXH64_hash_t& transformHash, uint32_t frame = kNoFrame) {
+      eraseInternal(transformHash, frame, /*vacatedTo*/ 0, /*isRefile*/ false);
+    }
+
+  private:
+    // The body of erase(), plus the one fact the public signature cannot carry:
+    // whether this removal is a destruction or the first half of a move().
+    //
+    // move() is implemented as erase-then-insert, so without this split every
+    // re-filing would be logged as a destruction and the ledger could not answer
+    // the question it was built for — "was the key vacated, or was the entry
+    // killed" — which are the two branches §5.5 of the residency handoff names.
+    void eraseInternal(const XXH64_hash_t& transformHash, uint32_t frame,
+                       XXH64_hash_t vacatedTo, bool isRefile) {
       const size_t slot = m_cache.findSlot(transformHash);
       if (slot != Cache::kInvalidSlot) {
         // NV-DXVK [SpatialErase]: log every erase. If a propId we expected
@@ -213,9 +304,16 @@ namespace dxvk {
         // Copied out before the erase: eraseAt() backward-shifts the probe run,
         // which can overwrite this slot's value in place.
         const Vector3 centroid = m_cache.valueAt(slot).centroid;
+        // Same reason, one line later than it looks: the owner is read for the
+        // ledger while the slot is still valid, and it is only ever compared and
+        // printed as an address afterwards.
+        const T* const owner = m_cache.valueAt(slot).data;
         eraseFromCell(centroid, transformHash);
         m_cache.eraseAt(slot);
         ++m_dbgErases;
+        ledgerRecord(transformHash,
+                     isRefile ? LedgerOp::Refiled : LedgerOp::Erased,
+                     frame, owner, vacatedTo, /*bumped*/ false);
       } else {
         // Note: This can happen if a duplicate hash is encountered in the insert() call.
         // TODO(REMIX-4134): Once spatial map is used on draw calls and not rtInstances, it should be safe to restore the assert() below.
@@ -223,6 +321,8 @@ namespace dxvk {
         // assert(false);
       }
     }
+
+  public:
 
     // The key an entry with this transform is (or would be) filed under.
     //
@@ -263,7 +363,7 @@ namespace dxvk {
     // a default; if that ever stops being true, fix those callers, because the
     // compiler will not.
     XXH64_hash_t move(const XXH64_hash_t& oldTransformHash, const Vector3& centroid, const Matrix4& newTransform, const T* data, uint64_t overrideHash = 0,
-                      XXH64_hash_t precomputedMatrixHash = 0) {
+                      XXH64_hash_t precomputedMatrixHash = 0, uint32_t frame = kNoFrame) {
       const XXH64_hash_t transformHash = computeKey(newTransform, overrideHash, precomputedMatrixHash);
 
       ++m_dbgMoves;
@@ -285,8 +385,148 @@ namespace dxvk {
             " mapSize=", m_cache.size()));
         }
         sMoveProbe += 1;
-        erase(oldTransformHash);
-        insert(centroid, newTransform, data, overrideHash);
+
+        // NV-DXVK [ReFile] 2026-08-25: HOW FAR DID IT ACTUALLY MOVE?
+        //
+        // This branch is the churn. [SpatialMove] counts ~40 re-filings a frame
+        // against a population [ReapJoin] reports as stable (removed=0) and
+        // [FastPathOrder] reports as byte-identical on 2,607,998 of 2,607,998
+        // fast-path placements. Every one of those re-filings mints a key that
+        // is never queried again -- 0 reciprocal pairs in 51 sampled moves, and
+        // one 5-entry map has cycled 1,622 distinct keys.
+        //
+        // A re-file is only legitimate when the object MOVED. The old entry's
+        // centroid is still in the cache at this point, so the distance is free
+        // to compute and it separates the two cases outright:
+        //
+        //   d == 0, or d below any physical scale (< 0.001 units)
+        //       The prop did not move. The matrix BYTES changed -- one mantissa
+        //       bit is enough, because the key is XXH64 over the raw bytes -- so
+        //       the key changes, the entry re-files, and the next frame's exact
+        //       lookup on the old key can never hit. That is a permanent dedup
+        //       failure driven by float jitter, and the fix is at whatever
+        //       recomposes the transform each frame, or in keying on a quantised
+        //       value rather than raw bytes.
+        //   d large
+        //       Genuine motion. The re-file is correct, the churn is explained,
+        //       and this is not where the instability lives.
+        {
+          struct ReFileAgg {
+            std::atomic<uint32_t> frame { 0u };
+            std::atomic<uint32_t> n     { 0 };
+            std::atomic<uint32_t> dZero { 0 };  // bit-identical centroid
+            std::atomic<uint32_t> dJit  { 0 };  // < 0.001  -- float jitter
+            std::atomic<uint32_t> dSub  { 0 };  // < 1
+            std::atomic<uint32_t> dReal { 0 };  // >= 1     -- claimed "real motion"
+            // dReal split by magnitude. In a stationary scene this bucket should
+            // hold only the viewmodel, so its SHAPE is the diagnosis: drift and
+            // teleport are different bugs and a single count cannot tell them
+            // apart.
+            std::atomic<uint32_t> dR10  { 0 };  // 10 .. 100
+            std::atomic<uint32_t> dR100 { 0 };  // 100 .. 1000
+            std::atomic<uint32_t> dR1k  { 0 };  // >= 1000  -- teleport
+            std::atomic<uint32_t> maxD  { 0 };  // largest, whole units
+          };
+          static ReFileAgg sReFile;
+
+          const size_t oldSlot = m_cache.findSlot(oldTransformHash);
+          if (oldSlot != Cache::kInvalidSlot) {
+            const Vector3 oldC = m_cache.valueAt(oldSlot).centroid;
+            const Vector3 dv = centroid - oldC;
+            const float d = std::sqrt(dv.x * dv.x + dv.y * dv.y + dv.z * dv.z);
+            sReFile.n.fetch_add(1, std::memory_order_relaxed);
+            if (dv.x == 0.f && dv.y == 0.f && dv.z == 0.f) {
+              sReFile.dZero.fetch_add(1, std::memory_order_relaxed);
+            } else if (d < 0.001f) {
+              sReFile.dJit.fetch_add(1, std::memory_order_relaxed);
+              // The DETAIL for this bucket now lives at the caller
+              // (RtInstance::onTransformChanged, [ReFileJit]), because naming
+              // the object needs a shader hash and a prop id that a class
+              // templated over T cannot ask for. debugCentroidOf hands the old
+              // centroid out so the caller can run this same magnitude test with
+              // that context attached.
+            } else if (d < 1.f) {
+              sReFile.dSub.fetch_add(1, std::memory_order_relaxed);
+            } else {
+              sReFile.dReal.fetch_add(1, std::memory_order_relaxed);
+              if (d >= 1000.f) {
+                sReFile.dR1k.fetch_add(1, std::memory_order_relaxed);
+              } else if (d >= 100.f) {
+                sReFile.dR100.fetch_add(1, std::memory_order_relaxed);
+              } else if (d >= 10.f) {
+                sReFile.dR10.fetch_add(1, std::memory_order_relaxed);
+              }
+              {
+                const uint32_t dWhole = static_cast<uint32_t>(d);
+                uint32_t prevMax = sReFile.maxD.load(std::memory_order_relaxed);
+                while (dWhole > prevMax
+                       && !sReFile.maxD.compare_exchange_weak(prevMax, dWhole,
+                                                              std::memory_order_relaxed)) {
+                }
+              }
+              // WHAT IS MOVING IN A STILL SCENE. dReal is ~130 per frame, and
+              // the scene is stationary apart from the viewmodel (hands and
+              // weapon), which is a handful of instances. So this bucket is the
+              // anomaly, not the healthy case -- the earlier reading that "a
+              // re-file means the object moved, so this is correct" assumed
+              // motion that is not there.
+              //
+              // Position separates the two populations without needing camera
+              // context here: the viewmodel sits within a couple of hundred
+              // units of the player, world props do not. Distance travelled
+              // says which kind of wrong it is -- a few units is drift, hundreds
+              // or thousands is a teleport, and a teleport every frame on a
+              // stationary prop is exactly the "specific objects, intermittent
+              // bursts" symptom.
+              {
+                static std::atomic<uint32_t> sRealFrame { 0u };
+                static std::atomic<uint32_t> sRealLines { 0 };
+                uint32_t rs = sRealFrame.load(std::memory_order_relaxed);
+                if (frame != kNoFrame && frame > rs
+                    && sRealFrame.compare_exchange_strong(rs, frame, std::memory_order_relaxed)) {
+                  sRealLines.store(0, std::memory_order_relaxed);
+                }
+                if (sRealLines.fetch_add(1, std::memory_order_relaxed) < 6u) {
+                  Logger::info(str::format(
+                    "[ReFileMove] f=", frame,
+                    " d=", d,
+                    " from=(", oldC.x, ",", oldC.y, ",", oldC.z, ")",
+                    " to=(", centroid.x, ",", centroid.y, ",", centroid.z, ")",
+                    " oldKey=0x", std::hex, static_cast<uint64_t>(oldTransformHash),
+                    " newKey=0x", static_cast<uint64_t>(transformHash), std::dec));
+                }
+              }
+            }
+
+            // Monotonic rollover, so two frame numbers cannot alternate and
+            // emit repeatedly. One line per frame.
+            uint32_t seen = sReFile.frame.load(std::memory_order_relaxed);
+            if (frame != kNoFrame && frame > seen
+                && sReFile.frame.compare_exchange_strong(seen, frame, std::memory_order_relaxed)) {
+              const uint32_t en = sReFile.n.exchange(0, std::memory_order_relaxed);
+              const uint32_t e0 = sReFile.dZero.exchange(0, std::memory_order_relaxed);
+              const uint32_t ej = sReFile.dJit.exchange(0, std::memory_order_relaxed);
+              const uint32_t es = sReFile.dSub.exchange(0, std::memory_order_relaxed);
+              const uint32_t er = sReFile.dReal.exchange(0, std::memory_order_relaxed);
+              const uint32_t e10 = sReFile.dR10.exchange(0, std::memory_order_relaxed);
+              const uint32_t e100 = sReFile.dR100.exchange(0, std::memory_order_relaxed);
+              const uint32_t e1k = sReFile.dR1k.exchange(0, std::memory_order_relaxed);
+              const uint32_t emx = sReFile.maxD.exchange(0, std::memory_order_relaxed);
+              if (seen != 0u && en != 0u) {
+                Logger::info(str::format(
+                  "[ReFile] f=", seen, " n=", en,
+                  " dZero=", e0, " dJit=", ej, " dSub=", es, " dReal=", er,
+                  " dR10=", e10, " dR100=", e100, " dR1k=", e1k, " maxD=", emx));
+              }
+            }
+          }
+        }
+        // [MapLedger]: the erase half is a VACATE, and it carries the key the
+        // entry is about to land on. That pair — "key K was vacated at frame F,
+        // by owner P, in favour of key K2" — is the whole answer §5.5 asks for
+        // when a stationary prop's lookup on K misses.
+        eraseInternal(oldTransformHash, frame, /*vacatedTo*/ transformHash, /*isRefile*/ true);
+        insert(centroid, newTransform, data, overrideHash, frame);
       }
       return transformHash;
     }
@@ -378,6 +618,76 @@ namespace dxvk {
     uint64_t debugMoves()   const { return m_dbgMoves; }
     uint64_t debugRefiled() const { return m_dbgRefiled; }
 
+    // NV-DXVK [MapLedger]: what the WRITER last did to this key on this map.
+    //
+    // Returns a record whose `op` is the verdict. Read it as:
+    //
+    //   None      the key was never written on this map. The writer files under
+    //             a key the reader never forms, so the fix is at the key
+    //             composition, not in the matcher. CHECK debugLedgerEvicted()
+    //             FIRST — an evicted record also reads None, and that is the one
+    //             false positive this structure can produce.
+    //   Inserted  the ledger says an entry is filed here and nothing removed it,
+    //             yet the caller's lookup on this key returned nothing. The
+    //             cache and the ledger disagree; look at `bumped`, which means
+    //             the entry was parked at key+N where no lookup can reach it.
+    //   Refiled   move() took the entry off this key at `frame` and put it on
+    //             `otherKey`. This is §5.5's candidate. Compare `data` against
+    //             the instance the reader expected: the same pointer means the
+    //             prop's own instance was re-filed under a different key while
+    //             the reader kept querying the old one, a different pointer
+    //             means another instance took the slot.
+    //   Erased    the entry was destroyed at `frame` — unlinked, reaped, or
+    //             migrated to another BlasEntry. Then the question moves to the
+    //             lifetime, and `frame` says how long ago it went.
+    //
+    // O(1), read-only, allocates nothing. Safe to call from the worker read
+    // phase: Phase2b makes every SpatialMap read-only there and applies writes
+    // in the single-threaded ordered tail, so no write — and therefore no
+    // ledger growth — can overlap this.
+    LedgerRec debugLedgerLookup(XXH64_hash_t key) const {
+      if (m_ledger.empty()) {
+        return LedgerRec { };
+      }
+      const size_t mask = m_ledger.size() - 1;
+      size_t slot = static_cast<size_t>(key) & mask;
+      for (size_t probe = 0; probe <= mask; ++probe) {
+        const LedgerRec& rec = m_ledger[slot];
+        if (rec.op == LedgerOp::None) {
+          break;              // open addressing: an empty slot ends the run
+        }
+        if (rec.key == key) {
+          return rec;
+        }
+        slot = (slot + 1) & mask;
+      }
+      return LedgerRec { };
+    }
+
+    // Records displaced to make room. NON-ZERO INVALIDATES EVERY `None` VERDICT,
+    // because an evicted key is indistinguishable from one never written. Print
+    // it on the same line as any None count or the count cannot be read.
+    uint64_t debugLedgerEvicted() const { return m_ledgerEvicted; }
+    size_t   debugLedgerEntries() const { return m_ledgerCount; }
+
+    // NV-DXVK [ReFileJit]: the centroid an entry is currently filed at.
+    //
+    // Exists so the CALLER can decide whether a re-file was real motion before
+    // it happens. The magnitude test lives naturally here -- move() holds both
+    // centroids -- but the identity does not: SpatialMap is templated over T and
+    // cannot ask an RtInstance for its shader hash or its prop id. Handing the
+    // old centroid out lets onTransformChanged run the same test with the full
+    // context attached, which is what turns "something jitters" into "this
+    // object jitters".
+    bool debugCentroidOf(XXH64_hash_t key, Vector3& outCentroid) const {
+      const size_t slot = m_cache.findSlot(key);
+      if (slot == Cache::kInvalidSlot) {
+        return false;
+      }
+      outCentroid = m_cache.valueAt(slot).centroid;
+      return true;
+    }
+
     // Closest entry that PASSES `filter`, ignoring cells and radius entirely.
     // debugClosestCachedDistSqr ignores the filter as well, so it cannot separate
     // "the instance is gone" from "the instance is present but was already
@@ -402,6 +712,93 @@ namespace dxvk {
     }
 
   private:
+
+    // NV-DXVK [MapLedger]: file one write event under `key`, replacing whatever
+    // that key last recorded. Only the LAST event per key is kept — the question
+    // is "what is the state of this key now and what put it there", and a full
+    // history per key would grow without bound for no extra answer.
+    //
+    // THREAD SAFETY. Called only from insert() and eraseInternal(), which
+    // Phase2b confines to the single-threaded ordered tail
+    // (InstanceManager::applyDeferredSpatialOp); every SpatialMap is read-only
+    // during the sharded worker phase. That is what makes growing the table here
+    // safe: a reallocation can never overlap a worker's debugLedgerLookup.
+    // If that contract is ever relaxed, this is one of the places that breaks,
+    // and it will break as a use-after-free rather than as a wrong number.
+    //
+    // COST. Bounded by real writes, not by calls: [SpatialErase] and
+    // [SpatialMove] measure ~11.7 erases and ~11.3 re-filings per frame against
+    // ~15,400 move() calls, because a stationary prop's move() is a no-op that
+    // returns before reaching here.
+    void ledgerRecord(XXH64_hash_t key, LedgerOp op, uint32_t frame,
+                      const T* data, XXH64_hash_t otherKey, bool bumped) {
+      if (m_ledger.empty()) {
+        m_ledger.resize(kLedgerInitialSlots);
+      } else if ((m_ledgerCount + 1) * 2 > m_ledger.size()) {
+        ledgerGrow();
+      }
+
+      const size_t mask = m_ledger.size() - 1;
+      size_t slot = static_cast<size_t>(key) & mask;
+      // Oldest-by-frame victim within the probe run, so that when the table is
+      // full it is the stale keys that go and the recent history — the only part
+      // a verdict can act on — survives.
+      size_t victim = slot;
+      uint32_t victimFrame = 0xFFFFFFFFu;
+      for (size_t probe = 0; probe <= mask; ++probe) {
+        LedgerRec& rec = m_ledger[slot];
+        if (rec.op == LedgerOp::None) {
+          ++m_ledgerCount;
+          rec.key = key; rec.otherKey = otherKey; rec.data = data;
+          rec.frame = frame; rec.writes = 1; rec.op = op;
+          rec.bumped = static_cast<uint8_t>(bumped ? 1 : 0);
+          return;
+        }
+        if (rec.key == key) {
+          const uint32_t writes = rec.writes;
+          rec.otherKey = otherKey; rec.data = data;
+          rec.frame = frame; rec.writes = writes + 1; rec.op = op;
+          // Sticky: once a key has been bumped, every later lookup of it is
+          // suspect, so a subsequent clean write must not clear the flag.
+          rec.bumped = static_cast<uint8_t>(rec.bumped | (bumped ? 1 : 0));
+          return;
+        }
+        if (rec.frame != kNoFrame && rec.frame < victimFrame) {
+          victimFrame = rec.frame;
+          victim = slot;
+        }
+        slot = (slot + 1) & mask;
+      }
+
+      // Table full and at the size cap. Displace the oldest of the run.
+      ++m_ledgerEvicted;
+      LedgerRec& rec = m_ledger[victim];
+      rec.key = key; rec.otherKey = otherKey; rec.data = data;
+      rec.frame = frame; rec.writes = 1; rec.op = op;
+      rec.bumped = static_cast<uint8_t>(bumped ? 1 : 0);
+    }
+
+    void ledgerGrow() {
+      if (m_ledger.size() >= kLedgerMaxSlots) {
+        return;   // capped: ledgerRecord falls through to oldest-victim eviction
+      }
+      std::vector<LedgerRec> old;
+      old.swap(m_ledger);
+      m_ledger.resize(old.size() * 2);
+      m_ledgerCount = 0;
+      const size_t mask = m_ledger.size() - 1;
+      for (const LedgerRec& src : old) {
+        if (src.op == LedgerOp::None) {
+          continue;
+        }
+        size_t slot = static_cast<size_t>(src.key) & mask;
+        while (m_ledger[slot].op != LedgerOp::None) {
+          slot = (slot + 1) & mask;
+        }
+        m_ledger[slot] = src;
+        ++m_ledgerCount;
+      }
+    }
 
     Vector3i getCellPos(const Vector3& position) const {
       const Vector3 scaledPos = position / m_cellSize;
@@ -441,6 +838,21 @@ namespace dxvk {
     uint64_t m_dbgErases  = 0;
     uint64_t m_dbgMoves   = 0;
     uint64_t m_dbgRefiled = 0;
+
+    // [MapLedger] storage. Lazily allocated on the map's first write, so an
+    // empty map costs one empty vector; power-of-two so the probe is a mask.
+    //
+    // The cap exists because the ledger holds keys over TIME, not just the live
+    // ones — an erased key stays until something displaces it — so a busy map
+    // would otherwise grow without bound over a long session. 65,536 records
+    // against the largest map yet measured (1,398 live entries) leaves room for
+    // roughly 47 generations of that map's keys before eviction starts, and
+    // m_ledgerEvicted says plainly when it has.
+    static constexpr size_t kLedgerInitialSlots = 256;
+    static constexpr size_t kLedgerMaxSlots     = 1u << 16;
+    std::vector<LedgerRec> m_ledger;
+    size_t   m_ledgerCount   = 0;
+    uint64_t m_ledgerEvicted = 0;
 
     float m_cellSize;
     // NV-DXVK [perf] handoff v7 sec 4b: m_cells is deliberately NOT flattened.
