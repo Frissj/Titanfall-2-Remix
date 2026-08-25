@@ -178,11 +178,35 @@ The tree already knows this is failing. `util_spatial_map.h:62-81` carries a
 whose exact lookup misses even though its transform has not changed. Two
 read-side theories have already been refuted."*
 
-**9. There are 893 distinct diagnostic probe tags and 910 `Logger::` calls in
-`d3d11_rtx.cpp` alone.** 75 distinct tags inside `ExtractTransforms` by itself.
-Most name investigations this tree's own records mark as RESOLVED. This is not a
-style complaint: it is why the five functions are 10,000 lines each, and it is
-the largest single obstacle to any of the splits below. See §6.
+**9. Diagnostic emission is ~15-20% of the code in `d3d11_rtx.cpp`, and the
+comments are NOT part of it.** 893 distinct probe tags across the draw path, 75
+inside `ExtractTransforms` alone. Measured:
+
+```
+d3d11_rtx.cpp                      76,898 lines
+  comment-only                     30,886   40%  -- THE RECORD. Stays.
+  blank                             2,556
+  code                             43,456
+    format-continuation (^ ")       5,088
+    Logger:: / str::format sites    1,089
+    static diagnostic counters        520
+                                   ------
+                                   ~6,700   ~15% of code, before the
+                                            accumulation and throttle scaffolding
+
+ExtractTransforms                   9,252 lines / 5,435 code / ~890 diagnostic (16%)
+```
+
+**The 40% is comments, and deleting them would be the single most destructive
+move available in this tree.** They carry the refuted hypotheses — the byte key
+chasing the camera, the o2w object key at 97% churn, the reverted
+`PropIdKeepLong` attempt — which is the only surviving record of four dead ends
+and is what makes §1.2's identity ladder writable at all. §6.1 removes probes,
+never prose.
+
+So the honest figure is **7,000-9,000 lines of diagnostic code**, not 17,000. It
+is still the largest single obstacle to the splits in slices 4-7, and it is still
+worth doing first. See §6.
 
 ### Not verifiable here
 
@@ -1007,13 +1031,22 @@ anyone's list.
 
 ### 6.1 The diagnostic estate
 
-893 distinct probe tags. 910 `Logger::` calls in `d3d11_rtx.cpp`. 75 tags inside
-`ExtractTransforms` alone.
+893 distinct probe tags; ~6,700 lines of emission code in `d3d11_rtx.cpp` before
+the accumulation and throttle scaffolding, against 43,456 code lines. 75 tags
+inside `ExtractTransforms` alone. §0.1 item 9 has the full measurement.
 
-They are the reason this tree solved as many bugs as it has and most of them
-should not be deleted on sight. But a probe built for a bug the record marks as
-RESOLVED is scaffolding left on a finished building, and it is the direct cause
-of the 10,000-line functions that make §1 through §5 hard.
+**This is a probe cull, not a comment cull.** The 30,886 comment-only lines in
+that file are 40% of it and they are the tree's memory: the refuted hypotheses,
+the reverted attempts, the reasons the obvious approach was rejected. Deleting
+them while splitting a function is the one genuinely destructive move available
+here, and it is easy to do by accident because a probe and the paragraph
+explaining why it exists sit next to each other. **Remove the probe, keep the
+paragraph, and add a line saying the probe was removed and why.**
+
+The probes are the reason this tree solved as many bugs as it has and most of
+them should not be deleted on sight. But a probe built for a bug the record marks
+as RESOLVED is scaffolding left on a finished building, and it is the direct
+cause of the 10,000-line functions that make §1 through §5 hard.
 
 The procedure, which is the fence procedure from `rules/simple.md`:
 
@@ -1036,6 +1069,13 @@ instrumentation carries the instrumentation into both halves.
 654 `RTX_OPTION` declarations (`rtx_options.h`). Each one is a branch, a
 configuration the code claims to support, and a rebuild of nearly the whole tree
 when the header is touched.
+
+**But most of them are inherited, and that changes what this slice is.** `main`
+carries 468; this branch added 186, of which ~50 are diagnostic-named (27 `log*`,
+plus `debug*` / `probe*` / `census*` / `verify*`). The upstream 468 are feature
+configuration and are not this document's business. **Scope slice 0b to the 186,
+and read the ~50 against §6.1's probe cull** — an option that only gates a probe
+that is being removed goes out with it, in the same pass.
 
 Two specific deletions already identified and still not done:
 
