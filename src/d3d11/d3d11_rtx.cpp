@@ -9534,6 +9534,12 @@ namespace dxvk {
     if (workers == 0) workers = std::max(2u, cores > 2u ? cores - 2u : 2u);
     m_pGeometryWorkers = std::make_unique<GeometryProcessor>(workers, "d3d11-geometry");
 
+    // NV-DXVK [JobGraph] slice 6 gate (§4.2.1). Runs once, off by default,
+    // logs only on failure. Read this before wiring the graph into anything.
+    if (RtxOptions::JobGraph::selfTest()) {
+      JobGraph::selfTest();
+    }
+
     // --- D3D11 sensible defaults (Default layer = lowest priority) ---
     // Written to the Default layer so rtx.conf, user.conf, and all other
     // config layers override them naturally.  Without this, setDeferred()
@@ -28303,9 +28309,31 @@ namespace dxvk {
 
   // NV-DXVK: helper â€” bump m_filterCounts AND record the reject against the
   // current VS so EndFrame can show per-shader outcomes.
+  // Shared by [MeshTrace] and [ResidentGate] so both name reasons identically.
+  const char* D3D11Rtx::FilterReasonName(uint32_t r) {
+    static const char* kNames[] = {
+      "Throttle","NonTriTopology","NoPixelShader","NoRenderTarget",
+      "CountTooSmall","FullscreenQuad","NoInputLayout","NoSemantics",
+      "NoPosition","Position2D","NoPosBuffer","NoIndexBuffer","HashFailed",
+      "UIFallback","UnsupPosFmt","CharDepthPrepass","AlphaSurface",
+      "WorldNoShadeInputs"
+    };
+    static_assert(std::size(kNames) == static_cast<size_t>(FilterReason::Count),
+                  "add the new reason's string when you add the enumerator");
+    if (r == static_cast<uint32_t>(FilterReason::Count)) {
+      return "NOFILTER";
+    }
+    return (r < std::size(kNames)) ? kNames[r] : "?";
+  }
+
   void D3D11Rtx::BumpFilter(FilterReason r) {
     const uint32_t ri = static_cast<uint32_t>(r);
     ++m_filterCounts[ri];
+
+    // Which filter ended this draw, read by the NEXT draw's residentGateBegin.
+    // LAST writer wins: several sites bump a filter then fall through to
+    // another before returning, and the last one matches the return taken.
+    m_rsLastFilter = ri;
 
     // NV-DXVK [MeshTrace] reject attribution. This is where the 20 "GAME DID
     // ISSUE THE DRAW â€” DISCARDED INSIDE d3d11_rtx" cases get a name: the
@@ -28315,13 +28343,6 @@ namespace dxvk {
     // through to another before returning.
     if (m_meshTraceActive && !m_meshTraceReported) {
       m_meshTraceReported = true;
-      static const char* kMtReason[] = {
-        "Throttle","NonTriTopology","NoPixelShader","NoRenderTarget",
-        "CountTooSmall","FullscreenQuad","NoInputLayout","NoSemantics",
-        "NoPosition","Position2D","NoPosBuffer","NoIndexBuffer","HashFailed",
-        "UIFallback","UnsupPosFmt","CharDepthPrepass","AlphaSurface",
-        "WorldNoShadeInputs"
-      };
       // f= is required, not decorative: this fires for every filtered draw of
       // a traced shader (15k lines in ~70s, mostly routine shadow/depth-pass
       // rejections). Only the ones on the same frame as a DROPPED line matter,
@@ -28332,7 +28353,7 @@ namespace dxvk {
           ? m_context->m_device->getCurrentFrameId() : 0u,
         " vs=0x", std::hex, m_meshTraceVs, std::dec,
         " idx=", m_meshTraceIdx,
-        " reason=", (ri < std::size(kMtReason) ? kMtReason[ri] : "?"),
+        " reason=", FilterReasonName(ri),
         " (FilterReason=", ri, ")"));
     }
     if (!m_currentVsHashCache.empty()) {
@@ -33078,6 +33099,9 @@ namespace dxvk {
   // [XfDefer] step 4b: per-draw MeshTrace scratch. See the declarations.
   thread_local bool     D3D11Rtx::m_meshTraceReported    = false;
   thread_local uint32_t D3D11Rtx::m_meshTraceCp          = 0;
+  // Sentinel = FilterReason::Count, i.e. exited without classifying itself.
+  thread_local uint32_t D3D11Rtx::m_rsLastFilter =
+      static_cast<uint32_t>(D3D11Rtx::FilterReason::Count);
   // [XfDefer] step 4c: the two PER-DRAW verdict flags. See the declarations.
   thread_local bool     D3D11Rtx::m_lastDrawCaptured     = false;
   thread_local bool     D3D11Rtx::m_lastDrawFilteredAsUI = false;
@@ -40085,6 +40109,16 @@ namespace dxvk {
     // one that fires and hits unless the shortfall is counted.
     if (m_rsDrawKey != 0ull) {
       m_rsNoTail += 1;
+      // m_rsLastFilter and m_meshTraceCp still hold the PREVIOUS draw's exit --
+      // neither is cleared until further down this same SubmitDraw.
+      const uint32_t nti =
+          (m_rsLastFilter <= static_cast<uint32_t>(FilterReason::Count))
+            ? m_rsLastFilter
+            : static_cast<uint32_t>(FilterReason::Count);
+      m_rsNoTailBy[nti] += 1;
+      if (nti == static_cast<uint32_t>(FilterReason::Count)) {
+        m_rsNoTailLastCp = m_meshTraceCp;
+      }
     }
     m_rsDrawKey  = 0ull;
     m_rsDrawGens = 0ull;
@@ -40128,6 +40162,28 @@ namespace dxvk {
           // that fires and hits. noTail high means residency does not cover
           // those draws at all, whatever hitPct says about the rest.
           " noTail=", m_rsNoTail,
+          // THE BREAKDOWN IS THE POINT. Almost every FilterReason means "not
+          // raytraced" -- not an object, not a hole. Throttle and HashFailed
+          // are the exceptions: eligible draws dropped anyway, and the only
+          // part of noTail that sec 1 must cover. NOFILTER = an exit that
+          // classifies itself nowhere; cp= names its line.
+          [this]() {
+            std::string out;
+            for (uint32_t i = 0; i <= static_cast<uint32_t>(FilterReason::Count); ++i) {
+              if (m_rsNoTailBy[i] == 0u) {
+                continue;
+              }
+              out += ' ';
+              out += FilterReasonName(i);
+              out += '=';
+              out += std::to_string(m_rsNoTailBy[i]);
+            }
+            if (m_rsNoTailLastCp != 0u) {
+              out += " cp=";
+              out += std::to_string(m_rsNoTailLastCp);
+            }
+            return out.empty() ? std::string(" noTailBy=none") : (" noTailBy{" + out + " }");
+          }(),
           // How many hits were ACTED ON is the RT side's to report, not this
           // one's: the skip is taken there, on evidence this thread cannot see.
           // Read [ResidentScene] touched= against hit= here -- a large gap means
@@ -40154,6 +40210,10 @@ namespace dxvk {
         m_rsDraws = m_rsHit = m_rsMissKey = m_rsMissGen = 0u;
         m_rsNewKeys = m_rsNoKey = 0u;
         m_rsMissO2w = m_rsMissMat = m_rsMissPlace = m_rsNoTail = 0u;
+        for (uint32_t& c : m_rsNoTailBy) {
+          c = 0u;
+        }
+        m_rsNoTailLastCp = 0u;
       }
 
       // PRUNE, AND IT IS NOT OPTIONAL. Both maps are keyed on engine buffer
@@ -41083,6 +41143,7 @@ namespace dxvk {
     // compare already reads 100% clean. If a tolerance is ever justified it will
     // be by a capture showing otherwise, not by anticipation.
     drawCallState.residentKey             = 0ull;
+    drawCallState.residentIdentity        = 0ull;
     drawCallState.residentGenHash         = 0ull;
     drawCallState.residentSrcVertexBuffer = 0ull;
     drawCallState.residentSrcIndexBuffer  = 0ull;
@@ -41981,6 +42042,8 @@ namespace dxvk {
     // whose record is never built is a draw the gate can never hit.
     drawCallState.residentKey             = key;
     drawCallState.residentOrdinal         = rsOrdinal;
+    // Pre-ordinal half, for the object resolver. See rtx_types.h.
+    drawCallState.residentIdentity        = narrowed;
     drawCallState.residentGenHash         = m_rsDrawGens;
     drawCallState.residentSrcVertexBuffer = m_rsDrawSrcVb;
     drawCallState.residentSrcIndexBuffer  = m_rsDrawSrcIb;
@@ -42719,6 +42782,9 @@ namespace dxvk {
     // Must reset: it is a member, so without this a draw that exits before
     // reaching any checkpoint would report the PREVIOUS draw's exit line.
     m_meshTraceCp = 0;
+    // Same reset. residentGateBegin ran at the top of this function and has
+    // already read the previous draw's value, so clearing here loses nothing.
+    m_rsLastFilter = static_cast<uint32_t>(FilterReason::Count);
     {
       auto vsEntry = m_context->m_state.vs.shader;
       if (vsEntry != nullptr && vsEntry->GetCommonShader() != nullptr) {
@@ -44357,6 +44423,8 @@ namespace dxvk {
             " (matches POSITION fmt=101 + BLENDWEIGHT@8 + BLENDINDICES@12 + no TEXCOORD + no NORMAL)"));
         }
         ++m_filterCounts[static_cast<uint32_t>(FilterReason::CharDepthPrepass)];
+        // Bypasses BumpFilter, so set the attribution by hand.
+        m_rsLastFilter = static_cast<uint32_t>(FilterReason::CharDepthPrepass);
         m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
         return;
       }
@@ -44463,6 +44531,8 @@ namespace dxvk {
             " nothing else per-vertex -- cannot be shaded)"));
         }
         ++m_filterCounts[static_cast<uint32_t>(FilterReason::WorldNoShadeInputs)];
+        // Bypasses BumpFilter, so set the attribution by hand.
+        m_rsLastFilter = static_cast<uint32_t>(FilterReason::WorldNoShadeInputs);
         m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
         return;
       }
@@ -44472,6 +44542,8 @@ namespace dxvk {
     // not world space, and cannot be raytraced.
     if (posSem->format == VK_FORMAT_R32G32_SFLOAT) {
       ++m_filterCounts[static_cast<uint32_t>(FilterReason::Position2D)];
+        // Bypasses BumpFilter, so set the attribution by hand.
+        m_rsLastFilter = static_cast<uint32_t>(FilterReason::Position2D);
       m_meshTraceCp = __LINE__;  // [MeshTrace] name this exit
       return;
     }

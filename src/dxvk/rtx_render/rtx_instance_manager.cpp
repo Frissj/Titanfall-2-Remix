@@ -1898,6 +1898,13 @@ namespace dxvk {
     // point the seed pass (RESIDENT_SCENE_PLAN.md 0.0) is anchored to: the set
     // must be repopulated from the new level's draws, never inherited.
     m_residentScene.clear();
+    // NV-DXVK [RenderObject] slice 1: the object store dies with the scene for
+    // exactly the same reason. Its identities are IA identities -- engine
+    // buffer pointers and input-layout pointers -- and those are reallocated on
+    // a level change, so a surviving object would name the previous level's
+    // allocation. That is the same class as carrying a stale RtInstance* across
+    // a clear, one level up.
+    m_renderObjectDB.clear();
     m_viewModelCandidates.clear();
     m_playerModelInstances.clear();
   }
@@ -4121,6 +4128,42 @@ namespace dxvk {
     // each one on the way out, and this is where the husks are erased.
     {
       m_residentScene.onFrameEnd(probeFrame);
+
+      // NV-DXVK [RenderObject] slice 1: retire and evict on the same schedule,
+      // and AFTER the reap for the same reason the resident sweep is -- an
+      // object whose primitives named instances this pass deleted should see
+      // the deletion before it decides what to keep.
+      m_renderObjectDB.onFrameEnd(probeFrame,
+                                  RtxOptions::RenderObject::quietFrames(),
+                                  RtxOptions::RenderObject::maxObjects());
+
+      if (RtxOptions::RenderObject::logStats()) {
+        static uint32_t sRoLastLogFrame = 0u;
+        if (probeFrame - sRoLastLogFrame >= 60u) {
+          sRoLastLogFrame = probeFrame;
+          const RenderObjectDB::Stats& ro = m_renderObjectDB.stats();
+          Logger::warn(str::format(
+            "[RenderObject] f=", probeFrame,
+            " objects=", static_cast<uint32_t>(m_renderObjectDB.objectCount()),
+            " prims=", static_cast<uint32_t>(m_renderObjectDB.primitiveCount()),
+            " resolves=", ro.resolves,
+            " hits=", ro.hits,
+            // THE GATE. Must be ~0 on a settled scene and must STAY ~0 with the
+            // camera moving. Anything else means the identity is chasing
+            // something -- see the option's description.
+            " newObjects=", ro.newObjects,
+            " newPrims=", ro.newPrimitives,
+            // Counted apart from newObjects on purpose. Expected non-zero.
+            " ordinalShift=", ro.ordinalShift,
+            " noIdentity=", ro.noIdentity,
+            " retired{obj=", ro.retiredObjects, " prim=", ro.retiredPrimitives, "}",
+            // CUMULATIVE, like [ResidentScene] wiped=: a ceiling that fires and
+            // then reads 0 by the time the line comes out is how a policy hides.
+            " evicted=", ro.evicted,
+            " | newObjects ~0 = identity stable; newObjects high = THE KEY IS CHASING SOMETHING"));
+          m_renderObjectDB.resetStats();
+        }
+      }
 
       if (RtxOptions::ResidentScene::logStats()) {
         // EVERY 10 FRAMES, and the counters are reset with each line so each is

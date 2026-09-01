@@ -30,6 +30,7 @@
 #include "../dxvk/dxvk_bone_diag.h"
 #include "../util/util_matrix.h"
 #include "../util/util_threadpool.h"
+#include "../util/util_job_graph.h"
 
 namespace dxvk {
 
@@ -3418,6 +3419,40 @@ namespace dxvk {
     // residency does not cover, and a gate that silently never fires for a fifth
     // of the frame looks identical to one that fires and hits.
     uint32_t m_rsNoTail    = 0;
+    // NV-DXVK [ResidentGate] 2026-08-31: WHY a keyed draw never reached the
+    // judge, not just how many did.
+    //
+    // m_rsNoTail alone cannot answer the question it was built for. ARCHITECTURE
+    // OVERHAUL sec 9 item 1 states it as still open -- "whether they are
+    // RT-captured at all is still unknown" -- and treats that as a possible
+    // coverage hole under the whole of sec 1. It is answerable without a new
+    // probe: every early exit between residentGateBegin (top of SubmitDraw) and
+    // residentGateJudge (last statement of SubmitDrawTail) already classifies
+    // itself through BumpFilter, and the ones that do not already record
+    // __LINE__ in m_meshTraceCp. This is the join of those two facts with the
+    // gate's own key, which is the one thing neither side had.
+    //
+    // Read it this way. Almost every FilterReason means "this draw is not
+    // raytraced at all" -- NoPixelShader, NoRenderTarget, NoInputLayout,
+    // NoSemantics, Position2D, UIFallback, CharDepthPrepass, WorldNoShadeInputs
+    // and the rest are depth prepasses, UI and HUD, and unshadeable geometry.
+    // Those are NOT objects the resident scene has to cover, and noTail landing
+    // in them is the funnel working, counted from the far side.
+    //
+    // TWO BUCKETS ARE DIFFERENT AND ARE THE REASON THIS EXISTS:
+    //   Throttle    a legitimate draw dropped because m_drawCallID hit
+    //               kMaxConcurrentDraws. That is real capture loss and scales
+    //               with scene complexity, which is exactly the direction
+    //               residency pushes.
+    //   HashFailed  passed every filter and lost only on the geometry-hash
+    //               future. Also real capture loss.
+    // Anything landing in NOFILTER is an exit that classifies itself nowhere;
+    // m_rsNoTailLastCp names its line so it can be given a reason.
+    //
+    // Index Count is the NOFILTER bucket, so the array is Count+1 wide.
+    // Declared with m_filterCounts instead of here: FilterReason is a nested
+    // enum declared further down this class, and a member's array bound cannot
+    // name it before its declaration. Search m_rsNoTailBy.
     uint32_t m_rsMissO2w   = 0;  // key and geometry clean, derived transform moved
     uint32_t m_rsMissMat   = 0;  // key, geometry and transform clean, material moved
     uint32_t m_rsMissPlace = 0;  // all of the above clean, the fanout batch gained or lost a prop
@@ -3858,6 +3893,15 @@ namespace dxvk {
     };
   private:
     uint32_t m_filterCounts[static_cast<uint32_t>(FilterReason::Count)] = {};
+    // NV-DXVK [ResidentGate] 2026-08-31: the noTail-by-reason join. Full
+    // reasoning is at the m_rsNoTail declaration above; these live here only
+    // because FilterReason has to be declared before its own Count can size an
+    // array. Index Count is the NOFILTER bucket, so this is Count+1 wide.
+    uint32_t m_rsNoTailBy[static_cast<uint32_t>(FilterReason::Count) + 1] = {};
+    uint32_t m_rsNoTailLastCp = 0;   // m_meshTraceCp of the most recent NOFILTER exit
+    // Name for a FilterReason, shared by BumpFilter's [MeshTrace] line and the
+    // [ResidentGate] noTail breakdown so the two logs use one vocabulary.
+    static const char* FilterReasonName(uint32_t r);
     // NV-DXVK: per-frame o2w path histogram (index = m_lastO2wPathId 0..10).
     // Bumped at COMMIT, dumped + reset in EndFrame.
     uint32_t m_o2wPathCounts[16] = {};
@@ -3908,6 +3952,13 @@ namespace dxvk {
     // not an answer; this names the site. Per-draw scratch, privatised with
     // m_meshTraceReported above.
     static thread_local uint32_t m_meshTraceCp;
+    // NV-DXVK [ResidentGate] 2026-08-31: the FilterReason this draw exited on,
+    // or FilterReason::Count if it exited without classifying itself. Same
+    // lifetime and the same reason for being thread_local as m_meshTraceCp
+    // beside it: per-draw scratch on the frame thread, reset at the top of
+    // SubmitDraw and read by the NEXT draw's residentGateBegin, which is the
+    // only place that knows the previous draw never reached the judge.
+    static thread_local uint32_t m_rsLastFilter;
     // NV-DXVK [VMHunt]: sticky per-draw flag set by SubmitDraw when count
     // matches a suspect viewmodel index count from PIX. Read by BumpFilter
     // and by COMMIT to emit reject/pass verdict with [VMHunt.result].

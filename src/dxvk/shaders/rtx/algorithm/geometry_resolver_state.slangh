@@ -180,6 +180,54 @@ struct GeometryResolverState : IBasePayloadState
   }
 
 #ifdef RAY_PIPELINE
+#ifdef RT_SHADER_EXECUTION_REORDERING
+  // NV-DXVK [SER] 2026-08-31: WAS an unconditional `return false` under a bare
+  // `#ifdef RAY_PIPELINE`, with rtx_options.h:2628 describing the option as
+  // "(Note: Hard disabled in shader code)".
+  //
+  // THAT NOTE MISLED, and ARCHITECTURE_OVERHAUL 0.1 item 10 / 5.4.1 inherited the
+  // mistake -- both read the stub as making the option inert ("the shader ignores
+  // it"). It does not. The option is read on the HOST, at
+  // rtx_pathtracer_gbuffer.cpp:407, and selects a whole separate permutation:
+  //
+  //   rtx_options.h:4590   isShaderExecutionReorderingInPathtracerGbufferEnabled()
+  //   rtx_pathtracer_gbuffer.cpp:660/671   bind getPipelineShaders(..., serEnabled, ...)
+  //   rtx_pathtracer_gbuffer.cpp:828+      -> gbuffer_raygen_ser* / gbuffer_psr_raygen_ser*
+  //   gbuffer.slang:29-33                  those variants define RT_SHADER_EXECUTION_REORDERING
+  //   resolve_expanded.slangh:56-84        which routes the resolve through
+  //                                          HitObject::TraceRay
+  //                                          if (payload.shouldReorder(...)) ReorderThread(...)
+  //                                          HitObject::Invoke
+  //
+  // So returning false here kept the decomposed HitObject trace and discarded the
+  // only thing it is decomposed FOR. Strictly dominated: the structural cost of
+  // SER, none of the reordering. The two honest exits were to un-stub this or to
+  // set the option false; doing neither was the one choice worse than both.
+  //
+  // ZERO HINTS IS DELIBERATE -- this is step 1 of 5.4.1, not a finished tuning.
+  // ReorderThread still sorts by hit/miss and by hit-group when
+  // numCoherenceHints == 0, so this measures the reorder alone, before any
+  // material-class or PSR-vs-primary classification is stacked on top. Add hints
+  // only against a warp-stall breakdown (G0). RE ENGINE (GDC 2026, same
+  // RayQuery-plus-bindless shape as us) reports SER as "not enough of a
+  // performance gain", so a null or negative result here is an expected outcome
+  // and must be read against the stall breakdown rather than frame time alone.
+  //
+  // THE PERMUTATION IS NOW THE SWITCH. serEnabled=false binds the non-SER binary,
+  // which never reaches this function, so the option and the shader can no longer
+  // disagree about whether SER is on.
+  bool shouldReorder(out uint coherenceHints, out uint numCoherenceHints)
+  {
+    coherenceHints = 0;
+    numCoherenceHints = 0;
+
+    return true;
+  }
+#else
+  // Non-SER ray-pipeline builds keep the predicate so the payload's shape is the
+  // same in every permutation. TraceRayCustom's non-SER overload
+  // (resolve_expanded.slangh:88) never calls it. Mirrors PathState, which has
+  // carried both branches all along (path_state.slangh:486-512).
   bool shouldReorder(out uint coherenceHints, out uint numCoherenceHints)
   {
     coherenceHints = 0;
@@ -187,6 +235,7 @@ struct GeometryResolverState : IBasePayloadState
 
     return false;
   }
+#endif // defined(RT_SHADER_EXECUTION_REORDERING)
 #endif // defined(RAY_PIPELINE)
 }
 
@@ -363,12 +412,30 @@ struct GeometryPSRResolverState : IBasePayloadState
   }
 
 #ifdef RAY_PIPELINE
-  bool shouldReorder(out uint coherenceHints, out uint numCoherenceHints) 
+#ifdef RT_SHADER_EXECUTION_REORDERING
+  // NV-DXVK [SER] 2026-08-31: un-stubbed with GeometryResolverState::shouldReorder
+  // above -- see the full reasoning there. PSR is the same payload path through
+  // resolve_expanded.slangh and was stubbed for the same reason, so it has to move
+  // with it: leaving PSR at false would reorder primary rays and not the two PSR
+  // passes, which is a worse comparison than either endpoint and would make G1's
+  // measurement unreadable (rtx_pathtracer_gbuffer.cpp:671/682 bind PSR with the
+  // same serEnabled flag).
+  bool shouldReorder(out uint coherenceHints, out uint numCoherenceHints)
   {
     coherenceHints = 0;
     numCoherenceHints = 0;
+
+    return true;
+  }
+#else
+  bool shouldReorder(out uint coherenceHints, out uint numCoherenceHints)
+  {
+    coherenceHints = 0;
+    numCoherenceHints = 0;
+
     return false;
   }
+#endif // defined(RT_SHADER_EXECUTION_REORDERING)
 #endif // defined(RAY_PIPELINE)
 };
 

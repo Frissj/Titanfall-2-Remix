@@ -1403,6 +1403,23 @@ struct DrawCallState {
   // [RsFailSize] / [RsFailMember] -- without it those lines cannot say whether
   // a failure came from the residual or from the separated majority.
   uint32_t residentOrdinal = 0u;
+  // NV-DXVK [RenderObject] slice 1: THE IDENTITY THE ORDINAL IS AN ORDINAL
+  // WITHIN -- residentGateJudge's `narrowed`, i.e. the IA identity folded with
+  // the material fold, BEFORE the occurrence is folded on top to make
+  // residentKey.
+  //
+  // Carried separately because residentKey cannot be decomposed back into its
+  // two parts, and the object resolver needs them apart rather than together:
+  // the identity is what names the OBJECT and is camera- and animation-
+  // invariant by construction, while the ordinal names WHICH COPY and is the
+  // known-weak half (ARCHITECTURE_OVERHAUL sec 1.2 rung 4 -- engine culling
+  // removing one copy of a multi-copy identity renumbers the survivors).
+  // Feeding the composite in as if it were the identity would make those two
+  // failure modes indistinguishable, which is the one thing slice 1's gate has
+  // to be able to tell apart.
+  //
+  // 0 for the same reason residentKey is 0: no usable identity.
+  uint64_t residentIdentity = 0ull;
   uint64_t residentGenHash = 0ull;
   // The engine buffers this draw was made of, as raw addresses. The record keeps
   // them so that ~D3D11Buffer freeing one can retire it -- a resident instance

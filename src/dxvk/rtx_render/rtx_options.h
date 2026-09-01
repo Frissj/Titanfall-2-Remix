@@ -2552,6 +2552,66 @@ namespace dxvk {
                  "turning verify off.");
     };
 
+    // NV-DXVK [JobGraph] -- ARCHITECTURE_OVERHAUL.md slice 6.
+    struct JobGraph {
+      friend class ImGUI;
+      friend class RtxOptions;
+
+      RTX_OPTION("rtx.jobGraph", bool, selfTest, false,
+                 "Run JobGraph::selfTest() once at init. THIS IS SLICE 6'S ACCEPTANCE GATE (\u00a74.2.1):\n"
+                 "always-refusing dispatch, zero-child fan-out, 384-child fan-out, a cancelled producer\n"
+                 "still releasing its consumer, and a stale handle caught by the node generation.\n"
+                 "Silent on success. Nothing may be wired onto the graph until this passes.");
+    };
+
+    // ==================================================================
+    // NV-DXVK [RenderObject] -- ARCHITECTURE_OVERHAUL.md slice 1.
+    //
+    // The object database that runs beside the resident scene. It has no
+    // master enable and no verify, and both omissions are deliberate:
+    //
+    //   no enable   there is nothing to turn off. Nothing reads an id, so the
+    //               store cannot change a pixel. An enable would only be a
+    //               switch for the mirror's own cost, and if that cost ever
+    //               matters the answer is to measure it, not to hide it behind
+    //               a flag nobody flips. sec 6.2: a flag that exists so a
+    //               deletion did not have to happen is that deletion deferred
+    //               forever.
+    //   no verify   verify exists to score a PREDICTION against the full path.
+    //               Slice 1 predicts nothing. Its acceptance test is a property
+    //               of the counters below -- newObjects ~0 and flat under a
+    //               pitch-and-yaw sweep -- not a per-draw comparison.
+    // ==================================================================
+    struct RenderObject {
+      friend class ImGUI;
+      friend class RtxOptions;
+
+      RTX_OPTION("rtx.renderObject", uint32_t, quietFrames, 300,
+                 "Frames a primitive survives without being observed by a draw before it is retired.\n"
+                 "EVIDENCE, NOT AGE: an observation resets it, so this bounds how long an observation\n"
+                 "stays good rather than how long an object may live. Generous on purpose -- slice 1\n"
+                 "is a mirror, and retiring early would show up as identity churn in newObjects and\n"
+                 "be indistinguishable from the failure that counter exists to detect.");
+
+      RTX_OPTION("rtx.renderObject", uint32_t, maxObjects, 65536,
+                 "Hard ceiling on live objects, oldest-observed evicted first. Same argument as\n"
+                 "rtx.residentScene.maxRecords: an unbounded store in a churning scene is a leak.\n"
+                 "If evicted= ever moves in steady state the ceiling is too small for the scene,\n"
+                 "which is the OPPOSITE finding from identity churn -- read it against newObjects\n"
+                 "before changing either.");
+
+      RTX_OPTION("rtx.renderObject", bool, logStats, false,
+                 "One [RenderObject] line per second. THE ACCEPTANCE GATE FOR SLICE 1 is read off it:\n"
+                 "newObjects must fall to ~0 on a settled scene and STAY there through a full\n"
+                 "pitch-and-yaw sweep. A climbing newObjects means the same real draw is being given\n"
+                 "a fresh identity every frame -- rungs 1 and 2 of the identity ladder failing again,\n"
+                 "and the only thing slice 1 exists to detect.\n"
+                 "Read ordinalShift APART from it: that counts a KNOWN identity turning up under a new\n"
+                 "occurrence, which is expected and non-zero because engine culling renumbers the\n"
+                 "copies of a multi-copy identity. High ordinalShift says wait for the engine handle;\n"
+                 "high newObjects says the key is wrong. Opposite responses, so never sum them.");
+    };
+
     // Resolve Options
     // Todo: Potentially document that after a number of resolver interactions is exhausted the next interaction will be treated as a hit regardless.
     RTX_OPTION_ARGS("rtx", uint8_t, primaryRayMaxInteractions, 32,
@@ -2625,7 +2685,19 @@ namespace dxvk {
     RTX_OPTION_ENV("rtx", bool, isShaderExecutionReorderingSupported, true, "DXVK_IS_SHADER_EXECUTION_REORDERING_SUPPORTED", "Enables Shader Execution Reordering (SER) if it is supported by the target HW and SW."); 
     // True if `isShaderExecutionReorderingSupported` is true and the computer actually supports it.
     public: static inline bool enableShaderExecutionReordering = true;
-    RTX_OPTION("rtx", bool, enableShaderExecutionReorderingInPathtracerGbuffer, false, "(Note: Hard disabled in shader code) Enables Shader Execution Reordering (SER) in GBuffer Raytrace pass if SER is supported.");
+    // NV-DXVK [SER] 2026-08-31: the doc string used to read "(Note: Hard disabled
+    // in shader code)". That was true of the predicate and false of the option,
+    // and the distinction cost real analysis time -- ARCHITECTURE_OVERHAUL 0.1
+    // item 10 and 5.4.1 both concluded from that note that setting this True was
+    // inert. It never was. This flag is read here on the host and picks a
+    // different PERMUTATION (gbuffer_raygen_ser*, gbuffer_psr_raygen_ser*), which
+    // routes the resolve through HitObject::TraceRay/Invoke instead of TraceRay.
+    // Until the predicate was un-stubbed, True bought the decomposition and threw
+    // away the reorder. geometry_resolver_state.slangh:182 now returns true, so
+    // the flag finally means what it says in both positions.
+    RTX_OPTION("rtx", bool, enableShaderExecutionReorderingInPathtracerGbuffer, false, "Enables Shader Execution Reordering (SER) in the GBuffer Raytrace pass if SER is supported.\n"
+               "Selects a separate shader permutation rather than taking a runtime branch, so toggling this rebuilds/rebinds the GBuffer raygen pipeline: true routes the resolve through HitObject::TraceRay + ReorderThread + HitObject::Invoke, false uses a plain TraceRay.\n"
+               "Only has an effect when rtx.renderPassGBufferRaytraceMode is a ray-pipeline mode (RayQueryRayGen or TraceRay); the RayQuery compute path does not define RAY_PIPELINE and ignores this entirely.");
     RTX_OPTION("rtx", bool, enableShaderExecutionReorderingInPathtracerIntegrateIndirect, true, "Enables Shader Execution Reordering (SER) in Integrate Indirect pass if SER is supported.");
 
     // Path Options
@@ -4103,6 +4175,14 @@ namespace dxvk {
     // sort per frame. Every count-based instrument reports this scene as
     // perfectly stable while meshes are visibly missing, so a count is known to
     // be the wrong shape for this artifact.
+    RTX_OPTION("rtx", bool, logSurfaceDelta, false,
+               "One [SurfaceDelta] line per second. SLICE 8'S PRECONDITION (\u00a79 item 5): how many of the\n"
+               "surface bytes uploaded every frame actually differ from last frame, and how many instances\n"
+               "had their surface slot move while surviving.\n"
+               "changed~0 on a stationary scene = delta upload is worth building. changed high = it is not,\n"
+               "whatever the O(scene) argument says. slotChurn high = stable slots must land first, because\n"
+               "a delta against an array that renumbers itself every frame is not expressible.\n"
+               "Costs one memcmp and one copy of the surface array per frame while enabled.");
     RTX_OPTION("rtx", bool, logTlasSet, false,
                "DIAGNOSTIC, O(instances) PER FRAME: logs [TlasSet], one line per "
                "frame per TLAS giving the order-independent signature of the "

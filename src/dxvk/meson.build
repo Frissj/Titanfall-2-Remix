@@ -246,6 +246,7 @@ dxvk_src = files([
   'rtx_render/rtx_initializer.h',
   'rtx_render/rtx_instance_manager.cpp',
   'rtx_render/rtx_resident_scene.cpp',
+  'rtx_render/rtx_render_object.cpp',
   'rtx_render/rtx_instance_manager.h',
   'rtx_render/rtx_intersection_test.h',
   'rtx_render/rtx_intersection_test_helpers.h',

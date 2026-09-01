@@ -7943,6 +7943,74 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK [SurfaceDelta] slice 8's precondition, §9 item 5. Measures the
+    // delta-upload opportunity WITHOUT changing what is uploaded.
+    //
+    // §5.1 argues from the code that a level-sized resident set makes this
+    // whole-array upload expensive. That is a prediction; this is the number.
+    // Two things are counted and they answer different questions:
+    //
+    //   slotChurn      instances whose surface slot MOVED between frames while
+    //                  the instance itself survived. Slot instability is what
+    //                  makes a delta impossible in the first place, so a high
+    //                  churn says stable slots must come before delta upload --
+    //                  which is exactly §5.1's "the delta has to start at the
+    //                  walk", stated as a measurement instead of an argument.
+    //   bytesChanged   of the bytes about to be written, how many differ from
+    //                  what was written last frame. This is the ceiling on what
+    //                  a delta upload could save. If a stationary scene does
+    //                  not read ~0 here, slice 8 saves nothing and drops down
+    //                  the list whatever the O(scene) argument says.
+    //
+    // Costs one memcmp + one copy of the surface array per frame while on, and
+    // nothing at all while off.
+    if (RtxOptions::logSurfaceDelta()) {
+      auto& prev = uploadSurfaceDataFuncState.prevSurfacesGPUData;
+      uint32_t changed = 0u, bytesChanged = 0u, churn = 0u;
+
+      for (uint32_t i = 0; i < m_reorderedSurfaces.size(); ++i) {
+        const RtInstance& inst = *m_reorderedSurfaces[i];
+        const uint32_t p = inst.getPreviousSurfaceIndex();
+        if (p != SURFACE_INDEX_INVALID && p != i) {
+          ++churn;
+        }
+      }
+
+      const size_t n = surfacesGPUData.size();
+      if (prev.size() != n) {
+        // First frame, or the array resized. Everything counts as changed --
+        // which is honest: a resize IS a full upload.
+        changed = static_cast<uint32_t>(n / kSurfaceGPUSize);
+        bytesChanged = static_cast<uint32_t>(n);
+      } else {
+        for (size_t off = 0; off + kSurfaceGPUSize <= n; off += kSurfaceGPUSize) {
+          if (std::memcmp(prev.data() + off, surfacesGPUData.data() + off, kSurfaceGPUSize) != 0) {
+            ++changed;
+            bytesChanged += static_cast<uint32_t>(kSurfaceGPUSize);
+          }
+        }
+      }
+      prev.assign(surfacesGPUData.begin(), surfacesGPUData.end());
+
+      const uint32_t frameId = m_device->getCurrentFrameId();
+      auto& lastLog = uploadSurfaceDataFuncState.surfaceDeltaLastLogFrame;
+      if (frameId - lastLog >= 60u) {
+        lastLog = frameId;
+        const uint32_t surfaces = static_cast<uint32_t>(m_reorderedSurfaces.size());
+        Logger::warn(str::format(
+          "[SurfaceDelta] f=", frameId,
+          " surfaces=", surfaces,
+          " uploadBytes=", static_cast<uint32_t>(n),
+          " changed=", changed,
+          " bytesChanged=", bytesChanged,
+          " slotChurn=", churn,
+          " changedPct=", (surfaces ? (100u * changed) / surfaces : 0u),
+          " churnPct=", (surfaces ? (100u * churn) / surfaces : 0u),
+          "  <- stationary scene: changed~0 means slice 8 pays; churn high means"
+          " stable slots must come first"));
+      }
+    }
+
     ctx->writeToBuffer(m_surfaceBuffer, 0, surfacesGPUData.size(), surfacesGPUData.data());
 
     // Allocate and initialize the surface mapping buffer

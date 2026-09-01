@@ -4493,6 +4493,32 @@ namespace dxvk {
                             drawCallState.residentSrcIndexBuffer,
                             m_device->getCurrentFrameId(),
                             sFanoutInstances);
+
+        // NV-DXVK [RenderObject] slice 1: THE RESOLVER, fed from the same point
+        // and under the same condition as the record above.
+        //
+        // WHY HERE AND NOWHERE ELSE. This is the CS-side point where "did this
+        // draw resolve to any instance" is answerable, and RESIDENT_SCENE_PLAN
+        // sec 2.1 already established that this is the only safe evidence --
+        // the frame thread cannot see it. Resolving anywhere earlier would mint
+        // objects for draws that turn out to produce nothing, which is the
+        // empty-record failure one level up.
+        //
+        // MIRROR ONLY. The id is bound to the resident key and then dropped.
+        // Nothing reads it back yet, deliberately: slice 1's whole job is to
+        // let [RenderObject] be watched for a window before anything is allowed
+        // to depend on an id. engineHandle is 0 because sec 7 slice B has not
+        // landed -- see rtx_render_object.h on why no grouping signal is safe
+        // before it does.
+        RenderObjectDB& objectDb = m_instanceManager.getRenderObjectDB();
+        const RenderPrimitiveId prim =
+            objectDb.resolve(drawCallState.residentIdentity,
+                             drawCallState.residentOrdinal,
+                             0ull,
+                             m_device->getCurrentFrameId());
+        if (prim.valid()) {
+          objectDb.bindResidentKey(prim, drawCallState.residentKey);
+        }
       }
     }
 

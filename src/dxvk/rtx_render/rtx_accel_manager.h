@@ -184,6 +184,10 @@ private:
   // Persistent containers to reduce frame to frame reallocations in ::uploadSurfaceData()
   struct {
     std::vector<unsigned char> surfacesGPUData;
+    // NV-DXVK [SurfaceDelta] §9 item 5: last frame's copy, for the changed-byte
+    // count. Only allocated while rtx.logSurfaceDelta is on.
+    std::vector<unsigned char> prevSurfacesGPUData;
+    uint32_t surfaceDeltaLastLogFrame = 0u;
     std::vector<uint32_t> surfaceIndexMapping;
     uint32_t previousFrameSurfaceCount = 0; // Tracks last frame's surface count for mapping coverage
   } uploadSurfaceDataFuncState;

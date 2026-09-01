@@ -775,6 +775,146 @@ namespace dxvk {
     return true;
   }
 
+  // ==========================================================================
+  // NV-DXVK [ExistenceSource] slice 5b. See the block comment in the header.
+  // ==========================================================================
+
+  void EnumerationSource::beginFrame(uint32_t frame) {
+    // Cleared, never accumulated. A union across frames would make "absent"
+    // unreachable, and absent is the only question the list exists to answer.
+    m_listed.clear();
+    m_frame = frame;
+  }
+
+  void EnumerationSource::note(uint64_t handle) {
+    if (handle != 0ull) {
+      m_listed.insert(handle);
+    }
+  }
+
+  bool EnumerationSource::listed(uint64_t handle) const {
+    return handle != 0ull && m_listed.find(handle) != m_listed.end();
+  }
+
+  void ExistenceSourcePromotion::observe(uint32_t listedCount) {
+    if (m_lastCount == ~0u) {
+      m_lastCount = listedCount;
+      m_flatFrames = 1u;
+      return;
+    }
+
+    if (listedCount == m_lastCount) {
+      ++m_flatFrames;
+      return;
+    }
+
+    // ANY movement resets the run to zero rather than decaying it. The camera
+    // is fixed, so the true population cannot change; a count that moves is
+    // culling leaking into the list, and one leak is enough to disqualify the
+    // source. A decay would let a list that is mostly-flat accumulate its way
+    // to promotion, which is exactly the "we believe it is pre-cull" judgement
+    // this class exists to refuse.
+    m_lastCount = listedCount;
+    m_flatFrames = 0u;
+    ++m_breaks;
+  }
+
+  void ExistenceSourcePromotion::reset() {
+    m_lastCount = ~0u;
+    m_flatFrames = 0u;
+    m_breaks = 0u;
+  }
+
+  std::unique_ptr<ExistenceSource> ExistenceSourcePromotion::promote(const char* name) const {
+    if (!flat()) {
+      // No source rather than an unproven one. A caller that forgets to check
+      // gets a null dereference on its own line instead of a silent scene
+      // drain three subsystems away.
+      Logger::warn(str::format(
+        "[ExistenceSource] REFUSED to promote '", name,
+        "' -- flatFrames=", m_flatFrames, "/", kRequiredFlatFrames,
+        " breaks=", m_breaks,
+        "  <- listed= is not flat under a fixed-position sweep, so this list is"
+        " post-cull or unproven and may NOT be wired to invalidation"));
+      return nullptr;
+    }
+
+    Logger::info(str::format(
+      "[ExistenceSource] promoted '", name, "' after ", m_flatFrames,
+      " flat frames, breaks=", m_breaks));
+    return std::unique_ptr<ExistenceSource>(new ExistenceSource(name));
+  }
+
+  uint32_t ResidentScene::invalidateAbsent(const ExistenceSource& source, uint32_t frame) {
+    uint32_t retired = 0u;
+    uint32_t skipped = 0u;
+
+    for (auto& kv : m_records) {
+      Record& rec = kv.second;
+      if (!rec.valid) {
+        continue;
+      }
+
+      // NO HANDLE, NO AUTHORITY. Not a retirement, not even a candidate --
+      // this source cannot name the record, so it cannot have an opinion about
+      // whether it is gone. Counted so the no-op case is visible AS a no-op:
+      // while absentSkipped tracks the record count, this function provably has
+      // not touched the scene.
+      if (rec.engineHandle == 0ull) {
+        ++skipped;
+        continue;
+      }
+
+      if (source.listed(rec.engineHandle)) {
+        // Present. sec 1.4: an enumeration is an ASSERTION that the object
+        // exists, so this is a positive liveness statement and the record's
+        // instances may be kept on it without a draw.
+        rec.frameLastSeen = frame;
+        continue;
+      }
+
+      // Absent from a PROVEN pre-cull list. This is the only place in this file
+      // where absence is allowed to mean death, and the parameter's type is
+      // what makes that legal.
+      rec.valid = false;
+
+      // AND DROP THE POINTERS, exactly as invalidateFor does and for exactly
+      // the [FanoutUAF, 2026-08-21] reason recorded there: marking the record
+      // invalid does NOT empty it, and three sites walk rec.instances and
+      // dereference every element without checking `valid`. A record retired
+      // here is retired while its instances are still live -- nothing is being
+      // destroyed on this path -- so clearing the back-pointer is also what
+      // releases them to the ordinary lifetime clause, which is the whole
+      // intent: their object is gone, so they should age out normally rather
+      // than stay exempt.
+      //
+      // Guarded on the key matching for the same reason invalidateFor guards
+      // it: an instance may have been rebuilt under a different record since
+      // this one was filed, and clearing that instance's key would retire it
+      // out of a record that is still good.
+      for (RtInstance* inst : rec.instances) {
+        if (inst != nullptr && inst->m_residentKey == kv.first) {
+          inst->m_residentKey = 0ull;
+        }
+      }
+      rec.instances.clear();
+
+      // Counted in BOTH places on purpose. invalidated= is "records that went
+      // invalid this window, whatever did it" and is what the eviction and
+      // churn columns are read against; absentRetired= is "records this path
+      // killed" and is cumulative. Folding them would make it impossible to ask
+      // whether a drain came from here or from instance destruction, which is
+      // the first question to ask if the scene ever empties.
+      m_stats.invalidated += 1;
+      ++retired;
+    }
+
+    m_stats.absentRetired += retired;
+    m_stats.absentSkipped = skipped;
+
+    return retired;
+  }
+
   void ResidentScene::invalidateFor(const RtInstance* instance) {
     if (instance == nullptr) {
       return;

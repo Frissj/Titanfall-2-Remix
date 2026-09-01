@@ -33,6 +33,93 @@ either a consequence of adding it or a deletion it makes possible.
 
 ---
 
+## 0.05 STATUS, 2026-08-31 — WHAT A RE-READ OF THE TREE CHANGED
+
+A verification pass re-read every load-bearing file:line in this document. The
+structural claims hold — `d3d11_rtx.cpp` is still exactly 76,898 lines and the
+five big functions are where §0.1 says. Three claims about *mechanism* do not,
+and two open questions closed. Evidence is inline at each corrected section.
+
+| | was | is |
+|---|---|---|
+| §9 item 2 | unknown enumerator | **SETTLED**: `2` = `TraceRay`, a ray pipeline. G1 is live, not inert |
+| §0.1 item 10, §5.4.1 | "the shader ignores it" | **WRONG**: the option picks a different *permutation*. The G-buffer paid SER's HitObject decomposition and threw away the reorder — strictly dominated. **Un-stubbed; G1 landed** |
+| §0.1 item 4 | `reclaim()` recycles on frame age | **REFUTED**: it recycles on evidence. **Slice 3 dropped** |
+| §5.1 | "papered over with a sort", 15.5k sorted | **OUTDATED**: already a partition + a sort of ~63 (`rtx_accel_manager.cpp:1127-1145`). The clear-and-rebuild and whole-array upload still stand |
+| §9 item 1 | "unknown whether RT-captured" | **ANSWERED**: they are not captured — all 18 exits are not-raytraced filters. Except `Throttle` and `HashFailed`, which are. **Breakdown added** |
+| §9 item 8 | an argument | **MEASURED**: ring-reuse detector added to `util_threadpool.h`. Unread |
+
+### What was BUILT on 2026-08-31
+
+| slice | state |
+|---|---|
+| **G1** | SER predicate un-stubbed in both G-buffer payload states, zero hints, mirroring `PathState`. The option's misleading doc string replaced |
+| **§9.1** | `noTail` made attributable — `m_rsNoTailBy[]` joins `BumpFilter`'s existing classification to the gate's key |
+| **§9.8** | Task-ring reuse detector in `util_threadpool.h` (`g_taskRingReuseCount`) |
+| **1** | `RenderObjectDB` — built, wired, logging. Object level 1:1 with primitive, deliberately |
+| **5b** | `ExistenceSource` / `VisibilitySource`. A post-cull source no longer *compiles* against the retirement path |
+| **6** | `JobGraph` primitive + `selfTest()` wired behind `rtx.jobGraph.selfTest`. Not yet wired into `flushGeometryBatch` |
+
+| **§9.5** | `[SurfaceDelta]` — measures the delta-upload opportunity without changing what is uploaded. Slice 8's precondition |
+
+Nothing here has been compiled or run. Each landed slice states its own gate and
+every one of those gates is still UNREAD.
+
+### Reading all of it in one run
+
+```
+rtx.jobGraph.selfTest = True      # slice 6 gate. Silent on success. Read FIRST
+rtx.renderObject.logStats = True  # slice 1 gate. newObjects ~0 and FLAT under a sweep
+rtx.residentScene.logStats = True # already existed; now also prints noTailBy{}
+rtx.logSurfaceDelta = True        # slice 8 precondition, §9 item 5
+```
+
+Then, in order:
+
+1. **`[JobGraph] selfTest`** — anything but silence means slice 6's contract is
+   not in the graph and nothing may be wired onto it.
+2. **`[RenderObject] newObjects`** — must fall to ~0 stationary and stay ~0
+   through a pitch-and-yaw sweep. Read `ordinalShift` separately; it is expected
+   non-zero and says "wait for the engine handle", where `newObjects` says "the
+   key is wrong". **Never sum them.**
+3. **`[ResidentGate] noTailBy{}`** — expect the not-raytraced reasons to
+   dominate. `Throttle` and `HashFailed` are the only two that are real capture
+   loss; `NOFILTER` means an exit classifies itself nowhere and `cp=` names its
+   line.
+4. **`[SurfaceDelta]`** — `changed~0` stationary means slice 8 pays. `slotChurn`
+   high means stable slots must land before any delta upload, which is §5.1's
+   "the delta has to start at the walk" turned into a number.
+5. **`g_taskRingReuseCount`** (§9 item 8) — no log, read it in a debugger. Non-zero
+   means slice 6 is a bug fix before it is an architecture change.
+
+Item 2 gates slice 8 and slice 2; item 1 gates slice 6's wiring. Everything on
+the G track still waits on G0's stall breakdown, which none of this touches.
+
+**Still blocked on a running game**: G0's stall breakdown (§9 item 2b) and §9
+items 2c, 3, 4, 5, 6. Nothing in G1-G5 is orderable before 2b, which is
+unchanged by any of the above.
+
+**The two slices that did NOT move, and why.** Slice 0 (the probe cull) is
+runnable — the tree IS a git repo, so the fence procedure's first step ("find the
+commit note that created it and the one that closed the bug") has the history it
+needs. It was not done because doing it *properly* is 67 blocks × archaeology,
+and doing it improperly is the one genuinely destructive move available here.
+
+For whoever takes it: the 67 `if (kDiagLogs)` blocks in `d3d11_rtx.cpp` are
+2,422 lines and `kDiagLogs` is `static constexpr bool = false`, so they are
+already dead-stripped — §6.1 rule 2's exact case. **Do not excise them by brace
+matching.** That was tried here and removed 5 net closing braces, because the
+file's `#if`/`#else` arms are individually unbalanced and a line-based brace
+counter cannot see it. Restored from git. Delete them by hand, or with a real
+preprocessor-aware parse, and check `git diff --stat` after each batch.
+
+Slice 0b needs §9 item 4's `shardInstanceProcessing` A/B, which is a
+measurement, and deleting one of two implementations on a guess is the same
+mistake in a different place.
+
+---
+
+
 ## 0.1 WHAT WAS VERIFIED, AND WHERE THE ADVICE WAS WRONG
 
 Read this before acting on any external suggestion. Six of them do not survive
@@ -93,6 +180,21 @@ Neither is settleable by argument, which is why `CbRange::srcPtr` and the
 PinDefer probe exist: record where the read happened, re-read at frame end, and
 bit-compare. **This is a measurement that has not been taken, not an
 optimisation waiting to be applied.** Take it before believing the idea.
+
+> **REFUTED 2026-08-31 — read this before acting on item 4.** The `reclaim()`
+> hazard below does not exist, and the "internal contradiction" is not one.
+> `m_lastRefFrame` is not a frame age; it is an evidence timestamp written by
+> `markBufferSlotReferenced` from an **unconditional** block in
+> `AccelManager::uploadSurfaceData` (`rtx_accel_manager.cpp:7844-7929`) that
+> walks `m_reorderedSurfaces` — which *is* the uploaded set — and marks **all
+> nine** `*BufferIndex` fields `RtSurface` has (`rtx_materials.h:391-450`; I
+> checked for a tenth). A slot any live surface references is stamped every
+> frame and can never age out. The renumber-under-a-live-surface theory closes
+> too: `SceneManager::clear()` wipes `m_bufferCache` (`:313`) and
+> `m_instanceManager` (`:328`) in the same call. **Slice 3 is dropped.** The
+> paragraph is kept because the reasoning it contains about `retain()` being
+> stronger than a generation is correct and worth keeping.
+
 
 **4. "Generational handles everywhere."** Mostly already solved, by a better
 mechanism, and the one place that genuinely needs a generation is not the one
@@ -1273,20 +1375,20 @@ sequencing preference; §1.2 is the reason.
 |---|---|---|---|
 | **0** | **Probe cull** (§6.1) — the fence procedure over all 893 tags | `d3d11_rtx.cpp`, `rtx_render/*.cpp` | line count down; every remaining tag traceable to an OPEN bug or an assertion |
 | **0b** | Dead-flag and dead-path deletion (§6.2, §6.3) | `rtx_options.h` once, conf, `d3d11_rtx.cpp` | one instance pipeline, one batch pipeline |
-| **1** | **`RenderObjectDB` mirroring `ResidentScene`** — no behaviour change, no perf target | `rtx_render_object.{h,cpp}` (new), `rtx_resident_scene.*` | same draw -> same `RenderObjectId` across frames and camera motion. This IS the invariant |
-| **2** | **Object resolver** — one place decides identity: handle, else `KeyHead`+occurrence | `d3d11_rtx.cpp`, resolver | `newKeys ~0` stationary; FLAT across a pitch-and-yaw sweep |
-| **3** | Slot generation on `BufferSlotTable` (§0.1 item 4) | `rtx_utils.h` | `[StaleTape] dead` becomes unreachable, not merely zero |
+| **1** | **`RenderObjectDB` mirroring `ResidentScene`** — **BUILT 2026-08-31.** `RenderObject`/`RenderPrimitive` with generational ids, the resolver, the resident-key join, evidence-based retire + LRU ceiling. Fed from `processDrawCallState` beside `ResidentScene::build`; cleared with the scene; `[RenderObject]` line under `rtx.renderObject.logStats`. **The object level is 1:1 with the primitive and that is deliberate — see the header: `residentDrawKey`'s own comment ("TF2 sub-allocates many meshes out of one pooled buffer and the pointer alone would merge them") rules out the only grouping signal available before §7 slice B, so grouping waits for the handle rather than being guessed.** | `rtx_render_object.{h,cpp}` ✔ (new), `rtx_types.h` ✔ (`residentIdentity`), `rtx_instance_manager.*` ✔, `rtx_scene_manager.cpp` ✔, `rtx_options.h` ✔, `meson.build` ✔ | **UNREAD.** `newObjects` ~0 stationary and FLAT across a pitch-and-yaw sweep. Read `ordinalShift` apart from it — that one is expected non-zero |
+| **2** | **Object resolver** — one place decides identity: handle, else `KeyHead`+occurrence | `rtx_render_object.cpp` ✔ (`RenderObjectDB::resolve` is written as `handle ?: iaIdentity+occurrence`, with the handle branch and `m_objectsByHandle` in place and empty) | **BLOCKED on §7 slice B, not on this file.** The resolver exists and will not need reshaping; slice 2 is now only *supplying a non-zero handle*. §9 item 7 (is any enumeration source promotable?) has to settle first |
+| ~~**3**~~ | ~~Slot generation on `BufferSlotTable`~~ — **DROP. §0.1 item 4 is refuted (2026-08-31): `m_lastRefFrame` is an evidence timestamp, not an age. Every live surface marks all nine of its buffer indices every frame from an unconditional block in `uploadSurfaceData`, and `clear()` takes the instance manager with it. The hazard is unreachable; `[StaleTape]` is the proof, not a substitute for one.** | — | — |
 | **4** | **Observe/derive split** — `SubmitDraw` captures and enqueues, derives nothing | `d3d11_rtx.cpp` | no live D3D11 read past capture; `XfLiveSite` escape counts all 0 |
 | **5** | **`ExtractTransforms` -> pure classifier** — `CaptureTransformInputs()` then `TransformClassifier(input) -> result`, deterministic, no hidden cross-draw state | `d3d11_rtx.cpp` | same inputs -> same output, run twice, bit-identical |
-| **5b** | **`ExistenceSource` / `VisibilitySource` types** (§3.1) — invalidation takes the first only | `rtx_resident_scene.*`, enumeration hooks | a post-cull source cannot compile against the retirement path. Do this BEFORE RESIDENT_SCENE_PLAN slice D is wired |
-| **6** | **Job graph: counters + graph-owned `JobHandle` + composable parallel-for + exactly-once completion** (§4.2, §4.2.1, §4.2.2) | `util_threadpool.h`, new graph, `d3d11_rtx.cpp` | undersized-queue + injected-cancellation run completes every dependent; `SynchronizeCsThread(SynchronizeAll)` removed from the flush; carrier groups are edges |
+| **5b** | **`ExistenceSource` / `VisibilitySource` types** (§3.1) — **BUILT 2026-08-31.** `EnumerationSource` base, `VisibilitySource` freely constructible, `ExistenceSource` with **no public constructor**, obtainable only through `ExistenceSourcePromotion` which refuses until `listed=` has been flat for 600 frames under a fixed-position sweep. `ResidentScene::invalidateAbsent` takes `const ExistenceSource&` and nothing else. Records carry `engineHandle`; **0 means no authority, so it is a no-op today** — which is correct while nothing produces handles. Clears instance back-pointers exactly as `invalidateFor` does ([FanoutUAF]). | `rtx_resident_scene.{h,cpp}` ✔ | **a post-cull source cannot compile against the retirement path — achieved.** Watch `absentRetired` against `[ReapJoin] starved`: the §3.1 failure makes `starved` read BETTER while the scene drains, and those two counters are the only place that is visible |
+| **6** | **Job graph: counters + graph-owned `JobHandle` + composable parallel-for + exactly-once completion** (§4.2, §4.2.1, §4.2.2) — **PRIMITIVE BUILT 2026-08-31, NOT YET WIRED.** `JobGraph` with dependency counters, a graph-owned node array carrying generations, enqueue-or-run-inline *inside* the graph, exactly-once completion via an unconditional scope guard, cancellation-as-completion, and a `parallelFor` where the COUNTER is the composable unit so a consumer is wired before the child count is known. **Takes a `Dispatch` callable rather than the pool** — §4.2.1's whole argument is that `Future` cannot carry the contract, so the graph does not know what a thread pool is and the undersized-queue gate is just a Dispatch that returns false. | `util/util_job_graph.{h,cpp}` ✔ (new), `util/meson.build` ✔, `rtx_options.h` ✔, `d3d11_rtx.cpp` ✔ (init hook) | **`JobGraph::selfTest()` IS the gate and it is WIRED** — set `rtx.jobGraph.selfTest=True`; runs once at init, silent on success — always-refusing dispatch, zero-child fan-out, 384-child fan-out, cancelled-producer-still-releases-consumer, and generation-catches-stale-handle. Run it first. **Then** the wiring: `SynchronizeCsThread(SynchronizeAll)` out of the flush, carrier groups become edges. That half is surgery on `flushGeometryBatch` and wants slices 4-5 first |
 | **6b** | **Declared read/write sets** (§4.2.3) — over the seven resources that have ids | graph, `rtx_instance_manager.*` | `deferredThisDraw` and the `PendingInstanceOps` sidecar DELETED, not merely unused. If they survive, the declaration is incomplete |
 | **7** | **Dirty-primitive jobs** — the graph is fed by the changed set, not the draw list | `d3d11_rtx.cpp`, resolver | one PRIMITIVE in 15 draws -> one geometry decision (§1.3: per primitive, not per object) |
 | **7b** | Pipeline observe-and-resolve one frame ahead (§4.2.4) — the pure half only | `d3d11_rtx.cpp` | frame N+1 resolve overlaps frame N commit; **no** second copy of any RT scene state |
-| **8** | **Persistent `m_reorderedSurfaces` slots, then delta upload** (§5.1) | `rtx_accel_manager.cpp` | `m_reorderedSurfaces.clear()` gone; `[SurfaceIndexStability]` sort deleted; stationary scene uploads ~0 surface bytes/frame |
+| **8** | **Persistent `m_reorderedSurfaces` slots, then delta upload** (§5.1) — **PRECONDITION MEASURED, BUILD NOT STARTED.** `[SurfaceDelta]` (`rtx.logSurfaceDelta`) now reports, per frame, how many uploaded surface bytes actually differ from last frame and how many instances had their slot move while surviving. **Do not build this until that reads.** §9 item 5 calls §5.1 a prediction, and it is: if `changed` is high on a stationary scene the delta saves nothing whatever the O(scene) argument says. If `slotChurn` is high, stable slots must come first — which is §5.1's own "the delta has to start at the walk". **Also blocked on slice 1's gate**: the slot identity §5.1 specifies is one per `RenderObject`, and consuming an id before `newObjects` reads ~0 is building on an unverified identity — the exact mistake §1.2's ladder is a record of. | `rtx_accel_manager.{h,cpp}` ✔ (probe only), `rtx_options.h` ✔ | `m_reorderedSurfaces.clear()` gone; `[SurfaceIndexStability]` sort deleted (**note: already reduced to a partition + a ~63-element sort**); stationary scene uploads ~0 surface bytes/frame |
 | **9** | **GPU scene cull generalised from PointInstancer** (§5.3) | `rtx_point_instancer_system.*`, `rtx_accel_manager.cpp` | `sceneCull` CPU loop gone; culled set matches the CPU verdict exactly under verify |
-| **G0** | **The GPU measurement** (§5.4) — Nsight warp-stall breakdown + the `renderPassGBufferRaytraceMode = 2` enum lookup | none | fetch-stall vs `stall_long_scoreboard` decided. **Nothing in G1-G4 is orderable before this** |
-| **G1** | **SER: un-stub, measure, then hint** (§5.4.1) | `geometry_resolver_state.slangh` | one line; read the stall breakdown, not just frame time. Nothing sequenced behind it |
+| **G0** | **The GPU measurement** (§5.4) — Nsight warp-stall breakdown. ~~+ the `renderPassGBufferRaytraceMode = 2` enum lookup~~ **(enum half DONE 2026-08-31: it is `TraceRay`, a ray pipeline)** | none | fetch-stall vs `stall_long_scoreboard` decided. **Nothing in G1-G4 is orderable before this** |
+| **G1** | **SER: un-stub, measure, then hint** (§5.4.1) — **UN-STUB DONE 2026-08-31**, both payload states, zero hints, mirroring `PathState`. Note the option was never inert: it selects the `_ser` PERMUTATION, so the pass was paying `HitObject::TraceRay`/`Invoke` and discarding the reorder. **MEASURE and HINT remain, and both are behind G0.** | `geometry_resolver_state.slangh` ✔, `rtx_options.h` ✔ (doc string corrected) | read the stall breakdown, not just frame time. Nothing sequenced behind it. A null/negative result is expected per §0.1 item 10 and must not be read as "SER off" |
 | **G2** | **BVH build on async compute** (§5.2) + committed-resource suballocation | `rtx_accel_manager.cpp` | build overlaps G-buffer/lighting; watch DLFG queue contention (`CreatorID` pairing) |
 | **G3** | **G-buffer material split** (§5.4.2) — reduce what each variant CONTAINS, not how variants dispatch | shaders | instruction count and register count down. **Promoted above SER's outcome**, not gated on it |
 | **G4** | Any-hit cost: measure OMM bind ratio, then consider the screen-space alpha test (§5.2.1) | shaders | measure first — this document has no verified coverage number |
@@ -1366,6 +1468,22 @@ and at G3, and it is wrong at all three.
 
 Each of these can invalidate a reading taken from a slice above.
 
+**1 — ANSWERED 2026-08-31, structurally, and the answer is mostly reassuring.**
+`residentGateBegin` is the first statement of `SubmitDraw` (`:42390`) and
+`residentGateJudge` the last of `SubmitDrawTail` (`:53954`), so every early
+return in between is a `noTail`. All 18 of them were enumerated and every one is
+a filter meaning *this draw is not raytraced* — NoPixelShader, NoRenderTarget,
+UI/HUD, Position2D, CharDepthPrepass, WorldNoShadeInputs and the rest. **A large
+`noTail` is the filter funnel counted from the far side, not a hole under §1.**
+
+Two exceptions are real capture loss and nothing separated them: **Throttle**
+(`:43763`, a legitimate draw dropped on `kMaxConcurrentDraws` — and it scales
+with scene complexity, which is the direction residency pushes) and
+**HashFailed** (`:47567`). The breakdown now exists: `m_rsNoTailBy[]` joins
+`BumpFilter`'s existing classification to the gate's key, and `[ResidentGate]`
+prints `noTailBy{ ... }`. Read that before believing any coverage number — but
+read it expecting the not-raytraced reasons to dominate.
+
 **1. `noTail` — the fifth of the frame the gate never sees.** Four shaders report
 `o2w{n=0}` across ~965 draws/frame; their draws are judged at the head of
 `SubmitDraw` and never reach `SubmitDrawTail`. Whether they are RT-captured at all
@@ -1373,6 +1491,13 @@ is still unknown. **An object identity that never reaches the resolver is an
 object the whole of §1 does not cover**, and no amount of enumeration fixes it —
 RESIDENT_SCENE_PLAN §7.6 item 1 says exactly this. Read `noTail` before believing
 any coverage number from slices 1, 2 or 7.
+
+**2 — SETTLED 2026-08-31. It is `TraceRay`, a RAY PIPELINE mode, not compute.**
+`rtx_pathtracer_gbuffer.h:33-38` — `RayQuery = 0, RayQueryRayGen, TraceRay,
+Count` — so `2` is `TraceRay (RGS)`, confirmed against the ImGui label table at
+`dxvk_imgui.cpp:207-209`. The precondition below is satisfied, G1 is live work,
+and this half of G0 needed no measurement. The other half (2b, the stall
+breakdown) is still open and still gates G1-G5.
 
 **2. The G-buffer raytrace mode.** `rtx.renderPassGBufferRaytraceMode = 2` in the
 conf against a `RayQuery` default. If that resolves to a compute mode, §5.4.1
@@ -1419,6 +1544,14 @@ are the eviction rule and three of the four need no object — but slice E (pose
 without draws) and the precise death signal do not arrive, and the plan should say
 so rather than assume a pre-cull list exists. Settle this before slices 1 and 2
 decide how much weight `engineHandle` carries in the resolver.
+
+**8 — DONE 2026-08-31. The measurement now exists; it has not been read.**
+`Task::m_captureSeq` is bumped in `capture()`, `Future` samples it and re-checks
+on both sides of the wait, `valid()` returns false on a reused slot, and
+`dxvk::g_taskRingReuseCount` counts occurrences with a debug `assert` beside it.
+Every claim §4.2.1 makes about the pool was verified first and all of them hold
+(`util_threadpool.h:362`, `:236`, `:159`, `:181`, `:106`, `:335`). Run it and
+read the counter.
 
 **8. Whether the task ring is already being overrun.** §4.2.1 argues it is safe
 today by accident. That is an argument, not a measurement, and it is cheap to

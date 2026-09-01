@@ -2,8 +2,10 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "rtx_constants.h"
 
@@ -48,6 +50,140 @@ namespace dxvk {
   // CALLED FROM A DESTRUCTOR, so it must be safe during process teardown and
   // must cost nothing when residency has never been armed -- see the body.
   void noteResidentSourceBufferDestroyed(uint64_t bufferPtr);
+
+  // ==========================================================================
+  // EXISTENCE AUTHORITY vs VISIBILITY OBSERVATION.
+  // ARCHITECTURE_OVERHAUL.md sec 3.1, invariant I9, build-order slice 5b.
+  //
+  // THE HAZARD, AND IT IS THE ONE THAT CAN EMPTY THE SCENE.
+  //
+  // RESIDENT_SCENE_PLAN sec 7.3 measured sub_1801A8350's return as POST-CULL:
+  // Gate 1, the view-direction-dependent leaf-frustum test, runs inside it, so
+  // its output list is what survived culling. Section 7.5 slice D then
+  // specifies that onFrameEnd "touches every record whose handle is listed,
+  // draw or no draw, and ABSENT HANDLES INVALIDATE".
+  //
+  // Those two sentences in the same document are a scene-emptying bug. Wire
+  // slice D to a post-cull list and every off-screen object is retired every
+  // frame -- residency inverted into a faster version of the exact starvation
+  // it was built to fix.
+  //
+  // AND IT WOULD NOT LOOK LIKE ONE. The drain happens through the RETIREMENT
+  // path rather than the reap path, so [ReapJoin] starved= -- the plan's own
+  // headline acceptance gate -- would read IMPROVED while the scene emptied.
+  // A bug that makes its own detector read better is why this is a type and
+  // not a comment.
+  //
+  // WHY A VERIFICATION STEP IS NOT SUFFICIENT. "We confirmed the list is
+  // pre-cull" is a fact about one capture, on one map, at one position.
+  // RESIDENT_SCENE_PLAN sec 0.0 already names a sixth cull with no flag at all
+  // -- sub_1802EAD60's position-keyed area order list, 30 of 179 areas -- which
+  // no configuration defeats and whose behaviour is not uniform across maps. A
+  // discipline that has to be re-established per map is a discipline that will
+  // be skipped once.
+  //
+  // SO THE DISTINCTION IS CARRIED BY THE TYPE:
+  //
+  //   ExistenceSource    may assert ALIVE   may assert DEAD    proven pre-cull
+  //   VisibilitySource   may assert VISIBLE MAY NEVER say DEAD everything else
+  //
+  // invalidateAbsent() takes an ExistenceSource and nothing else, and
+  // ExistenceSource has no public constructor. A post-cull list therefore
+  // cannot reach the retirement path -- not "must not", CANNOT. This is the
+  // sec 2.1 lesson applied again: find the place where the question answers
+  // itself rather than writing a rule somebody has to remember.
+  //
+  // DO NOT DISCARD A POST-CULL SOURCE -- TYPE IT AND USE IT. A VisibilitySource
+  // is the engine's own visibility answer, which is strictly better information
+  // than sceneCull's frustum-and-light-influence test (sec 1.4: culled=0,
+  // because lightAllKeep covers all 1298 off-screen instances). It is worth
+  // having as a culling input. It is just not allowed to kill anything.
+  // ==========================================================================
+  class EnumerationSource {
+  public:
+    const char* name() const { return m_name; }
+
+    // Start a frame's list. The previous frame's contents are dropped -- a
+    // union across frames would make "absent" unreachable, which is the one
+    // question the list exists to answer.
+    void beginFrame(uint32_t frame);
+
+    // The engine named this handle this frame.
+    void note(uint64_t handle);
+
+    bool listed(uint64_t handle) const;
+    uint32_t listedCount() const { return static_cast<uint32_t>(m_listed.size()); }
+    uint32_t frame() const { return m_frame; }
+
+  protected:
+    explicit EnumerationSource(const char* name) : m_name(name) { }
+
+    const char* m_name = "";
+    uint32_t m_frame = kInvalidFrameIndex;
+    std::unordered_set<uint64_t> m_listed;
+  };
+
+  // Post-cull, or pre-cull but unproven. Constructible by anyone, because the
+  // safe classification must be the easy one.
+  class VisibilitySource final : public EnumerationSource {
+  public:
+    explicit VisibilitySource(const char* name) : EnumerationSource(name) { }
+  };
+
+  // Proven pre-cull. The ONLY type invalidateAbsent() accepts.
+  //
+  // No public constructor and no conversion from VisibilitySource. The only way
+  // to obtain one is promoteToExistenceSource(), which will not hand one back
+  // until the flatness evidence has actually been collected -- so "we believe
+  // this list is pre-cull" cannot be expressed in code, only "this list has
+  // been measured flat for N frames".
+  class ExistenceSource final : public EnumerationSource {
+  public:
+    ExistenceSource(const ExistenceSource&) = delete;
+    ExistenceSource& operator=(const ExistenceSource&) = delete;
+
+  private:
+    explicit ExistenceSource(const char* name) : EnumerationSource(name) { }
+    friend class ExistenceSourcePromotion;
+  };
+
+  // THE PROMOTION GATE, and it is the one slice B already has: listed= FLAT
+  // across a fixed-position pitch-and-yaw sweep.
+  //
+  // A fixed camera position means the true object population cannot change, so
+  // any movement in listedCount() is culling leaking into the list. Flat across
+  // the sweep is therefore direct evidence the list is pre-cull; anything else
+  // is direct evidence it is not. Until it passes ON THE MAP UNDER TEST the
+  // source stays a VisibilitySource and residency keeps whatever liveness it
+  // had.
+  class ExistenceSourcePromotion {
+  public:
+    // Frames of unchanging listedCount required before promotion. Long enough
+    // that a sweep genuinely covers pitch and yaw rather than a pause in the
+    // middle of one.
+    static constexpr uint32_t kRequiredFlatFrames = 600u;
+
+    // Feed one frame's count while the camera sweeps from a FIXED POSITION.
+    // Moving the camera invalidates the evidence, which is why this is fed by
+    // the sweep harness rather than by the enumeration hook itself.
+    void observe(uint32_t listedCount);
+
+    bool flat() const { return m_flatFrames >= kRequiredFlatFrames; }
+    uint32_t flatFrames() const { return m_flatFrames; }
+    uint32_t breaks() const { return m_breaks; }
+
+    // Hands back an ExistenceSource ONLY once flat() holds. Returns nullptr
+    // otherwise, and a caller that does not check gets no source rather than an
+    // unproven one.
+    std::unique_ptr<ExistenceSource> promote(const char* name) const;
+
+    void reset();
+
+  private:
+    uint32_t m_lastCount = ~0u;
+    uint32_t m_flatFrames = 0u;
+    uint32_t m_breaks = 0u;
+  };
 
   // ==========================================================================
   // THE RESIDENT SCENE -- RT-SIDE HALF. See RESIDENT_SCENE_PLAN.md.
@@ -202,6 +338,16 @@ namespace dxvk {
       // of them, which passes every instance except the one it was measured on.
       // Held as a raw address for comparison only and never dereferenced.
       const void* builtBlas = nullptr;
+      // NV-DXVK [ExistenceSource] slice 5b: the engine handle this record's
+      // object was enumerated under, or 0 when none is known.
+      //
+      // 0 IS NOT "DEAD" AND MUST NEVER BE TREATED AS IT. Until sec 7 slice B
+      // lands there is no handle producer at all, so every record carries 0 --
+      // and invalidateAbsent() therefore skips every record, which is exactly
+      // the right behaviour for a scene nothing can vouch for. A record with no
+      // handle is OUTSIDE the enumeration's authority, which is a different
+      // statement from being absent from its list.
+      uint64_t engineHandle = 0ull;
       std::vector<RtInstance*> instances;
     };
 
@@ -257,6 +403,24 @@ namespace dxvk {
 
     // O(1) and TOTAL -- see the class comment.
     void invalidateFor(const RtInstance* instance);
+
+    // NV-DXVK [ExistenceSource] slice 5b: RETIRE WHAT THE ENGINE NO LONGER
+    // LISTS -- RESIDENT_SCENE_PLAN sec 7.5 slice D, with sec 3.1's type on it.
+    //
+    // Takes an ExistenceSource BY TYPE, not by convention. That is the entire
+    // point of the parameter: a VisibilitySource will not convert, so the
+    // scene-emptying wiring sec 3.1 describes DOES NOT COMPILE. If you are
+    // holding a VisibilitySource and want to call this, the answer is not a
+    // cast -- it is to run the fixed-position pitch-and-yaw sweep and promote
+    // it through ExistenceSourcePromotion.
+    //
+    // Records with engineHandle == 0 are SKIPPED, not invalidated -- see the
+    // field. That makes this a no-op today, which is correct: there is no
+    // handle producer until sec 7 slice B, and a source that cannot identify a
+    // record has no authority to retire it.
+    //
+    // Returns how many records were invalidated.
+    uint32_t invalidateAbsent(const ExistenceSource& source, uint32_t frame);
 
     // Erases invalidated records, then evicts down to rtx.residentScene.maxRecords
     // on the age-rung ladder (the [Perf.SplitXf] evict{} policy -- see the body
@@ -402,6 +566,20 @@ namespace dxvk {
       // the current window.
       uint32_t srcNotices = 0;
       uint32_t srcDrained = 0;
+      // NV-DXVK [ExistenceSource] slice 5b. CUMULATIVE, same argument as wiped
+      // and sourceDestroyed.
+      //
+      // WATCH THIS ONE HARDER THAN THE OTHERS. It is the counter for the only
+      // path in this file that can empty the scene, and sec 3.1's whole point
+      // is that the failure would make [ReapJoin] starved= read BETTER while it
+      // happened. absentRetired climbing while starved= falls is that failure,
+      // and it is the only place the two can be compared.
+      //
+      // absentSkipped is its denominator: records the source had no authority
+      // over because they carry no engine handle. While it equals the record
+      // count, invalidateAbsent is a no-op and cannot have done any harm.
+      uint32_t absentRetired = 0;
+      uint32_t absentSkipped = 0;
     };
 
     const Stats& stats() const { return m_stats; }
@@ -410,11 +588,15 @@ namespace dxvk {
       const uint32_t keepSourceDestroyed = m_stats.sourceDestroyed;
       const uint32_t keepSrcNotices = m_stats.srcNotices;
       const uint32_t keepSrcDrained = m_stats.srcDrained;
+      const uint32_t keepAbsentRetired = m_stats.absentRetired;
+      const uint32_t keepAbsentSkipped = m_stats.absentSkipped;
       m_stats = Stats();
       m_stats.wiped = keepWiped;
       m_stats.sourceDestroyed = keepSourceDestroyed;
       m_stats.srcNotices = keepSrcNotices;
       m_stats.srcDrained = keepSrcDrained;
+      m_stats.absentRetired = keepAbsentRetired;
+      m_stats.absentSkipped = keepAbsentSkipped;
     }
 
     size_t size() const { return m_records.size(); }

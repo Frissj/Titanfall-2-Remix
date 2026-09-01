@@ -39,6 +39,33 @@
 #include "sync/sync_spinlock.h"
 
 namespace dxvk {
+  // NV-DXVK [TaskRing] 2026-08-31: ARCHITECTURE_OVERHAUL sec 9 item 8 asks
+  // whether the task ring is ALREADY being overrun, and says the honest answer
+  // is that sec 4.2.1 gives an argument rather than a measurement. This is the
+  // measurement, and it is the shape that section asked for: a monotonic
+  // per-slot capture counter, sampled into the Future at capture and re-checked
+  // when the Future is used.
+  //
+  // WHAT IT CATCHES. m_tasks is a ring of m_taskCount slots indexed by
+  // `m_taskId++ & (m_taskCount - 1)` (see Schedule), and a Future is a bare
+  // Task* into it with no generation. If m_taskId advances a full lap between
+  // capture() and get(), the slot has been re-captured under the holder --
+  // capture() placement-news a new lambda and calls result.reset(), which clears
+  // hasResult while a holder may be sitting in get(). Task::valid() cannot see
+  // that, because there is nothing on the Task to see it with.
+  //
+  // WHY IT SHOULD READ ZERO TODAY. flushGeometryBatch schedules ~worker-count
+  // chunks and joins them immediately, so m_taskId cannot advance a full lap in
+  // between. That is a property of the ONE current call site, not of the
+  // primitive -- which is exactly why sec 4.2.1 refuses to build a dependency
+  // graph on it. A graph holds completion tokens across phases and removes the
+  // accident.
+  //
+  // Silent when clean, per the [StaleTape] model: a counter and a debug assert,
+  // no logging in this header (it is included by d3d11_rtx.h and rtx_types.h,
+  // and a log dependency here is not worth a probe).
+  inline std::atomic<uint64_t> g_taskRingReuseCount { 0 };
+
   const size_t kLambdaStorageCapacity = 256;
   // Note: use up to 64 bytes for state
   const size_t kResultStorageCapacity = 256 - 64;
@@ -158,7 +185,11 @@ namespace dxvk {
 
       result.reset();
 
-      return Future<ResultType>(*this);
+      // Bump AFTER reset(), so the sequence a holder samples names the lambda
+      // that is in the slot now rather than the one it displaced.
+      const uint32_t seq = m_captureSeq.fetch_add(1u, std::memory_order_acq_rel) + 1u;
+
+      return Future<ResultType>(*this, seq);
     }
 
     void operator() () {
@@ -180,6 +211,12 @@ namespace dxvk {
 
     bool valid() const {
       return !result.disposed();
+    }
+
+    // NV-DXVK [TaskRing]: which capture currently owns this slot. See
+    // g_taskRingReuseCount.
+    uint32_t captureSeq() const {
+      return m_captureSeq.load(std::memory_order_acquire);
     }
 
   private:
@@ -208,23 +245,33 @@ namespace dxvk {
     alignas(64) Result<kResultStorageCapacity> result;
     alignas(64) ThunkStorage thunkStorage;
     ThunkType* thunk = nullptr;
+    // Monotonic, never reset. Wrapping at 2^32 captures of ONE slot would need
+    // 2^32 * m_taskCount schedules, and a false negative there costs a missed
+    // report rather than a wrong result.
+    std::atomic<uint32_t> m_captureSeq { 0 };
   };
 
   template<typename ResultType>
   struct Future {
     Future() = default;
-    explicit Future(Task& task)
+    explicit Future(Task& task, uint32_t captureSeq)
     : task { &task }
+    , seq { captureSeq }
     { }
 
     ResultType get() const {
+      // Checked on BOTH sides of the wait. Before catches a slot that was
+      // already re-issued; after catches one re-issued while we blocked, which
+      // is the case the ring makes possible and Task::valid() cannot see.
+      noteIfReused();
       ResultType r = task->getResult<ResultType>();
+      noteIfReused();
       task = nullptr;
       return r;
     }
 
     bool valid() const {
-      return task != nullptr && task->valid();
+      return task != nullptr && task->valid() && !ringReused();
     }
 
     void cancel() const {
@@ -232,23 +279,43 @@ namespace dxvk {
       task = nullptr;
     }
 
+    // NV-DXVK [TaskRing]: true if this slot has been re-captured since this
+    // Future was handed out, i.e. the Task* is now naming somebody else's work.
+    // Counting rather than throwing: by the time this is observable the result
+    // is already gone, so the only useful thing left is to say so exactly once
+    // per occurrence and let the debug build stop on it.
+    bool ringReused() const {
+      return task != nullptr && task->captureSeq() != seq;
+    }
+
   private:
+    void noteIfReused() const {
+      if (ringReused()) {
+        g_taskRingReuseCount.fetch_add(1u, std::memory_order_relaxed);
+        assert(false && "Task ring slot was re-captured while a Future still held it "
+                        "-- see g_taskRingReuseCount in util_threadpool.h");
+      }
+    }
     mutable Task* task = nullptr;
+    uint32_t seq = 0;
   };
 
   template<>
   struct Future<void> {
     Future() = default;
-    explicit Future(Task& task)
-    : task { &task } { }
+    explicit Future(Task& task, uint32_t captureSeq)
+    : task { &task }
+    , seq { captureSeq } { }
 
     void get() const {
+      noteIfReused();
       task->getResult();
+      noteIfReused();
       task = nullptr;
     }
 
     bool valid() const {
-      return task != nullptr && task->valid();
+      return task != nullptr && task->valid() && !ringReused();
     }
 
     void cancel() const {
@@ -256,8 +323,25 @@ namespace dxvk {
       task = nullptr;
     }
 
+    // NV-DXVK [TaskRing]: true if this slot has been re-captured since this
+    // Future was handed out, i.e. the Task* is now naming somebody else's work.
+    // Counting rather than throwing: by the time this is observable the result
+    // is already gone, so the only useful thing left is to say so exactly once
+    // per occurrence and let the debug build stop on it.
+    bool ringReused() const {
+      return task != nullptr && task->captureSeq() != seq;
+    }
+
   private:
+    void noteIfReused() const {
+      if (ringReused()) {
+        g_taskRingReuseCount.fetch_add(1u, std::memory_order_relaxed);
+        assert(false && "Task ring slot was re-captured while a Future still held it "
+                        "-- see g_taskRingReuseCount in util_threadpool.h");
+      }
+    }
     mutable Task* task = nullptr;
+    uint32_t seq = 0;
   };
 
   /**
@@ -559,4 +643,5 @@ namespace dxvk {
     std::vector<QueuePtr> m_workerTasks;
     std::atomic_uint32_t m_numTasks;
   };
-} //dxvk
+
+}

@@ -37,8 +37,12 @@
 // NV-DXVK [ResidentScene]: forward-declares RtInstance only, so this include
 // cannot cycle back on us even though ResidentScene's .cpp includes this file.
 #include "rtx_resident_scene.h"
+// NV-DXVK [RenderObject] slice 1. Same property as the include above: it
+// forward-declares RtInstance and pulls in nothing from this tree except
+// rtx_constants.h, so it cannot cycle.
+#include "rtx_render_object.h"
 
-namespace dxvk 
+namespace dxvk
 {
 class DxvkContext;
 class DxvkDevice;
@@ -1015,8 +1019,22 @@ public:
   // rtx_resident_scene.h for why that decomposition removes the need for a lock.
   ResidentScene& getResidentScene() { return m_residentScene; }
   const ResidentScene& getResidentScene() const { return m_residentScene; }
+
+  // NV-DXVK [RenderObject] slice 1: the object database, sited beside the
+  // resident scene for the same reason the resident scene is sited here.
+  //
+  // MIRROR ONLY. Nothing reads an id yet. It runs off the same resolution point
+  // as ResidentScene::build and exists to prove one property -- that the same
+  // draw resolves to the same RenderObjectId across frames and camera motion --
+  // before anything downstream is allowed to depend on it. See
+  // rtx_render_object.h, and ARCHITECTURE_OVERHAUL.md slice 1 for why an object
+  // identity that does not move when the object does is the one abstraction
+  // this pipeline is missing.
+  RenderObjectDB& getRenderObjectDB() { return m_renderObjectDB; }
+  const RenderObjectDB& getRenderObjectDB() const { return m_renderObjectDB; }
 private:
   ResidentScene m_residentScene;
+  RenderObjectDB m_renderObjectDB;
   // [Perf.PushInst] tallies, dxvk-cs only.
   uint32_t m_piBatches = 0, m_piHit = 0, m_piMissKey = 0, m_piMissInput = 0;
   uint32_t m_piMissInvalid = 0, m_piServedInst = 0, m_piFail = 0;
