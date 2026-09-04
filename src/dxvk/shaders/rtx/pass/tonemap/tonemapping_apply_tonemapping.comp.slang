@@ -22,6 +22,7 @@
 #include "rtx/pass/tonemap/tonemapping.slangh"
 #include "rtx/pass/tonemap/tonemapping_noise.slangh"
 #include "rtx/pass/tonemap/tonemap_operators.slangh"
+#include "rtx/pass/psdt/psdt_transform.slangh"
 #include "rtx/utility/math.slangh"
 #include "rtx/utility/color.slangh"
 
@@ -39,6 +40,19 @@ RWTexture1D<float> InExposure;
 
 [[vk::binding(TONEMAPPING_APPLY_TONEMAPPING_COLOR_OUTPUT)]]
 RWTexture2D<float4> OutColorBuffer;
+
+// NV-DXVK [PSDT]: adaptation field (mipped, the multi-scale adaptation pyramid
+// and the glare kernel), its chroma companion (spatial white point and glare
+// tint), and the frame's AdaptationState. Always bound; only read when the
+// PerceptualTF2 operator is selected.
+[[vk::binding(TONEMAPPING_APPLY_PSDT_FIELD_INPUT)]]
+Sampler2D PsdtField;
+
+[[vk::binding(TONEMAPPING_APPLY_PSDT_CHROMA_INPUT)]]
+Sampler2D PsdtChroma;
+
+[[vk::binding(TONEMAPPING_APPLY_PSDT_STATE_INPUT)]]
+RWTexture1D<float> PsdtState;
 
 layout(push_constant)
 ConstantBuffer<ToneMappingApplyToneMappingArgs> cb;
@@ -127,7 +141,18 @@ float3 applyToneMapping(float3 color, uint2 pixelPosition)
 
   if (cb.toneMappingEnabled != 0)
   {
-    if (cb.tonemapOperator != tonemapOperatorNone)
+    if (cb.tonemapOperator == tonemapOperatorPerceptualTF2)
+    {
+      // NV-DXVK [PSDT]: the Perceptual Scene Display Transform. Handled here
+      // rather than in applyForkTonemap because it is not a pure function of
+      // one pixel - it reads the frame's adaptation state and a multi-scale
+      // adaptation field, which is the entire point of it. Colour grading,
+      // sRGB and dither below still run; ACES finalize and the tuning-mode
+      // split are bypassed exactly as for the other operators.
+      const float2 uv = (float2(pixelPosition) + 0.5f) / float2(imageSize(InColorBuffer));
+      color = psdtApply(color, uv, PsdtField, PsdtChroma, PsdtState);
+    }
+    else if (cb.tonemapOperator != tonemapOperatorNone)
     {
       // NV-DXVK [tonemap operators]: a selected fork operator (Psycho17 / GT7 /
       // Hable) replaces Remix's native dynamic tone curve. The operator consumes

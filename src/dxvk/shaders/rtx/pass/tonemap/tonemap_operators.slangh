@@ -82,6 +82,12 @@ float3 applyForkTonemap(uint op, float3 color)
       /*D=*/ 0.20f, /*E=*/ 0.02f, /*F=*/ 0.30f,
       /*W=*/ 4.00f);
   }
+  // tonemapOperatorPerceptualTF2 is deliberately absent. PSDT is not a pure
+  // function of one pixel - it needs the frame's adaptation state and the
+  // multi-scale adaptation field - so it cannot satisfy this dispatcher's
+  // signature and is invoked from the apply shader directly. Reaching here
+  // with it selected would mean the apply shader's branch was removed; the
+  // saturate fallback keeps that a visibly flat image rather than a crash.
   return saturate(color);
 }
 

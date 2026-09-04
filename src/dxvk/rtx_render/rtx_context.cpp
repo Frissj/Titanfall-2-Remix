@@ -8280,7 +8280,7 @@ namespace dxvk {
     // but the reset of denoised buffers causes wide tone curve differences
     // until it converges and thus making comparison of raytracing mode outputs more difficult
     setFramePassStage(RtxFramePassStage::ToneMapping);
-    // NV-DXVK [tonemap operators]: the fork operators (Psycho17/GT7/Hable) live in
+    // NV-DXVK [tonemap operators]: the fork operators (Psycho17/GT7/Hable/PSDT) live in
     // the GLOBAL tonemapper's apply shader. The default tonemappingMode is Local,
     // which bypasses the global path entirely — so when an operator is selected,
     // force the global tonemapper to run and skip the local one. Otherwise the
@@ -8297,7 +8297,7 @@ namespace dxvk {
     if (RtxOptions::tonemappingMode() == TonemappingMode::Global || operatorSelected || plusForcesGlobal) {
       DxvkToneMapping& toneMapper = m_common->metaToneMapping();
       // NV-DXVK [auto exposure plus]: carry the local tonemapper's S-curve across the override.
-      // Only the native curve needs it - the fork operators (Hable/Psycho17/GT7) bring their own
+      // Only the native curve needs it - the fork operators (Hable/Psycho17/GT7/PSDT) bring their own
       // toe and shoulder and bypass finalizeWithACES entirely, so forcing it there would be a
       // no-op at best and misleading in the log at worst.
       const bool forceACES = plusForcesGlobal && !operatorSelected;

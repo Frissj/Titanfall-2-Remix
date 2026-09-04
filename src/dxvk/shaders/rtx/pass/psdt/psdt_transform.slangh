@@ -1,0 +1,550 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+
+// ===========================================================================
+// PSDT - the per-pixel display transform
+// ===========================================================================
+//
+//                        exposed HDR radiance
+//                                |
+//              +-----------------+------------------+
+//              |                                    |
+//              v                                    v
+//     multi-scale adaptation field           AdaptationState
+//     (A_small / A_medium / A_large)         (anchor, white, intent)
+//              |                                    |
+//              +-----------------+------------------+
+//                                v
+//                      pooled local adaptation
+//                                |
+//                       contrast budget clamp        <- stops it flattening
+//                                v
+//                        adapted curve T(x; E)
+//                                |
+//                    base / detail decomposition     <- stops it going flat
+//                                v
+//                        display luminance
+//                                |
+//              +-----------------+------------------+
+//              |                                    |
+//              v                                    v
+//     colour-volume pressure                  highlight / glare
+//     (luma x chroma x gamut)                  (from the same pyramid)
+//              |                                    |
+//     chroma compression                            |
+//     hue trajectory                                |
+//     spatial white point                           |
+//              |                                    |
+//              +-----------------+------------------+
+//                                v
+//                        display gamut fit
+//                                v
+//                          display RGB
+//
+// Each box has one job, and every box can be turned off independently. That
+// is the entire argument for the design: the reason a physically correct
+// render looks flat is almost never that one stage is wrong, it is that four
+// stages are each independently compressing the same signal.
+// ===========================================================================
+
+#ifndef RTX_PASS_PSDT_TRANSFORM_SLANGH
+#define RTX_PASS_PSDT_TRANSFORM_SLANGH
+
+#include "rtx/pass/psdt/psdt.h"
+#include "rtx/pass/psdt/psdt_perceptual_space.slangh"
+#include "rtx/pass/psdt/psdt_curve.slangh"
+
+// Ceiling on local contrast restoration, as a multiplier on the scene detail
+// before the curve sees it. 1.0 means a neighbourhood may at most double the
+// contrast of the texture inside it. Deep in the toe or the shoulder the curve's
+// slope approaches zero and the restoration that would fully undo it approaches
+// infinity, so this has to exist; at the default detail strength it only engages
+// beyond about five stops from the anchor.
+static const float kPsdtMaxDetailBoost = 1.0;
+
+// ---------------------------------------------------------------------------
+// Adaptation budget
+// ---------------------------------------------------------------------------
+// How far local adaptation is allowed to move away from the frame's global
+// anchor, in stops, as a function of how bright the *region* is relative to
+// that anchor.
+//
+// This is the single most important constraint in the system. A local
+// exposure field with no budget converges on "every region is middle grey",
+// which is precisely the flat look that makes a physically correct render
+// read as fake - the scene's brightness hierarchy carries as much information
+// as its geometry does, and equalising it destroys that information while
+// technically improving visibility.
+//
+// Indexed by the *region's* adaptation level, deliberately not by the pixel's
+// own luminance. Making the budget depend on the pixel would let two adjacent
+// pixels of different brightness sit under different adaptation, which is a
+// discontinuity in a signal that has to stay smooth or it rings. Per-pixel
+// highlight behaviour is the curve shoulder's job and the detail-protection
+// term's job, further down.
+float psdtAdaptationBudget(float regionRelativeStops, float shadowB, float midB,
+                           float highB, float emitB)
+{
+  // Breakpoints in stops relative to the anchor: deep shadow, anchor,
+  // highlight, emitter.
+  if (regionRelativeStops <= -4.0) { return shadowB; }
+  if (regionRelativeStops <   0.0) { return lerp(shadowB, midB, saturate((regionRelativeStops + 4.0) / 4.0)); }
+  if (regionRelativeStops <   3.0) { return lerp(midB, highB, saturate(regionRelativeStops / 3.0)); }
+  if (regionRelativeStops <   8.0) { return lerp(highB, emitB, saturate((regionRelativeStops - 3.0) / 5.0)); }
+  return emitB;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-scale adaptation
+// ---------------------------------------------------------------------------
+struct PsdtAdaptation
+{
+  float pooledLog;     // Pooled local adaptation, log2 exposed luminance.
+  float anchorLog;     // Frame anchor, log2.
+  float adaptedLog;    // Budget-clamped adaptation actually used by the curve.
+  float bodyWeight;    // How much ordinary surface the neighbourhood contains.
+  float2 localChroma;  // Low-frequency mean chroma - the spatial white point.
+};
+
+PsdtAdaptation psdtSampleAdaptation(
+  Sampler2D field,
+  Sampler2D chroma,
+  RWTexture1D<float> state,
+  float2 uv)
+{
+  const float levelS = state[PSDT_STATE_FIELD_LEVEL_S];
+  const float levelM = state[PSDT_STATE_FIELD_LEVEL_M];
+  const float levelL = state[PSDT_STATE_FIELD_LEVEL_L];
+
+  const float4 fS = field.SampleLevel(uv, levelS);
+  const float4 fM = field.SampleLevel(uv, levelM);
+  const float4 fL = field.SampleLevel(uv, levelL);
+
+  const float anchor = state[PSDT_STATE_ANCHOR_LOGY];
+
+  // A neighbourhood made entirely of light sources has no body weight and
+  // therefore no opinion about adaptation; fall back to the frame anchor
+  // rather than adapting to the lamp. This is what stops a muzzle flash from
+  // re-exposing the corridor around it.
+  const float wS = fS.y;
+  const float wM = fM.y;
+  const float wL = fL.y;
+
+  const float aS = lerp(anchor, fS.x, saturate(wS * 4.0));
+  const float aM = lerp(anchor, fM.x, saturate(wM * 4.0));
+  const float aL = lerp(anchor, fL.x, saturate(wL * 4.0));
+
+  // Spatial pooling weights. Resolved per frame in psdt_state so the balance
+  // between "a large bright room" and "a small bright lamp" can differ - a
+  // scene dominated by one large luminance region should be governed by the
+  // coarse scale, a cluttered high-contrast one by the finer scales.
+  float3 w = float3(state[PSDT_STATE_ADAPT_WEIGHT_L],
+                    state[PSDT_STATE_ADAPT_WEIGHT_M],
+                    state[PSDT_STATE_ADAPT_WEIGHT_S]);
+  w /= max(w.x + w.y + w.z, 1e-4);
+
+  PsdtAdaptation a;
+  a.pooledLog  = w.x * aL + w.y * aM + w.z * aS;
+  a.anchorLog  = anchor;
+  a.bodyWeight = max(max(wS, wM), wL);
+
+  const float strength = state[PSDT_STATE_ADAPT_STRENGTH];
+  const float raw = lerp(anchor, a.pooledLog, strength);
+
+  const float budget = psdtAdaptationBudget(
+    a.pooledLog - anchor,
+    state[PSDT_STATE_BUDGET_SHADOW],
+    state[PSDT_STATE_BUDGET_MID],
+    state[PSDT_STATE_BUDGET_HIGHLIGHT],
+    state[PSDT_STATE_BUDGET_EMITTER]);
+
+  a.adaptedLog = anchor + clamp(raw - anchor, -budget, budget);
+
+  a.localChroma = chroma.SampleLevel(uv, levelL).xy;
+  return a;
+}
+
+// ---------------------------------------------------------------------------
+// Glare
+// ---------------------------------------------------------------------------
+// Not bloom. Bloom is a lens artifact applied to the image; glare is how an
+// intensity that cannot be shown as a value gets shown as an area instead.
+//
+// The kernel is the adaptation pyramid, reused. Level k of the field holds
+// the mean source energy over 16 * 2^k pixels, so a weighted sum down the
+// levels is a sum of progressively wider box responses - a decent
+// approximation of the eye's glare point-spread function, at the cost of a
+// handful of texture fetches and no extra passes at all.
+//
+// The radius is not a parameter. A dim source contributes energy only at the
+// finest levels, because its mean falls as 1/4^k the moment the level is
+// wider than the source. A very bright source stays above the visibility
+// threshold for several more levels, so its halo is physically wider. That
+// gives radius growing roughly with log luminance for free, and - crucially -
+// it is temporally stable, because the pyramid it is built from is.
+float3 psdtGlare(
+  Sampler2D field,
+  Sampler2D chroma,
+  RWTexture1D<float> state,
+  float2 uv,
+  uint space,
+  float refWhiteNits)
+{
+  const float strength = state[PSDT_STATE_GLARE_STRENGTH];
+  if (strength <= 0.0)
+  {
+    return float3(0.0);
+  }
+
+  const float falloff = state[PSDT_STATE_GLARE_FALLOFF];
+  const int levels = int(state[PSDT_STATE_GLARE_LEVELS]);
+
+  float energy = 0.0;
+  float norm = 0.0;
+  float weight = 1.0;
+
+  for (int k = 0; k < levels; ++k)
+  {
+    energy += weight * field.SampleLevel(uv, float(k)).z;
+    norm += weight;
+    weight *= falloff;
+  }
+
+  energy /= max(norm, 1e-4);
+
+  // Below the threshold there is no glare at all; a 10-nit lamp does not
+  // scatter visibly. The knee is soft so a source drifting across the
+  // threshold does not pop.
+  const float threshold = exp2(state[PSDT_STATE_GLARE_THRESHOLD]);
+  const float over = max(energy - threshold, 0.0);
+  const float visible = over / (over + threshold);
+
+  // Perceptual, not linear: the halo's brightness saturates while its extent
+  // keeps growing. A linear response makes an explosion wash the frame out.
+  const float amount = strength * visible * log2(1.0 + energy) * 0.125;
+
+  // Tint from the luminance-weighted local chroma, so a red flare glares red
+  // and a sodium lamp glares orange. Half strength - real ocular scatter is
+  // substantially broader-band than its source.
+  const float2 c = chroma.SampleLevel(uv, 1.0).xy * 0.5;
+  const float3 tinted = psdtFromPerceptual(
+    psdtFromPolar(psdtToPerceptual(float3(1.0, 1.0, 1.0), space, refWhiteNits).x,
+                  length(c), atan2(c.y, c.x)),
+    space, refWhiteNits);
+
+  return max(tinted, 0.0) * amount;
+}
+
+// ---------------------------------------------------------------------------
+// Colour-volume compression
+// ---------------------------------------------------------------------------
+// The question is "how much of this colour can the display reproduce at this
+// luminance, and what is the least perceptually damaging way to get there" -
+// not "is this pixel bright".
+//
+// A note on the combinator, because it is the one place this departs from the
+// obvious formulation. Writing the pressure as
+//
+//     P = 1 - (1 - Py)(1 - Pc)(1 - Pg)
+//
+// reads well and is wrong: it is an OR, so any single high term takes the
+// result to 1. Pc is high for *every* saturated colour, in gamut or not, so
+// that form desaturates a mid-luminance red that the display can show
+// perfectly well - measured at 0.26 of its chroma retained, which is exactly
+// the "everything goes grey" failure this whole stage exists to prevent. What
+// is actually wanted is the AND: compression proportional to luminance AND
+// chroma AND gamut distance. A bright white wall has no chroma and needs
+// nothing; a neon red at the same luminance is the thing that has to give.
+//
+// So the geometry leads and the perception modifies it. `demand` is the honest
+// measurement - what fraction of the display's remaining colour volume this
+// pixel is asking for - and the perceptual term only decides how early the
+// easing starts, never whether it happens.
+
+// Where compression begins, as a fraction of the boundary. Derived from
+// chromaPreservation so that the knob means what it says: more preservation
+// puts the knee closer to the boundary, and colour is untouched for longer.
+float psdtCompressionKnee(float chromaPreservation, float perceptualUrgency, float earlyOnset)
+{
+  const float base = 1.0 - 1.0 / (1.0 + max(chromaPreservation, 0.05));
+  return saturate(base * (1.0 - saturate(earlyOnset) * saturate(perceptualUrgency)));
+}
+
+// Soft-knee compression of the demand onto the boundary.
+//
+// Below the knee the colour is returned untouched. Above it the excess is
+// compressed exponentially and asymptotes to exactly 1.0 - the boundary - so a
+// colour converges on the most colourful thing the display can show at its
+// luminance rather than on white. That distinction is the difference between a
+// neon sign that stays a neon sign and one that becomes a white blob.
+//
+// C1 at the knee by construction, and monotonic in demand, so the chroma
+// trajectory has no corner in it.
+float psdtCompressToBoundary(float demand, float knee)
+{
+  if (demand <= knee)
+  {
+    return 1.0;
+  }
+
+  const float headroom = max(1.0 - knee, 1e-3);
+  const float compressed = knee + headroom * (1.0 - exp(-(demand - knee) / headroom));
+  return compressed / max(demand, 1e-4);
+}
+
+// ---------------------------------------------------------------------------
+// The transform
+// ---------------------------------------------------------------------------
+float3 psdtApply(
+  float3 colorIn,             // Exposed linear Rec.709 HDR.
+  float2 uv,                  // Normalised screen position.
+  Sampler2D field,
+  Sampler2D chroma,
+  RWTexture1D<float> state)
+{
+  const uint  space    = uint(state[PSDT_STATE_PERCEPTUAL_SPACE]);
+  const uint  gamut    = uint(state[PSDT_STATE_DISPLAY_GAMUT]);
+  const float refWhite = max(state[PSDT_STATE_DISPLAY_REF_WHITE], 1.0);
+  const float peakLog  = state[PSDT_STATE_DISPLAY_HEADROOM];
+  const float peak     = exp2(peakLog);
+
+  const float3 rgb = max(colorIn, 0.0);
+  const float sceneY = max(psdtLuminance(rgb), 1e-8);
+  const float sceneLog = log2(sceneY);
+
+  // --- adaptation -------------------------------------------------------
+  const PsdtAdaptation adapt = psdtSampleAdaptation(field, chroma, state, uv);
+
+  PsdtCurve curve = psdtLoadCurve(state);
+  // Local adaptation enters the transform here and nowhere else: it moves
+  // where the curve thinks middle grey is for this neighbourhood. That is a
+  // different thing from a local exposure multiply - the curve's toe and
+  // shoulder move with the anchor, so a dark region gains shadow separation
+  // rather than merely gain, and a bright region keeps its shoulder.
+  curve.midIn = adapt.adaptedLog;
+
+  // --- luminance compression with local contrast preservation -----------
+  // The pooled adaptation is already a low-pass of log luminance, so it is
+  // exactly the base layer a base/detail decomposition needs and it costs
+  // nothing extra - the pyramid that produced it had to exist anyway. Which
+  // half of the signal the curve is allowed to compress, and by how much, is
+  // what separates "compressed dynamic range" from "flat".
+  const float baseLog = adapt.pooledLog;
+  const float detailIn = sceneLog - baseLog;
+
+  // Local contrast restoration, applied *before* the curve rather than after.
+  //
+  // The obvious formulation - map the base, then add the detail back at some
+  // blend of the scene's contrast and the curve's - has two faults. It is not
+  // monotonic: the blend weight varies with the pixel, and near the top of the
+  // shoulder its derivative outruns the curve's own slope, which inverts the
+  // transfer function. The inversion is small (measured at 8e-5 in linear, well
+  // under a code value) but it breaks the most basic invariant there is, and a
+  // transform that can invert brightness ordering anywhere is one that has to
+  // be checked everywhere. It also needs an explicit taper bolted on to stop it
+  // re-expanding highlight contrast that the shoulder has already spent.
+  //
+  // Expanding the detail in the scene domain and letting the curve map the
+  // result fixes both at once, and removes two terms while doing it:
+  //
+  //   * the boost is a property of the neighbourhood, not of the pixel, so at a
+  //     fixed base the output is a monotone function of a monotone function and
+  //     cannot invert, anywhere, by construction rather than by measurement;
+  //   * a pixel far above its base is pushed *further* into the shoulder, where
+  //     the curve compresses it hardest. So a lamp core is never sharpened - not
+  //     because something prevents it, but because the mechanism that would do
+  //     the sharpening is the same one that compresses it.
+  const float baseSlope = psdtCurveSlopeLog(curve, baseLog);
+
+  // Restoration only means anything where the curve compresses. In the linear
+  // segment the slope is already above 1 and there is nothing to restore, which
+  // this expresses by producing a negative boost that the clamp discards.
+  const float baseProgress = psdtCurveHighlightProgress(curve, baseLog);
+  const float protect = state[PSDT_STATE_DETAIL_PROTECT];
+  const float restore = saturate(state[PSDT_STATE_DETAIL_STRENGTH])
+                      * (1.0 - saturate(baseProgress * protect));
+  const float targetSlope = lerp(baseSlope, 1.0, restore);
+  const float boost = clamp(targetSlope / max(baseSlope, 1e-3) - 1.0, 0.0, kPsdtMaxDetailBoost);
+
+  const float outLog = psdtCurveLog(curve, baseLog + detailIn * (1.0 + boost));
+
+  // Highlight position of the pixel itself, for the colour-volume stage. The
+  // luminance stage above deliberately uses the *base's* position instead; the
+  // two are different questions and conflating them is what made the previous
+  // formulation non-monotonic.
+  const float highlightProgress = psdtCurveHighlightProgress(curve, sceneLog);
+
+  float displayY = exp2(outLog);
+  displayY = clamp(displayY, exp2(curve.blackLog), peak);
+
+  // --- the two colour paths ---------------------------------------------
+  // Path B is the per-channel curve. Every channel goes through the same
+  // monotonic curve, so the result is inside the display volume by
+  // construction, and the dominant channel saturates first - which is what
+  // bends a red towards orange and then towards white and makes this the
+  // source of the hue trajectory.
+  //
+  // Deliberately not renormalised to the tone stage's luminance. For a
+  // saturated colour it lands *below* that target, and that is the whole point:
+  // a saturated red cannot be as bright as a white, so something has to give,
+  // and there are only two candidates. Bleach it to keep the brightness, or let
+  // it be darker to keep the colour. Film lets it be darker, and so does this.
+  const float3 pathFilm = float3(
+    psdtCurveLinear(curve, rgb.r),
+    psdtCurveLinear(curve, rgb.g),
+    psdtCurveLinear(curve, rgb.b));
+  const float filmY = max(psdtLuminance(pathFilm), 1e-8);
+
+  // How much trouble the tone stage's target is actually in: 0 while the colour
+  // still fits at that luminance, approaching 1 the further outside it lands.
+  const float3 strictRgb = rgb * (displayY / sceneY);
+  const float demandStrict = psdtGamutDemand(psdtToDisplayGamut(strictRgb, gamut), peak);
+  const float trouble = saturate(1.0 - 1.0 / max(demandStrict, 1e-4));
+
+  // Concede luminance towards what this hue can actually support, in proportion
+  // to that trouble. A neutral concedes nothing, because its demand is zero -
+  // this is the mechanism that lets a saturated highlight stay coloured without
+  // touching the brightness of everything else in the frame. min() so the
+  // concession can only ever darken; the tone stage owns the upper bound.
+  const float concession = saturate(state[PSDT_STATE_LUMA_CONCESSION]);
+  const float targetY = lerp(displayY, min(filmY, displayY), concession * trouble);
+
+  // Path A preserves chromaticity exactly by scaling RGB to the conceded
+  // target. Colour identity intact; what is left of the excess is the colour
+  // stage's problem.
+  const float3 pathPreserve = rgb * (targetY / sceneY);
+
+  // --- colour volume ----------------------------------------------------
+  const float3 iabPreserve = psdtToPerceptual(pathPreserve, space, refWhite);
+  const float3 iabFilm = psdtToPerceptual(pathFilm, space, refWhite);
+
+  const float chromaIn = psdtChroma(iabPreserve);
+  const float hueIn = psdtHue(iabPreserve);
+  const float hueFilm = psdtHue(iabFilm);
+
+  // Chroma normalised against the most chroma this display can produce at all.
+  // The perceptual "how saturated is this" term; the geometric "does it fit"
+  // term is the demand below, and the two are deliberately separate.
+  const float chromaNorm = saturate(chromaIn / max(state[PSDT_STATE_PRESSURE_CHROMA], 1e-3));
+
+  // Hue trajectory: a controlled rotation towards the film path's hue, driven
+  // by how far outside the volume the strict target landed.
+  //
+  // Driven by `trouble` rather than by the compression amount on purpose. The
+  // rotation changes the hue, a different amount of chroma fits at a different
+  // hue, and how much fits is exactly what we would otherwise want to drive the
+  // rotation with - a circular dependency. `trouble` is measured before any of
+  // it and answers the same question.
+  //
+  // Taking the shortest arc is what keeps the path smooth across the red /
+  // magenta wrap instead of producing a jump there.
+  const float convergence = pow(trouble, max(state[PSDT_STATE_WHITE_CONVERGE], 1e-3));
+  float dHue = hueFilm - hueIn;
+  dHue -= 6.283185307 * floor(dHue / 6.283185307 + 0.5);
+  const float hueOut = hueIn + dHue * state[PSDT_STATE_HUE_TRAJECTORY] * convergence;
+
+  // The rotated colour, before compression. Measuring the demand here rather
+  // than before the rotation matters: the rotation moves the colour to a hue
+  // where a different amount of chroma fits, so a factor computed beforehand
+  // leaves the result overshooting the boundary and the gamut fit at the end
+  // takes the difference out as a hard clip. Measured cost of getting the order
+  // wrong: about 9% of the available chroma at full hue trajectory.
+  float3 rotated = max(psdtFromPerceptual(
+    psdtFromPolar(iabPreserve.x, chromaIn, hueOut), space, refWhite), 0.0);
+  rotated *= targetY / max(psdtLuminance(rotated), 1e-8);
+
+  const float demand = psdtGamutDemand(psdtToDisplayGamut(rotated, gamut), peak);
+
+  // Bright AND saturated is what earns an early, gentle approach to the
+  // boundary. Bright alone does not, and saturated alone does not.
+  const float urgency = highlightProgress * chromaNorm;
+  const float knee = psdtCompressionKnee(state[PSDT_STATE_CHROMA_PRESERVE],
+                                         urgency, state[PSDT_STATE_PRESSURE_LUMA]);
+
+  const float compress = psdtCompressToBoundary(demand, knee);
+
+  // Colour-volume pressure, defined as how much chroma actually had to be given
+  // up. Deriving it from the compression rather than predicting it separately
+  // keeps the spatial white in step with what the chroma stage really did.
+  const float pressure = saturate(1.0 - compress);
+
+  // Spatial white point. The neutral that chroma compresses towards is the
+  // low-frequency local mean rather than D65, so an interior lit by tungsten
+  // stays warm as it desaturates instead of turning towards daylight white -
+  // which is what makes an indoor-to-outdoor transition read correctly.
+  const float2 spatialWhite = adapt.localChroma * state[PSDT_STATE_SPATIAL_WHITE];
+
+  // Colourfulness follows local adaptation: a region the viewer is
+  // dark-adapted to is shown at less absolute display luminance than the
+  // scene had, and needs proportionally more chroma to look equally
+  // colourful. This is the coupling between the tone stage and the colour
+  // stage that treating them as independent throws away.
+  const float adaptOffset = adapt.anchorLog - adapt.adaptedLog;
+  const float colourfulness = 1.0 + clamp(adaptOffset * state[PSDT_STATE_COLOURFULNESS] * 0.1, -0.35, 0.35);
+
+  const float2 relChroma = float2(chromaIn * cos(hueOut), chromaIn * sin(hueOut)) - spatialWhite;
+  const float2 compressed = relChroma * compress * colourfulness + spatialWhite * (1.0 - 0.5 * pressure);
+
+  float3 outRgb = psdtFromPerceptual(
+    float3(iabPreserve.x, compressed.x, compressed.y), space, refWhite);
+
+  // The perceptual round trip is not luminance-exact once chroma has moved,
+  // so restore the luminance the tone stage decided on. Chroma is what the
+  // colour stage is allowed to change; brightness is not.
+  outRgb = max(outRgb, 0.0);
+  outRgb *= targetY / max(psdtLuminance(outRgb), 1e-8);
+
+  // --- display gamut ----------------------------------------------------
+  // Everything above works in the perceptual domain and can still land
+  // outside the display's volume. This is the only hard clip in the
+  // transform, and by this point it has very little left to do: a
+  // luminance-preserving scale towards the achromatic axis rather than a
+  // per-channel clamp, so a colour that is still out of gamut loses chroma
+  // and keeps its hue and brightness instead of shifting hue on clip.
+  float3 displayRgb = psdtToDisplayGamut(outRgb, gamut);
+  const float fit = psdtGamutScale(displayRgb, peak);
+  const float grey = clamp(psdtLuminance(displayRgb), 0.0, peak);
+  displayRgb = grey + (displayRgb - grey) * fit;
+  outRgb = psdtFromDisplayGamut(displayRgb, gamut);
+
+  // --- glare ------------------------------------------------------------
+  // Added after the colour volume rather than before it, because glare is
+  // light arriving at the eye alongside the image, not part of the image the
+  // display transform is compressing. It is allowed to clip; that is what a
+  // very bright source looks like.
+  outRgb += psdtGlare(field, chroma, state, uv, space, refWhite);
+
+  // --- display encode ---------------------------------------------------
+  // The operator contract with the apply shader is linear [0,1]. On the SDR
+  // path peak == 1 and this clamp is the only thing it does. With headroom
+  // configured the signal is normalised into [0,1] so an SDR output chain
+  // shows an SDR-normalised preview of the HDR grade rather than clipping it.
+  outRgb = max(outRgb, 0.0);
+  if (peakLog > 0.0)
+  {
+    outRgb /= peak;
+  }
+
+  return min(outRgb, 1.0);
+}
+
+#endif  // RTX_PASS_PSDT_TRANSFORM_SLANGH

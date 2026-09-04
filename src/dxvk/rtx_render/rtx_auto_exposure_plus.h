@@ -44,7 +44,7 @@ namespace dxvk {
   //
   // This is an exposure pass only. Linear HDR radiance in, linear HDR radiance out, multiplied
   // by a spatially varying gain. It performs no display transform of its own, so the tonemapper
-  // downstream - Remix's native curve, Hable, Psycho17 or GT7 - runs unchanged and simply
+  // downstream - Remix's native curve, Hable, Psycho17, GT7 or PSDT - runs unchanged and simply
   // receives a better exposed image. The one exception is the *local* tonemapper, which this
   // pass overrides rather than stacks with; see forcesGlobalTonemapper() below for why.
   //
@@ -190,7 +190,7 @@ namespace dxvk {
     RTX_OPTION("rtx.autoExposurePlus", bool, forceGlobalTonemapper, true,
                "Routes the display transform through the global tonemapper while this pass is active, overriding rtx.tonemappingMode without modifying it.\n"
                "The local tonemapper is itself a local dynamic range compressor, so running it after this pass compresses the image twice and washes it out. Disable only to deliberately stack the two.\n"
-               "While this is active the global tonemapper's native curve also gets an ACES finalize it would not otherwise have, so that the S-curve the local tonemapper applies by default is not lost in the swap. Selected operators (Hable, Psycho17, GT7) supply their own and are left alone.");
+               "While this is active the global tonemapper's native curve also gets an ACES finalize it would not otherwise have, so that the S-curve the local tonemapper applies by default is not lost in the swap. Selected operators (Hable, Psycho17, GT7, PerceptualTF2) supply their own and are left alone.");
 
     // Temporal accumulation
     RTX_OPTION("rtx.autoExposurePlus", bool, temporalAccumulation, true,

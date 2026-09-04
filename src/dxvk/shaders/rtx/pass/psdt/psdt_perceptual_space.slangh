@@ -1,0 +1,372 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+
+// ===========================================================================
+// PSDT perceptual colour space abstraction and display colour volume
+// ===========================================================================
+//
+// The colour-space contract, stated once
+// --------------------------------------
+// This renderer's working space is linear **Rec.709 / sRGB primaries**, D65.
+// That is not an assumption, it is observable: the histogram, the auto
+// exposure and the colour grading all weight luminance with
+// calcBt709Luminance, and the apply shader finishes with the sRGB OETF and no
+// primary conversion. Anything that treats the framebuffer as Rec.2020 is
+// reading the wrong primaries - which desaturates, because Rec.709 values
+// interpreted as Rec.2020 describe a smaller volume than they actually
+// occupy. gt7.slangh and psycho17.slangh both do this. PSDT does not; it
+// converts explicitly, and both of those are left alone so they stay usable
+// as controls.
+//
+// Two perceptual spaces are provided behind one interface, because the choice
+// is an experiment rather than a conclusion:
+//
+//   ICtCp   ITU-R BT.2100. Cheap, well specified for HDR, excellent
+//           intensity/chroma separation. Hue linearity is good but not
+//           perfect at extreme chroma.
+//   Jzazbz  Safdar et al. 2017. Better hue linearity and a lightness scale
+//           that behaves over a much larger luminance range, at the cost of
+//           two more matrix multiplies.
+//
+// Both are absolute - they need to know what physical luminance a framebuffer
+// value of 1.0 represents. That is the display's reference (diffuse) white,
+// which PSDT carries in the state texture rather than hardcoding, so the same
+// transform can target a 100-nit sRGB panel and a 1000-nit HDR one.
+// ===========================================================================
+
+#ifndef RTX_PASS_PSDT_PERCEPTUAL_SPACE_SLANGH
+#define RTX_PASS_PSDT_PERCEPTUAL_SPACE_SLANGH
+
+#include "rtx/pass/psdt/psdt.h"
+#include "rtx/utility/pq.slangh"
+
+// ---------------------------------------------------------------------------
+// Primaries
+// ---------------------------------------------------------------------------
+
+// Rec.709 (D65) luminance weights. Matches calcBt709Luminance in color.slangh;
+// duplicated here so this header stands alone in the CPU reference harness.
+static const float3 kPsdtLumaRec709 = float3(0.2126, 0.7152, 0.0722);
+
+// Linear Rec.709 -> CIE XYZ (D65).
+static const float3x3 kPsdtRec709ToXYZ = float3x3(
+  0.4123907993, 0.3575843394, 0.1804807884,
+  0.2126390059, 0.7151686788, 0.0721923154,
+  0.0193308187, 0.1191947798, 0.9505321522);
+
+static const float3x3 kPsdtXYZToRec709 = float3x3(
+   3.2409699419, -1.5373831776, -0.4986107603,
+  -0.9692436363,  1.8759675015,  0.0415550574,
+   0.0556300797, -0.2039769589,  1.0569715142);
+
+// Linear Rec.709 -> linear Rec.2020, and back. Both D65, so this is a pure
+// primary change with no chromatic adaptation.
+static const float3x3 kPsdtRec709ToRec2020 = float3x3(
+  0.6274039, 0.3292830, 0.0433131,
+  0.0690973, 0.9195404, 0.0113623,
+  0.0163914, 0.0880132, 0.8955953);
+
+static const float3x3 kPsdtRec2020ToRec709 = float3x3(
+   1.6604910, -0.5876411, -0.0728499,
+  -0.1245505,  1.1328999, -0.0083494,
+  -0.0181508, -0.1005789,  1.1187297);
+
+// Linear Rec.709 -> linear DCI-P3 (D65), and back.
+static const float3x3 kPsdtRec709ToP3 = float3x3(
+  0.8224621, 0.1775380, 0.0000000,
+  0.0331941, 0.9668058, 0.0000000,
+  0.0170827, 0.0723974, 0.9105199);
+
+static const float3x3 kPsdtP3ToRec709 = float3x3(
+   1.2249401, -0.2249404,  0.0000000,
+  -0.0420569,  1.0420571,  0.0000000,
+  -0.0196376, -0.0786361,  1.0982735);
+
+// The largest chroma a Rec.709 display can actually produce, measured over the
+// whole displayable cube at a 100-nit reference. It is the denominator that
+// turns an absolute chroma into "how much of this display's colour capacity is
+// this pixel using", which is the only form in which chroma is comparable to a
+// luminance or a gamut distance.
+//
+// Measured rather than guessed - tools/psdt/psdt_suite.py recomputes both from
+// these same matrices, and reports them. They are not interchangeable: the two
+// spaces put the maximum in the same place (pure blue) but at very different
+// magnitudes, so using one number for both would silently halve or double the
+// chroma term of the colour-volume pressure the moment the space is switched.
+static const float kPsdtChromaReferenceICtCp  = 0.2933;
+static const float kPsdtChromaReferenceJzazbz = 0.1594;
+
+float psdtChromaReference(uint space)
+{
+  return (space == psdtSpaceJzazbz) ? kPsdtChromaReferenceJzazbz : kPsdtChromaReferenceICtCp;
+}
+
+float psdtLuminance(float3 rec709Linear)
+{
+  return dot(rec709Linear, kPsdtLumaRec709);
+}
+
+// Working space -> the gamut PSDT is fitting colours into. Selecting anything
+// wider than Rec.709 only makes sense if the output chain is actually wide;
+// on the default sRGB path the two are the same matrix and this is free.
+float3 psdtToDisplayGamut(float3 rec709Linear, uint gamut)
+{
+  if (gamut == psdtGamutP3)     { return mul(kPsdtRec709ToP3, rec709Linear); }
+  if (gamut == psdtGamutRec2020) { return mul(kPsdtRec709ToRec2020, rec709Linear); }
+  return rec709Linear;
+}
+
+float3 psdtFromDisplayGamut(float3 displayLinear, uint gamut)
+{
+  if (gamut == psdtGamutP3)     { return mul(kPsdtP3ToRec709, displayLinear); }
+  if (gamut == psdtGamutRec2020) { return mul(kPsdtRec2020ToRec709, displayLinear); }
+  return displayLinear;
+}
+
+// ---------------------------------------------------------------------------
+// PQ, parameterised on reference white
+// ---------------------------------------------------------------------------
+// pq.slangh hardcodes 100 cd/m^2 for GT7 parity. PSDT needs the reference to
+// be a property of the target display, so it carries its own copy. `v` is a
+// framebuffer value where 1.0 == refWhiteNits.
+
+float psdtPqEncode(float v, float refWhiteNits, float exponentScale)
+{
+  const float m2 = pq_m2 * exponentScale;
+  const float y = max(v, 0.0) * refWhiteNits / pq_maxLuminanceCdM2;
+  const float ym = pow(y, pq_m1);
+  return pow((pq_c1 + pq_c2 * ym) / (1.0 + pq_c3 * ym), m2);
+}
+
+float psdtPqDecode(float n, float refWhiteNits, float exponentScale)
+{
+  const float m2 = pq_m2 * exponentScale;
+  const float np = pow(max(n, 0.0), 1.0 / m2);
+  float l = max(np - pq_c1, 0.0) / max(pq_c2 - pq_c3 * np, 1e-6);
+  l = pow(l, 1.0 / pq_m1);
+  return l * pq_maxLuminanceCdM2 / refWhiteNits;
+}
+
+float3 psdtPqEncode3(float3 v, float refWhiteNits, float exponentScale)
+{
+  return float3(psdtPqEncode(v.x, refWhiteNits, exponentScale),
+                psdtPqEncode(v.y, refWhiteNits, exponentScale),
+                psdtPqEncode(v.z, refWhiteNits, exponentScale));
+}
+
+float3 psdtPqDecode3(float3 n, float refWhiteNits, float exponentScale)
+{
+  return float3(psdtPqDecode(n.x, refWhiteNits, exponentScale),
+                psdtPqDecode(n.y, refWhiteNits, exponentScale),
+                psdtPqDecode(n.z, refWhiteNits, exponentScale));
+}
+
+// ---------------------------------------------------------------------------
+// ICtCp (BT.2100)
+// ---------------------------------------------------------------------------
+// Rec.2020 linear -> LMS, per ITU-T T.302 / BT.2100.
+
+static const float3x3 kPsdtRec2020ToLMS = float3x3(
+  1688.0 / 4096.0, 2146.0 / 4096.0,  262.0 / 4096.0,
+   683.0 / 4096.0, 2951.0 / 4096.0,  462.0 / 4096.0,
+    99.0 / 4096.0,  309.0 / 4096.0, 3688.0 / 4096.0);
+
+static const float3x3 kPsdtLMSToICtCp = float3x3(
+   2048.0 / 4096.0,   2048.0 / 4096.0,      0.0,
+   6610.0 / 4096.0, -13613.0 / 4096.0,  7003.0 / 4096.0,
+  17933.0 / 4096.0, -17390.0 / 4096.0,  -543.0 / 4096.0);
+
+// Exact inverse of kPsdtLMSToICtCp, recomputed at double precision. The
+// widely-copied 6-digit constants round-trip to ~3e-6, which is fine for a
+// display transform but shows up in the round-trip fidelity metrics in the
+// PSDT test suite, so the exact values are used here.
+static const float3x3 kPsdtICtCpToLMS = float3x3(
+  1.0,  0.0086090370,  0.1110296250,
+  1.0, -0.0086090370, -0.1110296250,
+  1.0,  0.5600313357, -0.3206271750);
+
+static const float3x3 kPsdtLMSToRec2020 = float3x3(
+   3.4366066943, -2.5064521187,  0.0698454243,
+  -0.7913295556,  1.9836004518, -0.1922708962,
+  -0.0259498997, -0.0989137147,  1.1248636144);
+
+float3 psdtRec709ToICtCp(float3 rgb, float refWhiteNits)
+{
+  const float3 lms = mul(kPsdtRec2020ToLMS, mul(kPsdtRec709ToRec2020, rgb));
+  return mul(kPsdtLMSToICtCp, psdtPqEncode3(lms, refWhiteNits, 1.0));
+}
+
+float3 psdtICtCpToRec709(float3 ictcp, float refWhiteNits)
+{
+  const float3 lms = psdtPqDecode3(mul(kPsdtICtCpToLMS, ictcp), refWhiteNits, 1.0);
+  return mul(kPsdtRec2020ToRec709, mul(kPsdtLMSToRec2020, lms));
+}
+
+// ---------------------------------------------------------------------------
+// Jzazbz (Safdar et al., Opt. Express 25(13), 2017)
+// ---------------------------------------------------------------------------
+
+static const float kPsdtJzB  = 1.15;
+static const float kPsdtJzG  = 0.66;
+static const float kPsdtJzD  = -0.56;
+static const float kPsdtJzD0 = 1.6295499532821566e-11;
+// Jzazbz raises the PQ m2 exponent by this factor.
+static const float kPsdtJzExponentScale = 1.7;
+
+static const float3x3 kPsdtXYZToJzLMS = float3x3(
+   0.41478972, 0.579999, 0.0146480,
+  -0.20151000, 1.120649, 0.0531008,
+  -0.01660080, 0.264800, 0.6684799);
+
+static const float3x3 kPsdtJzLMSToXYZ = float3x3(
+   1.9242264358, -1.0047923126,  0.0376514040,
+   0.3503167621,  0.7264811939, -0.0653844229,
+  -0.0909828110, -0.3127282905,  1.5227665613);
+
+static const float3x3 kPsdtJzLMSToIab = float3x3(
+  0.500000, 0.500000,  0.000000,
+  3.524000, -4.066708, 0.542708,
+  0.199076, 1.096799, -1.295875);
+
+static const float3x3 kPsdtJzIabToLMS = float3x3(
+  1.0,  0.1386050433,  0.0580473162,
+  1.0, -0.1386050433, -0.0580473162,
+  1.0, -0.0960192421, -0.8118918959);
+
+float3 psdtRec709ToJzazbz(float3 rgb, float refWhiteNits)
+{
+  float3 xyz = mul(kPsdtRec709ToXYZ, rgb);
+
+  // Pre-adaptation of X and Z.
+  const float3 xyzP = float3(
+    kPsdtJzB * xyz.x - (kPsdtJzB - 1.0) * xyz.z,
+    kPsdtJzG * xyz.y - (kPsdtJzG - 1.0) * xyz.x,
+    xyz.z);
+
+  const float3 lms = mul(kPsdtXYZToJzLMS, xyzP);
+  const float3 lmsP = psdtPqEncode3(lms, refWhiteNits, kPsdtJzExponentScale);
+  const float3 iab = mul(kPsdtJzLMSToIab, lmsP);
+
+  const float jz = ((1.0 + kPsdtJzD) * iab.x) / (1.0 + kPsdtJzD * iab.x) - kPsdtJzD0;
+  return float3(jz, iab.y, iab.z);
+}
+
+float3 psdtJzazbzToRec709(float3 jab, float refWhiteNits)
+{
+  const float jz = jab.x + kPsdtJzD0;
+  const float iz = jz / (1.0 + kPsdtJzD - kPsdtJzD * jz);
+
+  const float3 lmsP = mul(kPsdtJzIabToLMS, float3(iz, jab.y, jab.z));
+  const float3 lms = psdtPqDecode3(lmsP, refWhiteNits, kPsdtJzExponentScale);
+  const float3 xyzP = mul(kPsdtJzLMSToXYZ, lms);
+
+  // Undo the pre-adaptation. X must be recovered before Y because Y' used X.
+  const float x = (xyzP.x + (kPsdtJzB - 1.0) * xyzP.z) / kPsdtJzB;
+  const float y = (xyzP.y + (kPsdtJzG - 1.0) * x) / kPsdtJzG;
+
+  return mul(kPsdtXYZToRec709, float3(x, y, xyzP.z));
+}
+
+// ---------------------------------------------------------------------------
+// The abstraction
+// ---------------------------------------------------------------------------
+// Everything downstream works in (intensity, a, b) and never names a space.
+// Swapping ICtCp for Jzazbz - or adding CAM16-UCS later - is one branch here
+// and no change at all in psdt_transform.slangh.
+
+float3 psdtToPerceptual(float3 rec709Linear, uint space, float refWhiteNits)
+{
+  if (space == psdtSpaceJzazbz) { return psdtRec709ToJzazbz(rec709Linear, refWhiteNits); }
+  return psdtRec709ToICtCp(rec709Linear, refWhiteNits);
+}
+
+float3 psdtFromPerceptual(float3 iab, uint space, float refWhiteNits)
+{
+  if (space == psdtSpaceJzazbz) { return psdtJzazbzToRec709(iab, refWhiteNits); }
+  return psdtICtCpToRec709(iab, refWhiteNits);
+}
+
+// Chroma and hue in whichever space is active. Hue is only ever used as a
+// difference or a rotation, so the absolute zero does not matter.
+float psdtChroma(float3 iab)
+{
+  return length(iab.yz);
+}
+
+float psdtHue(float3 iab)
+{
+  return atan2(iab.z, iab.y);
+}
+
+float3 psdtFromPolar(float intensity, float chroma, float hue)
+{
+  return float3(intensity, chroma * cos(hue), chroma * sin(hue));
+}
+
+// ---------------------------------------------------------------------------
+// Display colour volume
+// ---------------------------------------------------------------------------
+
+// The scale that puts this colour exactly on the gamut boundary, along the line
+// from the achromatic axis through the colour itself. Uncapped, so it is also a
+// measure of how much room is left: greater than 1 means the colour is inside
+// the boundary and could be that many times more colourful before it left,
+// exactly 1 means it is on it, less than 1 means it does not fit and this is
+// the factor that would make it.
+//
+// Exact rather than heuristic - it finds the largest t for which
+// grey + t * (rgb - grey) still lies inside [0, peak] on every channel. Roughly
+// ten instructions, no branches on the GPU. Everything the colour-volume stage
+// does is built on this one number, because it is the honest answer to "how
+// much colour can this display still show for this hue at this luminance", and
+// every heuristic that replaces it is a worse answer to the same question.
+float psdtGamutLimit(float3 displayLinear, float peak)
+{
+  const float grey = clamp(psdtLuminance(displayLinear), 0.0, peak);
+  const float3 d = displayLinear - grey;
+
+  float tMax = 1e6;
+  [unroll] for (int i = 0; i < 3; ++i)
+  {
+    const float di = d[i];
+    if (di > 1e-6)       { tMax = min(tMax, (peak - grey) / di); }
+    else if (di < -1e-6) { tMax = min(tMax, -grey / di); }
+  }
+
+  return max(tMax, 1e-6);
+}
+
+// How much of the display's remaining colour volume this pixel is asking for.
+// 1.0 is exactly the boundary; above 1.0 the colour does not fit.
+float psdtGamutDemand(float3 displayLinear, float peak)
+{
+  return 1.0 / psdtGamutLimit(displayLinear, peak);
+}
+
+// Luminance- and hue-preserving scale back onto the boundary. Capped at 1 so an
+// in-gamut colour is never expanded.
+float psdtGamutScale(float3 displayLinear, float peak)
+{
+  return min(psdtGamutLimit(displayLinear, peak), 1.0);
+}
+
+#endif  // RTX_PASS_PSDT_PERCEPTUAL_SPACE_SLANGH

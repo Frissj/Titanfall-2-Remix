@@ -1,0 +1,184 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+
+// ===========================================================================
+// PSDT perceptual luminance curve
+// ===========================================================================
+//
+// A luminance compressor and nothing else. It does not touch chroma, it does
+// not know about the gamut, and it does not decide what a highlight is. Those
+// are three other stages; the whole architecture rests on not letting one
+// curve quietly do all four jobs.
+//
+// Shape
+// -----
+// The curve is defined in log2 scene -> log2 display, because that is the
+// domain in which "contrast" is a slope and in which monotonicity is trivial
+// to guarantee. Three segments:
+//
+//    display log2
+//         ^
+//   peak  |                          ________________  asymptote
+//         |                    _____/
+//         |               ____/  <- exponential shoulder, C1 at xS
+//         |          ____/
+//    yMid |........./  <- linear segment, slope = midtone contrast
+//         |     ___/
+//         |  __/  <- exponential toe, C1 at xT
+//   black |_/____________________________________> scene log2
+//              xT   midIn      xS
+//
+// Both curved segments are of the form  asymptote -+ span * exp(-+ k x), the
+// same family GT7 uses for its shoulder, chosen for three properties that
+// matter more than the exact shape:
+//
+//   1. strictly monotonic          d(display)/d(scene) > 0 everywhere, so
+//                                  brightness ordering is never inverted;
+//   2. C1 at both joins            no visible crease where the shoulder
+//                                  starts, which a piecewise-power curve has;
+//   3. asymptotic, not clamped     the curve itself never clips. Clipping is
+//                                  a display event, handled once at the end,
+//                                  and the energy that does not fit is
+//                                  re-expressed as glare rather than lost.
+//
+// Exposure awareness
+// ------------------
+// Every field of PsdtCurve is resolved per frame in psdt_state from the
+// adaptation state - this is T(x; E), not T(x). A night scene gets a lower
+// mid anchor, a longer highlight range and more shadow separation; a daylight
+// scene gets more midtone compression and an earlier shoulder; a frame full
+// of explosion gets a hard shoulder and hands the rest to the glare model.
+// The curve stays deterministic given the state; all the inertia lives in the
+// state, which is what keeps the image from pumping.
+// ===========================================================================
+
+#ifndef RTX_PASS_PSDT_CURVE_SLANGH
+#define RTX_PASS_PSDT_CURVE_SLANGH
+
+#include "rtx/pass/psdt/psdt.h"
+
+struct PsdtCurve
+{
+  float blackLog;      // Display black floor, log2 of framebuffer units.
+  float peakLog;       // Display peak, log2 of framebuffer units. 0 for SDR.
+  float midIn;         // Scene anchor, log2 exposed luminance.
+  float midOutLog;     // Display anchor, log2 framebuffer units.
+  float slope;         // Midtone contrast: display stops per scene stop.
+  float toeStart;      // Toe onset, scene stops relative to midIn. Negative.
+  float shoulderStart; // Shoulder onset, scene stops relative to midIn. Positive.
+  float shoulderLen;   // Derived: stops from shoulder onset to 1/e of peak.
+  float whiteIn;       // Scene stops above midIn treated as converged to white.
+};
+
+PsdtCurve psdtLoadCurve(RWTexture1D<float> state)
+{
+  PsdtCurve c;
+  c.blackLog      = state[PSDT_STATE_CURVE_BLACK];
+  c.peakLog       = state[PSDT_STATE_DISPLAY_HEADROOM];
+  c.midIn         = state[PSDT_STATE_CURVE_MID_IN];
+  c.midOutLog     = log2(max(state[PSDT_STATE_CURVE_MID_OUT], 1e-6));
+  c.slope         = state[PSDT_STATE_CURVE_SLOPE];
+  c.toeStart      = state[PSDT_STATE_CURVE_TOE];
+  c.shoulderStart = state[PSDT_STATE_CURVE_SHOULDER_IN];
+  c.shoulderLen   = state[PSDT_STATE_CURVE_SHOULDER_LEN];
+  c.whiteIn       = state[PSDT_STATE_CURVE_WHITE_IN];
+  return c;
+}
+
+// Value of the linear segment at a scene log2 position.
+float psdtCurveLinearSegment(PsdtCurve c, float x)
+{
+  return c.midOutLog + c.slope * (x - c.midIn);
+}
+
+// The curve, in log2 scene -> log2 display.
+float psdtCurveLog(PsdtCurve c, float x)
+{
+  const float xT = c.midIn + c.toeStart;
+  const float xS = c.midIn + c.shoulderStart;
+
+  if (x < xT)
+  {
+    // Toe. span is the display range between the black floor and the join, so
+    // the exponential arrives at exactly the join value with exactly the
+    // linear segment's slope.
+    const float yT = psdtCurveLinearSegment(c, xT);
+    const float span = max(yT - c.blackLog, 1e-3);
+    return c.blackLog + span * exp((c.slope / span) * (x - xT));
+  }
+
+  if (x > xS)
+  {
+    const float yS = psdtCurveLinearSegment(c, xS);
+    const float span = max(c.peakLog - yS, 1e-3);
+    return c.peakLog - span * exp(-(c.slope / span) * (x - xS));
+  }
+
+  return psdtCurveLinearSegment(c, x);
+}
+
+// d(display log2) / d(scene log2). Analytic, so the local contrast stage in
+// psdt_transform can ask the curve exactly how much contrast it removed at a
+// given adaptation level rather than estimating it with finite differences.
+float psdtCurveSlopeLog(PsdtCurve c, float x)
+{
+  const float xT = c.midIn + c.toeStart;
+  const float xS = c.midIn + c.shoulderStart;
+
+  if (x < xT)
+  {
+    const float yT = psdtCurveLinearSegment(c, xT);
+    const float span = max(yT - c.blackLog, 1e-3);
+    return c.slope * exp((c.slope / span) * (x - xT));
+  }
+
+  if (x > xS)
+  {
+    const float yS = psdtCurveLinearSegment(c, xS);
+    const float span = max(c.peakLog - yS, 1e-3);
+    return c.slope * exp(-(c.slope / span) * (x - xS));
+  }
+
+  return c.slope;
+}
+
+// Linear convenience wrapper. Y in exposed scene units -> display framebuffer
+// units, where 1.0 is diffuse white and exp2(peakLog) is the display peak.
+float psdtCurveLinear(PsdtCurve c, float sceneLuminance)
+{
+  const float x = log2(max(sceneLuminance, 1e-8));
+  return exp2(psdtCurveLog(c, x));
+}
+
+// Where this scene luminance sits between the shoulder onset and full white
+// convergence, in [0,1]. This is the luminance term of the colour-volume
+// pressure - the point at which the curve starts having to spend display
+// range it does not have is exactly the point at which colour starts having
+// to be given up.
+float psdtCurveHighlightProgress(PsdtCurve c, float sceneLog2)
+{
+  const float xS = c.midIn + c.shoulderStart;
+  const float xW = c.midIn + c.whiteIn;
+  return saturate((sceneLog2 - xS) / max(xW - xS, 1e-3));
+}
+
+#endif  // RTX_PASS_PSDT_CURVE_SLANGH
