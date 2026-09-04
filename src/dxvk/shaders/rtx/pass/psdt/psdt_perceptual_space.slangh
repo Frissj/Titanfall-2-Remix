@@ -51,6 +51,25 @@
 // value of 1.0 represents. That is the display's reference (diffuse) white,
 // which PSDT carries in the state texture rather than hardcoding, so the same
 // transform can target a 100-nit sRGB panel and a 1000-nit HDR one.
+//
+// Three things every gamut owns
+// -----------------------------
+// v0.1 had one gamut's geometry and three gamuts' names. Selecting P3 changed
+// which primaries a colour was expressed in but left the achromatic axis, the
+// luminance weights and the chroma normaliser at Rec.709 values, so the gamut
+// mapper was solving the wrong problem in two of its three modes. A gamut is
+// three things and all three have to move together:
+//
+//   RGB <-> XYZ        which colours the primaries can reach
+//   luminance weights  where the achromatic axis is, which is what the gamut
+//                      ray is cast from and what "preserve brightness" means
+//   max chroma         the denominator that turns an absolute chroma into a
+//                      fraction of what this display can do
+//
+// The luminance weights below are the Y row of each gamut's own RGB -> XYZ
+// matrix; converting a Rec.709 colour into any of them and weighting with the
+// matching row reproduces the Rec.709 luminance to 2e-16, which is the check
+// that says these three tables agree with each other.
 // ===========================================================================
 
 #ifndef RTX_PASS_PSDT_PERCEPTUAL_SPACE_SLANGH
@@ -65,7 +84,10 @@
 
 // Rec.709 (D65) luminance weights. Matches calcBt709Luminance in color.slangh;
 // duplicated here so this header stands alone in the CPU reference harness.
-static const float3 kPsdtLumaRec709 = float3(0.2126, 0.7152, 0.0722);
+static const float3 kPsdtLumaRec709 = float3(0.2126390059, 0.7151686788, 0.0721923154);
+// Y row of the Display-P3 (D65) and Rec.2020 RGB -> XYZ matrices.
+static const float3 kPsdtLumaP3      = float3(0.2289745641, 0.6917385218, 0.0792869141);
+static const float3 kPsdtLumaRec2020 = float3(0.2627002120, 0.6779980715, 0.0593017165);
 
 // Linear Rec.709 -> CIE XYZ (D65).
 static const float3x3 kPsdtRec709ToXYZ = float3x3(
@@ -101,28 +123,53 @@ static const float3x3 kPsdtP3ToRec709 = float3x3(
   -0.0420569,  1.0420571,  0.0000000,
   -0.0196376, -0.0786361,  1.0982735);
 
-// The largest chroma a Rec.709 display can actually produce, measured over the
-// whole displayable cube at a 100-nit reference. It is the denominator that
-// turns an absolute chroma into "how much of this display's colour capacity is
-// this pixel using", which is the only form in which chroma is comparable to a
-// luminance or a gamut distance.
+// The largest chroma each display gamut can actually produce, measured over
+// that gamut's whole displayable cube at a 100-nit reference. It is the
+// denominator that turns an absolute chroma into "how much of this display's
+// colour capacity is this pixel using", which is the only form in which chroma
+// is comparable to a luminance or a gamut distance.
 //
-// Measured rather than guessed - tools/psdt/psdt_suite.py recomputes both from
-// these same matrices, and reports them. They are not interchangeable: the two
-// spaces put the maximum in the same place (pure blue) but at very different
-// magnitudes, so using one number for both would silently halve or double the
-// chroma term of the colour-volume pressure the moment the space is switched.
-static const float kPsdtChromaReferenceICtCp  = 0.2933;
-static const float kPsdtChromaReferenceJzazbz = 0.1594;
+// Measured rather than guessed - tools/psdt/psdt_suite.py recomputes all six
+// from these same matrices and reports them. None of them are
+// interchangeable: Rec.709 and Rec.2020 differ by 37% in ICtCp, so reusing one
+// number across gamuts silently rescales the chroma term of the colour-volume
+// pressure the moment the gamut is switched. v0.1 did exactly that.
+static const float kPsdtChromaRefICtCp709   = 0.2933;
+static const float kPsdtChromaRefICtCpP3    = 0.3505;
+static const float kPsdtChromaRefICtCp2020  = 0.4026;
+static const float kPsdtChromaRefJzazbz709  = 0.1594;
+static const float kPsdtChromaRefJzazbzP3   = 0.1727;
+static const float kPsdtChromaRefJzazbz2020 = 0.2133;
 
-float psdtChromaReference(uint space)
+float psdtChromaReference(uint space, uint gamut)
 {
-  return (space == psdtSpaceJzazbz) ? kPsdtChromaReferenceJzazbz : kPsdtChromaReferenceICtCp;
+  if (space == psdtSpaceJzazbz)
+  {
+    if (gamut == psdtGamutP3)      { return kPsdtChromaRefJzazbzP3; }
+    if (gamut == psdtGamutRec2020) { return kPsdtChromaRefJzazbz2020; }
+    return kPsdtChromaRefJzazbz709;
+  }
+  if (gamut == psdtGamutP3)      { return kPsdtChromaRefICtCpP3; }
+  if (gamut == psdtGamutRec2020) { return kPsdtChromaRefICtCp2020; }
+  return kPsdtChromaRefICtCp709;
 }
 
+// Luminance of a colour expressed in the working space.
 float psdtLuminance(float3 rec709Linear)
 {
   return dot(rec709Linear, kPsdtLumaRec709);
+}
+
+// Luminance of a colour already expressed in the display gamut's primaries.
+// This is the one v0.1 got wrong: the achromatic axis of a gamut is the ray
+// along which R == G == B, and locating a colour relative to it needs that
+// gamut's own Y coefficients, not Rec.709's. Using the wrong row puts the grey
+// point in the wrong place, which tilts every gamut ray cast from it.
+float psdtDisplayLuminance(float3 displayLinear, uint gamut)
+{
+  if (gamut == psdtGamutP3)      { return dot(displayLinear, kPsdtLumaP3); }
+  if (gamut == psdtGamutRec2020) { return dot(displayLinear, kPsdtLumaRec2020); }
+  return dot(displayLinear, kPsdtLumaRec709);
 }
 
 // Working space -> the gamut PSDT is fitting colours into. Selecting anything
@@ -130,16 +177,77 @@ float psdtLuminance(float3 rec709Linear)
 // on the default sRGB path the two are the same matrix and this is free.
 float3 psdtToDisplayGamut(float3 rec709Linear, uint gamut)
 {
-  if (gamut == psdtGamutP3)     { return mul(kPsdtRec709ToP3, rec709Linear); }
+  if (gamut == psdtGamutP3)      { return mul(kPsdtRec709ToP3, rec709Linear); }
   if (gamut == psdtGamutRec2020) { return mul(kPsdtRec709ToRec2020, rec709Linear); }
   return rec709Linear;
 }
 
 float3 psdtFromDisplayGamut(float3 displayLinear, uint gamut)
 {
-  if (gamut == psdtGamutP3)     { return mul(kPsdtP3ToRec709, displayLinear); }
+  if (gamut == psdtGamutP3)      { return mul(kPsdtP3ToRec709, displayLinear); }
   if (gamut == psdtGamutRec2020) { return mul(kPsdtRec2020ToRec709, displayLinear); }
   return displayLinear;
+}
+
+// ---------------------------------------------------------------------------
+// Chromatic adaptation (CAT02)
+// ---------------------------------------------------------------------------
+// What "the white point is not D65 here" has to mean.
+//
+// v0.1 implemented the spatial white point as an offset applied to the chroma
+// coordinates: subtract the local mean chroma, compress, add it back. That is
+// a translation of a colour space, not an adaptation of an observer, and it
+// has a specific failure - a colour that is neutral under the local
+// illuminant does not land on the perceptual neutral axis, so compressing
+// chroma towards zero does not take it towards the local white, and the
+// guarantee that a neutral is always inside the display volume stops holding.
+//
+// The correct operation is a von Kries transform in a cone-response space.
+// ICtCp and Jzazbz are both defined against D65, so adapting the pixel from
+// the local illuminant to D65 *before* encoding makes "chroma == 0" in the
+// perceptual space mean exactly "this pixel is the local white", which is what
+// the spatial white point was supposed to mean all along. Undoing the
+// adaptation after decoding puts the result back on the display.
+//
+// CAT02 rather than Bradford or plain XYZ scaling: it is the transform CIECAM02
+// and CAM16 are built on, so if the perceptual space abstraction ever grows a
+// CAM16-UCS entry the adaptation underneath it is already the matching one.
+//
+// The matrices below are CAT02 pre-composed with Rec.709 <-> XYZ, so the whole
+// adaptation is two 3x3 products and three divides.
+static const float3x3 kPsdtRec709ToCatLMS = float3x3(
+  0.390410370, 0.549917036, 0.008903719,
+  0.070914464, 0.963129579, 0.001358419,
+  0.023138990, 0.128015194, 0.936276576);
+
+static const float3x3 kPsdtCatLMSToRec709 = float3x3(
+   2.858765463, -1.628966853, -0.024822606,
+  -0.210429557,  1.158388030,  0.000320450,
+  -0.041879468, -0.118126014,  1.068630117);
+
+// CAT02 LMS of D65, which is (1,1,1) in linear Rec.709.
+static const float3 kPsdtCatLMSD65 = float3(0.949231125, 1.035402462, 1.087430760);
+
+// Per-channel cone gains that carry `whiteRgb` onto D65. `whiteRgb` is a
+// linear Rec.709 colour describing the illuminant; only its chromaticity
+// matters, so it is normalised to luminance 1 first and the gains then
+// preserve the luminance of a neutral exactly.
+float3 psdtAdaptationGain(float3 whiteRgb)
+{
+  const float y = max(psdtLuminance(whiteRgb), 1e-4);
+  const float3 lms = mul(kPsdtRec709ToCatLMS, whiteRgb / y);
+  return kPsdtCatLMSD65 / max(lms, 1e-4);
+}
+
+// Apply / undo the adaptation described by a gain vector.
+float3 psdtAdaptToD65(float3 rec709Linear, float3 gain)
+{
+  return mul(kPsdtCatLMSToRec709, gain * mul(kPsdtRec709ToCatLMS, rec709Linear));
+}
+
+float3 psdtAdaptFromD65(float3 rec709Linear, float3 gain)
+{
+  return mul(kPsdtCatLMSToRec709, mul(kPsdtRec709ToCatLMS, rec709Linear) / max(gain, 1e-6));
 }
 
 // ---------------------------------------------------------------------------
@@ -339,9 +447,14 @@ float3 psdtFromPolar(float intensity, float chroma, float hue)
 // does is built on this one number, because it is the honest answer to "how
 // much colour can this display still show for this hue at this luminance", and
 // every heuristic that replaces it is a worse answer to the same question.
-float psdtGamutLimit(float3 displayLinear, float peak)
+//
+// `gamut` selects which luminance weights locate the achromatic point. Passing
+// the wrong ones does not fail loudly; it quietly casts the ray from a grey
+// that is not grey, which is why v0.1's P3 and Rec.2020 paths were wrong in a
+// way no test caught.
+float psdtGamutLimit(float3 displayLinear, float peak, uint gamut)
 {
-  const float grey = clamp(psdtLuminance(displayLinear), 0.0, peak);
+  const float grey = clamp(psdtDisplayLuminance(displayLinear, gamut), 0.0, peak);
   const float3 d = displayLinear - grey;
 
   float tMax = 1e6;
@@ -357,16 +470,16 @@ float psdtGamutLimit(float3 displayLinear, float peak)
 
 // How much of the display's remaining colour volume this pixel is asking for.
 // 1.0 is exactly the boundary; above 1.0 the colour does not fit.
-float psdtGamutDemand(float3 displayLinear, float peak)
+float psdtGamutDemand(float3 displayLinear, float peak, uint gamut)
 {
-  return 1.0 / psdtGamutLimit(displayLinear, peak);
+  return 1.0 / psdtGamutLimit(displayLinear, peak, gamut);
 }
 
 // Luminance- and hue-preserving scale back onto the boundary. Capped at 1 so an
 // in-gamut colour is never expanded.
-float psdtGamutScale(float3 displayLinear, float peak)
+float psdtGamutScale(float3 displayLinear, float peak, uint gamut)
 {
-  return min(psdtGamutLimit(displayLinear, peak), 1.0);
+  return min(psdtGamutLimit(displayLinear, peak, gamut), 1.0);
 }
 
 #endif  // RTX_PASS_PSDT_PERCEPTUAL_SPACE_SLANGH
