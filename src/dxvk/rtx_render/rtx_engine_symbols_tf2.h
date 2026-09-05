@@ -120,6 +120,38 @@ namespace dxvk {
       /* searchAfter  */ 0,
     };
 
+    // engine.dll's R_DrawWorldMeshes. Remix trampolines its entry to capture
+    // the authoritative view-setup struct (rcx), which is what drives the Main
+    // camera when RtxOptions::useEngineHookMainCamera is on.
+    //
+    // It uses the literal "R_DrawWorldMeshes" internally as a profiling scope
+    // name, referenced from exactly one place, so we walk back from that
+    // reference to the enclosing function entry.
+    //
+    // This is a load-bearing repair, not a safety change. The old hardcoded
+    // RVA 0xB7DD0 is +0xE0 INSIDE sub_1800B7CF0 on the shipped build, so the
+    // trampoline's 7-byte prologue check failed, the hook never installed,
+    // g_engineMainW2v was never written, and Main had no camera source at all.
+    // The real entry is 0xB7F80 and does begin with the expected
+    // 48 8B C4 44 89 40 18.
+    //
+    // Note this function is SPLIT into chained .pdata chunks -- its first
+    // chunk is 0x18 bytes and the literal sits in a later one -- which is why
+    // the resolver follows UNW_FLAG_CHAININFO rather than trusting the
+    // containing chunk's BeginAddress.
+    inline const SymbolDesc kRDrawWorldMeshes {
+      /* name         */ "engine.R_DrawWorldMeshes",
+      /* moduleName   */ "engine.dll",
+      /* pattern      */ nullptr,
+      /* anchorString */ "R_DrawWorldMeshes",
+      /* kind         */ SymbolKind::StringEnclosingFunction,
+      /* addend       */ 0,
+      /* dispOffset   */ 0,
+      /* instrLength  */ 0,
+      /* searchBefore */ 0x400,
+      /* searchAfter  */ 0,
+    };
+
     // ------------------------------------------------------------------
     // UNREGISTERED -- identity not re-established on the shipped build.
     // Each resolves to 0; its feature disables itself and logs once.
@@ -174,6 +206,108 @@ namespace dxvk {
     inline const SymbolDesc kEngineModelInfo {
       "engine.ModelInfoPtr", "engine.dll", nullptr, nullptr,
       SymbolKind::RipRelativeData, 0, 0, 0, 0, 0 };
+
+    // ------------------------------------------------------------------
+    // engine.dll / studiorender.dll -- all UNREGISTERED.
+    //
+    // Every one of these is mid-function on the shipped v2.0.11.0 engine.dll,
+    // exactly like the client.dll set:
+    //
+    //   old RVA     lands in                        delta
+    //   -----------------------------------------------------------
+    //   0x1B2200    no function at all              (unmapped)
+    //   0xB4870     sub_1800B4780                   +0xF0
+    //   0xB84C0     sub_1800B81B0                   +0x310
+    //   0x1B2476    sub_1801B2340                   +0x136
+    //   0x1B23D6    sub_1801B2340                   +0x96
+    //   0x1B32ED    sub_1801B32D0                   +0x1D
+    //   0x1B320B    sub_1801B3100                   +0x10B
+    //
+    // They are additionally all in code that cannot run today: the
+    // tf2patches::kHookSub* flags gating them are constexpr false, and the
+    // remainder are held off by `static bool s_...Installed = true`. They are
+    // diagnostic probes kept for re-enabling, so they are wired to the
+    // resolver rather than deleted -- when one is wanted again, give it an
+    // anchor here and it comes back correct instead of patching a stale RVA.
+    inline const SymbolDesc kProducerMFenceSite {
+      "engine.ProducerMFence.target", "engine.dll", nullptr, nullptr,
+      SymbolKind::Function, 0, 0, 0, 0, 0 };
+
+    inline const SymbolDesc kOrSiteCapture {
+      "engine.OrSiteCapture.target", "engine.dll", nullptr, nullptr,
+      SymbolKind::Function, 0, 0, 0, 0, 0 };
+
+    inline const SymbolDesc kB84C0Capture {
+      "engine.B84C0Capture.target", "engine.dll", nullptr, nullptr,
+      SymbolKind::Function, 0, 0, 0, 0, 0 };
+
+    inline const SymbolDesc kPropCullSite {
+      "engine.PropCull.target", "engine.dll", nullptr, nullptr,
+      SymbolKind::Function, 0, 0, 0, 0, 0 };
+
+    inline const SymbolDesc kPropCullDecisionSite {
+      "engine.PropCullDecision.site", "engine.dll", nullptr, nullptr,
+      SymbolKind::CodeSite, 0, 0, 0, 0, 0 };
+
+    inline const SymbolDesc kBitmaskLoadSite {
+      "engine.BitmaskLoad.site", "engine.dll", nullptr, nullptr,
+      SymbolKind::CodeSite, 0, 0, 0, 0, 0 };
+
+    inline const SymbolDesc kDispatchSite {
+      "engine.Dispatch.site", "engine.dll", nullptr, nullptr,
+      SymbolKind::CodeSite, 0, 0, 0, 0, 0 };
+
+    inline const SymbolDesc kDispatchMFenceSite {
+      "engine.DispatchMFence.site", "engine.dll", nullptr, nullptr,
+      SymbolKind::CodeSite, 0, 0, 0, 0, 0 };
+
+    inline const SymbolDesc kVisibilityCounter {
+      "engine.VisibilityCounter", "engine.dll", nullptr, nullptr,
+      SymbolKind::RipRelativeData, 0, 0, 0, 0, 0 };
+
+    inline const SymbolDesc kBucketSourceTable {
+      "engine.BucketSourceTable", "engine.dll", nullptr, nullptr,
+      SymbolKind::RipRelativeData, 0, 0, 0, 0, 0 };
+
+    // [Join] draw-span call sites in client.dll -- the two
+    // IClientRenderable::DrawModel vcalls the renderable latch wraps. Same
+    // stale region as the gate sites (0x36E36A / 0x36E9F9), so unregistered.
+    //
+    // Candidate signatures, NOT registered until verified unique against a
+    // loaded client.dll, because a coincidental single match would redirect
+    // the wrong virtual call:
+    //   site A: 8B CF FF 50 48 48 8B 5C 24 40
+    //   site C: CB 41 FF 52 48 40 84 F6
+    inline const SymbolDesc kDrawSpanSiteA {
+      "client.JoinDrawSpan.siteA", "client.dll", nullptr, nullptr,
+      SymbolKind::CodeSite, 0, 0, 0, 0, 0 };
+    inline const SymbolDesc kDrawSpanSiteC {
+      "client.JoinDrawSpan.siteC", "client.dll", nullptr, nullptr,
+      SymbolKind::CodeSite, 0, 0, 0, 0, 0 };
+
+    // engine.dll vertex-budget immediate (the 3.1M-vert cap raised to
+    // 0x7FFFFFFF). Old RVA 0xB7100; the site verifies the immediate reads
+    // 0x00300000 before writing, and on the shipped build it does not.
+    inline const SymbolDesc kVertexBudgetCap {
+      "engine.VertexBudgetImmediate", "engine.dll", nullptr, nullptr,
+      SymbolKind::CodeSite, 0, 0, 0, 0, 0 };
+
+    // engine.dll byte patches, both byte-verified before writing and both
+    // stale on the shipped build (old RVAs 0x730DA, 0x1B32DF).
+    inline const SymbolDesc kEntityMaskGate {
+      "engine.EntityMaskGate.jz", "engine.dll", nullptr, nullptr,
+      SymbolKind::CodeSite, 0, 0, 0, 0, 0 };
+    inline const SymbolDesc kDispatchEntryE {
+      "engine.DispatchEntryE.load", "engine.dll", nullptr, nullptr,
+      SymbolKind::CodeSite, 0, 0, 0, 0, 0 };
+
+    inline const SymbolDesc kStudioDrawModelExecute {
+      "studiorender.DrawModelExecute", "studiorender.dll", nullptr, nullptr,
+      SymbolKind::Function, 0, 0, 0, 0, 0 };
+
+    inline const SymbolDesc kStudioQueuedDraw {
+      "studiorender.QueuedDrawEntry", "studiorender.dll", nullptr, nullptr,
+      SymbolKind::Function, 0, 0, 0, 0, 0 };
 
   } // namespace tf2sym
 } // namespace dxvk

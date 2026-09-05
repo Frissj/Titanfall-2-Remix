@@ -104,6 +104,13 @@ namespace dxvk {
       uintptr_t rdataBegin = 0, rdataEnd = 0;   // initialized, non-writable data (vtables, strings)
       uintptr_t dataBegin  = 0, dataEnd  = 0;   // writable data (globals, ConVar objects)
 
+      // The PE exception directory: a sorted array of RUNTIME_FUNCTION
+      // {BeginAddress, EndAddress, UnwindInfoAddress} covering every non-leaf
+      // function in the image. This is the AUTHORITATIVE answer to "where does
+      // this function start", and it is why nothing here has to guess from
+      // prologue bytes or int3 padding. See functionBounds().
+      uintptr_t pdataBegin = 0, pdataEnd = 0;
+
       // Bumps whenever the module is (re)loaded at a different base or with a
       // different link timestamp. Cached resolutions carry the generation they
       // were produced under and are discarded when it changes.
@@ -179,15 +186,37 @@ namespace dxvk {
     bool executable(const void* p);
 
     // ------------------------------------------------------------------
-    // Is `addr` plausibly the ENTRY of a function rather than a point inside
-    // one? This is the check whose absence caused the crash: the old code
-    // verified only that the page was committed and executable, which a
-    // mid-function address trivially satisfies.
+    // Exact function bounds from the PE exception directory.
     //
-    // Accepts when the address is 16-byte aligned (MSVC aligns function
-    // starts) or immediately preceded by inter-function padding (int3 / nop)
-    // or by a control-transfer terminator (ret / jmp), AND begins with a
-    // recognised x64 prologue form.
+    // Every x64 PE carries .pdata: a sorted RUNTIME_FUNCTION array giving the
+    // code range of every non-leaf function. Looking an address up there
+    // answers "which function is this inside, and where does it start"
+    // exactly, with no heuristics at all.
+    //
+    // One wrinkle, and it matters: MSVC SPLITS functions into several code
+    // ranges, so the entry containing an address is often a later chunk whose
+    // BeginAddress is not the function start. Chunks carry UNW_FLAG_CHAININFO
+    // in their unwind info, pointing at the primary entry, so we follow that
+    // chain to the real start. R_DrawWorldMeshes is exactly this shape: its
+    // first chunk is only 0x18 bytes and the "R_DrawWorldMeshes" literal it
+    // uses sits in a later one.
+    //
+    // Returns false for a leaf function with no unwind data, or when the
+    // address is outside every entry -- callers then fail safe.
+    // ------------------------------------------------------------------
+    bool functionBounds(const ModuleView& m, uintptr_t addr,
+                        uintptr_t& beginOut, uintptr_t& endOut);
+
+    // ------------------------------------------------------------------
+    // Is `addr` the ENTRY of a function rather than a point inside one? This
+    // is the check whose absence caused the crash: the old code verified only
+    // that the page was committed and executable, which a mid-function
+    // address trivially satisfies.
+    //
+    // Prefers .pdata, which is decisive -- client.dll+0x14EAE0 resolves to the
+    // function [0x14EA70,0x14EB1E), and 0x14EAE0 is not its start, so it is
+    // rejected outright. Falls back to a placement + prologue-shape heuristic
+    // only when the module has no exception directory.
     // ------------------------------------------------------------------
     bool looksLikeFunctionEntry(const ModuleView& m, uintptr_t addr);
 

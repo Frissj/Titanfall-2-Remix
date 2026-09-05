@@ -29,8 +29,14 @@
 #      src/, that is not in the baseline below. New reaches into a game module
 #      must go through dxvk::EngineSymbols and be declared in
 #      src/dxvk/rtx_render/rtx_engine_symbols_tf2.h.
-#   2. HARD FAILURE, ZERO TOLERANCE: any client.dll RVA literal at all. Those
-#      have all been migrated; there is no baseline to grandfather.
+#   2. HARD FAILURE, ZERO TOLERANCE: any RVA literal attributed to a module in
+#      ZERO_TOLERANCE_MODULES (client.dll, engine.dll). Those are fully
+#      migrated; there is no baseline to grandfather them.
+#
+#      Attribution follows the ASSIGNMENT (`base = (uintptr_t)cl`), not the
+#      variable's name. An earlier name-based version of this check reported
+#      client.dll clean while ~21 client.dll sites sat in functions that spell
+#      the same variable `base` -- a false all-clear.
 #   3. The baseline may only shrink. If it is stale (a listed file now has
 #      fewer hits), the script says so and asks you to lower the number, so
 #      migrating code ratchets the limit down and cannot silently regress.
@@ -69,24 +75,57 @@ PRUNED_DIRS = {
 ANY_BASE_RVA = re.compile(
     r'\b(clBase|cliBase|clientBase|enBase|engBase|srBase|base)\s*\+\s*0x[0-9A-Fa-f]{4,}')
 
-# client.dll specifically: fully migrated, so any hit is a regression.
-CLIENT_BASE_RVA = re.compile(
-    r'\b(clBase|cliBase|clientBase)\s*\+\s*0x[0-9A-Fa-f]{4,}')
-
-# Known-outstanding hits, by repo-relative path. These are engine.dll and
-# studiorender.dll reaches that have NOT been migrated yet.
+# Which module a base variable refers to is decided by the nearest preceding
+# GetModuleHandleA in the same function -- NOT by the variable's name.
 #
-# They are listed rather than fixed because they cannot be verified blind:
-# unlike the client.dll sites (all provably dead on the shipped build, so
-# disabling them cost nothing), several of these are LIVE -- notably the
-# engine.dll R_DrawWorldMeshes trampoline, whose byte check passes today and
-# which feeds the main camera. Replacing a working hook with a signature that
-# has not been proven unique in that module would trade a silent staleness bug
-# for an immediate visible regression. They need the same treatment as
-# client.dll: identify each target on the shipped binary, register an anchor or
-# signature in rtx_engine_symbols_tf2.h, drop the literal, lower this number.
+# This matters: an earlier pass checked only for names like `clBase` and
+# reported client.dll as clean, while ~21 client.dll sites were sitting in
+# functions that spell the same thing `base`. A name-based rule cannot see
+# those, so it gave a false all-clear.
+# `HMODULE cl = GetModuleHandleA("client.dll")` / `s_engine = GetModuleHandleA(...)`
+HANDLE_ASSIGN = re.compile(
+    r'\b(\w+)\s*=\s*GetModuleHandleA\(\s*"([\w.]+)"\s*\)')
+
+# `const uintptr_t base = reinterpret_cast<uintptr_t>(cl);` -- this is what
+# actually decides which module a `base + 0xRVA` refers to. Attributing by the
+# nearest preceding GetModuleHandleA instead is wrong: in a long function the
+# handle from an unrelated earlier block leaks forward, which mislabelled a
+# block of materialsystem reads off `s_msdx11` as client.dll.
+BASE_ASSIGN = re.compile(
+    r'\b(?:const\s+)?uintptr_t\s+(\w+)\s*=\s*reinterpret_cast<uintptr_t>\(\s*&?(\w+)\s*\)')
+
+# Statics whose module is fixed by declaration rather than by a nearby call.
+STATIC_HANDLES = {
+    's_msdx11': 'materialsystem_dx11.dll',
+    's_engine': 'engine.dll',
+}
+
+# A function definition at file or namespace scope, used to reset attribution
+# so one function's module never leaks into the next.
+FUNCTION_START = re.compile(r'^\s{0,4}(static\s+|inline\s+)*[\w:<>*&]+\s+\w+\s*\([^;]*$')
+
+# Modules whose sites are fully migrated. Any hit attributed to one of these
+# is a regression, with no baseline to grandfather it.
+ZERO_TOLERANCE_MODULES = {'client.dll', 'engine.dll'}
+
+# Known-outstanding hits, by repo-relative path.
+#
+# client.dll and engine.dll are DONE -- see ZERO_TOLERANCE_MODULES. What is
+# left is studiorender.dll (22) and materialsystem_dx11.dll (44).
+#
+# Those are a genuinely different case from the others, and the reason they are
+# listed rather than disabled: their RVAs are still CORRECT on the shipped
+# build. Checked against studiorender.dll v2.0.11.0, 0xDE10, 0x11CB0, 0x120B0,
+# 0x15A60, 0x15C00 and 0x15D10 are all exact function entries, so those hooks
+# install and work today. client.dll and engine.dll had drifted to a different
+# compilation; these two modules had not.
+#
+# So there is nothing to repair here, only brittleness to remove -- and
+# swapping a working hook for an unverified signature would trade a latent
+# problem for an immediate one. They need anchors derived against their own
+# binaries, then the literal dropped and this number lowered.
 BASELINE = {
-    'src/d3d11/d3d11_rtx.cpp': 99,
+    'src/d3d11/d3d11_rtx.cpp': 66,
 }
 
 
@@ -121,17 +160,34 @@ def scan():
         if '0x' not in text:
             continue
 
+        handle_module = dict(STATIC_HANDLES)   # handle var -> module
+        base_module = {}                       # base var   -> module
         for number, line in enumerate(text.splitlines(), 1):
-            if '0x' not in line:
-                continue
             stripped = line.lstrip()
-            if stripped.startswith('//') or stripped.startswith('*'):
+            is_comment = stripped.startswith('//') or stripped.startswith('*')
+
+            if not is_comment:
+                if FUNCTION_START.match(line) and 'GetModuleHandleA' not in line:
+                    handle_module = dict(STATIC_HANDLES)
+                    base_module = {}
+                for var, module in HANDLE_ASSIGN.findall(line):
+                    handle_module[var] = module
+                for base_var, src_var in BASE_ASSIGN.findall(line):
+                    if src_var in handle_module:
+                        base_module[base_var] = handle_module[src_var]
+                    else:
+                        base_module.pop(base_var, None)
+
+            if '0x' not in line or is_comment:
                 continue  # a comment describing history is not a reach
+
             for match in ANY_BASE_RVA.finditer(line):
+                module = base_module.get(match.group(1))
                 any_hits.setdefault(rel(path), []).append(
-                    (number, match.group(0), line.strip()))
-            if CLIENT_BASE_RVA.search(line):
-                client_hits.append((rel(path), number, line.strip()))
+                    (number, match.group(0), line.strip(), module))
+                if module in ZERO_TOLERANCE_MODULES:
+                    client_hits.append(
+                        (rel(path), number, module, line.strip()))
     return any_hits, client_hits
 
 
@@ -142,10 +198,10 @@ def main():
 
     if client_hits:
         failures.append(
-            'client.dll RVA literals are not allowed -- every client.dll site '
-            'has been migrated to dxvk::EngineSymbols:')
-        for path, number, text in client_hits:
-            failures.append('    %s:%d: %s' % (path, number, text))
+            'RVA literals are not allowed for these modules -- their sites have '
+            'been migrated to dxvk::EngineSymbols:')
+        for path, number, module, text in client_hits:
+            failures.append('    %s:%d [%s]: %s' % (path, number, module, text))
 
     for path, hits in sorted(any_hits.items()):
         allowed = BASELINE.get(path, 0)
@@ -155,8 +211,9 @@ def main():
                 'into a game module must go through dxvk::EngineSymbols and be '
                 'declared in src/dxvk/rtx_render/rtx_engine_symbols_tf2.h.'
                 % (path, len(hits), allowed))
-            for number, token, text in hits[allowed:]:
-                failures.append('    %s:%d: %s' % (path, number, text))
+            for number, token, text, module in hits[allowed:]:
+                failures.append('    %s:%d [%s]: %s'
+                                % (path, number, module or 'unknown', text))
 
     for path, allowed in sorted(BASELINE.items()):
         found = len(any_hits.get(path, []))
@@ -171,8 +228,8 @@ def main():
     if show_all:
         for path, hits in sorted(any_hits.items()):
             print('%s: %d' % (path, len(hits)))
-            for number, token, text in hits:
-                print('    %d: %s' % (number, text))
+            for number, token, text, module in hits:
+                print('    %d [%s]: %s' % (number, module or 'unknown', text))
 
     if failures:
         print('check_engine_rvas: FAILED')
@@ -181,8 +238,13 @@ def main():
         return 1
 
     total = sum(len(v) for v in any_hits.values())
-    print('check_engine_rvas: OK (%d known-outstanding literals, 0 new, '
-          '0 in client.dll)' % total)
+    by_module = {}
+    for hits in any_hits.values():
+        for _, _, _, module in hits:
+            by_module[module or 'unknown'] = by_module.get(module or 'unknown', 0) + 1
+    summary = ', '.join('%s=%d' % kv for kv in sorted(by_module.items()))
+    print('check_engine_rvas: OK (%d known-outstanding literals, 0 new; %s)'
+          % (total, summary or 'none'))
     return 0
 
 

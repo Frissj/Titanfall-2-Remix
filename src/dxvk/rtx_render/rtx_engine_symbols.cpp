@@ -316,6 +316,21 @@ namespace dxvk {
       out.timeDateStamp = nt->FileHeader.TimeDateStamp;
       out.peCheckSum    = nt->OptionalHeader.CheckSum;
 
+      // Exception directory (.pdata). Present on every x64 PE that contains
+      // non-leaf functions; this is what makes function-entry validation exact.
+      {
+        const IMAGE_DATA_DIRECTORY& dir =
+          nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+        if (dir.VirtualAddress != 0 && dir.Size >= sizeof(RUNTIME_FUNCTION)) {
+          const uintptr_t pb = base + dir.VirtualAddress;
+          const uintptr_t pe = pb + (dir.Size - dir.Size % sizeof(RUNTIME_FUNCTION));
+          if (pe > pb && readable(reinterpret_cast<const void*>(pb), pe - pb)) {
+            out.pdataBegin = pb;
+            out.pdataEnd   = pe;
+          }
+        }
+      }
+
       const auto* sec = IMAGE_FIRST_SECTION(nt);
       const WORD  count = nt->FileHeader.NumberOfSections;
       if (!readable(sec, sizeof(IMAGE_SECTION_HEADER) * count))
@@ -478,12 +493,99 @@ namespace dxvk {
     // true of every byte inside every function.
     // ==================================================================
 
+    bool functionBounds(const ModuleView& m, uintptr_t addr,
+                        uintptr_t& beginOut, uintptr_t& endOut) {
+      beginOut = 0;
+      endOut   = 0;
+      if (!m.valid() || m.pdataEnd <= m.pdataBegin || !m.containsCode(addr))
+        return false;
+
+      const auto* table = reinterpret_cast<const RUNTIME_FUNCTION*>(m.pdataBegin);
+      const size_t count = (m.pdataEnd - m.pdataBegin) / sizeof(RUNTIME_FUNCTION);
+      if (count == 0)
+        return false;
+
+      const uint32_t rva = static_cast<uint32_t>(addr - m.base);
+
+      // .pdata is sorted by BeginAddress, so this is a binary search.
+      size_t lo = 0, hi = count - 1;
+      const RUNTIME_FUNCTION* hit = nullptr;
+      while (lo <= hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        const RUNTIME_FUNCTION& rf = table[mid];
+        if (rva < rf.BeginAddress) {
+          if (mid == 0)
+            break;
+          hi = mid - 1;
+        } else if (rva >= rf.EndAddress) {
+          lo = mid + 1;
+        } else {
+          hit = &rf;
+          break;
+        }
+      }
+      if (hit == nullptr)
+        return false;                   // leaf function, or not code we can bound
+
+      uint32_t begin = hit->BeginAddress;
+      uint32_t end   = hit->EndAddress;
+      uint32_t unwind = hit->UnwindData;
+
+      // Follow UNW_FLAG_CHAININFO to the primary entry. Bounded: a malformed
+      // or hostile chain must not spin.
+      for (int hop = 0; hop < 8; ++hop) {
+        const uintptr_t ui = m.base + unwind;
+        if (!m.containsImage(ui) || !readable(reinterpret_cast<const void*>(ui), 4))
+          break;
+
+        const uint8_t* info  = reinterpret_cast<const uint8_t*>(ui);
+        const uint8_t  flags = static_cast<uint8_t>(info[0] >> 3);
+        if ((flags & 0x4) == 0)         // UNW_FLAG_CHAININFO
+          break;
+
+        const uint8_t codes = info[2];
+        const size_t  slots = (static_cast<size_t>(codes) + 1u) & ~size_t(1);
+        const uintptr_t chained = ui + 4 + slots * 2;
+        if (!m.containsImage(chained)
+            || !readable(reinterpret_cast<const void*>(chained), sizeof(RUNTIME_FUNCTION)))
+          break;
+
+        const auto* rf = reinterpret_cast<const RUNTIME_FUNCTION*>(chained);
+        if (rf->BeginAddress == 0 || rf->EndAddress <= rf->BeginAddress)
+          break;
+        begin  = rf->BeginAddress;
+        end    = rf->EndAddress;
+        unwind = rf->UnwindData;
+      }
+
+      const uintptr_t b = m.base + begin;
+      const uintptr_t e = m.base + end;
+      if (!m.containsCode(b) || e <= b)
+        return false;
+
+      beginOut = b;
+      endOut   = e;
+      return true;
+    }
+
     bool looksLikeFunctionEntry(const ModuleView& m, uintptr_t addr) {
       if (!m.valid() || !m.containsCode(addr))
         return false;
       if (!readable(reinterpret_cast<const void*>(addr), 16))
         return false;
 
+      // Authoritative path. .pdata knows exactly where each function starts,
+      // so there is nothing to infer: the address either IS a function start
+      // or it is not.
+      if (m.pdataEnd > m.pdataBegin) {
+        uintptr_t begin = 0, end = 0;
+        if (!functionBounds(m, addr, begin, end))
+          return false;                 // inside no known function -> refuse
+        return begin == addr;
+      }
+
+      // Fallback for a module with no exception directory. Weaker, and only
+      // reached if .pdata is absent entirely.
       const uint8_t* p = reinterpret_cast<const uint8_t*>(addr);
 
       // (1) Placement. A function entry is either 16-byte aligned (MSVC's
@@ -681,17 +783,33 @@ namespace dxvk {
       if (maxScanBack == 0 || maxScanBack > 0x4000)
         return false;
 
+      // Exact, via .pdata (including chained-chunk resolution). No scanning
+      // and no heuristic: a padding walk-back would fail outright here anyway,
+      // because R_DrawWorldMeshes' entry is preceded by the previous
+      // function's tail `jmp qword ptr [rax+8]` rather than by int3 padding.
+      uintptr_t begin = 0, end = 0;
+      if (functionBounds(m, insideAddr, begin, end)) {
+        // maxScanBack stays meaningful as a sanity bound: a literal an
+        // implausible distance from the entry suggests we followed the wrong
+        // chain, so fail safe rather than hand back a distant function.
+        if (insideAddr >= begin && insideAddr - begin <= maxScanBack) {
+          functionOut = begin;
+          return true;
+        }
+        return false;
+      }
+
+      // Fallback for a leaf function or a module with no exception directory:
+      // walk back to the nearest candidate that is int3-padded, 16-byte
+      // aligned AND prologue-shaped. All three together, because 0xCC also
+      // occurs as an immediate operand mid-function and landing on one would
+      // put a hook inside a function -- the failure mode this module exists
+      // to prevent.
       const uintptr_t lo = std::max(m.codeBegin, insideAddr > maxScanBack
                                                  ? insideAddr - maxScanBack : m.codeBegin);
       if (!readable(reinterpret_cast<const void*>(lo), insideAddr - lo + 16))
         return false;
 
-      // Walk back to the nearest candidate that is (a) preceded by int3
-      // padding, (b) 16-byte aligned, and (c) shaped like a prologue. All
-      // three together are what make this safe: 0xCC also occurs as an
-      // immediate operand mid-function, and landing on one of those would put
-      // a hook in the middle of a function -- the exact failure mode this
-      // module exists to prevent.
       for (uintptr_t a = insideAddr & ~uintptr_t(0xF); a > lo; a -= 16) {
         if (*reinterpret_cast<const uint8_t*>(a - 1) != 0xCC)
           continue;

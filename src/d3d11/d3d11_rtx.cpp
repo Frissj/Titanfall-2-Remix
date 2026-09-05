@@ -6133,13 +6133,15 @@ namespace dxvk {
     HMODULE cl = GetModuleHandleA("client.dll");
     HMODULE sr = GetModuleHandleA("studiorender.dll");
     if (cl == nullptr || sr == nullptr) return false;                  // retry until both loaded
-    const uintptr_t clBase = reinterpret_cast<uintptr_t>(cl);
-    const uintptr_t srBase = reinterpret_cast<uintptr_t>(sr);
-    (void)clBase;
+    // Both addresses this hook needs are resolved by symbol now, so the module
+    // bases are no longer named here -- presence is all we still check above.
 
     // Unregistered on the shipped build (old RVA 0x2E43A58).
     const uintptr_t ctxPtrAddr = EngineSymbols::resolve(tf2sym::kStudioRenderContextPtr);
-    if (ctxPtrAddr == 0)
+    // The vtable slot we expect to be displacing, so we swap a function we
+    // actually identified rather than whatever happens to be in slot +0xB8.
+    const uintptr_t de15Expected = EngineSymbols::resolve(tf2sym::kStudioDrawModelExecute);
+    if (ctxPtrAddr == 0 || de15Expected == 0)
       return true;                                                     // disabled, logged once
     void** pObj = reinterpret_cast<void**>(ctxPtrAddr);
     if (!studioMemReadable(pObj, 8)) return false;
@@ -6150,7 +6152,7 @@ namespace dxvk {
     void** slot = reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(vt) + 0xB8);
     void* cur = *slot;
     if (cur == reinterpret_cast<void*>(&de15Wrapper)) return true;     // already hooked
-    if (cur != reinterpret_cast<void*>(srBase + 0x15D10))
+    if (cur != reinterpret_cast<void*>(de15Expected))
       return false;                                                    // vtable not ready / wrong -> retry
     g_de15Orig = reinterpret_cast<De15_t>(cur);
     g_de15VtableSlot = slot;
@@ -6161,7 +6163,7 @@ namespace dxvk {
     *slot = reinterpret_cast<void*>(&de15Wrapper);
     DWORD tmp = 0; VirtualProtect(slot, 8, op, &tmp);
     Logger::warn(str::format("[De15] installed: slot=0x", std::hex,
-      reinterpret_cast<uintptr_t>(slot), " orig=0x", srBase + 0x15D10, std::dec));
+      reinterpret_cast<uintptr_t>(slot), " orig=0x", de15Expected, std::dec));
     return true;
   }
 
@@ -8562,14 +8564,17 @@ namespace dxvk {
   static bool drawSpanInstallHook() {
     HMODULE cl = GetModuleHandleA("client.dll");
     if (cl == nullptr) return false;
-    const uintptr_t base = reinterpret_cast<uintptr_t>(cl);
 
-    const uintptr_t siteA     = base + 0x36E36A;   // call [rax+0x48]
-    const uintptr_t wordA     = base + 0x36E368;   // the aligned word we store
-    const uintptr_t resumeA   = base + 0x36E372;   // after the mov we relocate
-    const uintptr_t siteC     = base + 0x36E9F9;   // call [r10+0x48]
-    const uintptr_t wordC     = base + 0x36E9F8;
-    const uintptr_t resumeC   = base + 0x36EA00;   // after the test we relocate
+    // Resolved, not hardcoded. Everything else is derived from the two sites,
+    // so there is no second address that can go stale independently.
+    const uintptr_t siteA     = EngineSymbols::resolve(tf2sym::kDrawSpanSiteA);
+    const uintptr_t siteC     = EngineSymbols::resolve(tf2sym::kDrawSpanSiteC);
+    if (siteA == 0 || siteC == 0)
+      return true;                                 // disabled, logged once
+    const uintptr_t wordA     = siteA - 2;         // the aligned word we store
+    const uintptr_t resumeA   = siteA + 8;         // after the mov we relocate
+    const uintptr_t wordC     = siteC - 1;
+    const uintptr_t resumeC   = siteC + 7;         // after the test we relocate
 
     // VERIFY BEFORE WRITING. These reach past the patch to cover every
     // instruction the islands replay, so a mismatch cannot leave us replaying
@@ -8585,11 +8590,11 @@ namespace dxvk {
       0x40, 0x84, 0xF6,                             // test sil, sil
     };
     if (std::memcmp(reinterpret_cast<const void*>(wordA), kSiteA, sizeof(kSiteA)) != 0) {
-      Logger::warn("[Join] draw site A at client+0x36E368 does not match the expected bytes; nothing patched");
+      Logger::warn("[Join] draw site A bytes do not match; nothing patched");
       return true;
     }
     if (std::memcmp(reinterpret_cast<const void*>(wordC), kSiteC, sizeof(kSiteC)) != 0) {
-      Logger::warn("[Join] draw site C at client+0x36E9F8 does not match the expected bytes; nothing patched");
+      Logger::warn("[Join] draw site C bytes do not match; nothing patched");
       return true;
     }
     if ((wordA & 7u) != 0u || (wordC & 7u) != 0u) {
@@ -9365,7 +9370,8 @@ namespace dxvk {
     HMODULE sr = GetModuleHandleA("studiorender.dll");
     if (sr == nullptr) return false;
     const uintptr_t srBase = reinterpret_cast<uintptr_t>(sr);
-    const uintptr_t site   = srBase + 0x15A60;                          // sub_180015A60 entry
+    const uintptr_t site   = EngineSymbols::resolve(tf2sym::kStudioQueuedDraw);
+    if (site == 0) return true;                                         // disabled, logged once
     const uint8_t*  cs     = reinterpret_cast<const uint8_t*>(site);
     if (!studioMemReadable(cs, 5)) return false;
     // Displaced bytes = the first instruction (mov [rsp+8], rbx), exactly 5 bytes.
@@ -68196,11 +68202,12 @@ namespace dxvk {
           if (!s_enginePatched) {
             s_engine = GetModuleHandleA("engine.dll");
             if (s_engine != nullptr) {
-              const uintptr_t base = reinterpret_cast<uintptr_t>(s_engine);
-              const uintptr_t patchAddr = base + 0xB7100;
+              const uintptr_t patchAddr =
+                EngineSymbols::resolve(tf2sym::kVertexBudgetCap);
               // Verify we're patching the expected immediate before writing.
-              const uint32_t observed = *reinterpret_cast<const uint32_t*>(patchAddr);
-              if (observed == 0x00300000u) {
+              const uint32_t observed = patchAddr != 0
+                ? *reinterpret_cast<const uint32_t*>(patchAddr) : 0u;
+              if (patchAddr != 0 && observed == 0x00300000u) {
                 DWORD oldProtect = 0;
                 if (VirtualProtect(reinterpret_cast<LPVOID>(patchAddr), 4,
                                    PAGE_EXECUTE_READWRITE, &oldProtect)) {
@@ -68212,9 +68219,9 @@ namespace dxvk {
                                         reinterpret_cast<LPVOID>(patchAddr), 4);
                   s_enginePatched = true;
                   Logger::warn(str::format(
-                    "[TF2Probe] engine.dll @ 0x", std::hex, base, std::dec,
-                    " â€” PATCHED BuildWorldMeshBatches vertex budget "
-                    "0x00300000 -> 0x7FFFFFFF at 0x", std::hex, patchAddr, std::dec));
+                    "[TF2Probe] engine.dll â€” PATCHED BuildWorldMeshBatches "
+                    "vertex budget 0x00300000 -> 0x7FFFFFFF at 0x",
+                    std::hex, patchAddr, std::dec));
                 } else {
                   Logger::warn(str::format(
                     "[TF2Probe] engine.dll: VirtualProtect FAILED at 0x",
@@ -68266,10 +68273,11 @@ namespace dxvk {
           if (!s_entityGatePatched) {
             HMODULE eng = GetModuleHandleA("engine.dll");
             if (eng != nullptr) {
-              const uintptr_t base = reinterpret_cast<uintptr_t>(eng);
-              const uintptr_t patchAddr = base + 0x730DA;
-              const uint16_t observed = *reinterpret_cast<const uint16_t*>(patchAddr);
-              if (observed == 0x0F74u) {  // little-endian: bytes 74 0F = jz +0xF
+              const uintptr_t patchAddr =
+                EngineSymbols::resolve(tf2sym::kEntityMaskGate);
+              const uint16_t observed = patchAddr != 0
+                ? *reinterpret_cast<const uint16_t*>(patchAddr) : 0u;
+              if (patchAddr != 0 && observed == 0x0F74u) {  // bytes 74 0F = jz +0xF
                 DWORD oldProtect = 0;
                 if (VirtualProtect(reinterpret_cast<LPVOID>(patchAddr), 2,
                                    PAGE_EXECUTE_READWRITE, &oldProtect)) {
@@ -68343,10 +68351,11 @@ namespace dxvk {
           if (!s_dispatchEntryEForcePatched) {
             HMODULE eng = GetModuleHandleA("engine.dll");
             if (eng != nullptr) {
-              const uintptr_t base = reinterpret_cast<uintptr_t>(eng);
-              const uintptr_t patchAddr = base + 0x1B32DF;
+              const uintptr_t patchAddr =
+                EngineSymbols::resolve(tf2sym::kDispatchEntryE);
               const uint8_t* p = reinterpret_cast<const uint8_t*>(patchAddr);
-              if (p[0] == 0x41 && p[1] == 0x0F && p[2] == 0xB6 &&
+              if (patchAddr != 0 &&
+                  p[0] == 0x41 && p[1] == 0x0F && p[2] == 0xB6 &&
                   p[3] == 0x76 && p[4] == 0x0E) {
                 DWORD oldProtect = 0;
                 if (VirtualProtect(reinterpret_cast<LPVOID>(patchAddr), 5,
@@ -68418,9 +68427,9 @@ namespace dxvk {
             HMODULE eng = GetModuleHandleA("engine.dll");
             if (eng != nullptr) {
               const uintptr_t engBase = reinterpret_cast<uintptr_t>(eng);
-              const uintptr_t target  = engBase + 0x1B2200;
+              const uintptr_t target  = EngineSymbols::resolve(tf2sym::kProducerMFenceSite);
               const uint8_t* tgt      = reinterpret_cast<const uint8_t*>(target);
-              if (tgt[0] == 0x48 && tgt[1] == 0x8B && tgt[2] == 0xC4 &&
+              if (target != 0 && tgt[0] == 0x48 && tgt[1] == 0x8B && tgt[2] == 0xC4 &&
                   tgt[3] == 0x53 && tgt[4] == 0x55 && tgt[5] == 0x57 &&
                   tgt[6] == 0x41 && tgt[7] == 0x55) {
                 uint8_t* tramp = nullptr;
@@ -68471,7 +68480,7 @@ namespace dxvk {
                   // jmp rel32 â†’ engBase + 0x1B2208 (after the prologue)
                   *p++ = 0xE9;
                   {
-                    const uintptr_t back = engBase + 0x1B2208;
+                    const uintptr_t back = target + 8;
                     const int32_t disp = static_cast<int32_t>(
                       static_cast<intptr_t>(back) -
                       static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
@@ -68567,11 +68576,18 @@ namespace dxvk {
             s_a2HookInstalled = true;
           if (!s_a2HookInstalled) {
             HMODULE eng = GetModuleHandleA("engine.dll");
-            if (eng != nullptr) {
+            // R_DrawWorldMeshes, located through the "R_DrawWorldMeshes"
+            // profiling literal it uses rather than by RVA. The old 0xB7DD0
+            // is +0xE0 INSIDE sub_1800B7CF0 on the shipped build, so this
+            // hook never installed -- which is why Main had no camera.
+            const uintptr_t target =
+              EngineSymbols::resolve(tf2sym::kRDrawWorldMeshes);
+            if (eng != nullptr && target != 0) {
               const uintptr_t engBase = reinterpret_cast<uintptr_t>(eng);
-              const uintptr_t target  = engBase + 0xB7DD0;  // R_DrawWorldMeshes
-              const uint8_t* tgt      = reinterpret_cast<const uint8_t*>(target);
-              // Verify the prolog matches what we IDA'd.
+              (void)engBase;
+              const uint8_t* tgt = reinterpret_cast<const uint8_t*>(target);
+              // The resolver proves this is a function entry; this proves the
+              // entry is still the 7-byte shape the trampoline relocates.
               if (tgt[0] == 0x48 && tgt[1] == 0x8B && tgt[2] == 0xC4 &&
                   tgt[3] == 0x44 && tgt[4] == 0x89 && tgt[5] == 0x40 &&
                   tgt[6] == 0x18) {
@@ -68724,7 +68740,8 @@ namespace dxvk {
                     *p++ = 0x48; *p++ = 0x8B; *p++ = 0x05;
                     {
                       const uintptr_t srcAddr =
-                        engBase + 0x12205120 + static_cast<uintptr_t>(i) * 8;
+                        EngineSymbols::resolve(tf2sym::kBucketSourceTable)
+                        + static_cast<uintptr_t>(i) * 8;
                       const int32_t disp = static_cast<int32_t>(
                         static_cast<intptr_t>(srcAddr) -
                         static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
@@ -69884,9 +69901,9 @@ namespace dxvk {
             HMODULE eng = GetModuleHandleA("engine.dll");
             if (eng != nullptr) {
               const uintptr_t engBase = reinterpret_cast<uintptr_t>(eng);
-              const uintptr_t target  = engBase + 0xB4870;
+              const uintptr_t target  = EngineSymbols::resolve(tf2sym::kOrSiteCapture);
               const uint8_t* tgt      = reinterpret_cast<const uint8_t*>(target);
-              if (tgt[0] == 0x83 && tgt[1] == 0xE6 && tgt[2] == 0x3F &&
+              if (target != 0 && tgt[0] == 0x83 && tgt[1] == 0xE6 && tgt[2] == 0x3F &&
                   tgt[3] == 0x48 && tgt[4] == 0xC1 && tgt[5] == 0xEF &&
                   tgt[6] == 0x06) {
                 // Allocate a 4KB executable trampoline near the target.
@@ -70448,9 +70465,9 @@ namespace dxvk {
             HMODULE eng = GetModuleHandleA("engine.dll");
             if (eng != nullptr) {
               const uintptr_t engBase = reinterpret_cast<uintptr_t>(eng);
-              const uintptr_t target  = engBase + 0xB84C0;
+              const uintptr_t target  = EngineSymbols::resolve(tf2sym::kB84C0Capture);
               const uint8_t* tgt      = reinterpret_cast<const uint8_t*>(target);
-              if (tgt[0] == 0x53 && tgt[1] == 0x56 && tgt[2] == 0x41 &&
+              if (target != 0 && tgt[0] == 0x53 && tgt[1] == 0x56 && tgt[2] == 0x41 &&
                   tgt[3] == 0x56 && tgt[4] == 0xB8 && tgt[5] == 0x30 &&
                   tgt[6] == 0x80 && tgt[7] == 0x00 && tgt[8] == 0x00) {
                 uint8_t* tramp = nullptr;
@@ -70635,9 +70652,9 @@ namespace dxvk {
             HMODULE eng = GetModuleHandleA("engine.dll");
             if (eng != nullptr) {
               const uintptr_t engBase = reinterpret_cast<uintptr_t>(eng);
-              const uintptr_t target  = engBase + 0x1B2200;
+              const uintptr_t target  = EngineSymbols::resolve(tf2sym::kPropCullSite);
               const uint8_t* tgt      = reinterpret_cast<const uint8_t*>(target);
-              if (tgt[0] == 0x48 && tgt[1] == 0x8B && tgt[2] == 0xC4 &&
+              if (target != 0 && tgt[0] == 0x48 && tgt[1] == 0x8B && tgt[2] == 0xC4 &&
                   tgt[3] == 0x53 && tgt[4] == 0x55 && tgt[5] == 0x57 &&
                   tgt[6] == 0x41 && tgt[7] == 0x55) {
                 uint8_t* tramp = nullptr;
@@ -70792,7 +70809,7 @@ namespace dxvk {
                   *p++ = 0x48; *p++ = 0x8D; *p++ = 0x0C; *p++ = 0xCA;
                   *p++ = 0x48; *p++ = 0x83; *p++ = 0xCA; *p++ = 0xFF;
                   *p++ = 0x8B; *p++ = 0x05;             // mov eax, [rip+globalCount]
-                  emitRipDisp((void*)(engBase + 0x7D2988));
+                  emitRipDisp((void*)(EngineSymbols::resolve(tf2sym::kVisibilityCounter)));
                   *p++ = 0x83; *p++ = 0xC0; *p++ = 0x3F; // add eax, 0x3F
                   *p++ = 0xC1; *p++ = 0xE8; *p++ = 0x06; // shr eax, 6  â†’ wordCount
                   // v57: extra `dec eax` so we skip the LAST word. The
@@ -70825,7 +70842,7 @@ namespace dxvk {
                   // was guarding against). rcx still = bitmask base here; rax/
                   // rcx/rdx are restored by the pops below.
                   *p++ = 0x8B; *p++ = 0x05;             // mov eax, [rip+globalCount]
-                  emitRipDisp((void*)(engBase + 0x7D2988));
+                  emitRipDisp((void*)(EngineSymbols::resolve(tf2sym::kVisibilityCounter)));
                   *p++ = 0x89; *p++ = 0xC2;             // mov edx, eax
                   *p++ = 0x83; *p++ = 0xE2; *p++ = 0x3F; // and edx, 0x3F   (count & 63)
                   *p++ = 0x83; *p++ = 0xC0; *p++ = 0x3F; // add eax, 0x3F
@@ -70957,9 +70974,9 @@ namespace dxvk {
             HMODULE eng = GetModuleHandleA("engine.dll");
             if (eng != nullptr) {
               const uintptr_t engBase = reinterpret_cast<uintptr_t>(eng);
-              const uintptr_t target  = engBase + 0x1B2476;
+              const uintptr_t target  = EngineSymbols::resolve(tf2sym::kPropCullDecisionSite);
               const uint8_t* tgt      = reinterpret_cast<const uint8_t*>(target);
-              if (tgt[0] == 0x0F && tgt[1] == 0x87 &&
+              if (target != 0 && tgt[0] == 0x0F && tgt[1] == 0x87 &&
                   tgt[2] == 0x68 && tgt[3] == 0xFF &&
                   tgt[4] == 0xFF && tgt[5] == 0xFF) {
                 uint8_t* tramp = nullptr;
@@ -71104,7 +71121,7 @@ namespace dxvk {
                   // ja rel32: 0F 87 disp32 (6 bytes)
                   *p++ = 0x0F; *p++ = 0x87;
                   {
-                    const uintptr_t cullTarget = engBase + 0x1B23E4;
+                    const uintptr_t cullTarget = target - 0x92;
                     const int32_t disp = static_cast<int32_t>(
                       static_cast<intptr_t>(cullTarget) -
                       static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
@@ -71113,7 +71130,7 @@ namespace dxvk {
                   // jmp rel32: E9 disp32 (5 bytes)
                   *p++ = 0xE9;
                   {
-                    const uintptr_t keepTarget = engBase + 0x1B247C;
+                    const uintptr_t keepTarget = target + 6;
                     const int32_t disp = static_cast<int32_t>(
                       static_cast<intptr_t>(keepTarget) -
                       static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
@@ -71183,11 +71200,11 @@ namespace dxvk {
             HMODULE eng = GetModuleHandleA("engine.dll");
             if (eng != nullptr) {
               const uintptr_t engBase = reinterpret_cast<uintptr_t>(eng);
-              const uintptr_t target  = engBase + 0x1B23D6;
+              const uintptr_t target  = EngineSymbols::resolve(tf2sym::kBitmaskLoadSite);
               const uint8_t* tgt      = reinterpret_cast<const uint8_t*>(target);
               // Expected: 4A 8B 14 C0 (mov rdx,[rax+r8*8]) +
               //           44 8B 54 24 24 (mov r10d,[rsp+0x24])
-              if (tgt[0] == 0x4A && tgt[1] == 0x8B && tgt[2] == 0x14 && tgt[3] == 0xC0 &&
+              if (target != 0 && tgt[0] == 0x4A && tgt[1] == 0x8B && tgt[2] == 0x14 && tgt[3] == 0xC0 &&
                   tgt[4] == 0x44 && tgt[5] == 0x8B && tgt[6] == 0x54 &&
                   tgt[7] == 0x24 && tgt[8] == 0x24) {
                 uint8_t* tramp = nullptr;
@@ -71272,7 +71289,7 @@ namespace dxvk {
                   // last_word_idx = (count + 63) / 64 - 1 and compare to r8d.
                   // mov eax, [rip + count_addr]
                   *p++ = 0x8B; *p++ = 0x05;
-                  emitRipDisp((void*)(engBase + 0x7D2988));
+                  emitRipDisp((void*)(EngineSymbols::resolve(tf2sym::kVisibilityCounter)));
                   // add eax, 63        ; eax = count+63
                   *p++ = 0x83; *p++ = 0xC0; *p++ = 0x3F;
                   // shr eax, 6         ; eax = wordCount
@@ -71318,7 +71335,7 @@ namespace dxvk {
                   // jmp rel32 â†’ engBase + 0x1B23DF (after the eaten mov)
                   *p++ = 0xE9;
                   {
-                    const uintptr_t back = engBase + 0x1B23DF;
+                    const uintptr_t back = target + 9;
                     const int32_t disp = static_cast<int32_t>(
                       static_cast<intptr_t>(back) -
                       static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
@@ -71391,9 +71408,9 @@ namespace dxvk {
             HMODULE eng = GetModuleHandleA("engine.dll");
             if (eng != nullptr) {
               const uintptr_t engBase = reinterpret_cast<uintptr_t>(eng);
-              const uintptr_t target  = engBase + 0x1B32ED;
+              const uintptr_t target  = EngineSymbols::resolve(tf2sym::kDispatchSite);
               const uint8_t* tgt      = reinterpret_cast<const uint8_t*>(target);
-              if (tgt[0] == 0x0F && tgt[1] == 0x84 &&
+              if (target != 0 && tgt[0] == 0x0F && tgt[1] == 0x84 &&
                   tgt[2] == 0xCB && tgt[3] == 0x02 &&
                   tgt[4] == 0x00 && tgt[5] == 0x00) {
                 uint8_t* tramp = nullptr;
@@ -71516,7 +71533,7 @@ namespace dxvk {
                   //   jmp rel32 â†’ engBase + 0x1B32F3  (process-entry path)
                   *p++ = 0x0F; *p++ = 0x84;
                   {
-                    const uintptr_t skipTarget = engBase + 0x1B35BE;
+                    const uintptr_t skipTarget = target + 0x2D1;
                     const int32_t disp = static_cast<int32_t>(
                       static_cast<intptr_t>(skipTarget) -
                       static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
@@ -71524,7 +71541,7 @@ namespace dxvk {
                   }
                   *p++ = 0xE9;
                   {
-                    const uintptr_t processTarget = engBase + 0x1B32F3;
+                    const uintptr_t processTarget = target + 6;
                     const int32_t disp = static_cast<int32_t>(
                       static_cast<intptr_t>(processTarget) -
                       static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
@@ -71613,9 +71630,9 @@ namespace dxvk {
             HMODULE eng = GetModuleHandleA("engine.dll");
             if (eng != nullptr) {
               const uintptr_t engBase = reinterpret_cast<uintptr_t>(eng);
-              const uintptr_t target  = engBase + 0x1B320B;
+              const uintptr_t target  = EngineSymbols::resolve(tf2sym::kDispatchMFenceSite);
               const uint8_t* tgt      = reinterpret_cast<const uint8_t*>(target);
-              if (tgt[0] == 0x83 && tgt[1] == 0xBF &&
+              if (target != 0 && tgt[0] == 0x83 && tgt[1] == 0xBF &&
                   tgt[2] == 0x30 && tgt[3] == 0x00 &&
                   tgt[4] == 0x05 && tgt[5] == 0x00 &&
                   tgt[6] == 0x00) {
@@ -71675,7 +71692,7 @@ namespace dxvk {
                   // jmp rel32 â†’ engBase + 0x1B3212 (the original `je`)
                   *p++ = 0xE9;
                   {
-                    const uintptr_t back = engBase + 0x1B3212;
+                    const uintptr_t back = target + 7;
                     const int32_t disp = static_cast<int32_t>(
                       static_cast<intptr_t>(back) -
                       static_cast<intptr_t>(reinterpret_cast<uintptr_t>(p + 4)));
@@ -71764,7 +71781,7 @@ namespace dxvk {
             uint32_t wordCount = 0;
             if (HMODULE eng = GetModuleHandleA("engine.dll")) {
               const uintptr_t engBase = reinterpret_cast<uintptr_t>(eng);
-              globalCount = *reinterpret_cast<const uint32_t*>(engBase + 0x7D2988);
+              globalCount = *reinterpret_cast<const uint32_t*>(EngineSymbols::resolve(tf2sym::kVisibilityCounter));
               wordCount = (globalCount + 63) >> 6;
               // No cap â€” trust the engine's globalCount.
             }
