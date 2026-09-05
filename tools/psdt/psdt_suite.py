@@ -820,80 +820,74 @@ def section_coherence():
     print('    GPU - like everything else here, they describe the code rather than a run.')
 
 
-def section_confidence():
-    rule('CONFIDENCE  telling a firefly from a muzzle flash')
+def section_support():
+    rule('SUPPORT  what a bright pixel is worth, and why there is no firefly guard')
 
-    print('  A path traced frame can put a hundredfold luminance spike in one block for one')
-    print('  frame. Nothing in a framebuffer separates that from a real flash; where it was')
-    print('  a frame ago does. Disagreement widens the history window the block has to')
-    print('  escape, so appearing costs something and persisting does not.')
+    print('  v0.3 briefly grew a firefly guard on the source field: a large disagreement')
+    print('  with the reprojected history widened the window that history had to escape,')
+    print('  so a spike had to persist to be believed. It was removed. This section is why,')
+    print('  and it is a property worth locking down regardless of that story.')
+    print()
+    print('  Two facts settle it. The tonemapper runs after dispatchDenoise,')
+    print('  dispatchComposite and the upscaler, so it never sees raw path tracing output.')
+    print('  And the source field is an AREA mean over 16x16 = 256 pixels, so a lone bright')
+    print('  pixel contributes a 256th of itself before anything else looks at it.')
+    print()
+    print('  Block source energy against the glare visibility threshold, at the defaults.')
     print()
 
-    dt = 1.0 / 60.0
+    threshold = P.glare_threshold_energy()
+    print(f'    {"case":<32s} {"px lit":>7s} {"x grey":>8s} {"block E":>9s} {"halo?":>7s}'
+          f' {"vs history 0":>13s}')
 
-    def run(profile, knee):
-        filt = P.SourceFilter(knee=knee, value=0.0)
-        filt.hasHistory = True
-        out = []
-        for measured in profile:
-            out.append(filt.step(measured, dt))
-        return out
-
-    knee = P.DEFAULTS['sourceConfidence']
-    frames = 180
-    spike = [0.0] + [400.0] + [0.0] * (frames - 2)
-    persistent = [0.0] + [400.0] * (frames - 1)
-
-    print('  What a one-frame spike is worth. Glare responds to log2(1 + energy) rather')
-    print('  than to energy, so the halo column is the one that says what is visible.')
-    print()
-    print(f'    {"":<22s} {"peak energy":>12s} {"halo (log2)":>12s} {"of v0.2":>9s}')
-    for label, k in (('v0.2 (no test)', 0.0), ('v0.3', knee)):
-        peak = max(run(spike, k))
-        halo = math.log2(1.0 + peak)
-        base = math.log2(1.0 + max(run(spike, 0.0)))
-        print(f'    {label:<22s} {peak:>12.1f} {halo:>12.2f} {halo / base * 100:>8.1f}%')
-
-    print()
-    print('  What it costs a real source. The same block, with the source still there.')
-    print()
-
-    def reach(trace, fraction, target=400.0):
-        for i, v in enumerate(trace):
-            if v >= target * fraction:
-                return i * dt
-        return float('nan')
-
-    print(f'    {"":<22s} {"50%":>8s} {"90%":>8s} {"99%":>8s}   {"halo at 0.1 s":>14s}')
-    for label, k in (('v0.2 (no test)', 0.0), ('v0.3', knee)):
-        trace = run(persistent, k)
-        at_100ms = trace[min(int(0.1 / dt), len(trace) - 1)]
-        print(f'    {label:<22s} {reach(trace, 0.5):>8.3f} {reach(trace, 0.9):>8.3f}'
-              f' {reach(trace, 0.99):>8.3f} s {math.log2(1.0 + at_100ms):>14.2f}')
+    # `want` is what the transform is supposed to do with each case, so the
+    # table is an assertion rather than a display. None of it depends on the
+    # temporal filter at all - that is the point.
+    cases = [
+        ('residual firefly, 1 px', 1, 100.0, False),
+        ('bright firefly, 1 px', 1, 1000.0, False),
+        ('firefly cluster, 4 px', 4, 1000.0, False),
+        ('specular glint, 12 px', 12, 200.0, False),
+        ('dim lamp, 20% of a block', 51, 60.0, False),
+        ('muzzle flash, 10% of a block', 26, 1000.0, True),
+        ('muzzle flash, 30% of a block', 77, 1000.0, True),
+        ('explosion, whole block', 256, 500.0, True),
+    ]
+    worst_small, weakest_flash, wrong = 0.0, 1e9, []
+    for label, px, over, want in cases:
+        e = P.block_source_energy(px, over)
+        octaves = math.log2((e + 1e-3) / 1e-3)
+        halos = e > threshold
+        if halos != want:
+            wrong.append(label)
+        print(f'    {label:<32s} {px:>7d} {over:>8.0f} {e:>9.3f}'
+              f' {("YES" if halos else "no"):>7s} {octaves:>12.1f}c')
+        if px <= 12:
+            worst_small = max(worst_small, e)
+        if want:
+            weakest_flash = min(weakest_flash, e)
 
     print()
-    print('  And the check that only one direction was slowed. A source that has been')
-    print('  established for half a second, switched off: time to fall below 1% of it.')
+    print(f'    Glare visibility threshold: {threshold:.2f} of block energy.'
+          + ('' if not wrong else f'   MISMATCH: {", ".join(wrong)}'))
     print()
-    settled = [400.0] * 60
-    print(f'    {"":<22s} {"release":>9s}')
-    for label, k in (('v0.2 (no test)', 0.0), ('v0.3', knee)):
-        filt = P.SourceFilter(knee=k, value=0.0)
-        filt.hasHistory = True
-        for v in settled:
-            filt.step(v, dt)
-        established = filt.value
-        released = float('nan')
-        for i in range(120):
-            if filt.step(0.0, dt) < established * 0.01:
-                released = (i + 1) * dt
-                break
-        print(f'    {label:<22s} {released:>8.3f}s')
-
+    print(f'    Nothing with support of 12 pixels or fewer reaches {worst_small:.2f}, so none of them')
+    print('    produces a halo at any setting of anything, with or without a temporal')
+    print(f'    guard. Every flash-sized event clears it, the weakest at {weakest_flash:.1f} - and')
+    print('    registers 14 or more octaves of disagreement against a block that was dark a')
+    print('    frame ago, which is maximum penalty under a guard keyed on disagreement. So')
+    print('    the guard could not reach what it was written for and hit hardest exactly')
+    print('    where it must not. The area mean was already the defence.')
     print()
-    print('    The release is unchanged, and has to be: the clamp\'s upper bound is what')
-    print('    handles a falling measurement and nothing here touches it. A light going')
-    print('    out is not a thing to be sceptical about.')
+    print('    The dim lamp is the control that keeps this honest: large support and it')
+    print('    still does not glare, because the threshold is anchored to adaptation and a')
+    print('    60x lamp is not blinding at this exposure. Support is not the criterion,')
+    print('    energy is - support is just what a lone pixel does not have.')
+    print()
+    print('    A real version of this needs a confidence signal from the denoiser rather')
+    print('    than a spike rediscovered from its output. NRD has one internally and the')
+    print('    Remix integration does not export it, so it is denoiser-side work and a v0.4')
+    print('    item rather than something the tonemapper can infer.')
 
 
 def section_temporal():
@@ -1199,7 +1193,7 @@ def section_compare():
 
 
 def section_invariants():
-    rule('INVARIANTS  the nine properties the transform is supposed to hold')
+    rule('INVARIANTS  the ten properties the transform is supposed to hold')
 
     st = P.State()
     fails = []
@@ -1373,6 +1367,23 @@ def section_invariants():
           f'lighting edge, {pull_shade:.4f} across ordinary   {"PASS" if ok else "FAIL"}')
     print('     shadow across the same wall                shading')
 
+    # 10. A bright pixel is not a light. The source field is an area mean over
+    #     256 pixels, so support of one or a few costs a factor of hundreds
+    #     before the glare threshold is consulted - and that, not any temporal
+    #     test, is what stops a stray bright pixel drawing a halo. Asserted
+    #     both ways, because an operator that also refuses a muzzle flash has
+    #     not passed, it has stopped working.
+    threshold = P.glare_threshold_energy()
+    small = max(P.block_source_energy(px, over)
+                for px, over in ((1, 1000.0), (4, 1000.0), (12, 200.0)))
+    flash = min(P.block_source_energy(px, over)
+                for px, over in ((26, 1000.0), (77, 1000.0), (256, 500.0)))
+    ok = small < threshold and flash > threshold
+    fails += [] if ok else ['support']
+    print(f' 10. a bright pixel is not a light           {small:.2f} for 12 px or fewer, '
+          f'{flash:.1f} for a flash,   {"PASS" if ok else "FAIL"}')
+    print(f'                                            threshold {threshold:.2f}')
+
     print()
     if fails:
         print(f'  {len(fails)} FAILED: {", ".join(fails)}')
@@ -1387,7 +1398,7 @@ SECTIONS = {
     'illuminant': section_illuminant, 'gamut': section_gamut,
     'response': section_response, 'colour': section_colour, 'hue': section_hue,
     'contrast': section_contrast, 'glare': section_glare,
-    'coherence': section_coherence, 'confidence': section_confidence,
+    'coherence': section_coherence, 'support': section_support,
     'temporal': section_temporal,
     'compare': section_compare, 'invariants': section_invariants,
 }

@@ -48,10 +48,10 @@ Fifteen sections. `python3 tools/psdt/psdt_suite.py <section>` runs one.
 | `contrast` | how much local contrast survives, and the detail-magnitude rolloff that stops a lamp being treated as texture |
 | `glare` | the halo radius grows with source luminance, the halo carries the source's colour, both lobes contribute, and the threshold tracks adaptation |
 | `coherence` | what came across from Auto Exposure Plus when it stopped running: the robust pyramid reduction, the cross-scale edge stop, and what each of the three ownership settings costs |
-| `confidence` | a one-frame spike against a source that persists, a source that flickers, and a light going out — the four cases that have to be told apart from each other |
+| `support` | what a bright pixel is actually worth once the source field's area mean has had it, and why there is no firefly guard |
 | `temporal` | step response of the two filters in series: settling times, overshoot, false cuts, and noise attenuation |
 | `compare` | the section-33 weighted score, PSDT against GT7, AgX, Reinhard and Hable |
-| `invariants` | the nine properties the transform is supposed to hold, as pass/fail |
+| `invariants` | the ten properties the transform is supposed to hold, as pass/fail |
 
 ### What it cannot establish
 
@@ -104,8 +104,11 @@ For each setting of one parameter, the metrics that parameter actually trades
 against each other. A default is defensible when it sits where the curves
 cross, not where it looked right in a screenshot.
 
-`highlightRolloff` 0.45, `luminanceConcession` 0.8 and `chromaPreservation` 2.5
-are set from this rather than by taste.
+`highlightRolloff` 0.45, `luminanceConcession` 0.8, `chromaPreservation` 2.5,
+`scaleCoherence` 1.20 and `pyramidCoherence` 1.00 are set from this rather than by
+taste. The last two sweep in `sweep_pooling()` rather than the main sweep,
+because `measure()` runs an isolated pixel where the pooling is never exercised
+and every row would come out identical.
 
 ## `RESULTS.txt`
 

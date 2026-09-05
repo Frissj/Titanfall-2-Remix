@@ -347,13 +347,6 @@ SCALE_DEADZONE = 1.0
 SKY_ADAPTATION_WEIGHT = 0.15
 EMISSIVE_THRESHOLD_DISCOUNT = 2.5
 
-# The source field's temporal confidence, from psdt_analysis. See SourceFilter.
-CONFIDENCE_FLOOR_RATIO = 0.25
-SPIKE_FLOOR_RATIO = 0.02
-CONFIDENCE_DEADZONE = 1.0
-CONFIDENCE_ENERGY_FLOOR = 1e-3
-MIN_CONFIDENCE_WEIGHT = 0.15
-
 # PSDT_STATE_SHIFT_COHERENCE is 8 bits of [0, PSDT_COHERENCE_MAX]. The
 # quantisation is modelled rather than ignored, because a sweep that reports a
 # value the GPU cannot actually be set to is a sweep of the wrong function.
@@ -370,7 +363,6 @@ DEFAULTS = dict(
     # adaptation
     sourceExclusion=0.75, localAdaptation=0.65, contrastBudget=1.0,
     depthSensitivity=0.35, scaleCoherence=1.20, pyramidCoherence=1.00,
-    sourceConfidence=1.50,
     adaptationSpeedUp=3.0, adaptationSpeedDown=1.2,
     # curve
     midtoneContrast=1.15, shadowDepth=0.55, highlightRolloff=0.45,
@@ -565,52 +557,44 @@ class StateFilter:
         return self.anchor
 
 
-class SourceFilter:
+def block_source_energy(pixels_lit, over_grey, opts=None):
     """
-    The source field's temporal accumulation, from psdt_analysis.
+    psdt_analysis's source-field reduction, for `pixels_lit` pixels of a 16x16
+    block at `over_grey` times middle grey.
 
-    Separate from FieldFilter because the two channels are filtered
-    differently and the difference is the point. The body channel is bounded by
-    a fixed +-3 stop window and left alone otherwise: it drives a slow, budgeted
-    anchor, and a muzzle flash really does light a room. The source channel
-    feeds the glare model, where believing one frame of noise costs a visible
-    flash of halo, so how far it is allowed to move is sized by how much it
-    disagrees with where it was.
-
-    Only appearing is slowed. The upper bound of the clamp is untouched, so a
-    light going out is released at once.
+    The reduction is an AREA mean over all 256 threads - `currentSource` is the
+    accumulated per-pixel energy times `invThreads`, not divided by how many
+    pixels contributed. That is deliberate, because the glare kernel needs the
+    field to conserve energy per unit area down the mip chain. It is also, on
+    its own, the whole of PSDT's defence against a bright pixel: support of one
+    costs a factor of 256 before anything else is consulted.
     """
+    o = dict(DEFAULTS)
+    if opts:
+        o.update(opts)
+    y = 0.18 * over_grey
+    rel = math.log2(max(over_grey, 1e-9))
+    t = o['sourceThreshold']
+    brightness = smoothstep(t - 0.5, t + 0.5, rel)
+    g = o['glareClassThreshold']
+    glareness = smoothstep(g - 1.0, g + 1.0, rel)
+    # Compactness only ever reduces sourceness, and a small bright population
+    # in a dark block is exactly the case where it does not engage.
+    energy_weight = brightness * lerp(0.25, 1.0, glareness)
+    return min(y, 16384.0) * energy_weight * pixels_lit / 256.0
 
-    def __init__(self, speed=8.0, knee=None, value=0.0):
-        self.speed = speed
-        self.knee = DEFAULTS['sourceConfidence'] if knee is None else knee
-        self.value = value
-        self.hasHistory = False
 
-    def step(self, measured, dt, cut_flag=0.0):
-        per_frame = self.speed * dt
-        current_weight = min(1.0, max(0.05, 1.0 - 2.0 ** (-per_frame))) if self.hasHistory else 1.0
-        current_weight = lerp(current_weight, 1.0, saturate(cut_flag))
-        if not self.hasHistory or current_weight >= 1.0:
-            self.value = measured
-            self.hasHistory = True
-            return self.value
-
-        floor_ratio = CONFIDENCE_FLOOR_RATIO
-        source_weight = current_weight
-        if self.knee > 1e-3:
-            now = measured + CONFIDENCE_ENERGY_FLOOR
-            was = self.value + CONFIDENCE_ENERGY_FLOOR
-            octaves = abs(math.log2(now / was))
-            excess = max(octaves - CONFIDENCE_DEADZONE, 0.0) / self.knee
-            confidence = max(1.0 / (1.0 + excess * excess), saturate(cut_flag))
-            floor_ratio = lerp(SPIKE_FLOOR_RATIO, CONFIDENCE_FLOOR_RATIO, confidence)
-            source_weight = current_weight * lerp(MIN_CONFIDENCE_WEIGHT, 1.0, confidence)
-
-        history = clamp(self.value, measured * floor_ratio, measured * 4.0 + 1e-3)
-        self.value = lerp(history, measured, source_weight)
-        self.hasHistory = True
-        return self.value
+def glare_threshold_energy(opts=None, anchor=None):
+    """
+    The block energy a level has to exceed to contribute any glare at all:
+    PSDT_STATE_GLARE_THRESHOLD is anchor + glareThreshold stops, and psdtGlare
+    exponentiates it before comparing against level energy.
+    """
+    o = dict(DEFAULTS)
+    if opts:
+        o.update(opts)
+    a = MIDDLE_GREY_LOG if anchor is None else anchor
+    return 2.0 ** (a + o['glareThreshold'])
 
 
 def reduce_body(children, sigma):

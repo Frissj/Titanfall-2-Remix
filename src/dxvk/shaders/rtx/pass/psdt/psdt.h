@@ -113,13 +113,20 @@
 //       weighted one, so a coarse level reports the dominant population of its
 //       children rather than an average across a boundary between two.
 //
-// And one signal neither had. A path traced frame can put a hundredfold
-// luminance spike in one block for one frame - a firefly the denoiser did not
-// catch, a speculative fireball, a specular hit on something that moved. From
-// the framebuffer that is indistinguishable from a muzzle flash. From the
-// reprojected history it is not, and PsdtAnalysisArgs::sourceConfidenceKnee is
-// what makes the difference cost something: a source that was there is
-// believed at once, one that appeared out of nothing has to persist.
+// A third change was written and then removed, and the removal is the more
+// useful record. It was a firefly guard on the source field: a large
+// disagreement with the reprojected history widened the window that history
+// had to escape, so a spike had to persist to be believed.
+//
+// It was wrong twice. The tonemapper runs after dispatchDenoise,
+// dispatchComposite and the upscaler, so it does not see raw path tracing
+// output and an isolated spike has already been through NRD. And the source
+// field is an area mean over 256 pixels, so a lone bright pixel contributes
+// 1/256 of itself and cannot clear the glare threshold whatever the guard
+// does - while a muzzle flash over a tenth of a block clears it easily and
+// registers as fourteen octaves of disagreement, which is maximum penalty for
+// the one event that must not be penalised. The area mean was already the
+// defence. See psdt_analysis.comp.slang and psdt_suite's `support` section.
 //
 // Structure
 // ---------
@@ -505,17 +512,6 @@ struct PsdtAnalysisArgs
   // Albedo below this in any channel makes radiance / albedo meaningless, so
   // the pixel contributes nothing to the illuminant estimate.
   float illuminantMinAlbedo;
-
-  // Octaves of disagreement between this frame's source energy and the
-  // reprojected history at which the block is only half believed. Zero
-  // disables the test and restores v0.2's fixed history window.
-  //
-  // This is the only defence the transform has against path tracing variance,
-  // and it is needed because nothing else in the pipeline can tell a firefly
-  // from a muzzle flash. Both are a hundredfold luminance spike in a handful
-  // of pixels; the difference is entirely in whether the same place said
-  // anything like it a frame ago. See psdt_analysis.comp.slang.
-  float sourceConfidenceKnee;
 
   float toneCurveMinStops;
   float toneCurveMaxStops;

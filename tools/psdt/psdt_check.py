@@ -245,11 +245,6 @@ def check_shared_constants():
         ('kPsdtScaleDeadzone', transform, 'SCALE_DEADZONE'),
         ('kSkyAdaptationWeight', analysis, 'SKY_ADAPTATION_WEIGHT'),
         ('kEmissiveThresholdDiscount', analysis, 'EMISSIVE_THRESHOLD_DISCOUNT'),
-        ('kConfidenceFloorRatio', analysis, 'CONFIDENCE_FLOOR_RATIO'),
-        ('kSpikeFloorRatio', analysis, 'SPIKE_FLOOR_RATIO'),
-        ('kConfidenceDeadzone', analysis, 'CONFIDENCE_DEADZONE'),
-        ('kConfidenceEnergyFloor', analysis, 'CONFIDENCE_ENERGY_FLOOR'),
-        ('kMinConfidenceWeight', analysis, 'MIN_CONFIDENCE_WEIGHT'),
     ]
     bad = []
     for shader_name, text, ref_name in pairs:

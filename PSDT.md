@@ -173,36 +173,66 @@ get the same weight. What saves it is that the finer level it was reduced from
 still holds both halves, is still pooled, and is where a feature that small
 belongs.
 
-### And one signal neither of them had
+### And one thing that was added and then taken out again
 
-A path-traced frame can put a hundredfold luminance spike in one block for one
-frame — a firefly the denoiser did not catch, a speculative fireball, a specular
-hit on something that moved. From the framebuffer that is indistinguishable from
-a muzzle flash. From the reprojected history it is not.
+A firefly guard on the source field. How far a block's source energy disagreed
+with its reprojected history sized the history window that history had to
+escape, so a spike had to persist to be believed. It was measured, it worked as
+specified, and it was removed, because it was defending the wrong door against
+the wrong thing.
 
-So how far a block's source energy disagrees with where it was now sizes the
-history window it is allowed to escape, and scales the weight it escapes at.
-Appearing out of nothing is expensive; persisting is not.
+**The tonemapper does not see path tracing output.** It runs after
+`dispatchDenoise`, `dispatchComposite` and the upscaler. An isolated raw spike
+has already been through NRD, whose entire job that is, and building a second
+denoiser out of the finished image is not a design, it is a duplication — which
+is what the rest of this version is about.
+
+**And the area mean was already the defence.** The source field is a mean over
+all 256 pixels of the block, not over the ones that contributed, because the
+glare kernel needs it to conserve energy per unit area down the mip chain. So a
+lone bright pixel arrives divided by 256, and at the default thresholds it
+cannot reach the glare model at all:
 
 ```
-                          one frame at 400x        a source that stays
-                          halo    of v0.2          90%       halo at 0.1 s
-   v0.2 (no test)         6.99    100%             0.367 s   7.84
-   v0.3                   3.91     56%             0.500 s   6.41
+   case                          px lit   x grey   block E   halo?   vs history 0
+   residual firefly                   1      100     0.018      no        4.2 oct
+   bright firefly                     1     1000     0.703      no        9.5
+   firefly cluster                    4     1000     2.812      no       11.5
+   specular glint                    12      200     0.731      no        9.5
+   dim lamp, 20% of a block          51       60     0.538      no        9.1
+   muzzle flash, 10% of a block      26     1000    18.281     YES       14.2
+   muzzle flash, 30% of a block      77     1000    54.141     YES       15.7
+   explosion, whole block           256      500    89.941     YES       16.5
+
+   glare visibility threshold                        5.760
 ```
 
-The discrimination is on repetition, not on steadiness, which is the distinction
-that matters for a game: a one-frame 4× spike is rejected to about a sixth of its
-halo, while a source flickering 4× *every* frame keeps 96% of what a steady one
-would. A fire stays lit.
+Read the last two columns together. Nothing small enough to be a firefly gets
+within a factor of two of the threshold — so the guard could not change what any
+of them looked like, at any setting. Everything flash-sized clears it easily and
+registers fourteen or more octaves of disagreement against a block that was dark
+a frame ago, which under a guard keyed on disagreement is *maximum penalty*. The
+mechanism was incapable of helping the cases it was written for and hit hardest
+on precisely the case it must not touch.
 
-Only the appearing direction is slowed. Release is one frame, unchanged, because
-the clamp's upper bound is what handles a falling measurement and a light going
-out is not something to be sceptical about.
+The synthetic test that made it look good fed `400` straight into the temporal
+filter. At block level that is the whole 256-pixel block going 400× brighter in
+one frame, which is not a firefly — it is an explosion. The headline number,
+"one-frame spike halo 6.99 → 3.91", was the transform attenuating an explosion by
+44% and calling it noise rejection. A test built from the mechanism's own units
+rather than from the pass's is a test that cannot fail.
 
-This is the only part of the transform that knows its input is path traced. It
-is one term on one channel, not a variance-aware pipeline, and it is described
-that way deliberately.
+`psdt_suite.py support` is now that measurement, and invariant 10 asserts it in
+both directions — small support below threshold *and* flash-sized above it,
+because a transform that also refuses a muzzle flash has not passed, it has
+stopped working.
+
+A real version of this is still worth having, and it is denoiser-side work: it
+needs a confidence signal *from* NRD rather than a spike rediscovered from its
+output. NRD maintains one internally; the Remix integration does not export it
+(`OUT_VALIDATION` is a debug visualisation allocated only under
+`enableValidation`, and `m_reprojectionConfidence` is an RTXDI reservoir signal
+at downscaled extent, not radiance stability). See v0.4.
 
 ---
 
@@ -219,8 +249,6 @@ that way deliberately.
               estimate the local illuminant as radiance / albedo
               accumulate a BODY-ONLY luminance histogram
               reduce each 16x16 block, reproject, accumulate
-              size the source channel's history window by how far it
-              disagrees with where it was  (v0.3)
                                  |
               +------------------+------------------+
               |                  |                  |
@@ -763,15 +791,15 @@ joins, and its analytic derivative matches a central difference to 1.3e-9. And
 `psdt_sweep.py` now reports **zero luminance inversions at every setting of
 every parameter it sweeps**, not just at the defaults.
 
-Six defaults are set by sweep rather than by taste — `highlightRolloff` 0.45,
+Five defaults are set by sweep rather than by taste — `highlightRolloff` 0.45,
 `luminanceConcession` 0.8, `chromaPreservation` 2.5, and v0.3's
-`scaleCoherence` 1.20, `pyramidCoherence` 1.00, `sourceConfidence` 1.50.
+`scaleCoherence` 1.20 and `pyramidCoherence` 1.00.
 
-The three new ones sweep in `psdt_sweep.py`'s pooling section rather than its
-main one, because the main sweep runs `psdt_apply` on an isolated pixel where
-the pooling is never exercised. Sweeping them through it would print identical
-rows and read as "this parameter does nothing", which is worse than not
-sweeping it at all.
+The two new ones sweep in `psdt_sweep.py`'s pooling section rather than its main
+one, because the main sweep runs `psdt_apply` on an isolated pixel where the
+pooling is never exercised. Sweeping them through it would print identical rows
+and read as "this parameter does nothing", which is worse than not sweeping it
+at all.
 
 `pyramidCoherence` moved from 1.50 to 1.00 on that sweep: at 1.50 a coarse texel
 made of three dark children and one three stops brighter still reported 0.13
@@ -806,13 +834,11 @@ value with the lowest error.
   adaptations. The adaptation is skipped entirely when `spatialWhite` is 0. None
   of that is a substitute for a profile — including the sixteen dispatches v0.3
   stopped submitting, which are counted from the code and not from a capture.
-* **The source-confidence term is one term on one channel.** It is not a
-  variance-aware pipeline and the design note that asked for one wanted more:
-  path-tracing variance feeding the exposure, the white point and the colour
-  mapping as well. This feeds the glare model, because that is where believing
-  one frame of noise costs a visible artifact, and because the body channel
-  already has a clamp, a budget and a slow anchor in front of it. Extending it
-  is a v0.4 item, not a claim being made here.
+* **Nothing in the transform knows its input is path traced.** v0.3 tried to
+  make something know, and it was wrong to: the tonemapper runs after the
+  denoiser and after the upscaler. Path-tracing variance is real and is worth
+  reaching the adaptation system, but it has to arrive as a signal from the
+  denoiser, not as an inference from the denoiser's output. See above.
 * **The robust pyramid reduction cannot break a tie.** Four children split two
   and two produce a value neither pair is at. See the v0.3 section.
 
@@ -909,15 +935,18 @@ In order, and the first one is not optional:
 
 Then the things v0.3 deliberately did not do:
 
-10. **Extend confidence past the source channel.** The design note asked for
-    path-tracing variance to reach the exposure, the white point and the colour
-    mapping. It currently reaches the glare model. The others each already have
-    a filter in front of them, so the case for extending it is a measurement
-    rather than an assumption — which means it needs the frame corpus first.
-11. **A real variance signal rather than a temporal one.** What is measured now
-    is disagreement with the reprojected history, which conflates path-tracing
-    noise with anything the reprojection got wrong. The denoiser knows the
-    difference and does not currently tell the tonemapper.
+10. **Export a confidence signal from the denoiser.** This is the one that
+    unblocks everything the design note wanted from path-tracing variance —
+    reaching the exposure, the white point and the colour mapping as well as the
+    glare model. It cannot be inferred from the denoiser's output, which is what
+    v0.3 tried; NRD maintains history length and accumulation confidence
+    internally and `rtx_nrd_context.cpp` does not surface either. Denoiser-side
+    work, and the tonemapper is the consumer rather than the place to fix it.
+11. **Then decide whether the adaptation system actually wants it.** With the
+    signal in hand, the body channel already has a clamp, a budget and a slow
+    anchor in front of it, and the glare model already has the area mean. The
+    case for wiring it in is a measurement on a frame corpus rather than an
+    assumption — and v0.3 is the reason that sentence is in this list.
 12. **Scene grading and display grading as separate operations.** The existing
     colour grading runs after PSDT and is a plain RGB operation that can undo the
     hue trajectory PSDT worked to produce. It is off by default, so this is

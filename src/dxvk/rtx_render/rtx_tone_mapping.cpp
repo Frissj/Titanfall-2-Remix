@@ -321,7 +321,6 @@ namespace dxvk {
         RemixGui::DragFloat("Adaptation Speed Down", &adaptationSpeedDownObject(), 0.05f, 0.05f, 30.f);
         RemixGui::Checkbox("Temporal Accumulation", &temporalAccumulationObject());
         RemixGui::DragFloat("Field Adaptation Speed", &fieldAdaptationSpeedObject(), 0.1f, 0.1f, 60.f);
-        RemixGui::DragFloat("Source Confidence (octaves)", &sourceConfidenceObject(), 0.05f, 0.f, 8.f);
         RemixGui::Separator();
         RemixGui::Combo("Local Adaptation Owner", &localAdaptationOwnerObject(),
                         "PSDT\0Auto Exposure Plus\0Both\0");
@@ -800,11 +799,6 @@ namespace dxvk {
         : 1.0f;
       pushArgs.skyViewZ = skyViewZ();
       pushArgs.illuminantMinAlbedo = std::max(illuminantMinAlbedo(), 1e-3f);
-      // The confidence test compares against the reprojected history, so it
-      // has nothing to compare against on a frame that is not accumulating.
-      // Passing 0 there disables it rather than letting it size a window that
-      // is not being used.
-      pushArgs.sourceConfidenceKnee = accumulate ? std::max(sourceConfidence(), 0.0f) : 0.0f;
       pushArgs.toneCurveMinStops = toneCurveMinStops();
       pushArgs.toneCurveMaxStops = toneCurveMaxStops();
       ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);

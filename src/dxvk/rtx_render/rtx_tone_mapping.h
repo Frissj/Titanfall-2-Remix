@@ -372,11 +372,6 @@ namespace dxvk {
                "Width, in stops, of the robust reweight in the pyramid's body reduction. 0 restores a plain weight-normalised mean.\n"
                "The other half of what came across from Auto Exposure Plus. Four children that are two dark walls and two sunlit ones average to a value describing neither, and every coarser level is then built out of values describing a scene that is not there. One Welsch step about the weighted mean makes a level report the population most of it belongs to instead; the bright minority is left to the finer level it came from, which still exists and is still pooled.\n"
                "Lower is more selective. Below about a stop it starts rejecting ordinary shading, at which point the coarse levels stop describing anything wider than the fine ones do.");
-    RTX_OPTION("rtx.tonemap.psdt", float, sourceConfidence, 1.50f,
-               "Octaves by which this frame's source energy may disagree with the reprojected history before the block is only half believed. 0 disables the test.\n"
-               "The only place in the transform that knows its input is path traced. A firefly the denoiser missed, a speculative fireball and a specular hit on something that moved are all a hundredfold luminance spike in a few pixels for one frame, and none of them is distinguishable from a muzzle flash in a framebuffer - but they are distinguishable from where the same block was a frame ago. Disagreement widens the history window the block has to escape, so a source that persists is believed and one that appeared out of nothing is admitted at a fraction of its energy until it repeats itself.\n"
-               "Only the appearing direction is slowed. A light going out is instant, because that is what a light going out is.\n"
-               "Lower is stricter. It is observable through debug view 4, which is the glare kernel's actual input rather than a re-derivation of it.");
     RTX_OPTION("rtx.tonemap.psdt", float, glareClassThreshold, 8.0f,
                "Stops above middle grey at which a pixel is too bright to be represented as a value at all, and its energy is handed to the glare model as spatial extent instead.");
     RTX_OPTION("rtx.tonemap.psdt", float, localAdaptation, 0.65f,

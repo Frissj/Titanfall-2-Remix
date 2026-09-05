@@ -128,53 +128,6 @@ def sweep_pooling():
     print('    The third column is the control and its error is against the plain mean,')
     print('    which is the right answer where there is no majority to find.')
 
-    print('\n  sourceConfidence   noise against signal')
-    dt = 1.0 / 60.0
-
-    def spike_halo(knee, ratio):
-        f = P.SourceFilter(knee=knee, value=0.0)
-        f.hasHistory = True
-        peak = max(f.step(m, dt) for m in [0.0, 400.0 * ratio] + [0.0] * 60)
-        return math.log2(1.0 + peak)
-
-    def flicker_kept(knee):
-        # A source that is really there and really is unsteady: a fire, a
-        # failing lamp, a muzzle flash train. Two octaves either side of its
-        # own mean, which is the case the knee actually decides - a 400x
-        # appearance is so far outside any knee in this range that every
-        # setting rejects it equally, so a table of that alone would say the
-        # parameter does nothing.
-        f = P.SourceFilter(knee=knee, value=100.0)
-        f.hasHistory = True
-        trace = [f.step(100.0 * (4.0 if i % 2 else 0.25), dt) for i in range(120)]
-        steady = P.SourceFilter(knee=0.0, value=100.0)
-        steady.hasHistory = True
-        ref = [steady.step(100.0 * (4.0 if i % 2 else 0.25), dt) for i in range(120)]
-        return (sum(trace[60:]) / 60.0) / max(sum(ref[60:]) / 60.0, 1e-9)
-
-    base_halo = spike_halo(0.0, 1.0)
-    print(f'    {"value":>8s} {"400x halo":>10s} {"vs off":>8s} {"4x halo":>9s} {"vs off":>8s}'
-          f' {"flicker":>8s} {"90% in":>8s}')
-    for v in (0.0, 0.75, 1.0, 1.5, 2.5, 4.0):
-        h400 = spike_halo(v, 1.0)
-        h4 = spike_halo(v, 0.01)
-        h4_off = spike_halo(0.0, 0.01)
-        f_stay = P.SourceFilter(knee=v, value=0.0)
-        f_stay.hasHistory = True
-        trace = [f_stay.step(m, dt) for m in [0.0] + [400.0] * 180]
-        t90 = next((i * dt for i, x in enumerate(trace) if x >= 360.0), float('nan'))
-        print(f'    {v:8.2f} {h400:10.2f} {h400 / base_halo * 100:7.1f}% {h4:9.2f}'
-              f' {h4 / h4_off * 100:7.1f}% {flicker_kept(v):8.3f} {t90:7.3f}s')
-    print('    A 400x appearance is outside every knee in this range and all of them reject')
-    print('    it, so the parameter is really chosen on the middle two columns - and those')
-    print('    are the result worth reading. A 4x one-frame spike is rejected to about a')
-    print('    sixth of its halo, while a source flickering 4x every frame keeps 94-97% of')
-    print('    what a steady one would. Repetition is what is being believed, not')
-    print('    steadiness, which is what stops this from putting out a fire.')
-    print('    The remaining trade is the last two columns, and it is real: rejecting')
-    print('    harder admits a genuinely new source more slowly. 1.5 is where the 400x')
-    print('    column starts to climb again, and costs 0.13 s of settling against 2.5.')
-
 
 if __name__ == '__main__':
     print('PSDT parameter sweep')
