@@ -48,8 +48,9 @@
 // (the resources are a couple of hundred KiB and always exist) so the apply
 // pipeline layout does not change with the operator selection.
 #define TONEMAPPING_APPLY_PSDT_FIELD_INPUT                 5
-#define TONEMAPPING_APPLY_PSDT_CHROMA_INPUT                6
-#define TONEMAPPING_APPLY_PSDT_STATE_INPUT                 7
+#define TONEMAPPING_APPLY_PSDT_SOURCE_INPUT                6
+#define TONEMAPPING_APPLY_PSDT_ILLUM_INPUT                 7
+#define TONEMAPPING_APPLY_PSDT_STATE_INPUT                 8
 
 #define TONEMAPPING_TONE_CURVE_SAMPLE_COUNT               256
 
@@ -75,6 +76,18 @@ static const uint32_t tonemapOperatorGT7         = 7;  // Gran Turismo 7 (SDR, I
 // apply shader directly rather than through applyForkTonemap, because it is
 // not a pure function of one pixel.
 static const uint32_t tonemapOperatorPerceptualTF2 = 8;
+// NV-DXVK [tonemap operators]: two more controls. Numbered above PSDT rather
+// than into the gaps at 1, 2, 4 and 5, which the RemixProjGroup fork has
+// already assigned - keeping those free is what lets an operator header be
+// dropped in from the fork without renumbering anything.
+//
+// These exist to be measured against, not to be used. Reinhard is the
+// canonical "no shoulder, no colour management" baseline and AgX is the
+// canonical "controlled path to white" one, so between them they bracket the
+// two axes PSDT claims to improve on. A claim about a display transform that
+// is only ever compared to its own predecessor is not worth much.
+static const uint32_t tonemapOperatorReinhard = 9;
+static const uint32_t tonemapOperatorAgX      = 10;
 
 // Constant buffers
 

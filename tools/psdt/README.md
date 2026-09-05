@@ -1,73 +1,96 @@
-# PSDT tools
+# PSDT harness
 
-CPU reference implementation of the Perceptual Scene Display Transform, and the
-objective test suite that sets its defaults.
+Three tools. Between them they answer the two questions a display transform
+has to answer before anyone looks at a screenshot: *is the maths right*, and
+*does the thing that runs on the GPU match the thing I tested*.
 
 ```bash
-python3 tools/psdt/psdt_suite.py            # everything
-python3 tools/psdt/psdt_suite.py curve      # one section
-python3 tools/psdt/psdt_sweep.py            # parameter sweeps
+python3 tools/psdt/psdt_check.py    # shader / header / C++ agree with each other
+python3 tools/psdt/psdt_suite.py    # the transform's own behaviour, measured
+python3 tools/psdt/psdt_sweep.py    # where a parameter's default should sit
 ```
 
-Standard library only. No build, no GPU.
+`psdt_check.py` exits non-zero on failure and is the one to run first.
 
-## Why this exists
+---
 
-A screenshot cannot tell you whether the tone curve is monotonic between the two
-points you happened to look at, how far a hue moved on its way to white, or how
-much of the input's local contrast survived. Those are the questions that decide
-whether a display transform is right, and they are all measurable.
+## `psdt_ref.py` — the CPU reference
 
-Three defects in the shipped transform were found here rather than on screen,
-and none of them would have been obvious in a screenshot:
+A port of the shaders where every constant, clamp and order of operations is
+the one the shader uses. It is not an idealised model of the transform; it is
+the transform, somewhere it can be measured.
 
-* the base/detail decomposition was a first-order Taylor expansion of the curve,
-  so a bright object against a dark surround extrapolated straight past the
-  shoulder and clipped. Grey clipped at 2.5 stops over the anchor;
-* the colour-volume pressure used `1 - (1-Py)(1-Pc)(1-Pg)`, which is an OR. Any
-  saturated colour has a high Pc whether or not it fits, so a mid-luminance red
-  the display could show perfectly well was being stripped to 0.26 of its
-  chroma - the "everything goes grey" failure the stage exists to prevent;
-* chroma was compressed by a factor measured *before* the hue rotation, so the
-  result overshot the boundary and the final gamut fit clipped the difference.
-  About 9% of the available chroma, at full hue trajectory.
+That claim is now enforced rather than asserted. `psdt_check.py` compares the
+shared constants, the chroma references, the shoulder clamp and the black-level
+epsilon between the two files and fails if any of them have drifted — which is
+exactly how v0.1's two divergences got in and stayed in.
 
-## Layout
+Everything in the file that does *not* correspond to shader code is marked
+`harness only`. That is the operator controls, and the two temporal filters'
+driving loop.
 
-| file | what it is |
+## `psdt_suite.py` — behaviour
+
+Thirteen sections. `python3 tools/psdt/psdt_suite.py <section>` runs one.
+
+| section | what it establishes |
 |---|---|
-| `psdt_ref.py` | line-for-line port of the shaders under `src/dxvk/shaders/rtx/pass/psdt/`, plus GT7 / Reinhard / Hable as controls |
-| `psdt_suite.py` | the eight measurement sections |
-| `psdt_sweep.py` | one-parameter sweeps, for choosing defaults from evidence |
+| `probe` | the colour-space constants are what the shipped matrices actually produce, per gamut and per space; the perceptual round trips are lossless; a colour that is the local white lands exactly on the adapted neutral axis |
+| `curve` | the luminance curve is monotonic over 40 stops, C1 at both joins, and its analytic derivative matches a central difference to 1e-9 |
+| `classify` | the classifier can tell a neon sign from a sunlit wall, an emissive screen from a specular glint, and sky from either — and what it collapses to when the gbuffer is unavailable |
+| `illuminant` | radiance over albedo recovers the illuminant of a room whose materials are strongly biased, where grey-world reports the paint; and a surface neutral under a non-D65 light is still inside the display volume |
+| `gamut` | what the per-gamut achromatic axis and chroma normaliser fixed, and by how much |
+| `response` | the luminance transfer and clipping rate, against four controls |
+| `colour` | chroma retention as a colour runs out of display volume, and the four terms that decide when compression starts |
+| `hue` | the path to white, and whether it has a discontinuity anywhere in a 1/42-stop sweep |
+| `contrast` | how much local contrast survives, and the detail-magnitude rolloff that stops a lamp being treated as texture |
+| `glare` | the halo radius grows with source luminance, the halo carries the source's colour, both lobes contribute, and the threshold tracks adaptation |
+| `temporal` | step response of the two filters in series: settling times, overshoot, false cuts, and noise attenuation |
+| `compare` | the section-33 weighted score, PSDT against GT7, AgX, Reinhard and Hable |
+| `invariants` | the eight properties the transform is supposed to hold, as pass/fail |
 
-`psdt_ref.py` is deliberately literal rather than idiomatic Python, so that a
-divergence from the GPU shows up as a visible diff and not as a judgement call.
-When you change a shader, change it here too and re-run the suite.
+### What it cannot establish
 
-## Sections
+It runs the CPU reference. So it establishes that the maths is right —
+monotonic, continuous, in gamut, settling when it should. It does **not**
+establish that the Vulkan implementation is right, because it does not run the
+Vulkan implementation, and it does not establish that PSDT looks better in
+Titanfall 2, because a swatch ladder is not a game frame.
 
-| section | answers |
-|---|---|
-| `probe` | are the colour matrices and their inverses right, and what is the largest chroma this display can actually produce |
-| `curve` | is the curve monotonic and C1 everywhere, and where do the anchors land in code values |
-| `response` | the luminance transfer function, against the controls |
-| `colour` | chroma retention as a colour runs out of display volume |
-| `hue` | the path to white, and whether it has a discontinuity in it |
-| `contrast` | how much local contrast survives, by luminance |
-| `compare` | the §33 score against GT7, Reinhard and Hable |
-| `invariants` | the seven perceptual properties the transform is supposed to hold |
+Both of those need the GPU. The in-image debug views
+(`rtx.tonemap.psdt.debugView`) exist for the second one, and the first thing to
+check in-game is the *classification* view rather than the final image: if the
+roles are wrong, everything downstream is answering the right question about
+the wrong pixels.
 
-## Reading the metrics
+### Psycho17 is not in the comparison
 
-**boundary use** is the honest one. It is the output chroma as a fraction of the
-most chroma the display can show at that output luminance and hue. 1.0 means the
-transform did as well as physics allows. **chroma kept** is measured against the
-scene colour scaled to the same output luminance - which is frequently a colour
-no display can show - so it is comparable between operators but is not a target
-anyone can reach.
+It is a 754-line vendored operator and a hand port could not be verified
+against the shader that runs. An unverified control is worse than a missing
+one, because its numbers look exactly as authoritative as the verified ones.
+Comparing against it needs a GPU capture.
 
-**sat. darkening**, in the sweep, is the price of the luminance concession: how
-many stops below a neutral a saturated colour of the same scene luminance
-renders. There is no correct value. Less darkening means brighter and more
-bleached; more means darker and more colourful. The setting exists so the trade
-is stated rather than assumed.
+## `psdt_check.py` — consistency
+
+The class of bug a CPU reference structurally cannot catch: a state slot
+written under one name and read under another, a push-constant field the C++
+never sets, a binding index used twice, an operator id that disagrees between
+the enum and the shader header, a constant that drifted between the shader and
+the reference.
+
+None of those change the reference's answers. All of them either break the
+build or silently produce a different transform on the GPU.
+
+## `psdt_sweep.py` — defaults
+
+For each setting of one parameter, the metrics that parameter actually trades
+against each other. A default is defensible when it sits where the curves
+cross, not where it looked right in a screenshot.
+
+`highlightRolloff` 0.45, `luminanceConcession` 0.8 and `chromaPreservation` 2.5
+are set from this rather than by taste.
+
+## `RESULTS.txt`
+
+A checked-in run of both tools, so a diff shows what a change did to the
+numbers. Regenerate with the command at the top of the file.

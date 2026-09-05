@@ -23,11 +23,15 @@
 #include "dxvk_device.h"
 
 #include <algorithm>
+#include <cmath>
 #include "dxvk_scoped_annotation.h"
 #include "rtx_render/rtx_shader_manager.h"
 #include "rtx.h"
 #include "rtx/pass/tonemap/tonemapping.h"
 #include "rtx/pass/psdt/psdt.h"
+#include "rtx_camera.h"
+#include "rtx_scene_manager.h"
+#include "rtx_auto_exposure_plus.h"
 
 #include <rtx_shaders/auto_exposure.h>
 #include <rtx_shaders/auto_exposure_histogram.h>
@@ -87,7 +91,8 @@ namespace dxvk {
         RW_TEXTURE1D_READONLY(TONEMAPPING_APPLY_TONEMAPPING_EXPOSURE_INPUT)
         RW_TEXTURE2D(TONEMAPPING_APPLY_TONEMAPPING_COLOR_OUTPUT)
         SAMPLER2D(TONEMAPPING_APPLY_PSDT_FIELD_INPUT)
-        SAMPLER2D(TONEMAPPING_APPLY_PSDT_CHROMA_INPUT)
+        SAMPLER2D(TONEMAPPING_APPLY_PSDT_SOURCE_INPUT)
+        SAMPLER2D(TONEMAPPING_APPLY_PSDT_ILLUM_INPUT)
         RW_TEXTURE1D_READONLY(TONEMAPPING_APPLY_PSDT_STATE_INPUT)
       END_PARAMETER()
     };
@@ -105,10 +110,16 @@ namespace dxvk {
         TEXTURE2D(PSDT_ANALYSIS_COLOR_INPUT)
         RW_TEXTURE1D_READONLY(PSDT_ANALYSIS_EXPOSURE_INPUT)
         TEXTURE2D(PSDT_ANALYSIS_MOTION_INPUT)
+        TEXTURE2D(PSDT_ANALYSIS_SURFACE_FLAGS_INPUT)
+        TEXTURE2D(PSDT_ANALYSIS_VIEW_Z_INPUT)
+        TEXTURE2D(PSDT_ANALYSIS_ALBEDO_INPUT)
         RW_TEXTURE2D(PSDT_ANALYSIS_FIELD_OUTPUT)
         SAMPLER2D(PSDT_ANALYSIS_FIELD_HISTORY_INPUT)
-        RW_TEXTURE2D(PSDT_ANALYSIS_CHROMA_OUTPUT)
-        SAMPLER2D(PSDT_ANALYSIS_CHROMA_HISTORY_INPUT)
+        RW_TEXTURE2D(PSDT_ANALYSIS_SOURCE_OUTPUT)
+        SAMPLER2D(PSDT_ANALYSIS_SOURCE_HISTORY_INPUT)
+        RW_TEXTURE2D(PSDT_ANALYSIS_ILLUM_OUTPUT)
+        SAMPLER2D(PSDT_ANALYSIS_ILLUM_HISTORY_INPUT)
+        RW_TEXTURE1D(PSDT_ANALYSIS_BODY_HISTOGRAM_OUTPUT)
         RW_TEXTURE1D_READONLY(PSDT_ANALYSIS_STATE_INPUT)
       END_PARAMETER()
     };
@@ -124,8 +135,10 @@ namespace dxvk {
       BEGIN_PARAMETER()
         TEXTURE2D(PSDT_DOWNSAMPLE_FIELD_INPUT)
         RW_TEXTURE2D(PSDT_DOWNSAMPLE_FIELD_OUTPUT)
-        TEXTURE2D(PSDT_DOWNSAMPLE_CHROMA_INPUT)
-        RW_TEXTURE2D(PSDT_DOWNSAMPLE_CHROMA_OUTPUT)
+        TEXTURE2D(PSDT_DOWNSAMPLE_SOURCE_INPUT)
+        RW_TEXTURE2D(PSDT_DOWNSAMPLE_SOURCE_OUTPUT)
+        TEXTURE2D(PSDT_DOWNSAMPLE_ILLUM_INPUT)
+        RW_TEXTURE2D(PSDT_DOWNSAMPLE_ILLUM_OUTPUT)
       END_PARAMETER()
     };
 
@@ -138,9 +151,12 @@ namespace dxvk {
       PUSH_CONSTANTS(PsdtStateArgs)
 
       BEGIN_PARAMETER()
-        RW_TEXTURE1D_READONLY(PSDT_STATE_HISTOGRAM_INPUT)
-        SAMPLER2D(PSDT_STATE_FIELD_INPUT)
-        RW_TEXTURE1D(PSDT_STATE_STATE_INPUT_OUTPUT)
+        RW_TEXTURE1D_READONLY(PSDT_STATE_BINDING_HISTOGRAM)
+        RW_TEXTURE1D(PSDT_STATE_BINDING_BODY_HISTOGRAM)
+        SAMPLER2D(PSDT_STATE_BINDING_FIELD)
+        SAMPLER2D(PSDT_STATE_BINDING_SOURCE)
+        SAMPLER2D(PSDT_STATE_BINDING_ILLUM)
+        RW_TEXTURE1D(PSDT_STATE_BINDING_STATE)
       END_PARAMETER()
     };
 
@@ -149,8 +165,8 @@ namespace dxvk {
 
   // NV-DXVK [tonemap operators]: dropdown for rtx.tonemap.tonemapOperator. Uses
   // ComboWithKey rather than a plain Combo because the enum values are sparse
-  // (0/3/6/7 - the gaps are reserved by the upstream fork's numbering), so the
-  // list index is not the option value.
+  // (0/3/6/7/8/9/10 - the gaps at 1, 2, 4 and 5 are reserved by the upstream
+  // fork's numbering), so the list index is not the option value.
   RemixGui::ComboWithKey<DxvkToneMapping::TonemapOperator> tonemapOperatorCombo {
     "Tonemap Operator",
     RemixGui::ComboWithKey<DxvkToneMapping::TonemapOperator>::ComboEntries { {
@@ -173,6 +189,57 @@ namespace dxvk {
         "pressure driving chroma compression and a controlled hue trajectory, a spatial white point, and\n"
         "a perceptual glare model. Settings live under rtx.tonemap.psdt.*; the other operators stay in\n"
         "this list as controls to measure it against." },
+      { DxvkToneMapping::TonemapOperator::Reinhard, "Reinhard (control)",
+        "Extended Reinhard, white point 4.0. No shoulder, no colour management, no path to white -\n"
+        "it does not compress chroma, it clips. Here as the baseline PSDT's chroma retention and\n"
+        "clipping figures are read against, not as a recommendation." },
+      { DxvkToneMapping::TonemapOperator::AgX, "AgX (control)",
+        "AgX at its reference configuration - no look transform, no contrast preset. The canonical\n"
+        "controlled path to white, which is the interesting comparison for PSDT's hue trajectory\n"
+        "rather than the easy one." },
+    } }
+  };
+
+  // NV-DXVK [PSDT]: in-image diagnostics. Contiguous enum, but ComboWithKey is
+  // used anyway so each entry carries the sentence explaining what a correct
+  // picture looks like - a debug view nobody can read is a debug view nobody
+  // uses.
+  RemixGui::ComboWithKey<DxvkToneMapping::PsdtDebugView> psdtDebugViewCombo {
+    "Debug View",
+    RemixGui::ComboWithKey<DxvkToneMapping::PsdtDebugView>::ComboEntries { {
+      { DxvkToneMapping::PsdtDebugView::Off, "Off", "The transformed image." },
+      { DxvkToneMapping::PsdtDebugView::Adaptation, "Adaptation field",
+        "Pooled local adaptation as stops about the frame anchor. Orange above, blue below.\n"
+        "Should follow the scene's large-scale luminance layout and show no structure at object scale." },
+      { DxvkToneMapping::PsdtDebugView::Budget, "Adaptation after budget",
+        "The same field after the contrast budget clamped it, at 2 stops full scale.\n"
+        "The difference between this and the previous view is the flattening the budget prevented." },
+      { DxvkToneMapping::PsdtDebugView::Roles, "Role classification",
+        "Green surface, red source, blue sky. The classification everything else is downstream of.\n"
+        "Lamps and muzzle flashes should be red, sunlit walls green, anything past the far plane blue.\n"
+        "If a bright wall is red, either Renderer Signals is off or Source Threshold is too low." },
+      { DxvkToneMapping::PsdtDebugView::SourceEnergy, "Source energy",
+        "The glare kernel's input, per channel, at mip 0. Should be black except at actual emitters,\n"
+        "and should carry the emitter's own colour rather than the surrounding scene's." },
+      { DxvkToneMapping::PsdtDebugView::Illuminant, "Local illuminant",
+        "The measured colour of the light, as radiance over albedo. A room of coloured walls under a\n"
+        "neutral light should read grey here; if it reads coloured, the estimate is picking up paint." },
+      { DxvkToneMapping::PsdtDebugView::Depth, "Depth and pooling trust",
+        "Red is body depth, green is how much of the coarse adaptation scales survived the depth test.\n"
+        "Green should collapse at a window or a skyline and stay high across a continuous surface." },
+      { DxvkToneMapping::PsdtDebugView::Demand, "Colour volume demand",
+        "Green while the colour fits the display, red once it does not, with the crossover at exactly\n"
+        "the boundary. The red area is what the colour-volume stage is actually working on." },
+      { DxvkToneMapping::PsdtDebugView::Pressure, "Chroma given up",
+        "How much chroma the compression actually removed. Should be zero over most of the frame." },
+      { DxvkToneMapping::PsdtDebugView::Glare, "Glare only",
+        "The glare contribution on its own, without the image underneath it." },
+      { DxvkToneMapping::PsdtDebugView::Clipping, "Pre-clamp overflow",
+        "Per-channel overflow measured before the final gamut fit had a chance to hide it.\n"
+        "This is the honest picture of how much work the last clip is doing; it should be nearly black." },
+      { DxvkToneMapping::PsdtDebugView::CurveSlope, "Curve slope",
+        "d(display)/d(scene) at each pixel's base level, about 1.0. Orange above 1, blue below.\n"
+        "Shows where the curve is adding contrast and where the shoulder and toe are taking it away." },
     } }
   };
 
@@ -214,23 +281,46 @@ namespace dxvk {
         ImGui::Unindent();
       }
 
+      if (ImGui::CollapsingHeader("Scene Classification", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Indent();
+        ImGui::TextWrapped(
+          "Which pixels are surfaces, which are light sources and which are sky. Everything else in "
+          "this transform is downstream of that question, and it is not answerable from the "
+          "framebuffer - a sunlit white wall and a neon sign are both just bright. Renderer Signals "
+          "reads the answer from the gbuffer instead: the per-pixel emissive bit, linear view depth, "
+          "and the albedo that lets reflectance be divided out of radiance to leave the colour of "
+          "the light. Turn it off to see how much of the image the guess was getting wrong.");
+        RemixGui::Checkbox("Renderer Signals", &rendererSignalsObject());
+        RemixGui::DragFloat("Source Threshold (stops)", &sourceThresholdObject(), 0.05f, 0.f, 16.f);
+        RemixGui::DragFloat("Glare Class Threshold (stops)", &glareClassThresholdObject(), 0.05f, 0.f, 24.f);
+        RemixGui::DragFloat("Sky View Depth", &skyViewZObject(), 1000.f, 1000.f, 400000.f);
+        RemixGui::DragFloat("Illuminant Min Albedo", &illuminantMinAlbedoObject(), 0.002f, 0.005f, 0.5f);
+        ImGui::Unindent();
+      }
+
       if (ImGui::CollapsingHeader("Adaptation", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Indent();
         ImGui::TextWrapped(
           "What the viewer is adapted to. Source Exclusion decides whether a sunlit window is scene "
           "content or a highlight event; Contrast Budget bounds how far local adaptation may pull a "
-          "region away from the frame anchor, and is what stops local adaptation flattening the image.");
+          "region away from the frame anchor, and is what stops local adaptation flattening the image. "
+          "Depth Sensitivity stops the pooling averaging a wall together with the sky behind it.");
         RemixGui::Checkbox("Scene Adaptive", &sceneAdaptiveObject());
         RemixGui::DragFloat("Source Exclusion", &sourceExclusionObject(), 0.01f, 0.f, 1.f);
         RemixGui::DragFloat("Local Adaptation", &localAdaptationObject(), 0.01f, 0.f, 1.f);
         RemixGui::DragFloat("Contrast Budget", &contrastBudgetObject(), 0.01f, 0.f, 4.f);
-        RemixGui::DragFloat("Source Threshold (stops)", &sourceThresholdObject(), 0.05f, 0.f, 16.f);
-        RemixGui::DragFloat("Glare Class Threshold (stops)", &glareClassThresholdObject(), 0.05f, 0.f, 24.f);
+        RemixGui::DragFloat("Depth Sensitivity", &depthSensitivityObject(), 0.01f, 0.f, 2.f);
         RemixGui::Separator();
         RemixGui::DragFloat("Adaptation Speed Up", &adaptationSpeedUpObject(), 0.05f, 0.05f, 30.f);
         RemixGui::DragFloat("Adaptation Speed Down", &adaptationSpeedDownObject(), 0.05f, 0.05f, 30.f);
         RemixGui::Checkbox("Temporal Accumulation", &temporalAccumulationObject());
         RemixGui::DragFloat("Field Adaptation Speed", &fieldAdaptationSpeedObject(), 0.1f, 0.1f, 60.f);
+        RemixGui::Separator();
+        RemixGui::Checkbox("Coordinate With Auto Exposure Plus", &coordinateWithAutoExposurePlusObject());
+        ImGui::TextWrapped(
+          "Plus applies a local gain before this pass and PSDT applies local adaptation after it. "
+          "Both are local dynamic range compression; at full strength in series they compress the "
+          "same signal twice, which is the failure this architecture exists to avoid.");
         ImGui::Unindent();
       }
 
@@ -244,6 +334,8 @@ namespace dxvk {
         RemixGui::DragFloat("Shadow Depth", &shadowDepthObject(), 0.01f, 0.05f, 0.98f);
         RemixGui::DragFloat("Highlight Rolloff", &highlightRolloffObject(), 0.01f, 0.05f, 0.98f);
         RemixGui::DragFloat("Detail Strength", &detailStrengthObject(), 0.01f, 0.f, 1.f);
+        RemixGui::DragFloat("Detail Highlight Protection", &detailProtectObject(), 0.01f, 0.f, 4.f);
+        RemixGui::DragFloat("Detail Knee (stops)", &detailKneeObject(), 0.05f, 0.25f, 12.f);
         ImGui::Unindent();
       }
 
@@ -254,12 +346,23 @@ namespace dxvk {
           "still show at that luminance - rather than towards white, and only when it does not fit. A "
           "bright white wall keeps its chroma untouched; a neon red at the same luminance is what has "
           "to give. Luminance Concession decides which of the two gives: a saturated red cannot be as "
-          "bright as a white, so either it bleaches or it renders darker. Film renders it darker.");
+          "bright as a white, so either it bleaches or it renders darker. Film renders it darker. "
+          "Spatial White is a chromatic adaptation towards the measured local illuminant, so a "
+          "tungsten interior desaturates towards its own warm white rather than towards daylight.");
         RemixGui::DragFloat("Chroma Preservation", &chromaPreservationObject(), 0.01f, 0.05f, 6.f);
         RemixGui::DragFloat("Luminance Concession", &luminanceConcessionObject(), 0.01f, 0.f, 1.f);
         RemixGui::DragFloat("Hue Trajectory", &hueTrajectoryObject(), 0.01f, 0.f, 1.f);
+        RemixGui::DragFloat("White Convergence", &whiteConvergenceObject(), 0.05f, 0.25f, 8.f);
         RemixGui::DragFloat("Spatial White", &spatialWhiteObject(), 0.01f, 0.f, 1.f);
         RemixGui::DragFloat("Colourfulness", &colourfulnessObject(), 0.01f, 0.f, 4.f);
+        RemixGui::Separator();
+        ImGui::TextWrapped(
+          "Anticipatory compression: how early a colour starts easing towards the boundary rather "
+          "than arriving at it. Pressure Luma is the brightness-times-chroma term; Pressure Context "
+          "brings it forward for a colour that is a bright outlier against its own neighbourhood, "
+          "where a hard clip would be visible and colour fidelity is not being judged.");
+        RemixGui::DragFloat("Pressure Luma", &pressureLumaObject(), 0.01f, 0.f, 1.f);
+        RemixGui::DragFloat("Pressure Context", &pressureContextObject(), 0.01f, 0.f, 3.f);
         ImGui::Unindent();
       }
 
@@ -268,10 +371,26 @@ namespace dxvk {
         ImGui::TextWrapped(
           "How a source too bright to be a value becomes an area instead. Separate from rtx.bloom.* on "
           "purpose - bloom is a lens artifact on the image, this is a property of the light. The radius "
-          "is not a setting: a brighter source survives more pyramid levels and spreads further on its own.");
+          "is not a setting: the threshold is applied per pyramid level, so a brighter source stays "
+          "visible at more levels and spreads further on its own. Near Field is the narrow lobe of the "
+          "kernel - the core a light has around it before the wide veil begins.");
         RemixGui::DragFloat("Glare Strength", &glareStrengthObject(), 0.01f, 0.f, 4.f);
         RemixGui::DragFloat("Glare Threshold (stops)", &glareThresholdObject(), 0.05f, 0.f, 20.f);
         RemixGui::DragFloat("Glare Falloff", &glareFalloffObject(), 0.01f, 0.05f, 0.95f);
+        RemixGui::DragFloat("Glare Near Field", &glareNearFieldObject(), 0.01f, 0.f, 1.f);
+        ImGui::Unindent();
+      }
+
+      if (ImGui::CollapsingHeader("Diagnostics")) {
+        ImGui::Indent();
+        ImGui::TextWrapped(
+          "Each view replaces the image with a value the transform actually read or produced on that "
+          "pixel on the way past, rather than recomputing its own version of it. Roles is the one to "
+          "look at first - green surface, red source, blue sky - because the whole architecture rests "
+          "on that classification. Clipping is the second, because it shows what the final gamut fit "
+          "had to hide.");
+        psdtDebugViewCombo.getKey(&debugViewObject());
+        RemixGui::DragInt("Pyramid Levels (0 = auto)", &levelsObject(), 1.f, 0, PSDT_MAX_LEVELS);
         ImGui::Unindent();
       }
 
@@ -365,12 +484,15 @@ namespace dxvk {
   void DxvkToneMapping::releasePsdtResources() {
     for (uint32_t i = 0; i < 2; ++i) {
       m_psdtField[i].reset();
-      m_psdtChroma[i].reset();
+      m_psdtSource[i].reset();
+      m_psdtIlluminant[i].reset();
     }
+    m_psdtBodyHistogram.reset();
     m_psdtState.reset();
     m_psdtFieldExtent = VkExtent3D { 0, 0, 0 };
     m_psdtLevelCount = 0;
     m_psdtHasHistory = false;
+    m_psdtHasCameraHistory = false;
   }
 
   void DxvkToneMapping::createPsdtResources(Rc<RtxContext> ctx, const VkExtent3D& targetExtent) {
@@ -380,15 +502,60 @@ namespace dxvk {
     m_psdtLevelCount = calcPsdtLevelCount(m_psdtFieldExtent);
 
     // The mip chain is the adaptation pyramid and the glare kernel at once, so
-    // both halves of the field need every level. See psdt_downsample.
+    // all three fields need every level. See psdt_downsample.
     for (uint32_t i = 0; i < 2; ++i) {
       m_psdtField[i] = RtxMipmap::createResource(
         ctx, i == 0 ? "psdt adaptation field 0" : "psdt adaptation field 1",
         m_psdtFieldExtent, VK_FORMAT_R16G16B16A16_SFLOAT, 0, { 0.f, 0.f, 0.f, 0.f }, m_psdtLevelCount);
 
-      m_psdtChroma[i] = RtxMipmap::createResource(
-        ctx, i == 0 ? "psdt chroma field 0" : "psdt chroma field 1",
-        m_psdtFieldExtent, VK_FORMAT_R16G16_SFLOAT, 0, { 0.f, 0.f, 0.f, 0.f }, m_psdtLevelCount);
+      m_psdtSource[i] = RtxMipmap::createResource(
+        ctx, i == 0 ? "psdt source field 0" : "psdt source field 1",
+        m_psdtFieldExtent, VK_FORMAT_R16G16B16A16_SFLOAT, 0, { 0.f, 0.f, 0.f, 0.f }, m_psdtLevelCount);
+
+      m_psdtIlluminant[i] = RtxMipmap::createResource(
+        ctx, i == 0 ? "psdt illuminant field 0" : "psdt illuminant field 1",
+        m_psdtFieldExtent, VK_FORMAT_R16G16B16A16_SFLOAT, 0, { 0.f, 0.f, 0.f, 0.f }, m_psdtLevelCount);
+    }
+
+    // Body-only luminance histogram. psdt_analysis accumulates into it with
+    // atomics and psdt_state zeroes it once it has been read, so the only
+    // clear needed is this one, for the first frame.
+    {
+      DxvkImageCreateInfo desc;
+      desc.type = VK_IMAGE_TYPE_1D;
+      desc.flags = 0;
+      desc.sampleCount = VK_SAMPLE_COUNT_1_BIT;
+      desc.numLayers = 1;
+      desc.mipLevels = 1;
+      desc.extent = VkExtent3D { PSDT_BODY_HISTOGRAM_SIZE, 1, 1 };
+      desc.stages = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+      desc.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+      desc.tiling = VK_IMAGE_TILING_OPTIMAL;
+      desc.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+      desc.format = VK_FORMAT_R32_UINT;
+      desc.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+      DxvkImageViewCreateInfo viewInfo;
+      viewInfo.type = VK_IMAGE_VIEW_TYPE_1D;
+      viewInfo.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+      viewInfo.minLevel = 0;
+      viewInfo.numLevels = 1;
+      viewInfo.minLayer = 0;
+      viewInfo.numLayers = 1;
+      viewInfo.format = desc.format;
+      viewInfo.usage = desc.usage;
+
+      m_psdtBodyHistogram.image = device()->createImage(desc, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                                        DxvkMemoryStats::Category::RTXRenderTarget, "psdt body histogram");
+      m_psdtBodyHistogram.view = device()->createImageView(m_psdtBodyHistogram.image, viewInfo);
+      ctx->changeImageLayout(m_psdtBodyHistogram.image, VK_IMAGE_LAYOUT_GENERAL);
+
+      VkClearColorValue clearColor = {};
+      VkImageSubresourceRange subRange = {};
+      subRange.layerCount = 1;
+      subRange.levelCount = 1;
+      subRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      ctx->clearColorImage(m_psdtBodyHistogram.image, clearColor, subRange);
     }
 
     // AdaptationState. A 1D float image rather than a storage buffer, matching
@@ -473,7 +640,7 @@ namespace dxvk {
     bool autoExposureEnabled) {
 
     if (!psdtSelected()) {
-      // Resources stay allocated once created. They are a few hundred KiB and
+      // Resources stay allocated once created. They are under a megabyte and
       // they stay bound to the apply shader whatever operator is selected, so
       // freeing them would only buy a re-allocation the next time the operator
       // is switched back - which is exactly when someone is A/B comparing.
@@ -483,18 +650,28 @@ namespace dxvk {
     ScopedGpuProfileZone(ctx, "PSDT");
 
     const VkExtent3D targetExtent = colorBuffer.view->imageInfo().extent;
+    const float deltaSeconds = 0.001f * frameTimeMilliseconds;
 
     if (m_resetState) {
       m_psdtHasHistory = false;
+      m_psdtHasCameraHistory = false;
     }
 
     // Reprojection needs valid motion vectors; without them fall back to the
-    // stateless field rather than reprojecting with garbage. The binding still
-    // has to be satisfied, so the chroma field - which is a two-component float
-    // image of the right shape - stands in for a resource the shader will not
-    // read while hasHistory is 0.
+    // stateless field rather than reprojecting with garbage.
     const bool motionAvailable = rtOutput.m_primaryScreenSpaceMotionVector.image != nullptr;
     const bool accumulate = temporalAccumulation() && motionAvailable && m_psdtHasHistory;
+
+    // The renderer-side classification signals. All three are plain
+    // per-frame resources at the pre-upscale extent, written by the gbuffer
+    // pass and still live at tonemap time. If any is missing the classifier
+    // falls back to luminance and compactness alone, which is v0.1 behaviour -
+    // worse, but not broken.
+    const bool gbufferAvailable =
+         rtOutput.m_primarySurfaceFlags.image != nullptr
+      && rtOutput.m_primaryLinearViewZ.image != nullptr
+      && rtOutput.m_primaryAlbedo.image != nullptr;
+    const bool useRendererSignals = rendererSignals() && gbufferAvailable;
 
     const uint32_t readIndex = m_psdtIndex;
     const uint32_t writeIndex = 1 - m_psdtIndex;
@@ -502,46 +679,117 @@ namespace dxvk {
     Rc<DxvkSampler> mipSampler = ctx->getResourceManager().getSampler(
       VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_LINEAR, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
 
-    // --- scene analysis: full-res HDR -> field mip 0 ----------------------
+    // --- camera transition ------------------------------------------------
+    // Three things look identical to a histogram and want three different
+    // responses: a player sweeping their view, a teleport, and a scripted cut.
+    // The camera separates the first two directly - isCameraCut is a position
+    // jump larger than the scene's own unique-object distance, so it is a
+    // teleport or a respawn by construction - and the angular delta across one
+    // frame is the continuous signal for the third. The luminance test in
+    // psdt_state stays as a second opinion for cuts that do not move the
+    // camera at all, such as a light going out.
+    float cameraAngularSpeed = 0.0f;
+    bool cameraCut = false;
+    bool cameraValid = false;
+    {
+      const RtCamera& camera = ctx->getSceneManager().getCamera();
+      const Vector3 forward = camera.getDirection(true);
+      const float forwardLength = length(forward);
+      if (forwardLength > 0.5f) {
+        cameraValid = true;
+        const Vector3 unitForward = forward / forwardLength;
+        if (m_psdtHasCameraHistory && deltaSeconds > 1e-5f) {
+          const float cosAngle = std::clamp(dot(unitForward, m_psdtPreviousCameraForward), -1.0f, 1.0f);
+          cameraAngularSpeed = std::acos(cosAngle) / deltaSeconds;
+        }
+        m_psdtPreviousCameraForward = unitForward;
+        m_psdtHasCameraHistory = true;
+      }
+      cameraCut = camera.isCameraCut();
+    }
+
+    // --- Auto Exposure Plus coordination ----------------------------------
+    // Plus applies a spatially varying gain before the tonemapper; PSDT
+    // applies local adaptation after it. Both are local dynamic range
+    // compression, and running both at full strength in series compresses the
+    // same signal twice - which is the exact failure this architecture was
+    // built to avoid, and which v0.1 did nothing about because it built its own
+    // adaptation field beside Plus rather than coordinating with it.
+    //
+    // The honest coordination is to spend the local adaptation budget once
+    // between the two passes. Plus reports how much of it it took as its own
+    // intensity, so PSDT takes the remainder.
+    float localScale = 1.0f;
+    if (coordinateWithAutoExposurePlus()) {
+      DxvkAutoExposurePlus& plus = ctx->getCommonObjects()->metaAutoExposurePlus();
+      if (plus.isActive()) {
+        localScale = std::max(0.0f, 1.0f - std::abs(DxvkAutoExposurePlus::intensity()));
+      }
+    }
+
+    // --- scene analysis: full-res HDR + gbuffer -> field mip 0 ------------
     {
       ScopedGpuProfileZone(ctx, "PSDT: Scene Analysis");
 
       const VkExtent3D motionExtent = motionAvailable
         ? rtOutput.m_primaryScreenSpaceMotionVector.image->info().extent
         : m_psdtFieldExtent;
+      const VkExtent3D gbufferExtent = useRendererSignals
+        ? rtOutput.m_primaryLinearViewZ.image->info().extent
+        : m_psdtFieldExtent;
 
       // Same exponential form the base auto exposure and Auto Exposure Plus
       // use, so that matching the speeds produces matching settling behaviour
       // rather than merely matching numbers.
-      const float perFrameSpeed = fieldAdaptationSpeed() * (0.001f * frameTimeMilliseconds);
+      const float perFrameSpeed = fieldAdaptationSpeed() * deltaSeconds;
 
       PsdtAnalysisArgs pushArgs = {};
       pushArgs.colorExtent = uvec2 { targetExtent.width, targetExtent.height };
       pushArgs.fieldExtent = uvec2 { m_psdtFieldExtent.width, m_psdtFieldExtent.height };
       pushArgs.motionExtent = uvec2 { motionExtent.width, motionExtent.height };
+      pushArgs.gbufferExtent = uvec2 { gbufferExtent.width, gbufferExtent.height };
       pushArgs.exposure = exp2f(exposureBias() + RtxOptions::calcUserEVBias());
-      pushArgs.enableAutoExposure = autoExposureEnabled ? 1u : 0u;
+      pushArgs.flags =
+          (autoExposureEnabled ? PSDT_ANALYSIS_FLAG_AUTO_EXPOSURE : 0u)
+        | (accumulate ? PSDT_ANALYSIS_FLAG_HAS_HISTORY : 0u)
+        | (useRendererSignals ? PSDT_ANALYSIS_FLAG_RENDERER_SIGNALS : 0u);
       pushArgs.sourceThresholdStops = sourceThreshold();
       pushArgs.glareThresholdStops = glareClassThreshold();
       pushArgs.currentWeight = accumulate
         ? std::min(1.0f, std::max(0.05f, 1.0f - exp2f(-perFrameSpeed)))
         : 1.0f;
-      pushArgs.hasHistory = accumulate ? 1u : 0u;
-      pushArgs.perceptualSpace = static_cast<uint32_t>(perceptualSpace());
-      pushArgs.refWhiteNits = displayRefWhiteNits();
+      pushArgs.skyViewZ = skyViewZ();
+      pushArgs.illuminantMinAlbedo = std::max(illuminantMinAlbedo(), 1e-3f);
+      pushArgs.toneCurveMinStops = toneCurveMinStops();
+      pushArgs.toneCurveMaxStops = toneCurveMaxStops();
       ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
+
+      // Bindings the shader will not read still have to be satisfied. The
+      // illuminant field is a four-component float image of the right shape,
+      // so it stands in for whichever gbuffer input is absent.
+      Rc<DxvkImageView> standIn = m_psdtIlluminant[readIndex].view;
 
       ctx->bindResourceView(PSDT_ANALYSIS_COLOR_INPUT, colorBuffer.view, nullptr);
       ctx->bindResourceView(PSDT_ANALYSIS_EXPOSURE_INPUT, exposureView, nullptr);
       ctx->bindResourceView(PSDT_ANALYSIS_MOTION_INPUT,
                             motionAvailable ? rtOutput.m_primaryScreenSpaceMotionVector.view
-                                            : m_psdtChroma[readIndex].view, nullptr);
+                                            : standIn, nullptr);
+      ctx->bindResourceView(PSDT_ANALYSIS_SURFACE_FLAGS_INPUT,
+                            useRendererSignals ? rtOutput.m_primarySurfaceFlags.view : standIn, nullptr);
+      ctx->bindResourceView(PSDT_ANALYSIS_VIEW_Z_INPUT,
+                            useRendererSignals ? rtOutput.m_primaryLinearViewZ.view : standIn, nullptr);
+      ctx->bindResourceView(PSDT_ANALYSIS_ALBEDO_INPUT,
+                            useRendererSignals ? rtOutput.m_primaryAlbedo.view : standIn, nullptr);
       ctx->bindResourceView(PSDT_ANALYSIS_FIELD_OUTPUT, m_psdtField[writeIndex].views[0], nullptr);
       ctx->bindResourceView(PSDT_ANALYSIS_FIELD_HISTORY_INPUT, m_psdtField[readIndex].view, nullptr);
       ctx->bindResourceSampler(PSDT_ANALYSIS_FIELD_HISTORY_INPUT, mipSampler);
-      ctx->bindResourceView(PSDT_ANALYSIS_CHROMA_OUTPUT, m_psdtChroma[writeIndex].views[0], nullptr);
-      ctx->bindResourceView(PSDT_ANALYSIS_CHROMA_HISTORY_INPUT, m_psdtChroma[readIndex].view, nullptr);
-      ctx->bindResourceSampler(PSDT_ANALYSIS_CHROMA_HISTORY_INPUT, mipSampler);
+      ctx->bindResourceView(PSDT_ANALYSIS_SOURCE_OUTPUT, m_psdtSource[writeIndex].views[0], nullptr);
+      ctx->bindResourceView(PSDT_ANALYSIS_SOURCE_HISTORY_INPUT, m_psdtSource[readIndex].view, nullptr);
+      ctx->bindResourceSampler(PSDT_ANALYSIS_SOURCE_HISTORY_INPUT, mipSampler);
+      ctx->bindResourceView(PSDT_ANALYSIS_ILLUM_OUTPUT, m_psdtIlluminant[writeIndex].views[0], nullptr);
+      ctx->bindResourceView(PSDT_ANALYSIS_ILLUM_HISTORY_INPUT, m_psdtIlluminant[readIndex].view, nullptr);
+      ctx->bindResourceSampler(PSDT_ANALYSIS_ILLUM_HISTORY_INPUT, mipSampler);
+      ctx->bindResourceView(PSDT_ANALYSIS_BODY_HISTOGRAM_OUTPUT, m_psdtBodyHistogram.view, nullptr);
       ctx->bindResourceView(PSDT_ANALYSIS_STATE_INPUT, m_psdtState.view, nullptr);
       ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, PsdtAnalysisShader::getShader());
 
@@ -565,8 +813,10 @@ namespace dxvk {
 
         ctx->bindResourceView(PSDT_DOWNSAMPLE_FIELD_INPUT, m_psdtField[writeIndex].views[level], nullptr);
         ctx->bindResourceView(PSDT_DOWNSAMPLE_FIELD_OUTPUT, m_psdtField[writeIndex].views[level + 1], nullptr);
-        ctx->bindResourceView(PSDT_DOWNSAMPLE_CHROMA_INPUT, m_psdtChroma[writeIndex].views[level], nullptr);
-        ctx->bindResourceView(PSDT_DOWNSAMPLE_CHROMA_OUTPUT, m_psdtChroma[writeIndex].views[level + 1], nullptr);
+        ctx->bindResourceView(PSDT_DOWNSAMPLE_SOURCE_INPUT, m_psdtSource[writeIndex].views[level], nullptr);
+        ctx->bindResourceView(PSDT_DOWNSAMPLE_SOURCE_OUTPUT, m_psdtSource[writeIndex].views[level + 1], nullptr);
+        ctx->bindResourceView(PSDT_DOWNSAMPLE_ILLUM_INPUT, m_psdtIlluminant[writeIndex].views[level], nullptr);
+        ctx->bindResourceView(PSDT_DOWNSAMPLE_ILLUM_OUTPUT, m_psdtIlluminant[writeIndex].views[level + 1], nullptr);
         ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, PsdtDownsampleShader::getShader());
 
         const VkExtent3D workgroups = util::computeBlockCount(dstExtent, VkExtent3D { PSDT_GROUP_SIZE, PSDT_GROUP_SIZE, 1 });
@@ -581,48 +831,68 @@ namespace dxvk {
       PsdtStateArgs pushArgs = {};
       pushArgs.toneCurveMinStops = toneCurveMinStops();
       pushArgs.toneCurveMaxStops = toneCurveMaxStops();
-      pushArgs.deltaTimeSeconds = 0.001f * frameTimeMilliseconds;
-      pushArgs.hasHistory = m_psdtHasHistory ? 1u : 0u;
+      pushArgs.deltaTimeSeconds = deltaSeconds;
 
-      pushArgs.fieldExtent = uvec2 { m_psdtFieldExtent.width, m_psdtFieldExtent.height };
-      pushArgs.levelCount = m_psdtLevelCount;
-      pushArgs.debugView = 0;
+      // Everything that is not a float lives in the flags word: PsdtStateArgs
+      // is exactly at the 128-byte push constant limit, so an enum that costs
+      // a whole dword costs a parameter somewhere else.
+      const uint32_t nearFieldFixed = static_cast<uint32_t>(
+        std::clamp(glareNearField(), 0.0f, 1.0f) * 255.0f + 0.5f);
+      pushArgs.flags =
+          (m_psdtHasHistory ? PSDT_STATE_FLAG_HAS_HISTORY : 0u)
+        | (sceneAdaptive() ? PSDT_STATE_FLAG_SCENE_ADAPTIVE : 0u)
+        | (cameraCut ? PSDT_STATE_FLAG_CAMERA_CUT : 0u)
+        | (cameraValid ? PSDT_STATE_FLAG_CAMERA_VALID : 0u)
+        | (static_cast<uint32_t>(displayGamut()) << PSDT_STATE_SHIFT_GAMUT)
+        | (static_cast<uint32_t>(perceptualSpace()) << PSDT_STATE_SHIFT_SPACE)
+        | ((static_cast<uint32_t>(debugView()) & 0xFu) << PSDT_STATE_SHIFT_DEBUG)
+        | ((m_psdtLevelCount & 0xFu) << PSDT_STATE_SHIFT_LEVELS)
+        | ((nearFieldFixed & 0xFFu) << PSDT_STATE_SHIFT_NEARFIELD);
 
       pushArgs.displayPeakNits = displayPeakNits();
       pushArgs.displayBlackNits = displayBlackNits();
       pushArgs.displayRefWhiteNits = displayRefWhiteNits();
       pushArgs.surroundNits = surroundNits();
 
-      pushArgs.displayGamut = static_cast<uint32_t>(displayGamut());
-      pushArgs.perceptualSpace = static_cast<uint32_t>(perceptualSpace());
-      pushArgs.sceneAdaptive = sceneAdaptive() ? 1u : 0u;
       pushArgs.sourceExclusion = sourceExclusion();
+      pushArgs.localStrength = localAdaptation() * localScale;
+      pushArgs.contrastBudget = contrastBudget() * localScale;
+      pushArgs.depthSensitivity = useRendererSignals ? depthSensitivity() : 0.0f;
 
-      pushArgs.localStrength = localAdaptation();
-      pushArgs.contrastBudget = contrastBudget();
       pushArgs.adaptationSpeedUp = adaptationSpeedUp();
       pushArgs.adaptationSpeedDown = adaptationSpeedDown();
+      pushArgs.cameraAngularSpeed = cameraAngularSpeed;
 
       pushArgs.midtoneContrast = midtoneContrast();
       pushArgs.shadowDepth = shadowDepth();
       pushArgs.highlightRolloff = highlightRolloff();
       pushArgs.detailStrength = detailStrength();
+      pushArgs.detailProtect = detailProtect();
+      pushArgs.detailKnee = detailKnee();
 
       pushArgs.chromaPreservation = chromaPreservation();
       pushArgs.hueTrajectory = hueTrajectory();
-      pushArgs.spatialWhiteStrength = spatialWhite();
+      pushArgs.pressureLuma = pressureLuma();
+      pushArgs.pressureContext = pressureContext();
+      pushArgs.whiteConvergence = whiteConvergence();
+      pushArgs.illuminantStrength = spatialWhite();
       pushArgs.colourfulness = colourfulness();
+      pushArgs.luminanceConcession = luminanceConcession();
 
       pushArgs.glareStrength = glareStrength();
       pushArgs.glareThresholdStops = glareThreshold();
       pushArgs.glareFalloff = glareFalloff();
-      pushArgs.luminanceConcession = luminanceConcession();
       ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
 
-      ctx->bindResourceView(PSDT_STATE_HISTOGRAM_INPUT, m_toneHistogram.view, nullptr);
-      ctx->bindResourceView(PSDT_STATE_FIELD_INPUT, m_psdtField[writeIndex].view, nullptr);
-      ctx->bindResourceSampler(PSDT_STATE_FIELD_INPUT, mipSampler);
-      ctx->bindResourceView(PSDT_STATE_STATE_INPUT_OUTPUT, m_psdtState.view, nullptr);
+      ctx->bindResourceView(PSDT_STATE_BINDING_HISTOGRAM, m_toneHistogram.view, nullptr);
+      ctx->bindResourceView(PSDT_STATE_BINDING_BODY_HISTOGRAM, m_psdtBodyHistogram.view, nullptr);
+      ctx->bindResourceView(PSDT_STATE_BINDING_FIELD, m_psdtField[writeIndex].view, nullptr);
+      ctx->bindResourceSampler(PSDT_STATE_BINDING_FIELD, mipSampler);
+      ctx->bindResourceView(PSDT_STATE_BINDING_SOURCE, m_psdtSource[writeIndex].view, nullptr);
+      ctx->bindResourceSampler(PSDT_STATE_BINDING_SOURCE, mipSampler);
+      ctx->bindResourceView(PSDT_STATE_BINDING_ILLUM, m_psdtIlluminant[writeIndex].view, nullptr);
+      ctx->bindResourceSampler(PSDT_STATE_BINDING_ILLUM, mipSampler);
+      ctx->bindResourceView(PSDT_STATE_BINDING_STATE, m_psdtState.view, nullptr);
       ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, PsdtStateShader::getShader());
 
       // One workgroup, one thread per histogram bucket. It has to run here -
@@ -833,8 +1103,10 @@ namespace dxvk {
 
       ctx->bindResourceView(TONEMAPPING_APPLY_PSDT_FIELD_INPUT, m_psdtField[currentIndex].view, nullptr);
       ctx->bindResourceSampler(TONEMAPPING_APPLY_PSDT_FIELD_INPUT, mipSampler);
-      ctx->bindResourceView(TONEMAPPING_APPLY_PSDT_CHROMA_INPUT, m_psdtChroma[currentIndex].view, nullptr);
-      ctx->bindResourceSampler(TONEMAPPING_APPLY_PSDT_CHROMA_INPUT, mipSampler);
+      ctx->bindResourceView(TONEMAPPING_APPLY_PSDT_SOURCE_INPUT, m_psdtSource[currentIndex].view, nullptr);
+      ctx->bindResourceSampler(TONEMAPPING_APPLY_PSDT_SOURCE_INPUT, mipSampler);
+      ctx->bindResourceView(TONEMAPPING_APPLY_PSDT_ILLUM_INPUT, m_psdtIlluminant[currentIndex].view, nullptr);
+      ctx->bindResourceSampler(TONEMAPPING_APPLY_PSDT_ILLUM_INPUT, mipSampler);
       ctx->bindResourceView(TONEMAPPING_APPLY_PSDT_STATE_INPUT, m_psdtState.view, nullptr);
     }
 

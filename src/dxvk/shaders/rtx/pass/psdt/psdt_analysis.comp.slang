@@ -144,7 +144,11 @@ RWTexture2D<vec4> OutIlluminant;
 layout(binding = PSDT_ANALYSIS_ILLUM_HISTORY_INPUT)
 Sampler2D InIlluminantHistory;
 
-layout(binding = PSDT_ANALYSIS_BODY_HISTOGRAM_OUTPUT)
+// Explicit vk::image_format, as the native tonemapper's histogram does: an
+// InterlockedAdd on a storage image needs the format declared or the atomic
+// does not survive SPIR-V generation.
+[[vk::image_format("r32ui")]]
+layout(r32ui, binding = PSDT_ANALYSIS_BODY_HISTOGRAM_OUTPUT)
 RWTexture1D<uint> OutBodyHistogram;
 
 layout(binding = PSDT_ANALYSIS_STATE_INPUT)
@@ -237,7 +241,7 @@ void main(uint2 groupId : SV_GroupID, uint2 groupThreadId : SV_GroupThreadID, ui
     g_illumR = 0; g_illumG = 0; g_illumB = 0; g_illumWeight = 0;
     g_peakLogBits = 0; g_brightCount = 0;
   }
-  [unroll] for (uint clearIndex = linearIndex; clearIndex < PSDT_BODY_HISTOGRAM_SIZE; clearIndex += kThreads)
+  for (uint clearIndex = linearIndex; clearIndex < PSDT_BODY_HISTOGRAM_SIZE; clearIndex += kThreads)
   {
     g_bodyHistogram[clearIndex] = 0;
   }
@@ -434,7 +438,7 @@ void main(uint2 groupId : SV_GroupID, uint2 groupThreadId : SV_GroupThreadID, ui
   // Merge this block's histogram into the frame's. Most buckets in a 256-pixel
   // block are empty, so the branch removes the great majority of the global
   // atomics rather than issuing 128 per workgroup unconditionally.
-  [unroll] for (uint mergeIndex = linearIndex; mergeIndex < PSDT_BODY_HISTOGRAM_SIZE; mergeIndex += kThreads)
+  for (uint mergeIndex = linearIndex; mergeIndex < PSDT_BODY_HISTOGRAM_SIZE; mergeIndex += kThreads)
   {
     const uint count = g_bodyHistogram[mergeIndex];
     if (count != 0)

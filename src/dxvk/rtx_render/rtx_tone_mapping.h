@@ -122,14 +122,30 @@ namespace dxvk {
     // motion vectors while writing this frame's, so the two cannot be the same
     // image - a workgroup would otherwise sample a texel another workgroup in
     // the same dispatch had already overwritten.
+    //
+    // Three fields rather than v0.1's two, because the source energy became
+    // per-channel (so glare carries the source's own colour) and the
+    // illuminant became a measured quantity of its own rather than a mean
+    // chroma riding along with it. Together they are about 780 KiB at 1080p.
     RtxMipmap::Resource m_psdtField[2];
-    RtxMipmap::Resource m_psdtChroma[2];
+    RtxMipmap::Resource m_psdtSource[2];
+    RtxMipmap::Resource m_psdtIlluminant[2];
+    // Body-only luminance histogram. Accumulated by psdt_analysis with atomics
+    // and zeroed by psdt_state once it has been read, the same way the
+    // tonemapper's own histogram is consumed by its tone curve pass.
+    Resources::Resource m_psdtBodyHistogram;
     Resources::Resource m_psdtState;
 
     VkExtent3D m_psdtFieldExtent = { 0, 0, 0 };
     uint32_t m_psdtLevelCount = 0;
     uint32_t m_psdtIndex = 0;
     bool m_psdtHasHistory = false;
+
+    // Camera state, for the transition classifier in psdt_state. Kept here
+    // rather than read from RtCamera's own history because the tonemapper runs
+    // once per frame and only needs the delta across that one step.
+    Vector3 m_psdtPreviousCameraForward = Vector3(0.0f, 0.0f, 1.0f);
+    bool m_psdtHasCameraHistory = false;
 
     bool m_resetState = true;
     bool m_isCurveChanged = true;
@@ -161,6 +177,26 @@ namespace dxvk {
       Jzazbz,
     };
 
+    // NV-DXVK [PSDT]: in-image diagnostics. Every entry shows a value the
+    // transform actually read or produced on that pixel on its way past,
+    // rather than recomputing its own version of it - a debug view that
+    // re-derives the quantity agrees with the shader right up until the moment
+    // something is wrong, which is the only moment it was needed.
+    enum class PsdtDebugView : uint32_t {
+      Off = 0,
+      Adaptation,     // Pooled adaptation, as stops about the frame anchor.
+      Budget,         // Adaptation left after the contrast budget clamped it.
+      Roles,          // BODY green, SOURCE red, SKY blue.
+      SourceEnergy,   // The glare kernel's input, per channel.
+      Illuminant,     // Measured local illuminant.
+      Depth,          // Body depth, and how much the coarse pooling trusted it.
+      Demand,         // Colour volume demand. Green in gamut, red out of it.
+      Pressure,       // Chroma actually given up.
+      Glare,          // Glare contribution alone.
+      Clipping,       // Pre-clamp overflow, before the gamut fit hides it.
+      CurveSlope,     // d(display)/d(scene) at this pixel's base.
+    };
+
     // NV-DXVK [tonemap operators]: selects a fork-ported tonemap operator that
     // replaces the native dynamic (histogram tone-curve) tonemapper. Numeric
     // values match the tonemapOperator* constants in
@@ -179,6 +215,13 @@ namespace dxvk {
       // rtx.tonemap.psdt. The others stay in the list as controls to measure it
       // against - that is worth more than the couple of kilobytes they cost.
       PerceptualTF2 = 8,
+      // Two more controls, added for the same reason. Reinhard is the
+      // no-shoulder no-colour-management baseline; AgX is the canonical
+      // controlled path to white, which is the interesting comparison for
+      // PSDT's hue trajectory rather than the easy one. Numbered above PSDT so
+      // the gaps at 1, 2, 4 and 5 stay reserved for the RemixProjGroup fork.
+      Reinhard = 9,
+      AgX = 10,
     };
 
     RTX_OPTION("rtx.tonemap", float, exposureBias, 0.f, "The exposure value to use for the global tonemapper when auto exposure is disabled, or a bias multiplier on top of the auto exposure's calculated exposure value.");
@@ -210,7 +253,8 @@ namespace dxvk {
     // highlight handling — default), 7 = GT7 (Gran Turismo 7, ICtCp chroma-
     // preserving). Set in rtx.conf, e.g. "rtx.tonemap.operator = 7" for GT7.
     RTX_OPTION("rtx.tonemap", TonemapOperator, tonemapOperator, TonemapOperator::Psycho17,
-               "Tonemap operator (set by number in rtx.conf). 0 = None (Remix native dynamic curve), 3 = HableFilmic (Uncharted 2, closest to Titanfall's native look), 6 = Psycho17 (perceptual vision-model, best bright/saturated handling; default), 7 = GT7 (Gran Turismo 7, SDR ICtCp chroma-preserving), 8 = PerceptualTF2 (PSDT - scene-adaptive perceptual display transform; see the rtx.tonemap.psdt.* group).");
+               "Tonemap operator (set by number in rtx.conf). 0 = None (Remix native dynamic curve), 3 = HableFilmic (Uncharted 2, closest to Titanfall's native look), 6 = Psycho17 (perceptual vision-model, best bright/saturated handling; default), 7 = GT7 (Gran Turismo 7, SDR ICtCp chroma-preserving), 8 = PerceptualTF2 (PSDT - scene-adaptive perceptual display transform; see the rtx.tonemap.psdt.* group), 9 = Reinhard (extended, white point 4.0), 10 = AgX (reference configuration).\n"
+               "9 and 10 exist as scientific controls for PSDT rather than as recommendations: Reinhard has no shoulder and no colour management at all, and AgX is the canonical controlled path to white. Everything PSDT claims is measured against those two and against 6 and 7 in tools/psdt/.");
 
     // =====================================================================
     // PSDT - Perceptual Scene Display Transform (operator 8)
@@ -250,9 +294,26 @@ namespace dxvk {
     RTX_OPTION("rtx.tonemap.psdt", float, sourceExclusion, 0.75f,
                "How completely light sources are excluded from the adaptation anchor, in [0,1].\n"
                "At 0 the anchor is the plain (centre-weighted) histogram median and a sunlit window will drag the whole corridor's exposure down with it. At 1 the anchor ignores anything classified as a source entirely and exposes purely for surfaces. This is the single setting that most changes how a dark interior with a bright opening reads.");
+    RTX_OPTION("rtx.tonemap.psdt", bool, rendererSignals, true,
+               "Classifies pixels using what the renderer knows - the per-pixel emissive bit, linear view depth and demodulated albedo - rather than from brightness alone.\n"
+               "This is the difference between 'source' meaning 'an emitter' and 'source' meaning 'bright'. With it off, a sunlit white wall meters as a lamp, sky cannot be told from a bright ceiling, and the white point falls back to a grey-world estimate over the scene's mean colour rather than an estimate of the light itself. Disable only to reproduce v0.1 behaviour or if the gbuffer is unavailable.");
     RTX_OPTION("rtx.tonemap.psdt", float, sourceThreshold, 4.0f,
                "Stops above middle grey at which a pixel starts being classified as a light source rather than a lit surface.\n"
-               "Relative rather than absolute, which only works because the input is post-exposure. With auto exposure disabled this becomes an absolute threshold and wants re-tuning.");
+               "Relative rather than absolute, which only works because the input is post-exposure. With auto exposure disabled this becomes an absolute threshold and wants re-tuning.\n"
+               "With rendererSignals on this is one input among several rather than the whole classifier: an emissive surface qualifies 2.5 stops sooner because the emissive bit is direct evidence, and a non-emissive one additionally has to be spatially compact, which is what keeps a large bright surface out of the source population.");
+    RTX_OPTION("rtx.tonemap.psdt", float, skyViewZ, 100000.0f,
+               "Linear view depth above which a pixel is sky rather than geometry.\n"
+               "A ray miss writes NRD's miss depth (500001) and far backdrop geometry is clamped to 200000, while interior geometry is orders of magnitude below both, so anything between about 10000 and 150000 separates them identically. Sky is neither surface nor lamp: it gets a low fixed adaptation weight, contributes no glare energy unless it is bright enough to be the sun, and is what the outdoor scene-intent term is measured from.");
+    RTX_OPTION("rtx.tonemap.psdt", float, illuminantMinAlbedo, 0.04f,
+               "Albedo below which a surface contributes nothing to the local illuminant estimate.\n"
+               "The estimate is radiance divided by albedo, which is the colour of the light rather than the colour of the paint - but only where the division means something. A near-black surface divides noise by noise and a fully saturated one has no information in its dark channels; both are weighted out rather than hard-tested, so the estimate degrades to 'no opinion' instead of flickering.");
+    RTX_OPTION("rtx.tonemap.psdt", float, depthSensitivity, 0.35f,
+               "How strongly the adaptation pooling refuses to average across a depth discontinuity. 0 disables it and restores a plain box pyramid.\n"
+               "Depth is carried through the pyramid as log2(1+z), so this is measured in octaves of distance and one value works from a corridor to a skybox: two walls at 5 and 10 units are 0.9 apart and still pool together, while the same wall and a 200000-unit backdrop are 15 apart and do not. It only ever reduces the coarse scales' weight, so the worst case is that pooling collapses to the finest scale, which is a real adaptation neighbourhood in its own right.\n"
+               "This is what stops a bright window from re-exposing the wall beside it.");
+    RTX_OPTION("rtx.tonemap.psdt", bool, coordinateWithAutoExposurePlus, true,
+               "Scales down local adaptation while Auto Exposure Plus is active, in proportion to that pass's own local correction strength.\n"
+               "Plus applies a spatially varying gain before the tonemapper and PSDT applies local adaptation after it. Both are local dynamic range compression; run at full strength in series they compress the same signal twice, which is the exact failure this architecture exists to avoid and which v0.1 did nothing about. Disable only to deliberately stack the two.");
     RTX_OPTION("rtx.tonemap.psdt", float, glareClassThreshold, 8.0f,
                "Stops above middle grey at which a pixel is too bright to be represented as a value at all, and its energy is handed to the glare model as spatial extent instead.");
     RTX_OPTION("rtx.tonemap.psdt", float, localAdaptation, 0.65f,
@@ -285,7 +346,13 @@ namespace dxvk {
                "The default is measured rather than chosen: tools/psdt/psdt_sweep.py shows 0.45 dominating 0.60 on every axis it trades against - more highlight separation (0.19 vs 0.16 display stops per scene stop over +2..+5), more chroma retained, six points less clipping - while still keeping the full midtone slope. Below about 0.40 the shoulder starts eating into the +-1 stop midtone region and punch begins to drop.");
     RTX_OPTION("rtx.tonemap.psdt", float, detailStrength, 0.55f,
                "How much of the scene's local contrast is restored after luminance compression, in [0,1].\n"
-               "The curve compresses a base layer; this decides how much of the detail riding on that base keeps its original contrast rather than the curve's compressed slope. It is what separates 'compressed dynamic range' from 'flat'. It is tapered away in the highlights and rolled off with detail magnitude, because re-expanding contrast the shoulder correctly removed is exactly how haloing appears around bright sources.");
+               "The curve compresses a base layer; this decides how much of the detail riding on that base keeps its original contrast rather than the curve's compressed slope. It is what separates 'compressed dynamic range' from 'flat'. It is tapered away in the highlights by detailProtect and rolled off with detail magnitude by detailKnee, because re-expanding contrast the shoulder correctly removed is exactly how haloing appears around bright sources.");
+    RTX_OPTION("rtx.tonemap.psdt", float, detailProtect, 1.0f,
+               "How hard highlights are protected from local contrast restoration. 0 restores contrast just as strongly in the shoulder as in the midtones.\n"
+               "Scales how quickly restoration fades as the neighbourhood moves up the shoulder. The shoulder spent that contrast deliberately, on the grounds that the display cannot show it; putting it back is how a bright rim appears around every light in the frame.");
+    RTX_OPTION("rtx.tonemap.psdt", float, detailKnee, 3.0f,
+               "Detail magnitude, in stops away from the neighbourhood's own level, at which restoration has fallen to half.\n"
+               "Texture sits a fraction of a stop from its surroundings and gets the full restoration. A lamp sits six stops from the wall behind it and gets almost none - it is not detail, it is a different object, and restoring the contrast between them is a halo rather than a texture. Lower values are more conservative.");
 
     // --- colour volume ---------------------------------------------------
     RTX_OPTION("rtx.tonemap.psdt", float, chromaPreservation, 2.5f,
@@ -300,8 +367,18 @@ namespace dxvk {
                "Only saturated colours are affected at all: a neutral is never outside the volume, so it concedes nothing and the brightness of the rest of the frame is untouched.\n"
                "At the default a fully saturated colour renders about 0.28 stops below a neutral of the same scene luminance, and retains 0.44 of its scene chroma against 0.35 with the concession off. 1.0 buys another 0.03 of chroma for 0.09 more stops of darkening.");
     RTX_OPTION("rtx.tonemap.psdt", float, spatialWhite, 0.35f,
-               "How much the local low-frequency mean colour, rather than D65, is used as the white that chroma compresses towards, in [0,1].\n"
-               "Keeps a tungsten-lit interior warm as it desaturates instead of drifting towards daylight white, which is most of what makes an indoor-to-outdoor transition read correctly. Set to 0 for a strict D65 convergence.");
+               "How far the observer is adapted towards the measured local illuminant rather than D65, in [0,1]. 0 is a strict D65 convergence.\n"
+               "Keeps a tungsten-lit interior warm as it desaturates instead of drifting towards daylight white, which is most of what makes an indoor-to-outdoor transition read correctly.\n"
+               "This is a von Kries chromatic adaptation in CAT02 cone space, not an offset applied to the chroma coordinates. The distinction is not academic: under an adaptation, a surface that is neutral under the local light lands exactly on the perceptual neutral axis, so compressing its chroma to zero takes it to the local white and a neutral is still guaranteed to fit inside the display volume. Under an offset - which is what v0.1 did - neither of those holds.\n"
+               "The illuminant itself is measured as radiance over albedo across surfaces where that division is meaningful, so a room of coloured walls under a neutral light reports a neutral illuminant. The effective strength is additionally scaled by how much of the frame produced a usable estimate, so a scene with no evidence adapts to D65 rather than to noise.");
+    RTX_OPTION("rtx.tonemap.psdt", float, pressureLuma, 0.50f,
+               "How early a colour that is bright AND saturated begins easing towards the gamut boundary, relative to an ordinary colour, in [0,1]. 0 waits until the colour genuinely does not fit.\n"
+               "Anticipatory compression: a transform does not have to wait for the boundary to arrive before it starts approaching it gracefully. Only the product of brightness and chroma moves this, so a bright neutral is never affected.");
+    RTX_OPTION("rtx.tonemap.psdt", float, pressureContext, 0.6f,
+               "How much a colour's contrast against its own neighbourhood brings that easing forward. 0 ignores spatial context.\n"
+               "The fourth term in the compression decision, after luminance, chroma and gamut distance. A bright outlier against a dark surround - a lamp against a wall, a muzzle flash in a corridor - is somewhere the eye is not looking for colour fidelity and where a hard boundary clip is very visible, so it earns an earlier and gentler approach. A colour sitting in a large field of its own brightness is the opposite case: a hue shift there is obvious and there is no clipping artifact to trade against, so it keeps its colour longer.");
+    RTX_OPTION("rtx.tonemap.psdt", float, whiteConvergence, 2.0f,
+               "Exponent shaping how quickly the hue trajectory engages as a colour leaves the display volume. Higher keeps ordinary colours untouched for longer and concentrates the rotation into the colours that genuinely cannot fit.");
     RTX_OPTION("rtx.tonemap.psdt", float, colourfulness, 1.0f,
                "Couples perceived colourfulness to local adaptation.\n"
                "A region the viewer is dark-adapted to is shown at less absolute display luminance than the scene had and needs proportionally more chroma to look equally colourful. This is the coupling between the tone stage and the colour stage that treating the two as independent throws away. 0 disables it.");
@@ -314,12 +391,19 @@ namespace dxvk {
                "Stops above the adaptation anchor at which a source starts to glare.\n"
                "Anchored to the adaptation state rather than to an absolute value, which is the whole reason a car headlight is blinding at night and invisible at noon.");
     RTX_OPTION("rtx.tonemap.psdt", float, glareFalloff, 0.65f,
-               "Per-level weight ratio of the glare kernel, in (0,1). Higher spreads glare wider.\n"
-               "The radius itself is not a parameter and cannot be: a dim source drops below the visibility threshold after one or two pyramid levels while a very bright one survives several more, so the halo grows with roughly the log of the source luminance on its own.");
+               "Per-level weight ratio of the glare kernel's wide lobe, in (0,1). Higher spreads the veil wider.\n"
+               "The radius itself is not a parameter and cannot be: the visibility threshold is applied per pyramid level, so a dim source drops below it after one or two levels while a very bright one survives several more, and the halo grows with roughly the log of the source luminance on its own. v0.1 thresholded the summed energy once instead, which gave every source the same profile scaled by brightness - a bloom, not a glare.");
+    RTX_OPTION("rtx.tonemap.psdt", float, glareNearField, 0.8f,
+               "Amplitude of the glare kernel's narrow lobe, relative to the wide one, in [0,1].\n"
+               "The eye's glare point-spread function is a narrow core sitting on a much wider, much fainter veil, and a single exponential cannot be both. This is the core, and it is also the near field a highlight needs between its clipped centre and its halo - the part that says a light source has an extent rather than just a position.");
 
     // --- diagnostics -----------------------------------------------------
     RTX_OPTION("rtx.tonemap.psdt", int, levels, 0,
                "Adaptation pyramid levels, or 0 to derive from the render resolution. Fewer levels confine both the adaptation pooling and the glare kernel to smaller radii.");
+    RTX_OPTION("rtx.tonemap.psdt", PsdtDebugView, debugView, PsdtDebugView::Off,
+               "Replaces the image with one of the transform's own intermediate values. 0 = Off, 1 = Adaptation, 2 = Budget, 3 = Roles, 4 = Source energy, 5 = Illuminant, 6 = Depth, 7 = Gamut demand, 8 = Pressure, 9 = Glare, 10 = Clipping, 11 = Curve slope.\n"
+               "Every view shows a value the transform actually read or produced on that pixel on its way past, rather than recomputing its own version of it. A debug view that re-derives the quantity agrees with the shader right up until the moment something is wrong, which is the only moment it was needed.\n"
+               "Roles is the one to look at first: it is the classification the whole architecture rests on, in green (surface), red (source) and blue (sky). Clipping is the second, because it shows what the final gamut fit had to hide.");
 
     // Dithering settings
     RTX_OPTION("rtx.tonemap", DitherMode, ditherMode, DitherMode::SpatialTemporal,

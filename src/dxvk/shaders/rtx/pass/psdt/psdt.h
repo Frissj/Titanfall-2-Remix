@@ -289,6 +289,18 @@
 #define PSDT_STATE_LEVEL_COUNT        69
 #define PSDT_STATE_DEBUG_VIEW         70
 
+// Previous frame's *measurements*, before any temporal filtering. Only the cut
+// detector reads them, and it has to: a cut is a discontinuity in what the
+// frame measures, not a large distance between the measurement and a state
+// that is deliberately slow to follow it. v0.1 compared the measurement to the
+// filtered anchor, so a legitimate half-second dimming - which downward
+// adaptation is designed to lag behind - opened a gap wide enough to read as a
+// scene change, and the exposure snapped. Measured in psdt_suite's temporal
+// section: a 6-stop fade over 0.5 s fired a false cut.
+#define PSDT_STATE_PREV_TARGET_ANCHOR 71
+#define PSDT_STATE_PREV_TARGET_WHITE  72
+#define PSDT_STATE_PREV_TARGET_BLACK  73
+
 // Perceptual space selector values.
 static const uint psdtSpaceICtCp  = 0;
 static const uint psdtSpaceJzazbz = 1;
@@ -329,7 +341,12 @@ static const uint psdtRoleSky    = 3;
 // stand-in. Without it the classifier falls back to luminance alone, which is
 // v0.1 behaviour and is what runs if the gbuffer is unavailable for a frame.
 #define PSDT_ANALYSIS_FLAG_RENDERER_SIGNALS (1u << 2)
-#define PSDT_ANALYSIS_FLAG_JZAZBZ          (1u << 3)
+// No perceptual-space bit: the analysis pass is space-agnostic. It stores the
+// illuminant as linear RGB rather than as chroma coordinates, so nothing in it
+// needs to know which space the colour-volume stage will use or what reference
+// white that space is absolute against. That is worth a line because v0.1's
+// version did one perceptual conversion per 16x16 block for a value the
+// transform then had to convert back.
 
 // ---------------------------------------------------------------------------
 // State flag bits (PsdtStateArgs::flags)
@@ -342,6 +359,11 @@ static const uint psdtRoleSky    = 3;
 #define PSDT_STATE_SHIFT_SPACE         10  // 1 bit
 #define PSDT_STATE_SHIFT_DEBUG         12  // 4 bits
 #define PSDT_STATE_SHIFT_LEVELS        16  // 4 bits
+// The near-field glare lobe's amplitude, as 8 bits of [0,1]. It lives in the
+// flags word rather than in a float of its own because PsdtStateArgs is
+// exactly at the 128-byte push constant limit and 1/255 is finer than the
+// amplitude of a glare lobe can be judged by eye.
+#define PSDT_STATE_SHIFT_NEARFIELD     20  // 8 bits, fixed point over [0,1]
 
 // ---------------------------------------------------------------------------
 // Bindings
@@ -369,12 +391,12 @@ static const uint psdtRoleSky    = 3;
 #define PSDT_DOWNSAMPLE_ILLUM_INPUT           4
 #define PSDT_DOWNSAMPLE_ILLUM_OUTPUT          5
 
-#define PSDT_STATE_HISTOGRAM_INPUT            0
-#define PSDT_STATE_BODY_HISTOGRAM_INOUT       1
-#define PSDT_STATE_FIELD_INPUT                2
-#define PSDT_STATE_SOURCE_INPUT               3
-#define PSDT_STATE_ILLUM_INPUT                4
-#define PSDT_STATE_STATE_INPUT_OUTPUT         5
+#define PSDT_STATE_BINDING_HISTOGRAM            0
+#define PSDT_STATE_BINDING_BODY_HISTOGRAM       1
+#define PSDT_STATE_BINDING_FIELD                2
+#define PSDT_STATE_BINDING_SOURCE               3
+#define PSDT_STATE_BINDING_ILLUM                4
+#define PSDT_STATE_BINDING_STATE         5
 
 // ---------------------------------------------------------------------------
 // Constant buffers
@@ -407,7 +429,6 @@ struct PsdtAnalysisArgs
   // the state texture rather than taking from here - the CPU never reads the
   // state back, and a cut is detected on the GPU.
   float currentWeight;
-  float refWhiteNits;
   // Linear view Z above which a pixel is sky rather than geometry. A ray miss
   // writes NRD's missLinearViewZ (500001); the fork clamps far geometry to
   // 200000; ordinary interiors are orders of magnitude below both.
@@ -418,8 +439,6 @@ struct PsdtAnalysisArgs
 
   float toneCurveMinStops;
   float toneCurveMaxStops;
-  uint  pad0;
-  uint  pad1;
 };
 
 struct PsdtDownsampleArgs
@@ -454,8 +473,12 @@ struct PsdtStateArgs
 
   float adaptationSpeedUp;
   float adaptationSpeedDown;
-  float cameraAngularSpeed;    // radians / second
-  float cameraTranslationSpeed; // world units / second, normalised by the scene scale
+  // Camera angular speed in radians/second. A teleport or a hard cut arrives
+  // separately as PSDT_STATE_FLAG_CAMERA_CUT; this is the continuous signal
+  // that separates a player sweeping their view from a player standing still,
+  // which want different adaptation time constants and did not have them in
+  // v0.1.
+  float cameraAngularSpeed;
 
   // --- curve ---
   float midtoneContrast;
@@ -481,6 +504,7 @@ struct PsdtStateArgs
   // --- glare ---
   float glareStrength;
   float glareThresholdStops;
+  float glareFalloff;
 };
 
 #endif  // PSDT_H

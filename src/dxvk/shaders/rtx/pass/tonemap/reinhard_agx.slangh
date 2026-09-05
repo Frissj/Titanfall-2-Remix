@@ -1,0 +1,123 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+
+// ===========================================================================
+// Reinhard and AgX - two controls
+// ===========================================================================
+//
+// Neither of these is here to be used. They are here because a claim about a
+// display transform is only worth what it is measured against, and PSDT's two
+// substantive claims - that it keeps more colour near the display boundary,
+// and that its path to white has no discontinuity in it - need one baseline
+// at each end to be meaningful:
+//
+//   Reinhard  no shoulder, no colour management, no path to white at all.
+//             Per-channel x/(1+x). It does not compress chroma, it clips, and
+//             the amount by which it clips is the number PSDT's chroma
+//             retention has to be read against.
+//   AgX       the canonical *controlled* path to white. It deliberately
+//             rotates hue as a colour brightens rather than clipping the
+//             channels independently, which is the same problem PSDT's hue
+//             trajectory solves by a different mechanism, so it is the
+//             interesting comparison rather than the easy one.
+//
+// Both are self-contained and neither touches any existing operator.
+// ===========================================================================
+
+#ifndef RTX_PASS_TONEMAP_REINHARD_AGX_SLANGH
+#define RTX_PASS_TONEMAP_REINHARD_AGX_SLANGH
+
+// ---------------------------------------------------------------------------
+// Reinhard, extended
+// ---------------------------------------------------------------------------
+// Reinhard et al. 2002, the per-channel form with a white point. whitePoint is
+// the scene value that maps to exactly 1.0; above it the curve would exceed 1
+// and is clamped, which is the clipping this operator exists to demonstrate.
+float3 reinhardToneMapping(float3 color, float whitePoint)
+{
+  const float3 x = max(color, 0.0);
+  const float w2 = max(whitePoint * whitePoint, 1e-4);
+  return saturate(x * (1.0 + x / w2) / (1.0 + x));
+}
+
+// ---------------------------------------------------------------------------
+// AgX
+// ---------------------------------------------------------------------------
+// Troy Sobotka's AgX, in the form that has become standard in Blender and
+// darktable: an input matrix that attenuates and rotates the primaries, a
+// log2 encoding over a fixed scene range, a sigmoid, and the inverse matrix.
+//
+// The path to white is a consequence of the matrix pair rather than of the
+// sigmoid. Attenuating the primaries on the way in means a saturated colour is
+// already partly desaturated before the curve sees it, so it approaches white
+// along a controlled arc instead of having its dominant channel clip first.
+// That is the idea PSDT's hue trajectory borrows and then makes conditional on
+// how much display volume is actually left.
+
+static const float3x3 kAgxInset = float3x3(
+  0.8566271533, 0.1373189729, 0.1118982129,
+  0.0951212405, 0.7612419906, 0.0767994814,
+  0.0482516061, 0.1014390365, 0.8113023057);
+
+static const float3x3 kAgxOutset = float3x3(
+   1.1271005818, -0.1413297634, -0.1413297634,
+  -0.1106066501,  1.1578237022, -0.1106066501,
+  -0.0164939043, -0.0164939043,  1.2519364065);
+
+// The reference scene range: 2^-12.47393 to 2^4.026069 about middle grey.
+static const float kAgxMinEv = -12.47393;
+static const float kAgxMaxEv = 4.026069;
+
+// Sixth-order polynomial fit to the AgX sigmoid over [0,1], from the Blender
+// implementation. Cheaper than the piecewise power form and visually identical.
+float3 agxSigmoid(float3 x)
+{
+  const float3 x2 = x * x;
+  const float3 x4 = x2 * x2;
+  return 15.5 * x4 * x2
+       - 40.14 * x4 * x
+       + 31.96 * x4
+       - 6.868 * x2 * x
+       + 0.4298 * x2
+       + 0.1191 * x
+       - 0.00232;
+}
+
+float3 agxToneMapping(float3 color)
+{
+  float3 v = mul(kAgxInset, max(color, 0.0));
+
+  // Log2 encode into the reference range.
+  v = clamp(log2(max(v, 1e-10)), kAgxMinEv, kAgxMaxEv);
+  v = (v - kAgxMinEv) / (kAgxMaxEv - kAgxMinEv);
+
+  v = agxSigmoid(saturate(v));
+
+  // The sigmoid's output is display-encoded at 2.2; undo that so the operator
+  // contract with the apply shader (linear [0,1] out) still holds and the sRGB
+  // OETF downstream is not applied on top of a gamma that is already there.
+  v = pow(max(v, 0.0), float3(2.2, 2.2, 2.2));
+
+  return saturate(mul(kAgxOutset, v));
+}
+
+#endif // RTX_PASS_TONEMAP_REINHARD_AGX_SLANGH

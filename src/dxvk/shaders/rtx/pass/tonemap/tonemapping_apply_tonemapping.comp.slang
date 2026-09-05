@@ -41,15 +41,19 @@ RWTexture1D<float> InExposure;
 [[vk::binding(TONEMAPPING_APPLY_TONEMAPPING_COLOR_OUTPUT)]]
 RWTexture2D<float4> OutColorBuffer;
 
-// NV-DXVK [PSDT]: adaptation field (mipped, the multi-scale adaptation pyramid
-// and the glare kernel), its chroma companion (spatial white point and glare
-// tint), and the frame's AdaptationState. Always bound; only read when the
-// PerceptualTF2 operator is selected.
+// NV-DXVK [PSDT]: the three adaptation fields - body (the multi-scale
+// adaptation pyramid), source (the glare kernel, per channel) and illuminant
+// (the measured local white point) - plus the frame's AdaptationState. All
+// mipped, all always bound; only read when the PerceptualTF2 operator is
+// selected.
 [[vk::binding(TONEMAPPING_APPLY_PSDT_FIELD_INPUT)]]
 Sampler2D PsdtField;
 
-[[vk::binding(TONEMAPPING_APPLY_PSDT_CHROMA_INPUT)]]
-Sampler2D PsdtChroma;
+[[vk::binding(TONEMAPPING_APPLY_PSDT_SOURCE_INPUT)]]
+Sampler2D PsdtSource;
+
+[[vk::binding(TONEMAPPING_APPLY_PSDT_ILLUM_INPUT)]]
+Sampler2D PsdtIlluminant;
 
 [[vk::binding(TONEMAPPING_APPLY_PSDT_STATE_INPUT)]]
 RWTexture1D<float> PsdtState;
@@ -150,12 +154,12 @@ float3 applyToneMapping(float3 color, uint2 pixelPosition)
       // sRGB and dither below still run; ACES finalize and the tuning-mode
       // split are bypassed exactly as for the other operators.
       const float2 uv = (float2(pixelPosition) + 0.5f) / float2(imageSize(InColorBuffer));
-      color = psdtApply(color, uv, PsdtField, PsdtChroma, PsdtState);
+      color = psdtApply(color, uv, PsdtField, PsdtSource, PsdtIlluminant, PsdtState);
     }
     else if (cb.tonemapOperator != tonemapOperatorNone)
     {
       // NV-DXVK [tonemap operators]: a selected fork operator (Psycho17 / GT7 /
-      // Hable) replaces Remix's native dynamic tone curve. The operator consumes
+      // Hable / Reinhard / AgX) replaces Remix's native dynamic tone curve. The operator consumes
       // the post-exposure linear color and returns linear [0,1]; the color
       // grading + sRGB + dither stages below still run. finalizeWithACES and the
       // tuning-mode debug split are bypassed in operator mode.

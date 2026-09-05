@@ -21,7 +21,8 @@
 */
 
 // NV-DXVK [tonemap operators]: minimal dispatcher for the fork-ported tonemap
-// operators (Psycho17 / GT7 / Hable-Uncharted2). Operators are pure functions
+// operators (Psycho17 / GT7 / Hable-Uncharted2 / Reinhard / AgX). Operators are
+// pure functions
 // (linear HDR in -> linear [0,1] out); the apply shader still does color
 // grading + sRGB + dither after. The caller selects the operator with the
 // tonemapOperator* constant; per-operator parameters are pinned here to each
@@ -35,6 +36,7 @@
 #include "rtx/pass/tonemap/psycho17.slangh"
 #include "rtx/pass/tonemap/gt7.slangh"
 #include "rtx/pass/tonemap/hable.slangh"
+#include "rtx/pass/tonemap/reinhard_agx.slangh"
 
 // applyForkTonemap — dispatch `color` (linear, post-exposure) through the
 // operator selected by `op`. Returns linear [0,1]. op == None / unknown returns
@@ -81,6 +83,18 @@ float3 applyForkTonemap(uint op, float3 color)
       /*A=*/ 0.15f, /*B=*/ 0.50f, /*C=*/ 0.10f,
       /*D=*/ 0.20f, /*E=*/ 0.02f, /*F=*/ 0.30f,
       /*W=*/ 4.00f);
+  }
+  if (op == tonemapOperatorReinhard)
+  {
+    // Extended Reinhard with the white point at 4.0, matching the Hable entry
+    // above so the two filmic-versus-not comparisons share a scene range.
+    return reinhardToneMapping(color, /*whitePoint=*/ 4.0f);
+  }
+  if (op == tonemapOperatorAgX)
+  {
+    // AgX at its reference configuration - no look transform, no contrast
+    // preset. A control is only a control if it is the unmodified thing.
+    return agxToneMapping(color);
   }
   // tonemapOperatorPerceptualTF2 is deliberately absent. PSDT is not a pure
   // function of one pixel - it needs the frame's adaptation state and the

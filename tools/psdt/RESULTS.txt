@@ -1,10 +1,66 @@
+PSDT test suite output. Regenerate with:
+    python3 tools/psdt/psdt_suite.py > tools/psdt/RESULTS.txt
+
+Consistency check (shader / header / C++ agreement):
+PSDT consistency check
+
+ state layout
+  [ok  ] state slots are unique
+  [ok  ] state slots fit PSDT_STATE_SIZE (96)
+  [ok  ] every state slot a shader names is defined
+  [ok  ] no state slot is read before anything writes it
+ bindings
+  [ok  ] psdt_analysis binding indices unique
+  [ok  ] psdt_downsample binding indices unique
+  [ok  ] psdt_state binding indices unique
+  [ok  ] tonemap apply binding indices unique
+  [ok  ] PsdtAnalysisShader: C++ parameter list matches the shader's bindings
+  [ok  ] PsdtDownsampleShader: C++ parameter list matches the shader's bindings
+  [ok  ] PsdtStateShader: C++ parameter list matches the shader's bindings
+ push constants
+  [ok  ] PsdtAnalysisArgs: every field is set by the CPU
+  [ok  ] PsdtAnalysisArgs: every field is read by a shader
+  [ok  ] PsdtAnalysisArgs: 68 bytes fits the 128-byte push constant limit   68 bytes
+  [ok  ] PsdtStateArgs: every field is set by the CPU
+  [ok  ] PsdtStateArgs: every field is read by a shader
+  [ok  ] PsdtStateArgs: 128 bytes fits the 128-byte push constant limit   128 bytes
+  [ok  ] PsdtDownsampleArgs: every field is set by the CPU
+  [ok  ] PsdtDownsampleArgs: every field is read by a shader
+  [ok  ] PsdtDownsampleArgs: 16 bytes fits the 128-byte push constant limit   16 bytes
+ shader / reference agreement
+  [ok  ] shared constants match between shader and reference
+  [ok  ] chroma references match between shader and reference
+  [ok  ] shoulder clamp present in both shader and reference   shader=True reference=True
+  [ok  ] black-level epsilon matches   shader=1e-7 reference=1e-7
+ operators and options
+  [ok  ] operator ids agree between the C++ enum and the shader header
+  [ok  ] every operator appears in the UI dropdown
+  [ok  ] every pure operator is reachable from applyForkTonemap
+  [ok  ] every PSDT option is reachable from the UI
+ syntax smoke test
+  [ok  ] braces, parens and brackets balance in every shader
+
+  note: 21 state slots are diagnostic-only (written, never read by a stage): ADAPT_VELOCITY, BODY_MEAN_LOGY, CAMERA_ANGULAR, CONTRAST_RANGE, DISPLAY_BLACK, DISPLAY_PEAK, FRAME_PEAK_LOGY, GLARE_FRACTION, ILLUM_CONFIDENCE, INTENT_BRIGHT, INTENT_INDOOR, INTENT_NIGHT, INTENT_OUTDOOR, LEVEL_COUNT, MEDIAN_LOGY, PRESSURE_GAMUT, SALIENCY_LOGY, SKY_FRACTION, SOURCE_FRACTION, SURROUND, TRANSITION
+  note: 41 PSDT options, all with UI
+
+  all consistency checks pass
+
 
 PROBE  colour-space constants, recomputed from the shipped matrices
 -------------------------------------------------------------------
-  max displayable chroma, ICtCp   = 0.2933  at rgb=[0.0, 0.0, 1.0]
-  max displayable chroma, Jzazbz  = 0.1594  at rgb=[0.0, 0.0, 1.0]
+  max displayable chroma, over each gamut's own cube:
+    gamut         ICtCp    Jzazbz   (shipped constant in brackets)
+    Rec709       0.2933    0.1594   [0.2933, 0.1594]
+    P3           0.3505    0.1727   [0.3505, 0.1727]
+    Rec2020      0.4026    0.2133   [0.4026, 0.2133]
+
+  per-gamut luminance agreement, max error = 4.64e-08   OK
   round-trip max abs error, ICtCp   = 1.981e-07   OK
   round-trip max abs error, Jzazbz  = 4.743e-10   OK
+  CAT02 round trip, max abs error         = 2.490e-09   OK
+  local white lands on the neutral axis   = 1.092e-09 channel spread   OK
+    (the property v0.1's chroma offset did not have, and the reason chroma
+     compression towards zero now actually converges on the local white)
 
 CURVE  monotonicity, C1 continuity, and where the anchors land
 --------------------------------------------------------------
@@ -21,6 +77,15 @@ CURVE  monotonicity, C1 continuity, and where the anchors land
   toe join       slope analytic 1.150000  finite-diff 1.149991  left 1.149965  right 1.150000   C1 OK
   shoulder join  slope analytic 1.150000  finite-diff 1.149976  left 1.150000  right 1.149906   C1 OK
   analytic vs numeric slope, max error over [-12,+12] stops: 1.28e-09   OK
+
+  the shoulder clamp, at settings steep enough for it to engage:
+     midtone  rolloff  unclamped  clamped to
+        1.15     0.45      1.001       1.001   
+        2.50     0.45      0.460       0.460   
+        2.50     0.95      0.972       0.773   clamped
+        2.50     0.05      0.051       0.250   clamped
+    Shader and reference now agree on it; in v0.1 only the reference had it, so
+    the suite was reporting on a curve that did not run.
 
   scene stop -> display value
     rel.anchor    scene Y     display Y   display 8-bit sRGB   slope
@@ -41,33 +106,120 @@ CURVE  monotonicity, C1 continuity, and where the anchors land
         +12        737.3     0.99988      255.0            0.0001
         +16     1.18e+04     1.00000      255.0            0.0000
 
+CLASSIFY  can it tell a lamp from a sunlit wall
+-----------------------------------------------
+  The question v0.1 could not answer. Its classifier was
+      sourceness = smoothstep(threshold, log2(Y) - middleGrey)
+  so anything bright was a source, and a sunlit white wall metered as a lamp.
+
+  Each row is one pixel at 6 stops over middle grey - the same luminance for
+  all of them - differing only in what the renderer says about it.
+
+    case                                emissive     depth  blockfill  body wt  source   sky
+    neon sign (emissive, compact)           True        10       0.05    0.000   1.000   0.0
+    emissive screen (large area)            True        10       1.00    0.000   1.000   0.0
+    sunlit white wall (large)              False        10       1.00    0.750   0.250   0.0
+    specular glint (compact)               False        10       0.05    0.000   1.000   0.0
+    open sky                               False    500001       1.00    0.150   0.000   1.0
+    distant backdrop geometry              False    200000       1.00    0.150   0.000   1.0
+
+    sunlit wall stays scene content:  body weight 0.750   PASS
+    neon sign is fully a source:      sourceness  1.000   PASS
+
+  the same six cases with rendererSignals off (v0.1 behaviour):
+    case                                body wt  source   sky
+    neon sign (emissive, compact)         0.000   1.000   0.0
+    emissive screen (large area)          0.750   0.250   0.0
+    sunlit white wall (large)             0.750   0.250   0.0
+    specular glint (compact)              0.000   1.000   0.0
+    open sky                              0.750   0.250   0.0
+    distant backdrop geometry             0.750   0.250   0.0
+
+    distinct classifications without the gbuffer: 2 of 6
+    (compactness still separates a glint from a wall, which is why it is kept as
+     the fallback - but nothing separates a lamp from a wall, or sky from either)
+
+ILLUMINANT  the colour of the light, not the colour of the paint
+----------------------------------------------------------------
+  A Titanfall interior: orange-painted panels, rust, a bit of grey deck. The
+  materials are strongly biased, the light is not. A grey-world estimate over
+  radiance - which is what v0.1 used as its white point - cannot tell those two
+  apart and reports the paint. Dividing by albedo can.
+
+    under neutral D65:
+      true illuminant       (1.000, 1.000, 1.000)
+      grey world (v0.1)     (1.459, 0.915, 0.494)   max error 0.506
+      radiance / albedo     (1.000, 1.000, 1.000)   max error 0.000   BETTER
+    under tungsten:
+      true illuminant       (1.296, 0.960, 0.528)
+      grey world (v0.1)     (1.802, 0.837, 0.249)   max error 0.507
+      radiance / albedo     (1.296, 0.960, 0.528)   max error 0.000   BETTER
+
+  in-gamut guarantee under a non-D65 white point:
+    D65       local-neutral surface -> demand 0.0000   IN GAMUT
+    tungsten  local-neutral surface -> demand 0.4721   IN GAMUT
+    cool      local-neutral surface -> demand 0.2288   IN GAMUT
+
+GAMUT  what the per-gamut geometry fixed
+----------------------------------------
+  v0.1 located the achromatic axis with Rec.709 luminance weights in every
+  gamut. In Rec.709 that is correct; in P3 and Rec.2020 it puts the grey point
+  somewhere that is not grey, and every gamut ray is cast from there.
+
+  A neutral cannot show it: every gamut's luminance row sums to 1, so R == G == B
+  weights to the same grey either way. It takes a chromatic colour, which is
+  exactly the population the colour-volume stage exists for.
+
+    gamut                     colour  correct Y  Rec.709 Y  demand err  headroom err
+    Rec709    (0.90,0.20,0.10)         0.8481     0.8481      0.0000        0.0000
+    P3        (0.90,0.20,0.10)         0.8456     0.8481      0.0025        0.0107
+    P3        (0.15,0.80,0.25)         0.7531     0.7589      0.0058        0.0145
+    P3        (0.20,0.30,0.95)         0.9255     0.9259      0.0003        0.0030
+    P3        (0.85,0.80,0.15)         0.8026     0.8036      0.0010        0.0038
+    Rec2020   (0.90,0.20,0.10)         0.8392     0.8481      0.0089        0.0363
+    Rec2020   (0.15,0.80,0.25)         0.7486     0.7589      0.0103        0.0254
+    Rec2020   (0.20,0.30,0.95)         0.9273     0.9259      0.0014        0.0134
+    Rec2020   (0.85,0.80,0.15)         0.8063     0.8036      0.0028        0.0109
+
+  Rec.709 is exact by construction, which is why the bug was invisible on the
+  default path. Elsewhere: largest demand error 0.0103, largest
+  achromatic-point error 0.0363 of full scale. The second one is the
+  one that matters - it is how far off the "preserve brightness, give up chroma"
+  scale was aiming, on every out-of-gamut colour in the frame.
+
+  chroma normaliser, as the pressure metric sees it:
+    Rec709    correct 0.2933   v0.1 used 0.2933   chroma term off by +0%
+    P3        correct 0.3505   v0.1 used 0.2933   chroma term off by -16%
+    Rec2020   correct 0.4026   v0.1 used 0.2933   chroma term off by -27%
+
 RESPONSE  luminance transfer, PSDT vs the controls
 --------------------------------------------------
-    scene Y     PSDT      GT7    Reinhard    Hable     (display luminance, grey)
-       0.001   0.00125   0.00017   0.00100   0.00107
-       0.003   0.00219   0.00070   0.00299   0.00322
-        0.01   0.00614   0.00328   0.00990   0.01074
-        0.03   0.02165   0.01352   0.02913   0.03212
-         0.1   0.08643   0.06584   0.09091   0.10405
-        0.18   0.16992   0.14487   0.15254   0.17994
-         0.5   0.51583   0.49789   0.33333   0.42665
-           1   0.74660   0.83513   0.50000   0.69110
-           2   0.87897   1.00000   0.66667   1.00000
-           4   0.94464   1.00000   0.80000   1.00000
-           8   0.97517   1.00000   0.88889   1.00000
-          16   0.98896   1.00000   0.94118   1.00000
-          32   0.99511   1.00000   0.96970   1.00000
-          64   0.99784   1.00000   0.98462   1.00000
-         128   0.99905   1.00000   0.99225   1.00000
-         256   0.99958   1.00000   0.99611   1.00000
-        1024   0.99992   1.00000   0.99902   1.00000
-        4096   0.99998   1.00000   0.99976   1.00000
-   1.638e+04   1.00000   1.00000   0.99994   1.00000
+    scene Y        PSDT       GT7       AgX  Reinhard     Hable   (display luminance, grey)
+       0.001   0.00125   0.00017   0.00009   0.00100   0.00107
+       0.003   0.00219   0.00070   0.00058   0.00299   0.00322
+        0.01   0.00614   0.00328   0.00527   0.00991   0.01074
+        0.03   0.02165   0.01352   0.02877   0.02918   0.03212
+         0.1   0.08643   0.06584   0.11565   0.09148   0.10405
+        0.18   0.16992   0.14487   0.19475   0.15426   0.17994
+         0.5   0.51583   0.49789   0.38967   0.34375   0.42665
+           1   0.74660   0.83513   0.54409   0.53125   0.69110
+           2   0.87897   1.00000   0.68892   0.75000   1.00000
+           4   0.94464   1.00000   0.79843   1.00000   1.00000
+           8   0.97517   1.00000   0.86477   1.00000   1.00000
+          16   0.98896   1.00000   0.91293   1.00000   1.00000
+          32   0.99511   1.00000   0.91894   1.00000   1.00000
+          64   0.99784   1.00000   0.91894   1.00000   1.00000
+         128   0.99905   1.00000   0.91894   1.00000   1.00000
+         256   0.99958   1.00000   0.91894   1.00000   1.00000
+        1024   0.99992   1.00000   0.91894   1.00000   1.00000
+        4096   0.99998   1.00000   0.91894   1.00000   1.00000
+   1.638e+04   1.00000   1.00000   0.91894   1.00000   1.00000
 
   clipping: fraction of the ladder x swatch grid that clips a channel at 1.0
     PSDT       34.4%
     GT7        59.3%
-    Reinhard   52.6%
+    AgX        50.7%
+    Reinhard   55.0%
     Hable      60.3%
 
 COLOUR  chroma retention and gamut pressure as a colour runs out of volume
@@ -75,38 +227,43 @@ COLOUR  chroma retention and gamut pressure as a colour runs out of volume
   chroma out / chroma in, measured in ICtCp against the un-compressed path
     swatch           0.03      0.1     0.18      0.5        1        2        4        8       16       32       64
     grey           1.000    1.000    1.000    1.000    1.000    1.000    1.000    1.000    1.000    1.000    1.000
-    red            0.973    0.973    0.973    0.537    0.375    0.225    0.100    0.043    0.019    0.008    0.004
-    green          0.937    0.937    0.937    0.924    0.841    0.652    0.395    0.192    0.088    0.039    0.017
-    blue           1.000    1.000    0.724    0.257    0.106    0.042    0.018    0.008    0.003    0.001    0.001
-    skin           1.000    1.000    1.000    1.000    0.737    0.339    0.153    0.068    0.030    0.013    0.006
-    neon           0.962    0.962    0.962    0.958    0.866    0.612    0.366    0.183    0.085    0.039    0.017
-    gunmetal       1.000    1.000    1.000    1.000    1.000    0.947    0.479    0.209    0.092    0.040    0.018
+    red            0.973    0.973    0.965    0.685    0.430    0.238    0.102    0.044    0.019    0.008    0.004
+    green          0.937    0.937    0.937    0.913    0.867    0.763    0.462    0.204    0.090    0.040    0.018
+    blue           1.000    0.995    0.835    0.287    0.110    0.043    0.018    0.008    0.003    0.001    0.001
+    skin           1.000    1.000    1.000    0.998    0.756    0.344    0.154    0.068    0.030    0.013    0.006
+    neon           0.962    0.962    0.962    0.952    0.936    0.726    0.403    0.192    0.087    0.039    0.017
+    gunmetal       1.000    1.000    1.000    1.000    1.000    0.945    0.479    0.209    0.092    0.040    0.018
 
   the point of the product form: chroma retention at a fixed high luminance
     a bright neutral and a bright saturated colour at the same display luminance
     grey      highlightProgress=1.000 chromaNorm=0.000 demand=0.000 knee=0.714 -> compress=1.000 pressure=0.000
-    gunmetal  highlightProgress=1.000 chromaNorm=0.048 demand=56.288 knee=0.697 -> compress=0.018 pressure=0.982
-    skin      highlightProgress=1.000 chromaNorm=0.171 demand=168.828 knee=0.653 -> compress=0.006 pressure=0.994
-    red       highlightProgress=1.000 chromaNorm=0.870 demand=272.540 knee=0.403 -> compress=0.004 pressure=0.996
-    neon      highlightProgress=1.000 chromaNorm=0.247 demand=58.137 knee=0.626 -> compress=0.017 pressure=0.983
+    gunmetal  highlightProgress=1.000 chromaNorm=0.048 demand=56.288 knee=0.687 -> compress=0.018 pressure=0.982
+    skin      highlightProgress=1.000 chromaNorm=0.171 demand=168.777 knee=0.616 -> compress=0.006 pressure=0.994
+    red       highlightProgress=1.000 chromaNorm=0.870 demand=272.290 knee=0.217 -> compress=0.004 pressure=0.996
+    neon      highlightProgress=1.000 chromaNorm=0.247 demand=57.933 knee=0.573 -> compress=0.017 pressure=0.983
+
+  the context term, which v0.1's blend function did not have:
+    the same neon at the same luminance, in two different neighbourhoods
+    large field of its own brightness    context=0.000 knee=0.626 -> compress=0.216
+    bright outlier against a dark room   context=1.000 knee=0.573 -> compress=0.052
 
 HUE  the path to white, and whether it is smooth
 ------------------------------------------------
   hue rotation in degrees along the ladder (+ is towards the film path)
     swatch          0.18     0.5       1       2       4       8      16      32      64     128     256
-    red           -0.00   -1.50   -4.54   -7.38   -9.02   -9.64   -9.90  -10.00  -10.05  -10.07  -10.08
-    green         -0.00   -0.00    0.00    0.86    4.79    7.79    9.22    9.88   10.18   10.31   10.37
-    blue           0.16    2.44    3.01    3.67    3.93    4.04    4.08    4.10    4.11    4.11    4.11
-    yellow         0.00    0.00    0.00    0.17    0.60    0.44    0.11   -0.10   -0.22   -0.27   -0.29
-    cyan          -0.00   -0.00   -0.00   -0.70   -1.43   -1.51   -1.38   -1.27   -1.21   -1.18   -1.17
-    magenta       -0.00   -0.57   -1.92   -3.51   -4.80   -5.46   -5.76   -5.89   -5.95   -5.98   -5.99
-    skin           0.00    0.00    0.44    3.66    5.86    6.94    7.44    7.67    7.77    7.82    7.84
-    neon          -0.00   -0.00   -0.01   -1.78   -3.15   -3.69   -3.89   -3.96   -4.00   -4.01   -4.02
+    red           -0.05   -1.61   -4.57   -7.38   -9.02   -9.64   -9.90  -10.00  -10.05  -10.07  -10.08
+    green         -0.00    0.02    0.04    0.87    4.59    7.80    9.23    9.88   10.18   10.31   10.37
+    blue           0.26    2.47    3.02    3.67    3.93    4.04    4.08    4.10    4.11    4.11    4.11
+    yellow         0.00   -0.00   -0.01    0.17    0.60    0.44    0.11   -0.10   -0.22   -0.27   -0.29
+    cyan          -0.00    0.01    0.01   -0.69   -1.42   -1.51   -1.38   -1.27   -1.21   -1.18   -1.17
+    magenta       -0.00   -0.60   -1.93   -3.51   -4.81   -5.46   -5.76   -5.89   -5.95   -5.98   -5.99
+    skin           0.00   -0.00    0.44    3.66    5.86    6.94    7.44    7.67    7.77    7.82    7.84
+    neon          -0.00    0.01    0.00   -1.77   -3.15   -3.69   -3.89   -3.96   -4.00   -4.01   -4.02
 
-  largest hue change between adjacent ladder steps: 3.93 deg
+  largest hue change between adjacent ladder steps: 3.72 deg
   (adjacent steps here are a full stop apart, so this is a coarse bound;
    the fine sweep below is the one that would catch a discontinuity)
-  fine sweep (1/42-stop steps, red/magenta/yellow): max step 0.0741 deg   SMOOTH
+  fine sweep (1/42-stop steps, red/magenta/yellow): max step 0.0728 deg   SMOOTH
 
 CONTRAST  how much local contrast survives the compression
 ----------------------------------------------------------
@@ -114,24 +271,120 @@ CONTRAST  how much local contrast survives the compression
   ratio 1.0 means the detail kept all its scene contrast; the curve slope
   column is what it would have kept with no restoration at all.
     base(rel)   curve slope   detail +-0.25 st   +-1.0 st   +-3.0 st
-          -8        0.3432     0.8350     0.8563     0.9084
+          -8        0.3432     0.7458     0.7326     0.7282
           -6        0.6303     1.1322     1.0741     0.9547
           -4        1.1500     1.1500     1.1500     1.1247
           -2        1.1500     1.1500     1.1500     1.0575
           +0        1.1500     1.1500     1.1500     0.9555
           +1        1.1500     1.1500     1.0886     0.8666
-          +2        0.5079     0.8313     0.8765     0.8026
-          +3        0.2242     0.4941     0.6684     0.9094
-          +4        0.0990     0.2404     0.3516     0.8438
+          +2        0.5079     0.7839     0.8399     0.7359
+          +3        0.2242     0.4302     0.5980     0.6879
+          +4        0.0990     0.2054     0.3089     0.5576
           +6        0.0193     0.0216     0.0239     0.0505
 
-COMPARE  the § 33 score, PSDT against the controls
---------------------------------------------------
-    operator    chroma kept  boundary use  max hue step  midtone contr   clipped   Y inv
-    PSDT              0.835         0.799        0.125d          1.150     34.4%       0
-    GT7               1.002         0.711        0.845d          1.307     59.3%       0
-    Reinhard          0.966         0.910        0.299d          0.840     52.6%       0
-    Hable             0.880         0.817        0.576d          0.902     60.3%       0
+  the detail-magnitude rolloff, which v0.1 documented and did not implement:
+    restoration as a function of how far the pixel is from its neighbourhood
+     detail (stops)    boost   what it is
+               0.25   0.0000   surface texture
+               1.00   0.0000   a shadow edge
+               3.00   0.0000   a bright object
+               6.00   0.0000   a lamp against a wall
+    a lamp six stops from the wall behind it is not detail, it is a different
+    object, and restoring the contrast between them is a halo rather than texture.
+
+GLARE  radius from luminance, and whose colour the halo is
+----------------------------------------------------------
+  A compact source of 256 pixels, at increasing luminance. "levels lit" is how
+  many pyramid levels stayed above the visibility threshold, which is the halo
+  radius: level k covers 16 * 2^k pixels.
+
+      source Y  levels lit  radius (px)    glare Y
+             1           0            0    0.00000
+             4           0            0    0.00000
+            16           1           16    0.06938
+            64           2           32    0.20124
+           256           3           64    0.34093
+          1024           4          128    0.47567
+          4096           5          256    0.60809
+         16384           6          512    0.73969
+
+    radius grows monotonically with source luminance: PASS
+
+  the halo's colour is the source's, not the scene's.
+  v0.1 tinted from the low-frequency scene chroma, so a white light near a red
+  wall glared red. The source field now carries the source's own RGB.
+
+    source            source chromaticity         glare chromaticity   hue err
+    grey       ( 1.000, 1.000, 1.000)      ( 1.000, 1.000, 1.000)     0.00d
+    red        ( 1.000, 0.040, 0.040)      ( 1.000, 0.174, 0.174)    -9.20d
+    neon       ( 0.100, 0.900, 1.000)      ( 0.397, 0.933, 1.000)     1.64d
+    muzzle     ( 1.000, 0.720, 0.300)      ( 1.000, 0.813, 0.533)    -2.89d
+    (pulled 40% towards white on purpose - ocular scatter is broader-band than
+     the light causing it - but the source's hue survives, which is the point)
+
+  the two lobes. Near field is the core a light has before the veil begins.
+    nearField 0.0 -> glare luminance 0.56134
+    nearField 0.4 -> glare luminance 0.59015
+    nearField 0.8 -> glare luminance 0.60809
+
+  and the threshold is relative to adaptation, which is why a headlight is
+  blinding at night and invisible at noon:
+    night  (anchor -4 stops)  glare luminance 0.25994
+    indoor (anchor  0 stops)  glare luminance 0.20124
+    noon   (anchor +4 stops)  glare luminance 0.00000
+
+TEMPORAL  step response of two filters in series
+------------------------------------------------
+  PSDT has two temporal filters: the adaptation field accumulates with motion
+  reprojection, and the anchor accumulates again on top of it. That is good for
+  stability and it is also how an image ends up still showing yesterday's
+  exposure. v0.1 asserted this was fine; this measures it.
+
+  Within the cut detector: a 2-stop change, which is a real lighting change and
+  not a scene change. This is the transform's actual time constant.
+    dark -> bright, +2 stops
+      anchor 10/50/90%   0.117 / 0.400 / 1.000 s   overshoot +0.0000 st   residual -0.0000 st   cuts fired 0
+    bright -> dark, -2 stops
+      anchor 10/50/90%   0.200 / 0.750 / 2.100 s   overshoot +0.0000 st   residual +0.0019 st   cuts fired 0
+    dark -> bright, +2 stops, mid fast turn
+      anchor 10/50/90%   0.067 / 0.233 / 0.550 s   overshoot +0.0000 st   residual -0.0000 st   cuts fired 0
+
+  A 6-stop change spread over half a second - walking through a doorway. Each
+  frame's step is small, so the cut detector correctly stays out of it.
+    doorway, +6 stops over 0.5 s
+      anchor 10/50/90%   0.317 / 0.683 / 1.283 s   overshoot +0.0000 st   residual -0.0000 st   cuts fired 0
+    doorway, -6 stops over 0.5 s
+      anchor 10/50/90%   0.433 / 1.033 / 2.383 s   overshoot +0.0000 st   residual +0.0078 st   cuts fired 0
+
+  And 6 stops in a single frame, which is not a lighting change - nothing in a
+  physical scene does that. Both detectors should fire and the state should
+  re-anchor rather than easing through several seconds of wash-out.
+    instant +6 stops (luminance cut)
+      anchor 10/50/90%   0.000 / 0.000 / 0.017 s   overshoot +0.0000 st   residual +0.0000 st   cuts fired 1
+    instant +6 stops (camera reports a cut)
+      anchor 10/50/90%   0.000 / 0.000 / 0.017 s   overshoot +0.0000 st   residual +0.0000 st   cuts fired 1
+
+    Up is faster than down by design - light adaptation is fast, dark adaptation
+    is slow - and that asymmetry is what makes an interior read as dark when you
+    step into it. A fast turn triples the rate, so sweeping your view does not
+    drag seconds of wash-out behind it. A cut re-anchors outright.
+
+    Note the field's own +-3 stop history clamp, which is doing real work here:
+    it bounds how far behind the measurement the field can ever be, so even the
+    un-cut path cannot lag more than three stops however slow the anchor is.
+
+  stability: a measurement with +-0.5 stops of frame-to-frame noise
+    largest frame-to-frame step, input  0.9647 stops
+    largest frame-to-frame step, anchor 0.0055 stops   (176x attenuation)
+
+COMPARE  the section 33 score, PSDT against the controls
+--------------------------------------------------------
+    operator    chroma kept  boundary use  max hue step  midtone contr  hilite bnd use   clipped   Y inv
+    PSDT              0.861         0.790        0.143d          1.150           0.819     34.4%       0
+    GT7               1.002         0.711        0.845d          1.307           0.237     59.3%       0
+    AgX               0.753         0.722        0.657d          0.810           0.913     50.7%       6
+    Reinhard          0.862         0.807        0.365d          0.852           0.600     55.0%       0
+    Hable             0.880         0.817        0.576d          0.902           0.400     60.3%       0
 
     chroma kept   chroma retained against the scene colour scaled to the same output
                   luminance. Unflattering by construction - the reference is often a
@@ -144,19 +397,48 @@ COMPARE  the § 33 score, PSDT against the controls
                   capacity - hue is undefined at white and every operator scores badly on
                   a raw sweep. Large = a visible discontinuity on the path to white.
     midtone contr display stops per scene stop across the anchor. 1.0 is flat.
+    hilite bnd use  boundary utilisation restricted to 1-4 stops past the shoulder, which
+                  is where a bright emissive actually sits. Raw chroma is the wrong measure
+                  up there: at 256x middle grey the correct answer really is white, so raw
+                  chroma just rewards whichever operator refuses to reach peak luminance.
     Y inversions  times a brighter scene value produced a darker display value.
                   Anything but 0 breaks the most basic perceptual invariant there is.
 
-INVARIANTS  the seven properties the transform is supposed to hold
+  weighted score  S = 0.25*SL + 0.25*SC + 0.2*SH + 0.15*SD + 0.15*ST
+    operator        SL      SC      SH      SD      ST        S
+    PSDT         0.656   0.790   0.867   0.700   0.947    0.782
+    GT7          0.407   0.711   0.430   1.000   1.000    0.665
+    AgX          0.000   0.722   0.518   0.020   1.000    0.437
+    Reinhard     0.450   0.807   0.694   0.105   1.000    0.619
+    Hable        0.397   0.817   0.562   0.204   1.000    0.597
+
+    SL  luminance fidelity: fraction of the grid that did not clip. Zero if the
+        operator ever inverted brightness ordering, because that is disqualifying
+        rather than merely costly.
+    SC  colour-volume fidelity: mean boundary utilisation, capped at 1.
+    SH  hue trajectory smoothness: exp(-maxstep / 1 degree).
+    SD  detail: midtone slope mapped from 0.8 (flat) to 1.3.
+    ST  temporal stability: exp(-worst frame-to-frame anchor step / 0.1 stops).
+        A pure function of one pixel scores 1 by construction - it has no state to
+        be unstable, which is also why it cannot adapt to anything.
+
+    Psycho17 is absent. It is a 754-line vendored operator and a hand port could
+    not be verified against the shader that runs; an unverified control is worse
+    than a missing one, because its numbers would look just as authoritative.
+    Comparing against it needs a GPU capture, not this harness.
+
+INVARIANTS  the eight properties the transform is supposed to hold
 ------------------------------------------------------------------
   1. brightness ordering preserved            0 inversions, largest dip 0.00e+00   PASS
   2. small bright object vs dark surround     4.05 display stops apart   PASS
-  3. mid-luminance red hue held               -0.00 deg   PASS
-  4. chroma trajectory continuous             max step 0.00081   PASS
-  5. deterministic given the state            PASS
-  6. adaptation budget respected              0.149 stops shift for a 6-stop brighter neighbourhood   PASS
-  7. emissive stays as colourful as the       worst boundary use 0.824 at +2 stops   PASS
+  3. mid-luminance red hue held               -0.05 deg   PASS
+  4. chroma trajectory continuous             max step 0.00055   PASS
+  5. colour stable under a noisy measurement  worst frame-to-frame step 0.00188 (0.48 code values)   PASS
+  6. adaptation budget respected              0.150 stops shift for a 6-stop brighter neighbourhood   PASS
+  7. emissive stays as colourful as the       worst boundary use 0.822 at +2 stops   PASS
      display allows
+  8. a wall is not re-exposed by the sky      0.0000 stops across a depth edge, 0.1810 stops without one   PASS
+     behind it
 
   all invariants hold
 

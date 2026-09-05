@@ -21,40 +21,34 @@
 */
 
 // ===========================================================================
-// PSDT adaptation pyramid: field level k -> level k+1
+// PSDT adaptation pyramid: field mip k -> mip k+1
 // ===========================================================================
 //
-// The mip chain is doing two jobs at once and is built to serve both.
+// The mip chain is two things at once and neither of them is a mip chain.
 //
-//   As an adaptation pyramid, level k is the eye's estimate of the
-//   surrounding luminance over a neighbourhood 16 * 2^k pixels wide. Three of
-//   these levels, pooled with scene-dependent weights, are the local
-//   adaptation signal - because adaptation is a property of a neighbourhood,
-//   and a single radius cannot tell "a large bright room" from "a small
-//   bright lamp".
+// It is the multi-scale adaptation pyramid: level k pools 16 * 2^k pixels, so
+// levels 0, 2 and 4 are the small, medium and large adaptation neighbourhoods
+// the transform pools between. And it is the glare kernel: a weighted sum
+// down the levels of the source field is a sum of progressively wider box
+// responses, which is a serviceable point-spread function for free.
 //
-//   As a glare kernel, the same levels are a stack of progressively wider box
-//   responses over the source energy. Weighted and summed they approximate
-//   the eye's glare point-spread function, so the glare model costs no passes
-//   of its own and inherits the pyramid's temporal stability for free.
+// Three textures, three reduction rules, and the rules are not
+// interchangeable:
 //
-// Each channel is reduced the way its meaning requires, which is the whole
-// reason this is not a generic mip generator:
+//   body field    a weight-normalised mean. Averaging the stored means
+//                 directly would give a block that is 1% wall and 99% lamp
+//                 the same say as one that is all wall.
+//   source field  an area mean. It has to conserve energy per unit area down
+//                 the chain or the glare kernel's falloff stops being a
+//                 property of the source and starts being a property of the
+//                 pyramid.
+//   illuminant    a plain mean, because the analysis pass already stored it
+//                 premultiplied by its own confidence. That is the entire
+//                 reason it is stored that way: this pass does not have to
+//                 know what it is averaging.
 //
-//   .x  body log luminance   weighted mean, weighted by .y. An unweighted
-//                            mean would let a block that is 95% lamp - and
-//                            therefore has almost no opinion - contribute as
-//                            much as a block that is entirely wall.
-//   .y  body weight          plain mean. It is a fraction of area, so area
-//                            averaging is exactly right.
-//   .z  source energy        plain mean, and the reason .z is stored linearly
-//                            rather than as a log: a mean of linear energy
-//                            over an area is energy-conserving, which is what
-//                            the glare sum needs. A geometric mean is not.
-//   .w  block peak           max, so the scene white estimate survives to the
-//                            coarse levels where psdt_state reads it. Averaged
-//                            it would decay towards the mean and the state
-//                            would lose sight of the brightest thing present.
+// The peak channel is a max, so the scene white estimate survives the whole
+// chain instead of being averaged into the mean it is supposed to bound.
 // ===========================================================================
 
 #include "rtx/pass/psdt/psdt.h"
@@ -65,11 +59,17 @@ Texture2D<float4> InField;
 layout(binding = PSDT_DOWNSAMPLE_FIELD_OUTPUT)
 RWTexture2D<vec4> OutField;
 
-layout(binding = PSDT_DOWNSAMPLE_CHROMA_INPUT)
-Texture2D<float4> InChroma;
+layout(binding = PSDT_DOWNSAMPLE_SOURCE_INPUT)
+Texture2D<float4> InSource;
 
-layout(binding = PSDT_DOWNSAMPLE_CHROMA_OUTPUT)
-RWTexture2D<vec4> OutChroma;
+layout(binding = PSDT_DOWNSAMPLE_SOURCE_OUTPUT)
+RWTexture2D<vec4> OutSource;
+
+layout(binding = PSDT_DOWNSAMPLE_ILLUM_INPUT)
+Texture2D<float4> InIlluminant;
+
+layout(binding = PSDT_DOWNSAMPLE_ILLUM_OUTPUT)
+RWTexture2D<vec4> OutIlluminant;
 
 layout(push_constant)
 ConstantBuffer<PsdtDownsampleArgs> cb;
@@ -83,60 +83,50 @@ void main(uint2 threadId : SV_DispatchThreadID)
     return;
   }
 
-  // Odd source extents leave the last row or column without a partner. Clamping
-  // rather than skipping keeps the edge texels weighted like the interior ones,
-  // which matters because the coarsest levels are only a few texels across and
-  // an edge artifact there is an adaptation artifact across a quarter of the
-  // screen.
+  // Odd source extents leave the last row or column without a partner.
+  // Clamping rather than skipping keeps the edge texels weighted like the
+  // interior ones, which matters because the coarsest levels are only a few
+  // texels across and an edge artifact there is an adaptation artifact across
+  // a quarter of the screen.
   const uint2 base = threadId * 2;
   const uint2 maxCoord = cb.srcExtent - 1;
 
-  float4 sum = float4(0.0);
-  float weightedLog = 0.0;
-  float weightSum = 0.0;
-  float peak = -1e4;
-  float2 chromaSum = float2(0.0);
+  const uint2 c00 = min(base, maxCoord);
+  const uint2 c10 = min(base + uint2(1, 0), maxCoord);
+  const uint2 c01 = min(base + uint2(0, 1), maxCoord);
+  const uint2 c11 = min(base + uint2(1, 1), maxCoord);
 
-  [unroll]
-  for (int dy = 0; dy < 2; ++dy)
-  {
-    [unroll]
-    for (int dx = 0; dx < 2; ++dx)
-    {
-      const uint2 coord = min(base + uint2(dx, dy), maxCoord);
-      const float4 s = InField[coord];
+  const float4 f00 = InField[c00];
+  const float4 f10 = InField[c10];
+  const float4 f01 = InField[c01];
+  const float4 f11 = InField[c11];
 
-      weightedLog += s.x * s.y;
-      weightSum += s.y;
-      sum.y += s.y;
-      sum.z += s.z;
-      peak = max(peak, s.w);
-      chromaSum += InChroma[coord].xy;
-    }
-  }
+  const float weightSum = f00.y + f10.y + f01.y + f11.y;
+  const float logSum = f00.x * f00.y + f10.x * f10.y + f01.x * f01.y + f11.x * f11.y;
+  const float depthSum = f00.w * f00.y + f10.w * f10.y + f01.w * f01.y + f11.w * f11.y;
 
-  float4 outValue;
+  float4 outField;
   // A block whose four children are all pure light source carries no body
   // weight at all. Dividing by that weight would be a divide by zero; falling
-  // back to the unweighted mean of the children's log luminance keeps the
-  // level continuous, and the near-zero .y it also writes tells the transform
-  // downstream to disregard this value and use the frame anchor instead.
+  // back to the unweighted mean of the children keeps the level continuous,
+  // and the near-zero .y it also writes tells the transform downstream to
+  // disregard this value and use the frame anchor instead.
   if (weightSum > 1e-4)
   {
-    outValue.x = weightedLog / weightSum;
+    outField.x = logSum / weightSum;
+    outField.w = depthSum / weightSum;
   }
   else
   {
-    outValue.x = 0.25 * (InField[min(base, maxCoord)].x
-                       + InField[min(base + uint2(1, 0), maxCoord)].x
-                       + InField[min(base + uint2(0, 1), maxCoord)].x
-                       + InField[min(base + uint2(1, 1), maxCoord)].x);
+    outField.x = 0.25 * (f00.x + f10.x + f01.x + f11.x);
+    outField.w = 0.25 * (f00.w + f10.w + f01.w + f11.w);
   }
 
-  outValue.y = sum.y * 0.25;
-  outValue.z = sum.z * 0.25;
-  outValue.w = peak;
+  outField.y = weightSum * 0.25;
+  outField.z = max(max(f00.z, f10.z), max(f01.z, f11.z));
 
-  OutField[threadId] = outValue;
-  OutChroma[threadId] = vec4(chromaSum * 0.25, 0.0, 0.0);
+  OutSource[threadId] = 0.25 * (InSource[c00] + InSource[c10] + InSource[c01] + InSource[c11]);
+  OutIlluminant[threadId] = 0.25 * (InIlluminant[c00] + InIlluminant[c10]
+                                  + InIlluminant[c01] + InIlluminant[c11]);
+  OutField[threadId] = outField;
 }
