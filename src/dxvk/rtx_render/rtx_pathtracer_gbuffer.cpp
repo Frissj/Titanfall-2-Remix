@@ -563,7 +563,7 @@ namespace dxvk {
     };
 
     switch (RtxOptions::renderPassGBufferRaytraceMode()) {
-    case RaytraceMode::RayQuery:
+    case RaytraceMode::RayQuery: {
       noteBranch("RayQuery(compute)");
       VkExtent3D workgroups = util::computeBlockCount(rayDims, VkExtent3D { 16, 8, 1 });
       {
@@ -619,6 +619,7 @@ namespace dxvk {
       }
       ctx->markGpuStage();
       break;
+    }
 
       case RaytraceMode::RayQueryRayGen:
         noteBranch("RayQueryRayGen(rt-pipeline)");

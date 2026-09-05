@@ -221,11 +221,21 @@ namespace dxvk {
       Both,
     };
 
+    // NV-DXVK [tonemap operators]: selects a fork-ported tonemap operator that
+    // replaces the native dynamic (histogram tone-curve) tonemapper. Numeric
+    // values match the tonemapOperator* constants in
+    // shaders/rtx/pass/tonemap/tonemapping.h and the RemixProjGroup fork.
+    // Public so the dispatch in rtx_context.cpp can force the global path when an
+    // operator is selected (the default tonemappingMode is Local, which would
+    // otherwise bypass the operator entirely).
+  public:
     // NV-DXVK [PSDT]: in-image diagnostics. Every entry shows a value the
     // transform actually read or produced on that pixel on its way past,
     // rather than recomputing its own version of it - a debug view that
     // re-derives the quantity agrees with the shader right up until the moment
     // something is wrong, which is the only moment it was needed.
+    // Public alongside TonemapOperator because the ComboWithKey describing it
+    // is a namespace-scope object in rtx_tone_mapping.cpp, outside the class.
     enum class PsdtDebugView : uint32_t {
       Off = 0,
       Adaptation,     // Pooled adaptation, as stops about the frame anchor.
@@ -244,14 +254,6 @@ namespace dxvk {
       CurveSlope,     // d(display)/d(scene) at this pixel's base.
     };
 
-    // NV-DXVK [tonemap operators]: selects a fork-ported tonemap operator that
-    // replaces the native dynamic (histogram tone-curve) tonemapper. Numeric
-    // values match the tonemapOperator* constants in
-    // shaders/rtx/pass/tonemap/tonemapping.h and the RemixProjGroup fork.
-    // Public so the dispatch in rtx_context.cpp can force the global path when an
-    // operator is selected (the default tonemappingMode is Local, which would
-    // otherwise bypass the operator entirely).
-  public:
     enum class TonemapOperator : uint32_t {
       None        = 0,  // Native Remix dynamic tone curve.
       HableFilmic = 3,  // Uncharted 2 filmic.

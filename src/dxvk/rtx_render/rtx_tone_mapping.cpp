@@ -525,19 +525,25 @@ namespace dxvk {
     m_psdtFieldExtent = calcPsdtFieldExtent(targetExtent);
     m_psdtLevelCount = calcPsdtLevelCount(m_psdtFieldExtent);
 
+    // RtxMipmap::createResource takes a non-const Rc<DxvkContext>&, the same as
+    // every other caller passes it (see DxvkLocalToneMapping::createTargetResource).
+    // Converting Rc<RtxContext> at the call site produces a temporary, which
+    // cannot bind to that reference, so hold the base handle in a named local.
+    Rc<DxvkContext> baseCtx = ctx;
+
     // The mip chain is the adaptation pyramid and the glare kernel at once, so
     // all three fields need every level. See psdt_downsample.
     for (uint32_t i = 0; i < 2; ++i) {
       m_psdtField[i] = RtxMipmap::createResource(
-        ctx, i == 0 ? "psdt adaptation field 0" : "psdt adaptation field 1",
+        baseCtx, i == 0 ? "psdt adaptation field 0" : "psdt adaptation field 1",
         m_psdtFieldExtent, VK_FORMAT_R16G16B16A16_SFLOAT, 0, { 0.f, 0.f, 0.f, 0.f }, m_psdtLevelCount);
 
       m_psdtSource[i] = RtxMipmap::createResource(
-        ctx, i == 0 ? "psdt source field 0" : "psdt source field 1",
+        baseCtx, i == 0 ? "psdt source field 0" : "psdt source field 1",
         m_psdtFieldExtent, VK_FORMAT_R16G16B16A16_SFLOAT, 0, { 0.f, 0.f, 0.f, 0.f }, m_psdtLevelCount);
 
       m_psdtIlluminant[i] = RtxMipmap::createResource(
-        ctx, i == 0 ? "psdt illuminant field 0" : "psdt illuminant field 1",
+        baseCtx, i == 0 ? "psdt illuminant field 0" : "psdt illuminant field 1",
         m_psdtFieldExtent, VK_FORMAT_R16G16B16A16_SFLOAT, 0, { 0.f, 0.f, 0.f, 0.f }, m_psdtLevelCount);
     }
 
