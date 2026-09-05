@@ -35,9 +35,14 @@
 // Three textures, three reduction rules, and the rules are not
 // interchangeable:
 //
-//   body field    a weight-normalised mean. Averaging the stored means
-//                 directly would give a block that is 1% wall and 99% lamp
-//                 the same say as one that is all wall.
+//   body field    a weight-normalised *robust* mean. Averaging the stored
+//                 means directly would give a block that is 1% wall and 99%
+//                 lamp the same say as one that is all wall - that is what the
+//                 weight fixes. The robust part fixes the other half of the
+//                 problem: four children that are two dark walls and two
+//                 sunlit ones average to a value describing neither, and a
+//                 level built out of those values describes a scene that is
+//                 not there. See the reweight below.
 //   source field  an area mean. It has to conserve energy per unit area down
 //                 the chain or the glare kernel's falloff stops being a
 //                 property of the source and starts being a property of the
@@ -115,6 +120,49 @@ void main(uint2 threadId : SV_DispatchThreadID)
   {
     outField.x = logSum / weightSum;
     outField.w = depthSum / weightSum;
+
+    // Robust reweight: one Welsch step about the weighted mean.
+    //
+    // This is Auto Exposure Plus's edge-aware downsample, in the form a 2x2
+    // reduction can carry. Plus used a 23-tap separable Kuwahara - two
+    // one-sided means, whichever has the lower variance wins - which needs a
+    // kernel wide enough for "the two sides" to mean something and has nothing
+    // to say about four texels. What survives the translation is the idea
+    // rather than the filter: a level should describe the population most of
+    // it belongs to, not the average of two populations it straddles.
+    //
+    // So each child is additionally weighted by how far it sits from its
+    // siblings' mean, on a Gaussian of width `coherenceSigma` stops. Four
+    // children within a stop of each other are unaffected. Three dark walls
+    // and a sunlit one produce a value that is the walls, and the sunlit child
+    // is left to be described by the finer level it came from - which still
+    // exists, is still pooled, and is where a value that small belongs.
+    //
+    // One step rather than iterating to convergence, because the initial
+    // estimate is a weighted mean of four samples and a second step moves it
+    // by less than the field's own temporal noise. Depth is reweighted with
+    // the same factors rather than its own: the depth channel exists to say
+    // which surface the luminance value describes, so it has to follow the
+    // luminance population or it describes a different one.
+    if (cb.coherenceSigma > 1e-3)
+    {
+      const float invSigma = 1.0 / cb.coherenceSigma;
+      const float4 d = float4(f00.x, f10.x, f01.x, f11.x) - outField.x;
+      const float4 z = d * invSigma;
+      const float4 rho = exp(-z * z);
+
+      const float4 w2 = float4(f00.y, f10.y, f01.y, f11.y) * rho;
+      const float w2Sum = w2.x + w2.y + w2.z + w2.w;
+
+      // The guard is not decorative: with a narrow sigma and four widely
+      // separated children every rho can underflow, and the reduction would
+      // divide zero by zero rather than degrade to the mean it started from.
+      if (w2Sum > 1e-4)
+      {
+        outField.x = dot(w2, float4(f00.x, f10.x, f01.x, f11.x)) / w2Sum;
+        outField.w = dot(w2, float4(f00.w, f10.w, f01.w, f11.w)) / w2Sum;
+      }
+    }
   }
   else
   {

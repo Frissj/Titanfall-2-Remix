@@ -76,6 +76,51 @@
 //   source-only RGB accumulation                    -> glare with the source's
 //                                                      own colour
 //
+// What v0.3 changed, and why
+// --------------------------
+// v0.2 had two systems doing the same job and a scalar apologising for it.
+//
+// Auto Exposure Plus built a multi-scale pyramid of local log luminance,
+// accumulated it temporally with reprojection, and multiplied the HDR buffer
+// by a spatially varying gain. PSDT built a multi-scale pyramid of local log
+// luminance, accumulated it temporally with reprojection, and moved the
+// curve's anchor per neighbourhood. Two pyramids over the same buffer, two
+// temporal filters, two local dynamic range compressors in series - and the
+// coordination between them was `1 - |plus.intensity|`, which is not a
+// coordination, it is a confession.
+//
+// v0.3 keeps one of them. PSDT's field already carries strictly more than
+// Plus's did - body weight, depth, per-channel source energy, illuminant - and
+// it is already the glare kernel as well, so it is the pyramid that survives.
+// Plus is not deleted: it is the local operator for every other tonemapper in
+// the list and it stays exactly as it is for them. It simply stops running
+// while PSDT owns local adaptation, which frees its resources and its 16
+// dispatches (at 1080p: init, 12 separable downsamples, fuse, temporal, and a
+// full-res read-modify-write of the HDR buffer), and lets PSDT spend the whole
+// local adaptation budget instead of a fraction of it.
+//
+// What Plus knew that PSDT did not was then moved across, because suppressing
+// a pass is only honest if nothing it was contributing is lost:
+//
+//   edge-stopping pyramid collapse -> PSDT_STATE_SCALE_COHERENCE. Plus chose
+//       per pixel which scale owned the exposure, by asking whether the scales
+//       agreed. PSDT pooled with frame-constant weights modulated only by
+//       depth. Depth catches a window in a wall; it does not catch a shadow
+//       across the middle of one, because both halves are at the same
+//       distance. This does.
+//   edge-aware downsample          -> PsdtDownsampleArgs::coherenceSigma. The
+//       body reduction is now a one-step robust mean rather than a plain
+//       weighted one, so a coarse level reports the dominant population of its
+//       children rather than an average across a boundary between two.
+//
+// And one signal neither had. A path traced frame can put a hundredfold
+// luminance spike in one block for one frame - a firefly the denoiser did not
+// catch, a speculative fireball, a specular hit on something that moved. From
+// the framebuffer that is indistinguishable from a muzzle flash. From the
+// reprojected history it is not, and PsdtAnalysisArgs::sourceConfidenceKnee is
+// what makes the difference cost something: a source that was there is
+// believed at once, one that appeared out of nothing has to persist.
+//
 // Structure
 // ---------
 //   psdt_analysis.comp    full-res HDR + gbuffer -> adaptation field mip 0.
@@ -256,6 +301,7 @@
 #define PSDT_STATE_BUDGET_HIGHLIGHT   44
 #define PSDT_STATE_BUDGET_EMITTER     45
 #define PSDT_STATE_DEPTH_SENSITIVITY  46  // How hard the pooling refuses to cross a depth edge.
+#define PSDT_STATE_SCALE_COHERENCE    74  // How hard it refuses to cross a luminance edge.
 
 // --- resolved local contrast restoration ---
 #define PSDT_STATE_DETAIL_STRENGTH    47
@@ -300,6 +346,8 @@
 #define PSDT_STATE_PREV_TARGET_ANCHOR 71
 #define PSDT_STATE_PREV_TARGET_WHITE  72
 #define PSDT_STATE_PREV_TARGET_BLACK  73
+// 74 is PSDT_STATE_SCALE_COHERENCE, declared with the other resolved
+// adaptation parameters above rather than here.
 
 // Perceptual space selector values.
 static const uint psdtSpaceICtCp  = 0;
@@ -318,7 +366,9 @@ static const uint psdtDebugBudget       = 2;   // Adaptation actually used, afte
 static const uint psdtDebugRoles        = 3;   // BODY green / SOURCE red / SKY blue.
 static const uint psdtDebugSourceEnergy = 4;   // The glare kernel's input, per channel.
 static const uint psdtDebugIlluminant   = 5;   // Local illuminant, normalised.
-static const uint psdtDebugDepth        = 6;   // Body depth, as the pooling sees it.
+static const uint psdtDebugDepth        = 6;   // Red: body depth. Green: how much of
+                                               // the coarse scales survived both
+                                               // agreement tests.
 static const uint psdtDebugDemand       = 7;   // Colour volume demand. Green in, red out of gamut.
 static const uint psdtDebugPressure     = 8;   // Chroma actually given up.
 static const uint psdtDebugGlare        = 9;   // Glare contribution alone.
@@ -351,19 +401,38 @@ static const uint psdtRoleSky    = 3;
 // ---------------------------------------------------------------------------
 // State flag bits (PsdtStateArgs::flags)
 // ---------------------------------------------------------------------------
+// PsdtStateArgs is exactly at the 128-byte push constant limit, which is
+// MaxPushConstantSize and the Vulkan guaranteed minimum, so every enum,
+// boolean and small scalar is packed into this one word. The layout is
+// contiguous and fully spent apart from bit 31; anything else that needs
+// adding has to displace a float somewhere else.
+//
+//   0..3    four booleans
+//   4..5    display gamut          2 bits
+//   6       perceptual space       1 bit
+//   7..10   debug view             4 bits
+//   11..14  pyramid levels         4 bits
+//   15..22  glare near-field lobe  8 bits, fixed point over [0, 1]
+//   23..30  scale coherence        8 bits, fixed point over [0, kMax]
+//   31      spare
+//
+// The two fixed-point fields are quantised because they can be: 1/255 of a
+// glare lobe's amplitude and 1/64 of a pooling sensitivity are both finer than
+// the quantity can be judged at, and both are still fine enough to sweep.
 #define PSDT_STATE_FLAG_HAS_HISTORY    (1u << 0)
 #define PSDT_STATE_FLAG_SCENE_ADAPTIVE (1u << 1)
 #define PSDT_STATE_FLAG_CAMERA_CUT     (1u << 2)
 #define PSDT_STATE_FLAG_CAMERA_VALID   (1u << 3)
-#define PSDT_STATE_SHIFT_GAMUT         8   // 2 bits
-#define PSDT_STATE_SHIFT_SPACE         10  // 1 bit
-#define PSDT_STATE_SHIFT_DEBUG         12  // 4 bits
-#define PSDT_STATE_SHIFT_LEVELS        16  // 4 bits
-// The near-field glare lobe's amplitude, as 8 bits of [0,1]. It lives in the
-// flags word rather than in a float of its own because PsdtStateArgs is
-// exactly at the 128-byte push constant limit and 1/255 is finer than the
-// amplitude of a glare lobe can be judged by eye.
-#define PSDT_STATE_SHIFT_NEARFIELD     20  // 8 bits, fixed point over [0,1]
+#define PSDT_STATE_SHIFT_GAMUT         4   // 2 bits
+#define PSDT_STATE_SHIFT_SPACE         6   // 1 bit
+#define PSDT_STATE_SHIFT_DEBUG         7   // 4 bits
+#define PSDT_STATE_SHIFT_LEVELS        11  // 4 bits
+#define PSDT_STATE_SHIFT_NEARFIELD     15  // 8 bits, fixed point over [0, 1]
+#define PSDT_STATE_SHIFT_COHERENCE     23  // 8 bits, fixed point over [0, 4]
+// Upper end of the scale-coherence fixed point range. Four is already well
+// past the point where the coarse scales are rejected outright by a one-stop
+// disagreement, so the range is not the limiting factor on the knob.
+#define PSDT_COHERENCE_MAX       4.0f
 
 // ---------------------------------------------------------------------------
 // Bindings
@@ -437,6 +506,17 @@ struct PsdtAnalysisArgs
   // the pixel contributes nothing to the illuminant estimate.
   float illuminantMinAlbedo;
 
+  // Octaves of disagreement between this frame's source energy and the
+  // reprojected history at which the block is only half believed. Zero
+  // disables the test and restores v0.2's fixed history window.
+  //
+  // This is the only defence the transform has against path tracing variance,
+  // and it is needed because nothing else in the pipeline can tell a firefly
+  // from a muzzle flash. Both are a hundredfold luminance spike in a handful
+  // of pixels; the difference is entirely in whether the same place said
+  // anything like it a frame ago. See psdt_analysis.comp.slang.
+  float sourceConfidenceKnee;
+
   float toneCurveMinStops;
   float toneCurveMaxStops;
 };
@@ -445,12 +525,23 @@ struct PsdtDownsampleArgs
 {
   uvec2 srcExtent;
   uvec2 dstExtent;
+
+  // Width, in stops, of the robust reweight applied to the body reduction. A
+  // child more than about this far from its siblings' mean is treated as a
+  // different population rather than as part of this one, so a coarse level
+  // reports what most of it is doing instead of the average of two things it
+  // is doing at once. Zero restores a plain weight-normalised mean.
+  float coherenceSigma;
 };
 
 // Exactly 128 bytes, which is MaxPushConstantSize and also the Vulkan
 // guaranteed minimum. Every enum, boolean and small integer is packed into
 // `flags` for that reason; anything else that needs adding has to displace
 // something or become a value resolved from what is already here.
+//
+// v0.3's scale coherence is the second thing to arrive after that ceiling was
+// reached, so it went into `flags` as fixed point the way the glare near-field
+// lobe did. There is one bit left. The next parameter is a repack.
 struct PsdtStateArgs
 {
   // --- histogram domain, shared with the native tonemapper ---

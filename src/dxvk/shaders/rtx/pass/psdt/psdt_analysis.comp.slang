@@ -97,6 +97,17 @@
 //                                   moves the adaptation. A one-frame
 //                                   speculative fireball does not re-expose
 //                                   the room.
+//                                   v0.3 makes this evidence rather than a
+//                                   side effect of the blend: how far a block
+//                                   disagrees with where it was sizes the
+//                                   history window it is allowed to escape,
+//                                   so appearing out of nothing is expensive
+//                                   and persisting is not. That is the only
+//                                   thing in the transform that knows the
+//                                   input is path traced, and it is the
+//                                   difference between a firefly and a muzzle
+//                                   flash - which is a difference the
+//                                   framebuffer does not contain.
 //
 // The brightness thresholds remain, but as one input among several rather
 // than as the whole classifier. They are in stops above middle grey rather
@@ -171,6 +182,44 @@ static const float kMinLuminance = 1e-5;
 // f16 storage ceiling for source energy. Well below 65504 so that the mip
 // chain's running sums cannot overflow either.
 static const float kMaxSourceEnergy = 16384.0;
+
+// --- source confidence ------------------------------------------------------
+// How far below the current measurement the reprojected history is allowed to
+// stay, as a ratio, when the two agree and when they do not.
+//
+// The history window is what actually decides how fast source energy is
+// allowed to appear, and v0.2's was a fixed 0.25. A block whose energy went
+// from nothing to a hundred in one frame had its history dragged up to a
+// quarter of the spike immediately, so a single frame of firefly reached about
+// a third of full glare and then decayed over ten more.
+//
+// Widening the window when the two disagree is what makes appearing cost
+// something. At kSpikeFloorRatio a one-frame spike is admitted at a few
+// percent of its energy and has to keep saying the same thing to be believed.
+// Nothing here slows a source *leaving*: that is the upper bound of the same
+// clamp, it is unchanged, and a light going out is instant and real.
+static const float kConfidenceFloorRatio = 0.25;
+static const float kSpikeFloorRatio = 0.02;
+
+// How much of the ordinary blend weight a block with no confidence keeps.
+//
+// The window above decides where the history is allowed to sit; this decides
+// how fast the measurement is allowed to drag it off that floor. Both are
+// needed, because the window alone still admits a full frame's blend weight of
+// a hundredfold spike, which is most of what is left of it. Not zero: a source
+// that genuinely appeared has to be able to establish itself, and a block that
+// can never move is a block that has stopped measuring.
+static const float kMinConfidenceWeight = 0.15;
+
+// A factor of two between frames is ordinary - a light moving behind geometry,
+// a block straddling a moving silhouette, the denoiser converging - so the
+// disagreement is measured past a one-octave dead zone rather than from zero.
+static const float kConfidenceDeadzone = 1.0;
+
+// Luminance floor for the confidence ratio. Both sides of a log2 ratio have to
+// be bounded away from zero or an empty block disagrees infinitely with
+// another empty block.
+static const float kConfidenceEnergyFloor = 1e-3;
 
 // How much a sky pixel counts towards adaptation, relative to a surface.
 // Not zero and not one, and the reason is the whole sky/window distinction:
@@ -542,12 +591,45 @@ void main(uint2 groupId : SV_GroupID, uint2 groupThreadId : SV_GroupThreadID, ui
       history.w = clamp(history.w, currentField.w - 2.0, currentField.w + 2.0);
       currentField = lerp(history, currentField, currentWeight);
 
+      // Source energy, with the history window opened up by how much this
+      // block disagrees with where it was.
+      //
+      // Measured on the raw sample, before the clamp: the clamp is what is
+      // being sized here, so taking the disagreement from its own output
+      // would cap it at the window it is meant to be widening.
       float4 sourceHistory = InSourceHistory.SampleLevel(previousUv, 0);
+
+      float floorRatio = kConfidenceFloorRatio;
+      float sourceWeight = currentWeight;
+      if (cb.sourceConfidenceKnee > 1e-3)
+      {
+        const float energyNow = psdtLuminance(max(currentSource.xyz, 0.0))
+                              + kConfidenceEnergyFloor;
+        const float energyWas = psdtLuminance(max(sourceHistory.xyz, 0.0))
+                              + kConfidenceEnergyFloor;
+        // Octaves, and symmetric: a block that lost a source disagrees with
+        // its history exactly as much as one that gained a source, and the
+        // clamp's upper bound is what handles the losing case. Only the lower
+        // bound is being widened here, so the symmetry costs nothing and is
+        // one fewer branch.
+        const float octaves = abs(log2(energyNow / energyWas));
+        const float excess = max(octaves - kConfidenceDeadzone, 0.0) / cb.sourceConfidenceKnee;
+
+        // A cut invalidates the history, and therefore invalidates any
+        // disagreement with it: after a cut every value in the frame is new
+        // and none of it is suspicious. The flag decays over about a quarter
+        // of a second, so this fades out rather than switching off.
+        const float confidence = max(1.0 / (1.0 + excess * excess), cutFlag);
+
+        floorRatio = lerp(kSpikeFloorRatio, kConfidenceFloorRatio, confidence);
+        sourceWeight = currentWeight * lerp(kMinConfidenceWeight, 1.0, confidence);
+      }
+
       sourceHistory.xyz = clamp(sourceHistory.xyz,
-                                currentSource.xyz * 0.25,
+                                currentSource.xyz * floorRatio,
                                 currentSource.xyz * 4.0 + 1e-3);
       sourceHistory.w = clamp(sourceHistory.w, currentSource.w - 0.35, currentSource.w + 0.35);
-      currentSource = lerp(sourceHistory, currentSource, currentWeight);
+      currentSource = lerp(sourceHistory, currentSource, sourceWeight);
 
       // The illuminant is the slowest-moving thing the field carries and the
       // one that benefits most from a long memory - a room's light does not

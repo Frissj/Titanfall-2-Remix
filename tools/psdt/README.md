@@ -32,7 +32,7 @@ driving loop.
 
 ## `psdt_suite.py` — behaviour
 
-Thirteen sections. `python3 tools/psdt/psdt_suite.py <section>` runs one.
+Fifteen sections. `python3 tools/psdt/psdt_suite.py <section>` runs one.
 
 | section | what it establishes |
 |---|---|
@@ -47,9 +47,11 @@ Thirteen sections. `python3 tools/psdt/psdt_suite.py <section>` runs one.
 | `hue` | the path to white, and whether it has a discontinuity anywhere in a 1/42-stop sweep |
 | `contrast` | how much local contrast survives, and the detail-magnitude rolloff that stops a lamp being treated as texture |
 | `glare` | the halo radius grows with source luminance, the halo carries the source's colour, both lobes contribute, and the threshold tracks adaptation |
+| `coherence` | what came across from Auto Exposure Plus when it stopped running: the robust pyramid reduction, the cross-scale edge stop, and what each of the three ownership settings costs |
+| `confidence` | a one-frame spike against a source that persists, a source that flickers, and a light going out — the four cases that have to be told apart from each other |
 | `temporal` | step response of the two filters in series: settling times, overshoot, false cuts, and noise attenuation |
 | `compare` | the section-33 weighted score, PSDT against GT7, AgX, Reinhard and Hable |
-| `invariants` | the eight properties the transform is supposed to hold, as pass/fail |
+| `invariants` | the nine properties the transform is supposed to hold, as pass/fail |
 
 ### What it cannot establish
 

@@ -125,6 +125,18 @@ namespace dxvk {
   DxvkAutoExposurePlus::~DxvkAutoExposurePlus() { }
 
   void DxvkAutoExposurePlus::showImguiSettings() {
+    // A pass that has silently stopped running is worse than one that is off, because every
+    // setting below still moves and none of them does anything. Say so first.
+    if (DxvkToneMapping::psdtOwnsLocalAdaptation()) {
+      ImGui::TextWrapped(
+        "This pass is not running. PSDT is the selected tonemap operator and owns local "
+        "adaptation, so its pyramid does this job and this one has released its resources rather "
+        "than duplicating it. The settings below are inert until the operator changes or "
+        "rtx.tonemap.psdt.localAdaptationOwner is set to Auto Exposure Plus or Both. Target "
+        "Brightness has an equivalent that still applies: rtx.tonemap.exposureBias.");
+      RemixGui::Separator();
+    }
+
     // Plus and the local tonemapper are both local dynamic range compressors. Running them in
     // series over-flattens the image, and the symptom (washed out, low contrast) reads as "Plus
     // is too strong", so it is easy to chase by lowering intensity instead of fixing the pair.
@@ -172,13 +184,33 @@ namespace dxvk {
 
   bool DxvkAutoExposurePlus::forcesGlobalTonemapper() {
     return DxvkAutoExposure::mode() == DxvkAutoExposure::AutoExposureMode::Plus
-        && forceGlobalTonemapper();
+        && forceGlobalTonemapper()
+        && !DxvkToneMapping::psdtOwnsLocalAdaptation();
   }
 
   bool DxvkAutoExposurePlus::isEnabled() const {
-    // No interaction with the tonemapper selection: this pass only rescales linear radiance, so
-    // it composes with every operator rather than replacing any of them.
-    return DxvkAutoExposure::mode() == DxvkAutoExposure::AutoExposureMode::Plus;
+    // Almost no interaction with the tonemapper selection: this pass rescales linear radiance, so
+    // it composes with every operator rather than replacing any of them. There is exactly one
+    // exception, and it is not a composition problem but a duplication one.
+    //
+    // PSDT is not an operator, it is a display transform, and it performs local adaptation of its
+    // own from a pyramid of its own. Running this pass in front of it means two multi-scale
+    // pyramids over the same buffer, two temporally reprojected accumulations of them, and two
+    // local dynamic range compressors in series - which flattens the image twice and is precisely
+    // the failure PSDT exists to avoid. v0.2 scaled PSDT down by this pass's intensity to share the
+    // budget between them, which kept every resource and every dispatch on both sides alive in
+    // order to do one job badly.
+    //
+    // So while PSDT owns local adaptation this pass deactivates. Not "runs at reduced strength":
+    // RtxPass turns isEnabled() into isActive() once at frame begin and calls releaseTargetResource
+    // on the transition, so the pyramid, its scratch and both accumulation targets are freed and
+    // the sixteen dispatches stop being recorded. Everything this pass knew that PSDT did not -
+    // the edge-stopping collapse and the edge-aware downsample - was moved into PSDT's pooling and
+    // its pyramid reduction, so this is a de-duplication rather than a removal.
+    //
+    // For every other operator, and whenever the owner is set to anything else, this is unchanged.
+    return DxvkAutoExposure::mode() == DxvkAutoExposure::AutoExposureMode::Plus
+        && !DxvkToneMapping::psdtOwnsLocalAdaptation();
   }
 
   VkExtent3D DxvkAutoExposurePlus::calcPyramidExtent(const VkExtent3D& targetExtent) {

@@ -9,6 +9,9 @@ PSDT consistency check
   [ok  ] state slots fit PSDT_STATE_SIZE (96)
   [ok  ] every state slot a shader names is defined
   [ok  ] no state slot is read before anything writes it
+  [ok  ] every packed flags field declares a width   10 found
+  [ok  ] no two flags fields share a bit
+  [ok  ] packed field masks match their declared widths
  bindings
   [ok  ] psdt_analysis binding indices unique
   [ok  ] psdt_downsample binding indices unique
@@ -20,13 +23,13 @@ PSDT consistency check
  push constants
   [ok  ] PsdtAnalysisArgs: every field is set by the CPU
   [ok  ] PsdtAnalysisArgs: every field is read by a shader
-  [ok  ] PsdtAnalysisArgs: 68 bytes fits the 128-byte push constant limit   68 bytes
+  [ok  ] PsdtAnalysisArgs: 72 bytes fits the 128-byte push constant limit   72 bytes
   [ok  ] PsdtStateArgs: every field is set by the CPU
   [ok  ] PsdtStateArgs: every field is read by a shader
   [ok  ] PsdtStateArgs: 128 bytes fits the 128-byte push constant limit   128 bytes
   [ok  ] PsdtDownsampleArgs: every field is set by the CPU
   [ok  ] PsdtDownsampleArgs: every field is read by a shader
-  [ok  ] PsdtDownsampleArgs: 16 bytes fits the 128-byte push constant limit   16 bytes
+  [ok  ] PsdtDownsampleArgs: 20 bytes fits the 128-byte push constant limit   20 bytes
  shader / reference agreement
   [ok  ] shared constants match between shader and reference
   [ok  ] chroma references match between shader and reference
@@ -41,12 +44,18 @@ PSDT consistency check
   [ok  ] operator ids agree between the C++ enum and the shader header
   [ok  ] every operator appears in the UI dropdown
   [ok  ] every pure operator is reachable from applyForkTonemap
+  [ok  ] the tonemapper exposes psdtOwnsLocalAdaptation()
+  [ok  ] Auto Exposure Plus deactivates when PSDT owns local adaptation
+  [ok  ] localAdaptationOwner defaults to PSDT   Psdt
+  [ok  ] Auto Exposure Plus still composes with every other operator
+  [ok  ] the interaction is documented where it would be looked for
   [ok  ] every PSDT option is reachable from the UI
  syntax smoke test
   [ok  ] braces, parens and brackets balance in every shader
 
   note: 21 state slots are diagnostic-only (written, never read by a stage): ADAPT_VELOCITY, BODY_MEAN_LOGY, CAMERA_ANGULAR, CONTRAST_RANGE, DISPLAY_BLACK, DISPLAY_PEAK, FRAME_PEAK_LOGY, GLARE_FRACTION, ILLUM_CONFIDENCE, INTENT_BRIGHT, INTENT_INDOOR, INTENT_NIGHT, INTENT_OUTDOOR, LEVEL_COUNT, MEDIAN_LOGY, PRESSURE_GAMUT, SALIENCY_LOGY, SKY_FRACTION, SOURCE_FRACTION, SURROUND, TRANSITION
-  note: 41 PSDT options, all with UI
+  note: flags word: 31 of 32 bits used, free: 31
+  note: 44 PSDT options, all with UI
 
   all consistency checks pass
 
@@ -386,6 +395,109 @@ GLARE  radius from luminance, and whose colour the halo is
     indoor (anchor  0 stops)  glare luminance 0.20124
     noon   (anchor +4 stops)  glare luminance 0.00000
 
+COHERENCE  what moved across when Auto Exposure Plus stopped running
+--------------------------------------------------------------------
+  v0.3 stops running Plus while PSDT owns local adaptation, on the grounds that
+  two multi-scale reprojected pyramids over one buffer is one too many. That is
+  only defensible if what Plus was contributing came with it, so this measures
+  the two things it did that PSDT's pooling did not.
+
+  1. Edge-aware downsample. A coarse texel whose four children straddle a
+     boundary. The plain weighted mean lands between two populations and
+     describes neither; the robust reduction reports the one most of them are
+     in. "wanted" is that population, or the mean where there is no majority.
+
+    case                             children (stops)  wanted   plain  robust  err was     is
+    shadow across a wall         [0.0, 0.0, 0.0, 3.0]    0.00   0.750   0.011    0.750  0.011
+    window in a wall             [0.0, 0.0, 0.0, 6.0]    0.00   1.500   0.000    1.500  0.000
+    lamp against a wall          [0.0, 0.0, 0.0, 9.0]    0.00   2.250   0.000    2.250  0.000
+    wall beside a window         [0.0, 0.0, 6.0, 6.0]    3.00   3.000   3.000    0.000  0.000
+    ordinary shading            [0.0, 0.2, -0.3, 0.4]    0.08   0.075   0.079    0.000  0.004
+    a real gradient              [0.0, 1.0, 2.0, 3.0]    1.50   1.500   1.500    0.000  0.000
+
+    The last three rows are the controls, and two of them are limitations
+    rather than successes. Ordinary shading must not move, and moves by
+    0.0040 stops. A monotone gradient has no majority to find, so the
+    robust answer is the plain one - correct, rather than a failure to fire.
+    An even split has no majority either, and a one-step reweight cannot
+    invent one: both halves sit the same distance from the mean and are
+    weighted identically, so that texel still reports a value neither half is
+    at. What saves it is that the finer level it was reduced from still holds
+    both, is still pooled, and is where a feature that small belongs.
+
+  2. Edge-stopping collapse. How much of a coarse neighbourhood at a given
+     luminance offset reaches the pooled adaptation, with the depth term off so
+     that only the luminance test can act.
+
+
+     Reported on the pooled value, before the contrast budget. The budget is a
+     clamp, so past a couple of stops it hides most of what the pooling did and
+     a table of the clamped value measures the clamp. Both are shown.
+
+     coarse offset  pooled v0.2  pooled v0.3  rejected  adapted v0.2  adapted v0.3
+             0.25c       0.1969       0.1969      0.0%        0.1280        0.1280
+             0.50c       0.3937       0.3937      0.0%        0.2559        0.2559
+             1.00c       0.7875       0.7875      0.0%        0.4712        0.4712
+             2.00c       1.5750       1.0588     32.8%        0.3925        0.4441
+             3.00c       2.3625       0.0915     96.1%        0.3138        0.0595
+             4.00c       3.1500       0.0003    100.0%        0.2440        0.0002
+             6.00c       4.7250       0.0000    100.0%        0.1810        0.0000
+             9.00c       7.0875       0.0000    100.0%        0.0865        0.0000
+
+    A stop is free by construction - the dead zone is what stops this from
+    disabling the coarse scales over the frame's own shading - and past it the
+    falloff is squared, so a lighting edge is gone and a gradient is not.
+    The adapted columns cross over around two stops: below it the budget was
+    not binding and v0.3 is lower, above it v0.2 was being clamped anyway and
+    the two converge. That is the budget and the pooling doing the same job at
+    different ends of the range, which is why the pooled columns are the ones
+    that describe this term.
+
+  3. Who owns local dynamic range compression. The v0.2 default ran both and
+     split the budget by 1 - |plus.intensity|, which left PSDT at 0.65 of its
+     local strength while Plus did the rest in linear radiance - two
+     implementations, two pyramids, two temporal filters, one job.
+
+    owner                   PSDT local   budget  Plus dispatches  Plus memory
+    PSDT (default)               0.650     2.00                0     released
+    Auto Exposure Plus           0.000     0.00               16      ~14 MiB
+    Both (v0.2)                  0.423     1.30               16      ~14 MiB
+
+    Dispatch and memory figures are for 1920x1080 and are counted from
+    DxvkAutoExposurePlus::dispatch and its four resources, not measured on a
+    GPU - like everything else here, they describe the code rather than a run.
+
+CONFIDENCE  telling a firefly from a muzzle flash
+-------------------------------------------------
+  A path traced frame can put a hundredfold luminance spike in one block for one
+  frame. Nothing in a framebuffer separates that from a real flash; where it was
+  a frame ago does. Disagreement widens the history window the block has to
+  escape, so appearing costs something and persisting does not.
+
+  What a one-frame spike is worth. Glare responds to log2(1 + energy) rather
+  than to energy, so the halo column is the one that says what is visible.
+
+                            peak energy  halo (log2)   of v0.2
+    v0.2 (no test)                126.5         6.99    100.0%
+    v0.3                           14.1         3.91     55.9%
+
+  What it costs a real source. The same block, with the source still there.
+
+                                50%      90%      99%    halo at 0.1 s
+    v0.2 (no test)            0.083    0.367    0.783 s           7.84
+    v0.3                      0.200    0.500    0.917 s           6.41
+
+  And the check that only one direction was slowed. A source that has been
+  established for half a second, switched off: time to fall below 1% of it.
+
+                             release
+    v0.2 (no test)            0.017s
+    v0.3                      0.017s
+
+    The release is unchanged, and has to be: the clamp's upper bound is what
+    handles a falling measurement and nothing here touches it. A light going
+    out is not a thing to be sceptical about.
+
 TEMPORAL  step response of two filters in series
 ------------------------------------------------
   PSDT has two temporal filters: the adaptation field accumulates with motion
@@ -480,8 +592,8 @@ COMPARE  the section 33 score, PSDT against the controls
     than a missing one, because its numbers would look just as authoritative.
     Comparing against it needs a GPU capture, not this harness.
 
-INVARIANTS  the eight properties the transform is supposed to hold
-------------------------------------------------------------------
+INVARIANTS  the nine properties the transform is supposed to hold
+-----------------------------------------------------------------
   1. brightness ordering preserved            0 inversions, largest dip 0.00e+00   PASS
   2. small bright object vs dark surround     4.05 display stops apart   PASS
   3. mid-luminance red hue held               -0.05 deg   PASS
@@ -492,6 +604,8 @@ INVARIANTS  the eight properties the transform is supposed to hold
      display allows
   8. a wall is not re-exposed by the sky      0.0000 stops across a depth edge, 0.1810 stops without one   PASS
      behind it
+  9. a lit wall does not re-expose the        0.0000 stops across a 6-stop lighting edge, 0.2559 across ordinary   PASS
+     shadow across the same wall                shading
 
   all invariants hold
 

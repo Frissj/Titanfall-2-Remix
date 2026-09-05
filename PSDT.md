@@ -59,6 +59,10 @@ Keeping those apart is the whole design. Every stage can be turned off
 independently, every stage has a debug view showing what it actually read, and
 when the image is wrong it is possible to say which stage is wrong.
 
+The rule that v0.2 broke is the other half of the same sentence: **nothing owns
+two of them, and no job has two owners.** Local dynamic range compression had
+two, and that is what v0.3 is about.
+
 ---
 
 ## v0.1 → v0.2: heuristics became measurements
@@ -97,6 +101,111 @@ Three further things v0.2 fixed, each found by a test rather than by looking:
 
 ---
 
+## v0.2 → v0.3: one pyramid, one owner
+
+v0.2 had two systems doing one job and a scalar apologising for it.
+
+Auto Exposure Plus builds a multi-scale pyramid of local log luminance over the
+HDR buffer, accumulates it across frames with motion reprojection, collapses it
+with an edge-stopping selector, reconstructs it at full resolution with a guided
+filter, and multiplies the buffer by the result. PSDT builds a multi-scale
+pyramid of local log luminance over the same buffer, accumulates it across
+frames with motion reprojection, pools it, and moves the curve's anchor by the
+result. Two pyramids, two temporal filters, two full-resolution passes, both
+compressing local dynamic range, running in series.
+
+v0.2's answer was to scale PSDT's local strength and contrast budget by
+`1 − |plus.intensity|` and call it coordination. It is not a coordination. It is
+a way of maintaining two implementations of one idea and then dividing the work
+between them so that neither does it properly.
+
+**v0.3 picks one.** PSDT's field already carries strictly more than Plus's did —
+body weight, depth, per-channel source energy, illuminant — and it is already
+the glare kernel, so it is the pyramid that survives. While PSDT owns local
+adaptation, `DxvkAutoExposurePlus::isEnabled()` returns false: the pass
+deactivates, `RtxPass` releases its four resources, and its sixteen dispatches
+stop being recorded. PSDT then spends the whole budget rather than 65% of it.
+
+Plus is not deleted and not weakened. It is the local operator for every other
+tonemapper in the list — the native curve, Hable, Psycho17, GT7, Reinhard, AgX
+— and for all of them it is exactly what it was.
+
+### What came across with it
+
+Suppressing a pass is only honest if what it was contributing comes too, and
+Plus was contributing two things PSDT's pooling did not have.
+
+**The edge-stopping collapse.** Plus chose, per pixel, which scale owned the
+exposure, by asking whether the scales agreed with each other. PSDT pooled with
+frame-resolved weights modulated only by depth agreement. Depth catches a window
+in a wall. It does not catch a shadow across the middle of one — same surface,
+same distance, two lighting conditions — and that is exactly where local
+adaptation is supposed to earn its keep. `scaleCoherence` is that term, in the
+same shape as the depth term: a one-stop dead zone, then a squared falloff.
+
+```
+   coarse neighbourhood at    +0.5   +1     +2     +3     +4     +6   stops
+   pooled, v0.2              0.394  0.788  1.575  2.363  3.150  4.725
+   pooled, v0.3              0.394  0.788  1.059  0.092  0.000  0.000
+   rejected                   0.0%   0.0%  32.8%  96.1% 100.0% 100.0%
+```
+
+**The edge-aware downsample.** Plus reduced its pyramid with a separable
+Kuwahara — two one-sided means, lower variance wins — so a level averaged within
+features rather than across them. A 2×2 reduction has no "two sides", so what
+crossed over is the idea rather than the filter: one Welsch reweight about the
+weighted mean, which makes a coarse texel report the population most of its
+children are in.
+
+```
+   children (stops)          plain   robust   wanted
+   [0, 0, 0, +3]             0.750    0.011      0     a shadow across a wall
+   [0, 0, 0, +6]             1.500    0.000      0     a window in a wall
+   [0, 0, 0, +9]             2.250    0.000      0     a lamp against a wall
+   [0, +0.2, -0.3, +0.4]     0.075    0.079      —     ordinary shading, control
+   [0, +1, +2, +3]           1.500    1.500      —     a gradient, control
+   [0, 0, +6, +6]            3.000    3.000      —     an even split
+```
+
+The last row is a limitation, stated rather than hidden: a one-step reweight
+cannot break a tie, because both halves sit the same distance from the mean and
+get the same weight. What saves it is that the finer level it was reduced from
+still holds both halves, is still pooled, and is where a feature that small
+belongs.
+
+### And one signal neither of them had
+
+A path-traced frame can put a hundredfold luminance spike in one block for one
+frame — a firefly the denoiser did not catch, a speculative fireball, a specular
+hit on something that moved. From the framebuffer that is indistinguishable from
+a muzzle flash. From the reprojected history it is not.
+
+So how far a block's source energy disagrees with where it was now sizes the
+history window it is allowed to escape, and scales the weight it escapes at.
+Appearing out of nothing is expensive; persisting is not.
+
+```
+                          one frame at 400x        a source that stays
+                          halo    of v0.2          90%       halo at 0.1 s
+   v0.2 (no test)         6.99    100%             0.367 s   7.84
+   v0.3                   3.91     56%             0.500 s   6.41
+```
+
+The discrimination is on repetition, not on steadiness, which is the distinction
+that matters for a game: a one-frame 4× spike is rejected to about a sixth of its
+halo, while a source flickering 4× *every* frame keeps 96% of what a steady one
+would. A fire stays lit.
+
+Only the appearing direction is slowed. Release is one frame, unchanged, because
+the clamp's upper bound is what handles a falling measurement and a light going
+out is not something to be sceptical about.
+
+This is the only part of the transform that knows its input is path traced. It
+is one term on one channel, not a variance-aware pipeline, and it is described
+that way deliberately.
+
+---
+
 ## Pipeline
 
 ```
@@ -110,6 +219,8 @@ Three further things v0.2 fixed, each found by a test rather than by looking:
               estimate the local illuminant as radiance / albedo
               accumulate a BODY-ONLY luminance histogram
               reduce each 16x16 block, reproject, accumulate
+              size the source channel's history window by how far it
+              disagrees with where it was  (v0.3)
                                  |
               +------------------+------------------+
               |                  |                  |
@@ -122,6 +233,7 @@ Three further things v0.2 fixed, each found by a test rather than by looking:
                       psdt_downsample x (levels-1)
               the mip chain IS the adaptation pyramid
               and IS the glare kernel
+              body reduction is robust, not a plain mean  (v0.3)
                                  |
         +------------------------+------------------------+
         |                                                 |
@@ -144,8 +256,9 @@ Three further things v0.2 fixed, each found by a test rather than by looking:
 multi-    contrast  exposure-  local    chromatic  colour    perceptual
 scale     budget    aware      contrast adaptation volume    glare
 adapt.              curve      restore  to the     pressure  (two lobes,
-(depth-             T(x;E)              measured   + hue      source-
- aware)                                 illuminant trajectory coloured)
+(depth +            T(x;E)              measured   + hue      source-
+ light                                  illuminant trajectory coloured)
+ edges)
    |         |         |         |         |         |         |
    +---------+---------+---------+---------+---------+---------+
                                  v
@@ -159,6 +272,11 @@ default six levels that is **seven compute dispatches**, not three — v0.1's
 README said three and was counting the loop as one. The downsamples are a few
 thousand threads each; the analysis pass is the only one that touches every
 pixel.
+
+Against v0.2 the net is **sixteen fewer**, because Auto Exposure Plus no longer
+runs alongside it: one init, twelve separable downsamples, a fuse, a temporal
+pass and a full-resolution read-modify-write of the HDR buffer. Two of the three
+passes that touched every pixel are now one. None of that is a profile.
 
 ---
 
@@ -215,9 +333,12 @@ compactness, which still separates a glint from a wall and collapses everything
 else — six cases into two. That is v0.1's behaviour, and it is the honest
 picture of how much the renderer signals were doing.
 
-### Multi-scale adaptation under a contrast budget, across depth edges
+### Multi-scale adaptation under a contrast budget, across depth and light edges
 
-Three scales — 16, 64 and 256 pixels — pooled with scene-dependent weights.
+Three scales — 16, 64 and 256 pixels — pooled with scene-dependent weights, from
+a pyramid whose reduction is robust rather than plain (see v0.3 above: a coarse
+texel reports the population most of its children are in, so the levels being
+pooled describe something that is actually there).
 
 Then the budget, which is the most important constraint in the system:
 
@@ -241,8 +362,23 @@ so the disagreement is in octaves of distance and one constant works from a
 corridor to a skybox — with a one-octave dead zone (a factor of two in distance
 is the same surface) and a squared falloff past it.
 
-Measured: a wall with sky six stops brighter behind it shifts by **0.0000
+Measured, with the luminance term off so the depth term is what is being
+measured: a wall with sky six stops brighter behind it shifts by **0.0000
 stops**; the same six-stop neighbour at the same depth shifts it by 0.181.
+
+New in v0.3: the pooling also refuses to average across a *lighting*
+discontinuity, which is the case depth cannot see. A wall with a shadow across
+the middle of it is one surface at one distance under two lighting conditions,
+and a coarse level spanning both meters the lit half too dark and the shadowed
+half too bright. Same shape as the depth term — a one-stop dead zone, then a
+squared falloff — and measured the same way, with the depth term off: a six-stop
+lighting edge at the same depth shifts the wall by **0.0000 stops**, while
+ordinary half-stop shading still pools normally at 0.256.
+
+Two terms that overlap have to be measured one at a time, or the control case in
+each collapses and both tests pass without demonstrating anything. That is why
+invariants 8 and 9 each disable the other's term; it is also the bug the v0.2
+invariant list would have hidden.
 
 ### An exposure-aware curve
 
@@ -435,19 +571,26 @@ in two frames. Under a measurement carrying ±0.5 stops of frame-to-frame noise
 the anchor moves by at most 0.0055 stops — a 176× attenuation, and the reason
 two filters in series exist at all.
 
-### Coordination with Auto Exposure Plus
+### Ownership of local dynamic range compression
 
-Plus applies a spatially varying gain before the tonemapper; PSDT applies local
-adaptation after it. Both are local dynamic range compression, and running both
-at full strength in series compresses the same signal twice — which is the exact
-failure this architecture was built to avoid, and which v0.1 did nothing about
-because it built its own adaptation field beside Plus rather than coordinating
-with it.
+`rtx.tonemap.psdt.localAdaptationOwner`, and the default is PSDT. See the v0.3
+section above for why this replaced a scalar.
 
-The local adaptation budget is now spent once between the two: while Plus is
-active, PSDT scales its local strength and contrast budget by
-`1 − |plus.intensity|`. `rtx.tonemap.psdt.coordinateWithAutoExposurePlus`
-disables it for anyone who wants to stack them deliberately.
+```
+   owner                 PSDT local  budget   Plus dispatches   Plus memory
+   PSDT (default)             0.650    2.00                 0      released
+   Auto Exposure Plus         0.000    0.00                16       ~14 MiB
+   Both (v0.2)                0.423    1.30                16       ~14 MiB
+```
+
+The dispatch and memory figures are for 1080p and are counted from
+`DxvkAutoExposurePlus::dispatch` and its four resources — read off the code, not
+off a GPU, like everything else here.
+
+The other two settings are controls rather than fallbacks. `AutoExposurePlus`
+hands the spatial half of the job back to Plus and leaves PSDT's curve anchored
+globally, which isolates what PSDT's own local adaptation contributes. `Both`
+reproduces v0.2 exactly, so the change is measurable rather than asserted.
 
 ---
 
@@ -499,7 +642,8 @@ was needed.
  3 role classification   green surface, red source, blue sky   <- start here
  4 source energy         the glare kernel's input, per channel
  5 local illuminant      should read grey in a coloured room under a white light
- 6 depth and trust       how much of the coarse pooling survived the depth test
+ 6 depth and trust       how much of the coarse pooling survived both agreement
+                       tests; dark green is pooling on the finest scale  <- second
  7 gamut demand          green in gamut, red out of it, hard edge at the boundary
  8 chroma given up       should be zero over most of the frame
  9 glare only            the halo without the image under it
@@ -591,7 +735,7 @@ six times on the grid, which is disqualifying rather than merely costly. The
 stateless operators all score 1 on temporal stability by construction — they
 have no state to be unstable, which is also why they cannot adapt to anything.
 
-All eight perceptual invariants hold:
+All nine perceptual invariants hold:
 
 ```
   1. brightness ordering preserved         0 inversions
@@ -604,15 +748,38 @@ All eight perceptual invariants hold:
      allows
   8. a wall is not re-exposed by the sky   0.0000 stops across a depth edge,
      behind it                             0.181 without one
+  9. a wall is not re-exposed by the       0.0000 stops across a lighting edge,
+     sunlit half of the same wall          0.256 across ordinary shading
 ```
+
+The nine scores were unchanged by v0.3, and that is the right answer rather than
+a disappointing one: the comparison grid runs on an isolated pixel where every
+scale reports the frame anchor, so nothing the pooling does can reach it. What
+v0.3 changed is measured in `coherence` and `confidence`, which exist because
+the existing sections could not see it.
 
 The curve is monotonic over 40 stops with a worst step of exactly 0, C1 at both
 joins, and its analytic derivative matches a central difference to 1.3e-9. And
 `psdt_sweep.py` now reports **zero luminance inversions at every setting of
 every parameter it sweeps**, not just at the defaults.
 
-Three defaults are set by sweep rather than by taste — `highlightRolloff` 0.45,
-`luminanceConcession` 0.8, `chromaPreservation` 2.5.
+Six defaults are set by sweep rather than by taste — `highlightRolloff` 0.45,
+`luminanceConcession` 0.8, `chromaPreservation` 2.5, and v0.3's
+`scaleCoherence` 1.20, `pyramidCoherence` 1.00, `sourceConfidence` 1.50.
+
+The three new ones sweep in `psdt_sweep.py`'s pooling section rather than its
+main one, because the main sweep runs `psdt_apply` on an isolated pixel where
+the pooling is never exercised. Sweeping them through it would print identical
+rows and read as "this parameter does nothing", which is worse than not
+sweeping it at all.
+
+`pyramidCoherence` moved from 1.50 to 1.00 on that sweep: at 1.50 a coarse texel
+made of three dark children and one three stops brighter still reported 0.13
+stops above the dark ones, and at 1.00 it reports 0.011, while the ordinary
+shading control moves by 0.004 stops either way. Below about 0.75 the reweight
+becomes narrower than the field's plausible residual noise, which is a stability
+risk this harness cannot measure — so 1.00 is the value with margin, not the
+value with the lowest error.
 
 ---
 
@@ -637,7 +804,17 @@ Three defaults are set by sweep rather than by taste — `highlightRolloff` 0.45
 * **Performance is unmeasured.** Seven dispatches, all small, plus a per-pixel
   transform that does two to four perceptual conversions and up to two chromatic
   adaptations. The adaptation is skipped entirely when `spatialWhite` is 0. None
-  of that is a substitute for a profile.
+  of that is a substitute for a profile — including the sixteen dispatches v0.3
+  stopped submitting, which are counted from the code and not from a capture.
+* **The source-confidence term is one term on one channel.** It is not a
+  variance-aware pipeline and the design note that asked for one wanted more:
+  path-tracing variance feeding the exposure, the white point and the colour
+  mapping as well. This feeds the glare model, because that is where believing
+  one frame of noise costs a visible artifact, and because the body channel
+  already has a clamp, a budget and a slow anchor in front of it. Extending it
+  is a v0.4 item, not a claim being made here.
+* **The robust pyramid reduction cannot break a tie.** Four children split two
+  and two produce a value neither pair is at. See the v0.3 section.
 
 ### Not a human vision model
 
@@ -682,48 +859,73 @@ the histogram on its way out.
 
 ---
 
-## What v0.3 should be
+## What v0.4 should be
 
-Everything left needs a GPU. That is not a coincidence — the CPU-side work is
-done, and what remains is verification against the real renderer.
+Everything on v0.3's list that needed a GPU still needs one, and nothing on this
+one is a substitute for that.
 
 In order, and the first one is not optional:
 
 1. **Compile and run it.** Nothing below matters until the shaders have been
    through slangc and a frame has gone through them. `psdt_check.py` catches the
-   header/C++/shader mismatches that would stop a build; it cannot catch a Slang
-   syntax error, because there is no Slang compiler on this machine.
+   header/C++/shader mismatches that would stop a build — it now also checks the
+   `flags` bit packing, which v0.3 rearranged and which nothing else would have
+   noticed going wrong. It cannot catch a Slang syntax error, because there is no
+   Slang compiler on this machine.
 2. **Look at the role classification in-game** before looking at the image. If
    the roles are wrong, every measurement downstream is answering the right
    question about the wrong pixels.
-3. **Run the operator x Plus matrix.** The instrumentation is in place, so this
-   is mechanical: four runs of the same scene with
-   `rtx.tonemap.colorGradingEnabled=0`, bloom off, and
-   `rtx.logSurfaceCoverage=1`, then diff the `[TonemapProbe]` lines.
+3. **Look at the depth view second.** `debugView` 6 now shows the combined
+   agreement of both pooling terms in green, so a frame that is dark there is a
+   frame pooling on the finest scale alone. That is the failure mode v0.3
+   introduced, and it is one screenshot to rule out.
+4. **Run the operator matrix.** The instrumentation is in place, so this is
+   mechanical: run the same scene under each operator with
+   `rtx.tonemap.colorGradingEnabled=0`, bloom off, and `rtx.logSurfaceCoverage=1`,
+   then diff the `[TonemapProbe]` lines.
 
    ```
-   operator 7 (GT7)       + Plus off
-   operator 7 (GT7)       + Plus on
-   operator 9 (Reinhard)  + Plus off
-   operator 9 (Reinhard)  + Plus on
+   operator 6 (Psycho17)   + Plus off / Plus on
+   operator 7 (GT7)        + Plus off / Plus on
+   operator 9 (Reinhard)   + Plus off / Plus on
+   operator 8 (PSDT)       localAdaptationOwner = PSDT / Plus / Both
    ```
 
-   Add operators 6 and 8 to the same sweep and it also answers "is PSDT better
-   than the operator it would replace", which the synthetic suite cannot.
-4. **Decide the GT7 input-space question**, with the `gt7space` numbers in hand.
+   The last row is the one that establishes whether v0.3 was right. The synthetic
+   suite cannot answer it, because it cannot exercise the pooling at all.
+5. **Decide the GT7 input-space question**, with the `gt7space` numbers in hand.
    Either convert around the branch and accept that GT7 changes appearance, or
    keep it and state in every comparison that the control is off by up to a
    third of a stop on saturated colours. What is not defensible is leaving it
    undecided, which is where it has been.
-5. **Measure Psycho17's input-space assumption too.** It has the same Rec.2020
+6. **Measure Psycho17's input-space assumption too.** It has the same Rec.2020
    comment and it is the current default operator, so it matters more than GT7's.
-6. **Profile it**, per stage, with the option toggles that already exist.
-7. **A Titanfall frame corpus**, captured through the debug views, so
+7. **Profile it**, per stage, with the option toggles that already exist — and
+   confirm the sixteen dispatches v0.3 removed are actually gone from a capture
+   rather than merely absent from the code path they were counted in.
+8. **A Titanfall frame corpus**, captured through the debug views, so
    "does this look better" becomes a measurement.
-8. **Psycho17 in the comparison**, via GPU capture rather than a hand port.
-9. **Scene grading and display grading as separate operations.** The existing
-   colour grading runs after PSDT and is a plain RGB operation that can undo the
-   hue trajectory PSDT worked to produce. It is off by default, so this is
-   latent rather than active.
-10. **GT7 parameters as options.** Non-blocking, and it touches an operator that
+9. **Psycho17 in the comparison**, via GPU capture rather than a hand port.
+
+Then the things v0.3 deliberately did not do:
+
+10. **Extend confidence past the source channel.** The design note asked for
+    path-tracing variance to reach the exposure, the white point and the colour
+    mapping. It currently reaches the glare model. The others each already have
+    a filter in front of them, so the case for extending it is a measurement
+    rather than an assumption — which means it needs the frame corpus first.
+11. **A real variance signal rather than a temporal one.** What is measured now
+    is disagreement with the reprojected history, which conflates path-tracing
+    noise with anything the reprojection got wrong. The denoiser knows the
+    difference and does not currently tell the tonemapper.
+12. **Scene grading and display grading as separate operations.** The existing
+    colour grading runs after PSDT and is a plain RGB operation that can undo the
+    hue trajectory PSDT worked to produce. It is off by default, so this is
+    latent rather than active.
+13. **Bloom and glare are still two systems spreading the same energy.** They are
+    conceptually distinct — a lens artifact and an ocular one — and both are on
+    by default, which is the same shape of problem v0.3 just fixed one instance
+    of. This one is not PSDT's to fix unilaterally, because `rtx.bloom` is
+    Remix's and every other operator uses it.
+14. **GT7 parameters as options.** Non-blocking, and it touches an operator that
     is deliberately frozen, so it wants a decision before an edit.

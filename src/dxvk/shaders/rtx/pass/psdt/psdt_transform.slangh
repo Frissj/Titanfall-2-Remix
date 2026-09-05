@@ -99,6 +99,12 @@ static const float kPsdtGlareTintFraction = 0.6;
 // - which over a six-stop difference is still a visible gradient.
 static const float kPsdtDepthDeadzone = 1.0;
 
+// Stops of disagreement between two adaptation scales that cost nothing. Set
+// by the same argument as the depth dead zone: a scene has gradients in it,
+// and a pooling term that fires on ordinary shading is one that has disabled
+// the coarse scales rather than one that is protecting an edge.
+static const float kPsdtScaleDeadzone = 1.0;
+
 // ---------------------------------------------------------------------------
 // Adaptation budget
 // ---------------------------------------------------------------------------
@@ -141,7 +147,10 @@ struct PsdtAdaptation
   float adaptedLog;    // Budget-clamped adaptation actually used by the curve.
   float bodyWeight;    // How much ordinary surface the neighbourhood contains.
   float depthLog;      // Depth of the surface the adaptation describes.
-  float coarseTrust;   // How much of the coarse scales survived the depth test.
+  float coarseTrust;   // How much of the coarse scales survived the agreement
+                       // tests - depth and luminance together, so a low value
+                       // means "the neighbourhood does not extend this far",
+                       // whichever of the two said so.
   float3 illuminant;   // Local illuminant, linear Rec.709, normalised to Y = 1.
 };
 
@@ -209,14 +218,58 @@ PsdtAdaptation psdtSampleAdaptation(
   // This only reduces the coarse weights, never raises them, so the worst case
   // is that pooling collapses to the finest scale - which is a real
   // adaptation neighbourhood in its own right, not a degenerate one.
+  //
+  // Luminance-aware pooling, which is the same argument one axis over.
+  //
+  // Depth answers "is the coarse scale describing the same surface". It does
+  // not answer "is it describing the same light", and those come apart exactly
+  // where local adaptation matters most: a wall with a shadow across the
+  // middle of it is one surface at one distance under two lighting conditions,
+  // and a coarse level spanning both reports a level that neither half is at.
+  // The lit half is then metered too dark and the shadowed half too bright,
+  // which is the flattening this architecture exists to avoid arriving through
+  // the pooling instead of through the curve.
+  //
+  // This is Auto Exposure Plus's edge-stopping pyramid collapse, moved here.
+  // Plus asked, per pixel, whether the finer level disagreed with the coarser
+  // accumulator, and where it did it trusted the finer one - which is what let
+  // it push much harder than a Laplacian fusion before haloing. That is
+  // precisely the term PSDT's fixed pooling weights did not have, and moving
+  // it across is what makes suppressing Plus a de-duplication rather than a
+  // loss. It only ever reduces a coarse weight, so the worst case is the same
+  // as the depth term's: pooling collapses to the finest scale, which is a
+  // real adaptation neighbourhood in its own right.
+  //
+  // Measured against `aS/aM/aL` rather than the raw field, so a neighbourhood
+  // that is all light source - which has already fallen back to the frame
+  // anchor above - agrees with the fine scale rather than being rejected by it.
   const float depthSensitivity = state[PSDT_STATE_DEPTH_SENSITIVITY];
+  const float scaleCoherence = state[PSDT_STATE_SCALE_COHERENCE];
   float coarseTrust = 1.0;
-  if (depthSensitivity > 1e-3)
+  if (depthSensitivity > 1e-3 || scaleCoherence > 1e-3)
   {
-    const float excessM = max(abs(fM.w - fS.w) - kPsdtDepthDeadzone, 0.0);
-    const float excessL = max(abs(fL.w - fS.w) - kPsdtDepthDeadzone, 0.0);
-    const float agreeM = exp(-depthSensitivity * excessM * excessM);
-    const float agreeL = exp(-depthSensitivity * excessL * excessL);
+    float agreeM = 1.0;
+    float agreeL = 1.0;
+
+    if (depthSensitivity > 1e-3)
+    {
+      const float excessM = max(abs(fM.w - fS.w) - kPsdtDepthDeadzone, 0.0);
+      const float excessL = max(abs(fL.w - fS.w) - kPsdtDepthDeadzone, 0.0);
+      agreeM *= exp(-depthSensitivity * excessM * excessM);
+      agreeL *= exp(-depthSensitivity * excessL * excessL);
+    }
+
+    if (scaleCoherence > 1e-3)
+    {
+      // A stop of disagreement between adaptation neighbourhoods is ordinary
+      // shading and costs nothing; the dead zone is what stops this from
+      // quietly disabling the coarse scales over every gradient in the frame.
+      const float lumM = max(abs(aM - aS) - kPsdtScaleDeadzone, 0.0);
+      const float lumL = max(abs(aL - aS) - kPsdtScaleDeadzone, 0.0);
+      agreeM *= exp(-scaleCoherence * lumM * lumM);
+      agreeL *= exp(-scaleCoherence * lumL * lumL);
+    }
+
     w.x *= agreeL;
     w.y *= agreeM;
     coarseTrust = 0.5 * (agreeM + agreeL);

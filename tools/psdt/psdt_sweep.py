@@ -82,6 +82,100 @@ def sweep(name, values, fmt='{:.2f}'):
               f'{m["shadow"]:8.3f} {m["punch"]:8.3f} {m["sep"]:8.4f} {m["clip"]:6.1f}% {m["inv"]:5d}')
 
 
+def sweep_pooling():
+    """
+    The v0.3 pooling parameters, which the sweep above cannot see.
+
+    measure() runs psdt_apply on an isolated pixel, so every scale reports the
+    frame anchor and the pooling weights are never exercised. Sweeping the
+    coherence parameters through it would print identical rows and read as
+    "this parameter does nothing", which is worse than not sweeping it.
+    """
+    print('\n  scaleCoherence   pooled stops for a coarse neighbourhood at +N, depth term off')
+    print(f'    {"value":>8s} {"+0.5":>8s} {"+1":>8s} {"+2":>8s} {"+3":>8s} {"+4":>8s}'
+          f' {"+6":>8s} {"select":>8s}')
+    for v in (0.0, 0.4, 0.8, 1.2, 1.6, 2.4, 4.0):
+        st = P.State(opts=dict(depthSensitivity=0.0, scaleCoherence=v))
+        base = (st.anchor, 1.0, st.anchor, 0.0)
+        row = []
+        for offset in (0.5, 1.0, 2.0, 3.0, 4.0, 6.0):
+            far = (st.anchor + offset, 1.0, st.anchor + offset, 0.0)
+            a = P.sample_adaptation(st, {'S': base, 'M': far, 'L': far})
+            row.append(a.pooledLog - st.anchor)
+        # Selectivity: how much of ordinary shading survives per unit of
+        # lighting edge that does not. Higher is a sharper discriminator; it is
+        # unbounded as the edge term goes to zero, so it is capped for display.
+        select = min(row[0] / max(row[4], 1e-4), 9999.0)
+        print(f'    {v:8.2f} ' + ' '.join(f'{x:8.4f}' for x in row) + f' {select:8.1f}')
+    print('    select = (+0.5 kept) / (+4 kept). The knee is where a lighting edge has')
+    print('    gone and ordinary shading has not moved at all; past it there is nothing')
+    print('    left to buy, because the +0.5 column is already flat.')
+
+    print('\n  pyramidCoherence   reduced value for four children straddling a boundary')
+    cases = [('3 dark + 1 lit at +3', [0.0, 0.0, 0.0, 3.0], 0.0),
+             ('3 dark + 1 lit at +6', [0.0, 0.0, 0.0, 6.0], 0.0),
+             ('shading', [0.0, 0.2, -0.3, 0.4], None)]
+    print(f'    {"value":>8s} ' + ' '.join(f'{c[0]:>21s}' for c in cases))
+    for v in (0.0, 0.75, 1.0, 1.5, 2.0, 3.0, 6.0):
+        cells = []
+        for _, stops, wanted in cases:
+            children = [(s, 1.0) for s in stops]
+            got = P.reduce_body(children, v)
+            target = P.reduce_body(children, 0.0) if wanted is None else wanted
+            cells.append(f'{got:10.4f} ({abs(got - target):+.4f})')
+        print(f'    {v:8.2f} ' + ' '.join(f'{c:>21s}' for c in cells))
+    print('    The bracketed figure is the error against what the texel should report.')
+    print('    The third column is the control and its error is against the plain mean,')
+    print('    which is the right answer where there is no majority to find.')
+
+    print('\n  sourceConfidence   noise against signal')
+    dt = 1.0 / 60.0
+
+    def spike_halo(knee, ratio):
+        f = P.SourceFilter(knee=knee, value=0.0)
+        f.hasHistory = True
+        peak = max(f.step(m, dt) for m in [0.0, 400.0 * ratio] + [0.0] * 60)
+        return math.log2(1.0 + peak)
+
+    def flicker_kept(knee):
+        # A source that is really there and really is unsteady: a fire, a
+        # failing lamp, a muzzle flash train. Two octaves either side of its
+        # own mean, which is the case the knee actually decides - a 400x
+        # appearance is so far outside any knee in this range that every
+        # setting rejects it equally, so a table of that alone would say the
+        # parameter does nothing.
+        f = P.SourceFilter(knee=knee, value=100.0)
+        f.hasHistory = True
+        trace = [f.step(100.0 * (4.0 if i % 2 else 0.25), dt) for i in range(120)]
+        steady = P.SourceFilter(knee=0.0, value=100.0)
+        steady.hasHistory = True
+        ref = [steady.step(100.0 * (4.0 if i % 2 else 0.25), dt) for i in range(120)]
+        return (sum(trace[60:]) / 60.0) / max(sum(ref[60:]) / 60.0, 1e-9)
+
+    base_halo = spike_halo(0.0, 1.0)
+    print(f'    {"value":>8s} {"400x halo":>10s} {"vs off":>8s} {"4x halo":>9s} {"vs off":>8s}'
+          f' {"flicker":>8s} {"90% in":>8s}')
+    for v in (0.0, 0.75, 1.0, 1.5, 2.5, 4.0):
+        h400 = spike_halo(v, 1.0)
+        h4 = spike_halo(v, 0.01)
+        h4_off = spike_halo(0.0, 0.01)
+        f_stay = P.SourceFilter(knee=v, value=0.0)
+        f_stay.hasHistory = True
+        trace = [f_stay.step(m, dt) for m in [0.0] + [400.0] * 180]
+        t90 = next((i * dt for i, x in enumerate(trace) if x >= 360.0), float('nan'))
+        print(f'    {v:8.2f} {h400:10.2f} {h400 / base_halo * 100:7.1f}% {h4:9.2f}'
+              f' {h4 / h4_off * 100:7.1f}% {flicker_kept(v):8.3f} {t90:7.3f}s')
+    print('    A 400x appearance is outside every knee in this range and all of them reject')
+    print('    it, so the parameter is really chosen on the middle two columns - and those')
+    print('    are the result worth reading. A 4x one-frame spike is rejected to about a')
+    print('    sixth of its halo, while a source flickering 4x every frame keeps 94-97% of')
+    print('    what a steady one would. Repetition is what is being believed, not')
+    print('    steadiness, which is what stops this from putting out a fire.')
+    print('    The remaining trade is the last two columns, and it is real: rejecting')
+    print('    harder admits a genuinely new source more slowly. 1.5 is where the 400x')
+    print('    column starts to climb again, and costs 0.13 s of settling against 2.5.')
+
+
 if __name__ == '__main__':
     print('PSDT parameter sweep')
     print('  boundary use     output chroma / max displayable chroma at that luminance. Higher is better.')
@@ -98,4 +192,5 @@ if __name__ == '__main__':
     sweep('hueTrajectory', [0.0, 0.25, 0.5, 0.6, 0.75, 1.0])
     sweep('midtoneContrast', [0.95, 1.05, 1.15, 1.25, 1.4])
     sweep('highlightRolloff', [0.35, 0.45, 0.6, 0.75, 0.9])
+    sweep_pooling()
     print()

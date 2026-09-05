@@ -306,23 +306,31 @@ namespace dxvk {
           "What the viewer is adapted to. Source Exclusion decides whether a sunlit window is scene "
           "content or a highlight event; Contrast Budget bounds how far local adaptation may pull a "
           "region away from the frame anchor, and is what stops local adaptation flattening the image. "
-          "Depth Sensitivity stops the pooling averaging a wall together with the sky behind it.");
+          "Depth Sensitivity stops the pooling averaging a wall together with the sky behind it, and "
+          "Scale Coherence stops it averaging a wall together with the shadow across the middle of "
+          "one - same surface, same distance, two lighting conditions.");
         RemixGui::Checkbox("Scene Adaptive", &sceneAdaptiveObject());
         RemixGui::DragFloat("Source Exclusion", &sourceExclusionObject(), 0.01f, 0.f, 1.f);
         RemixGui::DragFloat("Local Adaptation", &localAdaptationObject(), 0.01f, 0.f, 1.f);
         RemixGui::DragFloat("Contrast Budget", &contrastBudgetObject(), 0.01f, 0.f, 4.f);
         RemixGui::DragFloat("Depth Sensitivity", &depthSensitivityObject(), 0.01f, 0.f, 2.f);
+        RemixGui::DragFloat("Scale Coherence", &scaleCoherenceObject(), 0.01f, 0.f, PSDT_COHERENCE_MAX);
+        RemixGui::DragFloat("Pyramid Coherence (stops)", &pyramidCoherenceObject(), 0.05f, 0.f, 8.f);
         RemixGui::Separator();
         RemixGui::DragFloat("Adaptation Speed Up", &adaptationSpeedUpObject(), 0.05f, 0.05f, 30.f);
         RemixGui::DragFloat("Adaptation Speed Down", &adaptationSpeedDownObject(), 0.05f, 0.05f, 30.f);
         RemixGui::Checkbox("Temporal Accumulation", &temporalAccumulationObject());
         RemixGui::DragFloat("Field Adaptation Speed", &fieldAdaptationSpeedObject(), 0.1f, 0.1f, 60.f);
+        RemixGui::DragFloat("Source Confidence (octaves)", &sourceConfidenceObject(), 0.05f, 0.f, 8.f);
         RemixGui::Separator();
-        RemixGui::Checkbox("Coordinate With Auto Exposure Plus", &coordinateWithAutoExposurePlusObject());
+        RemixGui::Combo("Local Adaptation Owner", &localAdaptationOwnerObject(),
+                        "PSDT\0Auto Exposure Plus\0Both\0");
         ImGui::TextWrapped(
-          "Plus applies a local gain before this pass and PSDT applies local adaptation after it. "
-          "Both are local dynamic range compression; at full strength in series they compress the "
-          "same signal twice, which is the failure this architecture exists to avoid.");
+          "Exactly one pass should perform local dynamic range compression, and until v0.3 two did. "
+          "At the default PSDT owns it and the Auto Exposure Plus pass does not run while this "
+          "operator is selected - it deactivates and gives back its pyramid rather than being scaled "
+          "down. Plus is untouched for every other operator. What it knew and PSDT did not is now "
+          "Scale Coherence and Pyramid Coherence above.");
         ImGui::Unindent();
       }
 
@@ -456,6 +464,21 @@ namespace dxvk {
 
   bool DxvkToneMapping::psdtSelected() const {
     return tonemapOperator() == TonemapOperator::PerceptualTF2 && tonemappingEnabled();
+  }
+
+  bool DxvkToneMapping::psdtOwnsLocalAdaptation() {
+    // Deliberately a pure function of two options and nothing else. It is
+    // called from DxvkAutoExposurePlus::isEnabled(), which runs at frame begin
+    // before any tonemapper state exists for the frame, and an answer that
+    // depended on per-frame state would make the two passes' activation order
+    // matter.
+    //
+    // Mirrors psdtSelected()'s conditions rather than calling it, because that
+    // one is const-qualified on an instance and this has to be reachable
+    // without one.
+    return tonemapOperator() == TonemapOperator::PerceptualTF2
+        && tonemappingEnabled()
+        && localAdaptationOwner() == LocalAdaptationOwner::Psdt;
   }
 
   VkExtent3D DxvkToneMapping::calcPsdtFieldExtent(const VkExtent3D& targetExtent) {
@@ -710,22 +733,37 @@ namespace dxvk {
       cameraCut = camera.isCameraCut();
     }
 
-    // --- Auto Exposure Plus coordination ----------------------------------
-    // Plus applies a spatially varying gain before the tonemapper; PSDT
-    // applies local adaptation after it. Both are local dynamic range
-    // compression, and running both at full strength in series compresses the
-    // same signal twice - which is the exact failure this architecture was
-    // built to avoid, and which v0.1 did nothing about because it built its own
-    // adaptation field beside Plus rather than coordinating with it.
+    // --- who owns local dynamic range compression -------------------------
+    // v0.2 divided the local adaptation budget between two passes that were
+    // both implementing it, with the split taken from one of them's intensity
+    // setting. That kept both pyramids, both temporal filters and both
+    // full-resolution passes alive to do one job between them.
     //
-    // The honest coordination is to spend the local adaptation budget once
-    // between the two passes. Plus reports how much of it it took as its own
-    // intensity, so PSDT takes the remainder.
+    // v0.3 picks one. At the default PSDT owns it and DxvkAutoExposurePlus has
+    // already deactivated itself for the frame - see
+    // psdtOwnsLocalAdaptation() - so there is nothing to divide the budget with
+    // and PSDT spends all of it. The other two settings exist as controls: one
+    // hands the spatial half back to Plus entirely, and one reproduces v0.2's
+    // stacking so the difference can be measured rather than argued about.
     float localScale = 1.0f;
-    if (coordinateWithAutoExposurePlus()) {
-      DxvkAutoExposurePlus& plus = ctx->getCommonObjects()->metaAutoExposurePlus();
-      if (plus.isActive()) {
-        localScale = std::max(0.0f, 1.0f - std::abs(DxvkAutoExposurePlus::intensity()));
+    switch (localAdaptationOwner()) {
+      case LocalAdaptationOwner::Psdt:
+        localScale = 1.0f;
+        break;
+      case LocalAdaptationOwner::AutoExposurePlus:
+        // Plus is running and owns the spatial half. PSDT's curve stays
+        // anchored globally; everything else it does - the curve, the colour
+        // volume, the glare - is unaffected, which is what makes this a
+        // control for the local adaptation stage specifically rather than an
+        // off switch for the transform.
+        localScale = 0.0f;
+        break;
+      case LocalAdaptationOwner::Both: {
+        DxvkAutoExposurePlus& plus = ctx->getCommonObjects()->metaAutoExposurePlus();
+        if (plus.isActive()) {
+          localScale = std::max(0.0f, 1.0f - std::abs(DxvkAutoExposurePlus::intensity()));
+        }
+        break;
       }
     }
 
@@ -762,6 +800,11 @@ namespace dxvk {
         : 1.0f;
       pushArgs.skyViewZ = skyViewZ();
       pushArgs.illuminantMinAlbedo = std::max(illuminantMinAlbedo(), 1e-3f);
+      // The confidence test compares against the reprojected history, so it
+      // has nothing to compare against on a frame that is not accumulating.
+      // Passing 0 there disables it rather than letting it size a window that
+      // is not being used.
+      pushArgs.sourceConfidenceKnee = accumulate ? std::max(sourceConfidence(), 0.0f) : 0.0f;
       pushArgs.toneCurveMinStops = toneCurveMinStops();
       pushArgs.toneCurveMaxStops = toneCurveMaxStops();
       ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
@@ -811,6 +854,7 @@ namespace dxvk {
         PsdtDownsampleArgs pushArgs = {};
         pushArgs.srcExtent = uvec2 { srcExtent.width, srcExtent.height };
         pushArgs.dstExtent = uvec2 { dstExtent.width, dstExtent.height };
+        pushArgs.coherenceSigma = std::max(pyramidCoherence(), 0.0f);
         ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
 
         ctx->bindResourceView(PSDT_DOWNSAMPLE_FIELD_INPUT, m_psdtField[writeIndex].views[level], nullptr);
@@ -837,9 +881,13 @@ namespace dxvk {
 
       // Everything that is not a float lives in the flags word: PsdtStateArgs
       // is exactly at the 128-byte push constant limit, so an enum that costs
-      // a whole dword costs a parameter somewhere else.
+      // a whole dword costs a parameter somewhere else. The layout is written
+      // out in psdt.h and there is one bit left in it.
       const uint32_t nearFieldFixed = static_cast<uint32_t>(
         std::clamp(glareNearField(), 0.0f, 1.0f) * 255.0f + 0.5f);
+      const uint32_t coherenceFixed = static_cast<uint32_t>(
+        std::clamp(scaleCoherence(), 0.0f, PSDT_COHERENCE_MAX)
+        * (255.0f / PSDT_COHERENCE_MAX) + 0.5f);
       pushArgs.flags =
           (m_psdtHasHistory ? PSDT_STATE_FLAG_HAS_HISTORY : 0u)
         | (sceneAdaptive() ? PSDT_STATE_FLAG_SCENE_ADAPTIVE : 0u)
@@ -849,7 +897,8 @@ namespace dxvk {
         | (static_cast<uint32_t>(perceptualSpace()) << PSDT_STATE_SHIFT_SPACE)
         | ((static_cast<uint32_t>(debugView()) & 0xFu) << PSDT_STATE_SHIFT_DEBUG)
         | ((m_psdtLevelCount & 0xFu) << PSDT_STATE_SHIFT_LEVELS)
-        | ((nearFieldFixed & 0xFFu) << PSDT_STATE_SHIFT_NEARFIELD);
+        | ((nearFieldFixed & 0xFFu) << PSDT_STATE_SHIFT_NEARFIELD)
+        | ((coherenceFixed & 0xFFu) << PSDT_STATE_SHIFT_COHERENCE);
 
       pushArgs.displayPeakNits = displayPeakNits();
       pushArgs.displayBlackNits = displayBlackNits();

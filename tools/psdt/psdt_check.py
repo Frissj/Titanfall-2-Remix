@@ -72,6 +72,66 @@ def check_state_slots(psdt_h):
     return {n[0] for n in slots.values()}
 
 
+def check_state_flag_packing(psdt_h, cpp):
+    """
+    The flags word must not have two fields on the same bit.
+
+    PsdtStateArgs is exactly at the 128-byte push constant limit, so every
+    boolean, enum and small scalar is bit-packed into one uint. That is a
+    perfectly reasonable thing to do and a completely silent thing to get
+    wrong: two overlapping fields produce a transform that is wrong in a way
+    that looks like a tuning problem, on a machine where the shader cannot be
+    compiled to notice. v0.3 repacked the whole word to fit an 8-bit scale
+    coherence in, which is exactly the kind of edit this exists for.
+
+    Field widths are read from the trailing "// N bits" comment, so the comment
+    is load-bearing rather than decorative.
+    """
+    fields = {}
+    for name, bit in re.findall(r'#define\s+PSDT_STATE_FLAG_(\w+)\s+\(1u\s*<<\s*(\d+)\)', psdt_h):
+        fields[f'FLAG_{name}'] = (int(bit), 1)
+    for name, shift, width in re.findall(
+            r'#define\s+PSDT_STATE_SHIFT_(\w+)\s+(\d+)\s*//\s*(\d+)\s+bit', psdt_h):
+        fields[f'SHIFT_{name}'] = (int(shift), int(width))
+
+    check('every packed flags field declares a width', len(fields) >= 9,
+          f'{len(fields)} found')
+
+    owner = {}
+    clashes = []
+    for name, (shift, width) in sorted(fields.items()):
+        for bit in range(shift, shift + width):
+            if bit >= 32:
+                clashes.append(f'{name} runs past bit 31')
+            elif bit in owner:
+                clashes.append(f'bit {bit}: {owner[bit]} and {name}')
+            else:
+                owner[bit] = name
+    check('no two flags fields share a bit', not clashes, '; '.join(sorted(set(clashes))))
+
+    # And the masks the shader and the C++ apply have to match the declared
+    # widths, or a field is silently truncated or reads its neighbour's bits.
+    state = read(os.path.join(SHADER_DIR, 'psdt_state.comp.slang'))
+    bad = []
+    for name, (shift, width) in sorted(fields.items()):
+        if not name.startswith('SHIFT_'):
+            continue
+        want = (1 << width) - 1
+        macro = 'PSDT_STATE_' + name
+        for text, label in ((state, 'shader'), (cpp, 'C++')):
+            for mask in re.findall(r'>>\s*' + macro + r'\)\s*&\s*0x([0-9A-Fa-f]+)u', text):
+                if int(mask, 16) != want:
+                    bad.append(f'{label} masks {macro} with 0x{mask} not 0x{want:X}')
+            for mask in re.findall(r'&\s*0x([0-9A-Fa-f]+)u\)\s*<<\s*' + macro, text):
+                if int(mask, 16) != want:
+                    bad.append(f'{label} masks {macro} with 0x{mask} not 0x{want:X}')
+    check('packed field masks match their declared widths', not bad, '; '.join(bad))
+
+    free = [b for b in range(32) if b not in owner]
+    notes.append(f'flags word: {32 - len(free)} of 32 bits used, free: '
+                 + (', '.join(str(b) for b in free) if free else 'none'))
+
+
 def check_bindings(psdt_h):
     """Binding indices must be unique within each descriptor set."""
     groups = {
@@ -182,8 +242,14 @@ def check_shared_constants():
         ('kPsdtMaxDetailBoost', transform, 'MAX_DETAIL_BOOST'),
         ('kPsdtGlareTintFraction', transform, 'GLARE_TINT_FRACTION'),
         ('kPsdtDepthDeadzone', transform, 'DEPTH_DEADZONE'),
+        ('kPsdtScaleDeadzone', transform, 'SCALE_DEADZONE'),
         ('kSkyAdaptationWeight', analysis, 'SKY_ADAPTATION_WEIGHT'),
         ('kEmissiveThresholdDiscount', analysis, 'EMISSIVE_THRESHOLD_DISCOUNT'),
+        ('kConfidenceFloorRatio', analysis, 'CONFIDENCE_FLOOR_RATIO'),
+        ('kSpikeFloorRatio', analysis, 'SPIKE_FLOOR_RATIO'),
+        ('kConfidenceDeadzone', analysis, 'CONFIDENCE_DEADZONE'),
+        ('kConfidenceEnergyFloor', analysis, 'CONFIDENCE_ENERGY_FLOOR'),
+        ('kMinConfidenceWeight', analysis, 'MIN_CONFIDENCE_WEIGHT'),
     ]
     bad = []
     for shader_name, text, ref_name in pairs:
@@ -433,6 +499,58 @@ def check_bindings_declared():
               + (f'shader only: {", ".join(only_shader)}' if only_shader else ''))
 
 
+def check_single_local_owner():
+    """
+    Exactly one pass may perform local dynamic range compression.
+
+    This is the whole of v0.3 and it is enforced in one line of C++ that
+    nothing else references, in a different file from the option that drives
+    it. Deleting that line would not fail a build, would not fail the suite,
+    and would silently restore the two-pyramid arrangement - the image would
+    just quietly flatten again. So it is asserted here.
+    """
+    plus_h = read(os.path.join(ROOT, 'src/dxvk/rtx_render/rtx_auto_exposure_plus.h'))
+    plus_cpp = read(os.path.join(ROOT, 'src/dxvk/rtx_render/rtx_auto_exposure_plus.cpp'))
+    hdr = read(HDR)
+    cpp = read(CPP)
+
+    check('the tonemapper exposes psdtOwnsLocalAdaptation()',
+          'static bool psdtOwnsLocalAdaptation();' in hdr
+          and re.search(r'bool\s+DxvkToneMapping::psdtOwnsLocalAdaptation\s*\(', cpp) is not None)
+
+    # It has to be consulted from isEnabled(), not from the dispatch call site:
+    # RtxPass only releases the pass's resources on an isEnabled() transition,
+    # so checking it later skips the work and keeps the pyramid allocated.
+    body = re.search(r'bool\s+DxvkAutoExposurePlus::isEnabled\s*\(\s*\)\s*const\s*\{(.*?)\n  \}',
+                     plus_cpp, re.S)
+    # Comments stripped: this function is mostly comment, and the prose in it
+    # names the very identifiers the tests below look for.
+    code = re.sub(r'//[^\n]*', '', body.group(1)) if body else ''
+    consults = body is not None and 'psdtOwnsLocalAdaptation' in code
+    check('Auto Exposure Plus deactivates when PSDT owns local adaptation', consults,
+          '' if consults else 'isEnabled() does not consult it')
+
+    # And the option that drives it has to still exist, with PSDT as default.
+    m = re.search(r'RTX_OPTION\("rtx\.tonemap\.psdt",\s*LocalAdaptationOwner,\s*'
+                  r'localAdaptationOwner,\s*LocalAdaptationOwner::(\w+)', hdr)
+    check('localAdaptationOwner defaults to PSDT', m is not None and m.group(1) == 'Psdt',
+          m.group(1) if m else 'option missing')
+
+    # Plus itself must be otherwise untouched for the other operators: its
+    # enablement may depend on the auto exposure mode and on this, and nothing
+    # else. A test on the operator here would make it stop composing.
+    conditions = re.findall(r'(\w+)\s*\(\)', code)
+    allowed = {'mode', 'psdtOwnsLocalAdaptation'}
+    extra = sorted(set(conditions) - allowed)
+    check('Auto Exposure Plus still composes with every other operator',
+          not extra, ('isEnabled() also tests: ' + ', '.join(extra)) if extra else '')
+
+    # The Plus header should say so too, because someone reading it to find out
+    # why the pass is not running will read that before they read this.
+    check('the interaction is documented where it would be looked for',
+          'PSDT' in plus_h and 'isEnabled()' in plus_h)
+
+
 def check_options_documented():
     """Every rtx.tonemap.psdt option must be reachable from the UI, or it is a
     setting that exists only for someone who has read the header."""
@@ -453,6 +571,7 @@ if __name__ == '__main__':
     print(' state layout')
     slot_names = check_state_slots(psdt_h)
     check_state_names_used(psdt_h, slot_names)
+    check_state_flag_packing(psdt_h, cpp)
     print(' bindings')
     check_bindings(psdt_h)
     check_bindings_declared()
@@ -464,6 +583,7 @@ if __name__ == '__main__':
     print(' operators and options')
     check_gt7_port()
     check_operators()
+    check_single_local_owner()
     check_options_documented()
     print(' syntax smoke test')
     check_braces()

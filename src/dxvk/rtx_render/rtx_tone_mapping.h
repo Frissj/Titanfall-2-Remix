@@ -62,6 +62,19 @@ namespace dxvk {
     // must stay reachable even while the mode is set to Local.
     static void showOperatorImguiSetting();
 
+    // NV-DXVK [PSDT v0.3]: true when PSDT is the selected operator and is the
+    // configured owner of local dynamic range compression.
+    //
+    // Read by DxvkAutoExposurePlus::isEnabled(), which is why it is static and
+    // public: the answer is a pure function of two rtx options, so it needs no
+    // object and creates no dependency on the tonemapper's state. Deciding it
+    // through isEnabled() rather than at the dispatch call site is what makes
+    // the suppression complete - RtxPass turns isEnabled() into isActive() once
+    // per frame and releases the pass's resources on the transition, so Plus
+    // gives back its pyramid rather than merely skipping work with it
+    // allocated.
+    static bool psdtOwnsLocalAdaptation();
+
   private:
     void createResources(Rc<RtxContext> ctx);
 
@@ -177,6 +190,37 @@ namespace dxvk {
       Jzazbz,
     };
 
+    // NV-DXVK [PSDT v0.3]: which pass performs local dynamic range compression.
+    //
+    // Exactly one of them should, and until v0.3 two of them did. Auto Exposure
+    // Plus builds a pyramid, accumulates it temporally and multiplies the HDR
+    // buffer by a spatially varying gain; PSDT builds a pyramid, accumulates it
+    // temporally and moves the curve's anchor per neighbourhood. Running both
+    // compresses the same signal twice, and v0.2's answer - scale PSDT down by
+    // 1 - |plus.intensity| - divided the job between two implementations of it
+    // rather than choosing one.
+    //
+    // The default is Psdt, which suppresses the Plus pass entirely rather than
+    // weakening it: DxvkAutoExposurePlus::isEnabled() consults
+    // psdtOwnsLocalAdaptation(), so the pass deactivates, releases its
+    // resources, and its dispatches stop being submitted. Plus is untouched for
+    // every other operator, which is the only reason it can be suppressed here
+    // without being deleted there.
+    enum class LocalAdaptationOwner : uint32_t {
+      // PSDT owns it. The Plus pass does not run while this operator is
+      // selected, and PSDT spends the whole local adaptation budget.
+      Psdt = 0,
+      // Plus owns it. PSDT's local strength and contrast budget go to zero, so
+      // its curve is anchored globally and the spatial part of the job is done
+      // upstream in linear radiance. Useful as a control: it isolates what
+      // PSDT's own local adaptation is contributing.
+      AutoExposurePlus,
+      // Both, with the budget split by 1 - |plus.intensity|. This is exactly
+      // v0.2's behaviour, kept so the change is measurable rather than merely
+      // asserted.
+      Both,
+    };
+
     // NV-DXVK [PSDT]: in-image diagnostics. Every entry shows a value the
     // transform actually read or produced on that pixel on its way past,
     // rather than recomputing its own version of it - a debug view that
@@ -189,7 +233,10 @@ namespace dxvk {
       Roles,          // BODY green, SOURCE red, SKY blue.
       SourceEnergy,   // The glare kernel's input, per channel.
       Illuminant,     // Measured local illuminant.
-      Depth,          // Body depth, and how much the coarse pooling trusted it.
+      Depth,          // Body depth in red; in green, how much of the coarse
+                      // scales survived the depth AND luminance agreement
+                      // tests. A dark frame here is one pooling on the
+                      // finest scale alone.
       Demand,         // Colour volume demand. Green in gamut, red out of it.
       Pressure,       // Chroma actually given up.
       Glare,          // Glare contribution alone.
@@ -311,9 +358,25 @@ namespace dxvk {
                "How strongly the adaptation pooling refuses to average across a depth discontinuity. 0 disables it and restores a plain box pyramid.\n"
                "Depth is carried through the pyramid as log2(1+z), so this is measured in octaves of distance and one value works from a corridor to a skybox: two walls at 5 and 10 units are 0.9 apart and still pool together, while the same wall and a 200000-unit backdrop are 15 apart and do not. It only ever reduces the coarse scales' weight, so the worst case is that pooling collapses to the finest scale, which is a real adaptation neighbourhood in its own right.\n"
                "This is what stops a bright window from re-exposing the wall beside it.");
-    RTX_OPTION("rtx.tonemap.psdt", bool, coordinateWithAutoExposurePlus, true,
-               "Scales down local adaptation while Auto Exposure Plus is active, in proportion to that pass's own local correction strength.\n"
-               "Plus applies a spatially varying gain before the tonemapper and PSDT applies local adaptation after it. Both are local dynamic range compression; run at full strength in series they compress the same signal twice, which is the exact failure this architecture exists to avoid and which v0.1 did nothing about. Disable only to deliberately stack the two.");
+    RTX_OPTION("rtx.tonemap.psdt", LocalAdaptationOwner, localAdaptationOwner, LocalAdaptationOwner::Psdt,
+               "Which pass performs local dynamic range compression. 0 = PSDT, 1 = Auto Exposure Plus, 2 = both.\n"
+               "Exactly one of them should, and until v0.3 two of them did. Plus builds a pyramid over the HDR buffer, accumulates it temporally with reprojection and multiplies by a spatially varying gain; PSDT builds a pyramid over the same buffer, accumulates it temporally with reprojection and moves the curve's anchor per neighbourhood. Two implementations of one job, coordinated by a scalar - which is not a coordination.\n"
+               "At the default PSDT owns it and the Plus pass does not run at all while this operator is selected: it deactivates, releases its pyramid, and stops submitting its dispatches (16 of them at 1080p, one a full-resolution read-modify-write of the HDR buffer). Plus is completely unaffected for every other operator, which is what makes suppressing it here reasonable. What Plus knew and PSDT did not - the edge-stopping pyramid collapse and the edge-aware downsample - moved into scaleCoherence and pyramidCoherence below, so nothing it was contributing is lost.\n"
+               "1 is the control that isolates PSDT's own local adaptation by handing the spatial half of the job back to Plus. 2 reproduces v0.2's stacking exactly, so the change is measurable rather than merely asserted.");
+    RTX_OPTION("rtx.tonemap.psdt", float, scaleCoherence, 1.20f,
+               "How strongly the adaptation pooling refuses to average across a luminance boundary between scales. 0 disables it and restores fixed pooling weights.\n"
+               "Depth already stops the pooling from averaging a wall together with the sky behind it. This stops it averaging a wall together with the shadow across the middle of it - one surface, one distance, two lighting conditions, which depth cannot see and which is where local adaptation matters most. Measured past a one-stop dead zone, so ordinary shading costs nothing, with a squared falloff after it.\n"
+               "This is Auto Exposure Plus's edge-stopping pyramid collapse, moved here. It only ever reduces a coarse scale's weight, so the worst case is that pooling falls back to the finest scale.\n"
+               "Transported as 8 bits of [0, 4]; the push constant block is exactly full.");
+    RTX_OPTION("rtx.tonemap.psdt", float, pyramidCoherence, 1.00f,
+               "Width, in stops, of the robust reweight in the pyramid's body reduction. 0 restores a plain weight-normalised mean.\n"
+               "The other half of what came across from Auto Exposure Plus. Four children that are two dark walls and two sunlit ones average to a value describing neither, and every coarser level is then built out of values describing a scene that is not there. One Welsch step about the weighted mean makes a level report the population most of it belongs to instead; the bright minority is left to the finer level it came from, which still exists and is still pooled.\n"
+               "Lower is more selective. Below about a stop it starts rejecting ordinary shading, at which point the coarse levels stop describing anything wider than the fine ones do.");
+    RTX_OPTION("rtx.tonemap.psdt", float, sourceConfidence, 1.50f,
+               "Octaves by which this frame's source energy may disagree with the reprojected history before the block is only half believed. 0 disables the test.\n"
+               "The only place in the transform that knows its input is path traced. A firefly the denoiser missed, a speculative fireball and a specular hit on something that moved are all a hundredfold luminance spike in a few pixels for one frame, and none of them is distinguishable from a muzzle flash in a framebuffer - but they are distinguishable from where the same block was a frame ago. Disagreement widens the history window the block has to escape, so a source that persists is believed and one that appeared out of nothing is admitted at a fraction of its energy until it repeats itself.\n"
+               "Only the appearing direction is slowed. A light going out is instant, because that is what a light going out is.\n"
+               "Lower is stricter. It is observable through debug view 4, which is the glare kernel's actual input rather than a re-derivation of it.");
     RTX_OPTION("rtx.tonemap.psdt", float, glareClassThreshold, 8.0f,
                "Stops above middle grey at which a pixel is too bright to be represented as a value at all, and its energy is handed to the glare model as spatial extent instead.");
     RTX_OPTION("rtx.tonemap.psdt", float, localAdaptation, 0.65f,
@@ -403,7 +466,7 @@ namespace dxvk {
     RTX_OPTION("rtx.tonemap.psdt", PsdtDebugView, debugView, PsdtDebugView::Off,
                "Replaces the image with one of the transform's own intermediate values. 0 = Off, 1 = Adaptation, 2 = Budget, 3 = Roles, 4 = Source energy, 5 = Illuminant, 6 = Depth, 7 = Gamut demand, 8 = Pressure, 9 = Glare, 10 = Clipping, 11 = Curve slope.\n"
                "Every view shows a value the transform actually read or produced on that pixel on its way past, rather than recomputing its own version of it. A debug view that re-derives the quantity agrees with the shader right up until the moment something is wrong, which is the only moment it was needed.\n"
-               "Roles is the one to look at first: it is the classification the whole architecture rests on, in green (surface), red (source) and blue (sky). Clipping is the second, because it shows what the final gamut fit had to hide.");
+               "Roles is the one to look at first: it is the classification the whole architecture rests on, in green (surface), red (source) and blue (sky). Depth is the second: its green channel is how much of the coarse adaptation scales survived the depth and luminance agreement tests, so a frame that is dark there is one pooling on the finest scale alone - which is the way the v0.3 pooling terms fail. Clipping is the third, because it shows what the final gamut fit had to hide.");
 
     // Dithering settings
     RTX_OPTION("rtx.tonemap", DitherMode, ditherMode, DitherMode::SpatialTemporal,

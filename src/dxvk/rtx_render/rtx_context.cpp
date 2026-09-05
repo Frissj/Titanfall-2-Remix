@@ -8482,6 +8482,10 @@ namespace dxvk {
 
     DxvkAutoExposurePlus& autoExposurePlus = m_common->metaAutoExposurePlus();
     if (!autoExposurePlus.isActive()) {
+      // Inactive covers two cases and they are worth telling apart when reading a capture: the
+      // auto exposure mode is not Plus, or PSDT is the selected operator and owns local
+      // adaptation, in which case this pass has deactivated itself and released its pyramid
+      // rather than building a second one beside PSDT's. See DxvkAutoExposurePlus::isEnabled().
       return;
     }
 

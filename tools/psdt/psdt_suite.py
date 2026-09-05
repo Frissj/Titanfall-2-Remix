@@ -706,6 +706,196 @@ def section_glare():
         print(f'    {label}  glare luminance {P.luminance(g.colour):.5f}')
 
 
+def section_coherence():
+    rule('COHERENCE  what moved across when Auto Exposure Plus stopped running')
+
+    print('  v0.3 stops running Plus while PSDT owns local adaptation, on the grounds that')
+    print('  two multi-scale reprojected pyramids over one buffer is one too many. That is')
+    print('  only defensible if what Plus was contributing came with it, so this measures')
+    print('  the two things it did that PSDT\'s pooling did not.')
+
+    # --- the pyramid reduction ---------------------------------------------
+    print()
+    print('  1. Edge-aware downsample. A coarse texel whose four children straddle a')
+    print('     boundary. The plain weighted mean lands between two populations and')
+    print('     describes neither; the robust reduction reports the one most of them are')
+    print('     in. "wanted" is that population, or the mean where there is no majority.')
+    print()
+    print(f'    {"case":<26s} {"children (stops)":>22s} {"wanted":>7s} {"plain":>7s}'
+          f' {"robust":>7s} {"err was":>8s} {"is":>6s}')
+
+    cases = [
+        ('shadow across a wall', [0.0, 0.0, 0.0, 3.0], 0.0),
+        ('window in a wall', [0.0, 0.0, 0.0, 6.0], 0.0),
+        ('lamp against a wall', [0.0, 0.0, 0.0, 9.0], 0.0),
+        ('wall beside a window', [0.0, 0.0, 6.0, 6.0], None),
+        ('ordinary shading', [0.0, 0.2, -0.3, 0.4], None),
+        ('a real gradient', [0.0, 1.0, 2.0, 3.0], None),
+    ]
+    sigma = P.DEFAULTS['pyramidCoherence']
+    shading_shift = 0.0
+    for label, stops, wanted in cases:
+        children = [(s, 1.0) for s in stops]
+        plain = P.reduce_body(children, 0.0)
+        robust = P.reduce_body(children, sigma)
+        target = plain if wanted is None else wanted
+        print(f'    {label:<26s} {str(stops):>22s} {target:>7.2f} {plain:>7.3f}'
+              f' {robust:>7.3f} {abs(plain - target):>8.3f} {abs(robust - target):>6.3f}')
+        if label == 'ordinary shading':
+            shading_shift = abs(robust - plain)
+
+    print()
+    print('    The last three rows are the controls, and two of them are limitations')
+    print('    rather than successes. Ordinary shading must not move, and moves by')
+    print(f'    {shading_shift:.4f} stops. A monotone gradient has no majority to find, so the')
+    print('    robust answer is the plain one - correct, rather than a failure to fire.')
+    print('    An even split has no majority either, and a one-step reweight cannot')
+    print('    invent one: both halves sit the same distance from the mean and are')
+    print('    weighted identically, so that texel still reports a value neither half is')
+    print('    at. What saves it is that the finer level it was reduced from still holds')
+    print('    both, is still pooled, and is where a feature that small belongs.')
+
+    # --- the cross-scale edge stop -----------------------------------------
+    print()
+    print('  2. Edge-stopping collapse. How much of a coarse neighbourhood at a given')
+    print('     luminance offset reaches the pooled adaptation, with the depth term off so')
+    print('     that only the luminance test can act.')
+    print()
+    print()
+    print('     Reported on the pooled value, before the contrast budget. The budget is a')
+    print('     clamp, so past a couple of stops it hides most of what the pooling did and')
+    print('     a table of the clamped value measures the clamp. Both are shown.')
+    print()
+    print(f'    {"coarse offset":>14s} {"pooled v0.2":>12s} {"pooled v0.3":>12s} {"rejected":>9s}'
+          f' {"adapted v0.2":>13s} {"adapted v0.3":>13s}')
+
+    fixed = P.State(opts=dict(depthSensitivity=0.0, scaleCoherence=0.0))
+    coherent = P.State(opts=dict(depthSensitivity=0.0))
+    base = (fixed.anchor, 1.0, fixed.anchor, 0.0)
+    for offset in (0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 9.0):
+        far = (fixed.anchor + offset, 1.0, fixed.anchor + offset, 0.0)
+        levels = {'S': base, 'M': far, 'L': far}
+        a_was = P.sample_adaptation(fixed, levels)
+        a_now = P.sample_adaptation(coherent, levels)
+        was = a_was.pooledLog - fixed.anchor
+        now = a_now.pooledLog - coherent.anchor
+        rejected = 1.0 - (abs(now) / abs(was) if abs(was) > 1e-9 else 0.0)
+        print(f'    {offset:>13.2f}c {was:>12.4f} {now:>12.4f} {rejected * 100:>8.1f}%'
+              f' {a_was.adaptedLog - fixed.anchor:>13.4f}'
+              f' {a_now.adaptedLog - coherent.anchor:>13.4f}')
+
+    print()
+    print('    A stop is free by construction - the dead zone is what stops this from')
+    print('    disabling the coarse scales over the frame\'s own shading - and past it the')
+    print('    falloff is squared, so a lighting edge is gone and a gradient is not.')
+    print('    The adapted columns cross over around two stops: below it the budget was')
+    print('    not binding and v0.3 is lower, above it v0.2 was being clamped anyway and')
+    print('    the two converge. That is the budget and the pooling doing the same job at')
+    print('    different ends of the range, which is why the pooled columns are the ones')
+    print('    that describe this term.')
+
+    # --- ownership ----------------------------------------------------------
+    print()
+    print('  3. Who owns local dynamic range compression. The v0.2 default ran both and')
+    print('     split the budget by 1 - |plus.intensity|, which left PSDT at 0.65 of its')
+    print('     local strength while Plus did the rest in linear radiance - two')
+    print('     implementations, two pyramids, two temporal filters, one job.')
+    print()
+    plus_intensity = 0.35
+    print(f'    {"owner":<22s} {"PSDT local":>11s} {"budget":>8s} {"Plus dispatches":>16s}'
+          f' {"Plus memory":>12s}')
+    for label, scale, plus_on in (
+            ('PSDT (default)', 1.0, False),
+            ('Auto Exposure Plus', 0.0, True),
+            ('Both (v0.2)', 1.0 - plus_intensity, True)):
+        st = P.State(opts=dict(localAdaptation=P.DEFAULTS['localAdaptation'] * scale,
+                               contrastBudget=P.DEFAULTS['contrastBudget'] * scale))
+        # 1080p: init, 2 x 6 separable downsamples, fuse, temporal, apply.
+        print(f'    {label:<22s} {st.adaptStrength:>11.3f} {st.budgetShadow:>8.2f}'
+              f' {(16 if plus_on else 0):>16d} {("~14 MiB" if plus_on else "released"):>12s}')
+
+    print()
+    print('    Dispatch and memory figures are for 1920x1080 and are counted from')
+    print('    DxvkAutoExposurePlus::dispatch and its four resources, not measured on a')
+    print('    GPU - like everything else here, they describe the code rather than a run.')
+
+
+def section_confidence():
+    rule('CONFIDENCE  telling a firefly from a muzzle flash')
+
+    print('  A path traced frame can put a hundredfold luminance spike in one block for one')
+    print('  frame. Nothing in a framebuffer separates that from a real flash; where it was')
+    print('  a frame ago does. Disagreement widens the history window the block has to')
+    print('  escape, so appearing costs something and persisting does not.')
+    print()
+
+    dt = 1.0 / 60.0
+
+    def run(profile, knee):
+        filt = P.SourceFilter(knee=knee, value=0.0)
+        filt.hasHistory = True
+        out = []
+        for measured in profile:
+            out.append(filt.step(measured, dt))
+        return out
+
+    knee = P.DEFAULTS['sourceConfidence']
+    frames = 180
+    spike = [0.0] + [400.0] + [0.0] * (frames - 2)
+    persistent = [0.0] + [400.0] * (frames - 1)
+
+    print('  What a one-frame spike is worth. Glare responds to log2(1 + energy) rather')
+    print('  than to energy, so the halo column is the one that says what is visible.')
+    print()
+    print(f'    {"":<22s} {"peak energy":>12s} {"halo (log2)":>12s} {"of v0.2":>9s}')
+    for label, k in (('v0.2 (no test)', 0.0), ('v0.3', knee)):
+        peak = max(run(spike, k))
+        halo = math.log2(1.0 + peak)
+        base = math.log2(1.0 + max(run(spike, 0.0)))
+        print(f'    {label:<22s} {peak:>12.1f} {halo:>12.2f} {halo / base * 100:>8.1f}%')
+
+    print()
+    print('  What it costs a real source. The same block, with the source still there.')
+    print()
+
+    def reach(trace, fraction, target=400.0):
+        for i, v in enumerate(trace):
+            if v >= target * fraction:
+                return i * dt
+        return float('nan')
+
+    print(f'    {"":<22s} {"50%":>8s} {"90%":>8s} {"99%":>8s}   {"halo at 0.1 s":>14s}')
+    for label, k in (('v0.2 (no test)', 0.0), ('v0.3', knee)):
+        trace = run(persistent, k)
+        at_100ms = trace[min(int(0.1 / dt), len(trace) - 1)]
+        print(f'    {label:<22s} {reach(trace, 0.5):>8.3f} {reach(trace, 0.9):>8.3f}'
+              f' {reach(trace, 0.99):>8.3f} s {math.log2(1.0 + at_100ms):>14.2f}')
+
+    print()
+    print('  And the check that only one direction was slowed. A source that has been')
+    print('  established for half a second, switched off: time to fall below 1% of it.')
+    print()
+    settled = [400.0] * 60
+    print(f'    {"":<22s} {"release":>9s}')
+    for label, k in (('v0.2 (no test)', 0.0), ('v0.3', knee)):
+        filt = P.SourceFilter(knee=k, value=0.0)
+        filt.hasHistory = True
+        for v in settled:
+            filt.step(v, dt)
+        established = filt.value
+        released = float('nan')
+        for i in range(120):
+            if filt.step(0.0, dt) < established * 0.01:
+                released = (i + 1) * dt
+                break
+        print(f'    {label:<22s} {released:>8.3f}s')
+
+    print()
+    print('    The release is unchanged, and has to be: the clamp\'s upper bound is what')
+    print('    handles a falling measurement and nothing here touches it. A light going')
+    print('    out is not a thing to be sceptical about.')
+
+
 def section_temporal():
     rule('TEMPORAL  step response of two filters in series')
 
@@ -1009,7 +1199,7 @@ def section_compare():
 
 
 def section_invariants():
-    rule('INVARIANTS  the eight properties the transform is supposed to hold')
+    rule('INVARIANTS  the nine properties the transform is supposed to hold')
 
     st = P.State()
     fails = []
@@ -1127,13 +1317,25 @@ def section_invariants():
     # 8. Spatial stability, which the depth-aware pooling is for: a bright
     #    object must not change the exposure of the surface next to it when the
     #    two are at different depths.
-    near_surface = (st.anchor, 1.0, st.anchor, math.log2(1.0 + 5.0))
-    sky_behind = (st.anchor + 6.0, 1.0, st.anchor + 6.0, math.log2(1.0 + 200000.0))
-    same_depth = (st.anchor + 6.0, 1.0, st.anchor + 6.0, math.log2(1.0 + 5.0))
+    #
+    #    Measured with scale coherence off, so that what is being tested is the
+    #    depth term. With both on, both reject the coarse scale and the control
+    #    case - a bright neighbour at the *same* depth, which depth alone must
+    #    not reject - collapses to zero as well, at which point the test passes
+    #    without demonstrating anything. Two mechanisms that overlap have to be
+    #    measured one at a time or neither is measured.
+    depth_only = P.State(opts=dict(scaleCoherence=0.0))
+    near_surface = (depth_only.anchor, 1.0, depth_only.anchor, math.log2(1.0 + 5.0))
+    sky_behind = (depth_only.anchor + 6.0, 1.0, depth_only.anchor + 6.0,
+                  math.log2(1.0 + 200000.0))
+    same_depth = (depth_only.anchor + 6.0, 1.0, depth_only.anchor + 6.0, math.log2(1.0 + 5.0))
 
-    a_iso = P.sample_adaptation(st, {'S': near_surface, 'M': near_surface, 'L': near_surface})
-    a_sky = P.sample_adaptation(st, {'S': near_surface, 'M': sky_behind, 'L': sky_behind})
-    a_same = P.sample_adaptation(st, {'S': near_surface, 'M': same_depth, 'L': same_depth})
+    a_iso = P.sample_adaptation(depth_only,
+                                {'S': near_surface, 'M': near_surface, 'L': near_surface})
+    a_sky = P.sample_adaptation(depth_only,
+                                {'S': near_surface, 'M': sky_behind, 'L': sky_behind})
+    a_same = P.sample_adaptation(depth_only,
+                                 {'S': near_surface, 'M': same_depth, 'L': same_depth})
     pull_sky = abs(a_sky.adaptedLog - a_iso.adaptedLog)
     pull_same = abs(a_same.adaptedLog - a_iso.adaptedLog)
     ok = pull_sky < 0.02 and pull_same > 4.0 * pull_sky
@@ -1141,6 +1343,35 @@ def section_invariants():
     print(f'  8. a wall is not re-exposed by the sky      {pull_sky:.4f} stops across a depth edge, '
           f'{pull_same:.4f} stops without one   {"PASS" if ok else "FAIL"}')
     print('     behind it')
+
+    # 9. The other half of the same argument, and the one Auto Exposure Plus
+    #    was carrying: a wall with a shadow across it is one surface at one
+    #    distance under two lighting conditions. Depth cannot see that, so this
+    #    is measured with the depth term off.
+    #
+    #    Two cases, and the second is the one that matters. Rejecting a distant
+    #    bright neighbourhood is easy; doing it without also rejecting the
+    #    frame's ordinary shading is what separates an edge-stopping term from
+    #    one that has quietly turned the coarse scales off. Half a stop sits
+    #    inside the dead zone and must still pool.
+    lum_only = P.State(opts=dict(depthSensitivity=0.0))
+    flat = (lum_only.anchor, 1.0, lum_only.anchor, 0.0)
+    lit_side = (lum_only.anchor + 6.0, 1.0, lum_only.anchor + 6.0, 0.0)
+    shading = (lum_only.anchor + 0.5, 1.0, lum_only.anchor + 0.5, 0.0)
+
+    b_iso = P.sample_adaptation(lum_only, {'S': flat, 'M': flat, 'L': flat})
+    b_lit = P.sample_adaptation(lum_only, {'S': flat, 'M': lit_side, 'L': lit_side})
+    b_shade = P.sample_adaptation(lum_only, {'S': flat, 'M': shading, 'L': shading})
+    pull_lit = abs(b_lit.adaptedLog - b_iso.adaptedLog)
+    pull_shade = abs(b_shade.adaptedLog - b_iso.adaptedLog)
+    # The second half is a lower bound on how much of a half-stop neighbour
+    # still gets through: 0.5 stops x the coarse weights x the adaptation
+    # strength, less a little for quantisation of the coherence knob.
+    ok = pull_lit < 0.02 and pull_shade > 0.15
+    fails += [] if ok else ['scale-coherent pooling']
+    print(f'  9. a lit wall does not re-expose the        {pull_lit:.4f} stops across a 6-stop '
+          f'lighting edge, {pull_shade:.4f} across ordinary   {"PASS" if ok else "FAIL"}')
+    print('     shadow across the same wall                shading')
 
     print()
     if fails:
@@ -1155,7 +1386,9 @@ SECTIONS = {
     'gt7space': section_gt7space,
     'illuminant': section_illuminant, 'gamut': section_gamut,
     'response': section_response, 'colour': section_colour, 'hue': section_hue,
-    'contrast': section_contrast, 'glare': section_glare, 'temporal': section_temporal,
+    'contrast': section_contrast, 'glare': section_glare,
+    'coherence': section_coherence, 'confidence': section_confidence,
+    'temporal': section_temporal,
     'compare': section_compare, 'invariants': section_invariants,
 }
 

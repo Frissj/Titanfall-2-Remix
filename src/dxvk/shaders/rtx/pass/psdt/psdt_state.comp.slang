@@ -392,6 +392,8 @@ void main(uint i : SV_GroupIndex)
   const uint space = (cb.flags >> PSDT_STATE_SHIFT_SPACE) & 0x1u;
   const uint debugView = (cb.flags >> PSDT_STATE_SHIFT_DEBUG) & 0xFu;
   const float nearField = float((cb.flags >> PSDT_STATE_SHIFT_NEARFIELD) & 0xFFu) / 255.0;
+  const float scaleCoherence = float((cb.flags >> PSDT_STATE_SHIFT_COHERENCE) & 0xFFu)
+                             * (PSDT_COHERENCE_MAX / 255.0);
 
   const float refWhite = max(cb.displayRefWhiteNits, 1.0);
   const float peakLog = log2(max(cb.displayPeakNits, refWhite) / refWhite);
@@ -488,6 +490,14 @@ void main(uint i : SV_GroupIndex)
   InOutState[PSDT_STATE_BUDGET_HIGHLIGHT] = budget * 0.25;
   InOutState[PSDT_STATE_BUDGET_EMITTER]   = budget * 0.05;
   InOutState[PSDT_STATE_DEPTH_SENSITIVITY] = max(cb.depthSensitivity, 0.0);
+
+  // Scale coherence. Held back in scenes the transform has already decided are
+  // low-range, for the same reason the adaptation strength is: with nothing to
+  // redistribute there is no boundary worth protecting, and rejecting the
+  // coarse scales over the frame's own gentle gradient would leave the pooling
+  // running on the finest scale alone - which is the noisiest of the three and
+  // the one that most wants company.
+  InOutState[PSDT_STATE_SCALE_COHERENCE] = scaleCoherence * lerp(1.0, rangeGate, adaptive);
 
   // --- local contrast ---------------------------------------------------
   InOutState[PSDT_STATE_DETAIL_STRENGTH] = saturate(cb.detailStrength);

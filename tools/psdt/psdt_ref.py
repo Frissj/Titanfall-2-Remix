@@ -336,14 +336,29 @@ class Curve:
 
 MIDDLE_GREY_LOG = math.log2(0.18)
 
-# kPsdtMaxDetailBoost, kPsdtGlareTintFraction, kPsdtDepthDeadzone
+# kPsdtMaxDetailBoost, kPsdtGlareTintFraction, kPsdtDepthDeadzone,
+# kPsdtScaleDeadzone
 MAX_DETAIL_BOOST = 1.0
 GLARE_TINT_FRACTION = 0.6
 DEPTH_DEADZONE = 1.0
+SCALE_DEADZONE = 1.0
 
 # kSkyAdaptationWeight, kEmissiveThresholdDiscount (psdt_analysis)
 SKY_ADAPTATION_WEIGHT = 0.15
 EMISSIVE_THRESHOLD_DISCOUNT = 2.5
+
+# The source field's temporal confidence, from psdt_analysis. See SourceFilter.
+CONFIDENCE_FLOOR_RATIO = 0.25
+SPIKE_FLOOR_RATIO = 0.02
+CONFIDENCE_DEADZONE = 1.0
+CONFIDENCE_ENERGY_FLOOR = 1e-3
+MIN_CONFIDENCE_WEIGHT = 0.15
+
+# PSDT_STATE_SHIFT_COHERENCE is 8 bits of [0, PSDT_COHERENCE_MAX]. The
+# quantisation is modelled rather than ignored, because a sweep that reports a
+# value the GPU cannot actually be set to is a sweep of the wrong function.
+COHERENCE_MAX = 4.0
+COHERENCE_STEPS = 255.0
 
 DEFAULTS = dict(
     displayPeakNits=100.0, displayRefWhiteNits=100.0, displayBlackNits=0.05,
@@ -354,7 +369,8 @@ DEFAULTS = dict(
     skyViewZ=100000.0, illuminantMinAlbedo=0.04,
     # adaptation
     sourceExclusion=0.75, localAdaptation=0.65, contrastBudget=1.0,
-    depthSensitivity=0.35,
+    depthSensitivity=0.35, scaleCoherence=1.20, pyramidCoherence=1.00,
+    sourceConfidence=1.50,
     adaptationSpeedUp=3.0, adaptationSpeedDown=1.2,
     # curve
     midtoneContrast=1.15, shadowDepth=0.55, highlightRolloff=0.45,
@@ -446,6 +462,15 @@ class State:
         # The shader zeroes this when the gbuffer is unavailable, because the
         # depth channel is then meaningless rather than merely coarse.
         self.depthSensitivity = max(o['depthSensitivity'], 0.0) if o['rendererSignals'] else 0.0
+
+        # Scale coherence, through the same 8-bit quantisation the flags word
+        # applies, and gated by the same range test the adaptation strength is.
+        # Unlike depth this needs no gbuffer: it is measured on the field's own
+        # luminance, which is why it still works on the fallback path.
+        coherence_q = round(clamp(o['scaleCoherence'], 0.0, COHERENCE_MAX)
+                            * (COHERENCE_STEPS / COHERENCE_MAX))
+        self.scaleCoherence = (coherence_q * (COHERENCE_MAX / COHERENCE_STEPS)
+                               * lerp(1.0, rangeGate, adaptive))
 
         self.detailStrength = saturate(o['detailStrength'])
         self.detailProtect = max(o['detailProtect'], 0.0)
@@ -540,6 +565,77 @@ class StateFilter:
         return self.anchor
 
 
+class SourceFilter:
+    """
+    The source field's temporal accumulation, from psdt_analysis.
+
+    Separate from FieldFilter because the two channels are filtered
+    differently and the difference is the point. The body channel is bounded by
+    a fixed +-3 stop window and left alone otherwise: it drives a slow, budgeted
+    anchor, and a muzzle flash really does light a room. The source channel
+    feeds the glare model, where believing one frame of noise costs a visible
+    flash of halo, so how far it is allowed to move is sized by how much it
+    disagrees with where it was.
+
+    Only appearing is slowed. The upper bound of the clamp is untouched, so a
+    light going out is released at once.
+    """
+
+    def __init__(self, speed=8.0, knee=None, value=0.0):
+        self.speed = speed
+        self.knee = DEFAULTS['sourceConfidence'] if knee is None else knee
+        self.value = value
+        self.hasHistory = False
+
+    def step(self, measured, dt, cut_flag=0.0):
+        per_frame = self.speed * dt
+        current_weight = min(1.0, max(0.05, 1.0 - 2.0 ** (-per_frame))) if self.hasHistory else 1.0
+        current_weight = lerp(current_weight, 1.0, saturate(cut_flag))
+        if not self.hasHistory or current_weight >= 1.0:
+            self.value = measured
+            self.hasHistory = True
+            return self.value
+
+        floor_ratio = CONFIDENCE_FLOOR_RATIO
+        source_weight = current_weight
+        if self.knee > 1e-3:
+            now = measured + CONFIDENCE_ENERGY_FLOOR
+            was = self.value + CONFIDENCE_ENERGY_FLOOR
+            octaves = abs(math.log2(now / was))
+            excess = max(octaves - CONFIDENCE_DEADZONE, 0.0) / self.knee
+            confidence = max(1.0 / (1.0 + excess * excess), saturate(cut_flag))
+            floor_ratio = lerp(SPIKE_FLOOR_RATIO, CONFIDENCE_FLOOR_RATIO, confidence)
+            source_weight = current_weight * lerp(MIN_CONFIDENCE_WEIGHT, 1.0, confidence)
+
+        history = clamp(self.value, measured * floor_ratio, measured * 4.0 + 1e-3)
+        self.value = lerp(history, measured, source_weight)
+        self.hasHistory = True
+        return self.value
+
+
+def reduce_body(children, sigma):
+    """
+    psdt_downsample's body reduction: a weight-normalised mean, then one
+    Welsch reweight about it.
+
+    `children` is four (logY, weight) pairs. Returns the reduced logY. The
+    depth channel uses the same reweight factors, so modelling luminance alone
+    is enough to characterise the filter.
+    """
+    weight_sum = sum(w for _, w in children)
+    if weight_sum <= 1e-4:
+        return sum(x for x, _ in children) / 4.0
+    mean = sum(x * w for x, w in children) / weight_sum
+    if sigma <= 1e-3:
+        return mean
+    inv = 1.0 / sigma
+    w2 = [w * math.exp(-((x - mean) * inv) ** 2) for x, w in children]
+    w2_sum = sum(w2)
+    if w2_sum <= 1e-4:
+        return mean
+    return sum(x * k for (x, _), k in zip(children, w2)) / w2_sum
+
+
 class FieldFilter:
     """
     The adaptation field's own temporal accumulation, from psdt_analysis. One
@@ -608,11 +704,18 @@ def sample_adaptation(st, field_levels=None, illum=None):
 
     w = [st.weightL, st.weightM, st.weightS]
     coarse_trust = 1.0
-    if st.depthSensitivity > 1e-3:
-        excess_m = max(abs(fM[3] - fS[3]) - DEPTH_DEADZONE, 0.0)
-        excess_l = max(abs(fL[3] - fS[3]) - DEPTH_DEADZONE, 0.0)
-        agree_m = math.exp(-st.depthSensitivity * excess_m * excess_m)
-        agree_l = math.exp(-st.depthSensitivity * excess_l * excess_l)
+    if st.depthSensitivity > 1e-3 or st.scaleCoherence > 1e-3:
+        agree_m = agree_l = 1.0
+        if st.depthSensitivity > 1e-3:
+            excess_m = max(abs(fM[3] - fS[3]) - DEPTH_DEADZONE, 0.0)
+            excess_l = max(abs(fL[3] - fS[3]) - DEPTH_DEADZONE, 0.0)
+            agree_m *= math.exp(-st.depthSensitivity * excess_m * excess_m)
+            agree_l *= math.exp(-st.depthSensitivity * excess_l * excess_l)
+        if st.scaleCoherence > 1e-3:
+            lum_m = max(abs(aM - aS) - SCALE_DEADZONE, 0.0)
+            lum_l = max(abs(aL - aS) - SCALE_DEADZONE, 0.0)
+            agree_m *= math.exp(-st.scaleCoherence * lum_m * lum_m)
+            agree_l *= math.exp(-st.scaleCoherence * lum_l * lum_l)
         w[0] *= agree_l
         w[1] *= agree_m
         coarse_trust = 0.5 * (agree_m + agree_l)

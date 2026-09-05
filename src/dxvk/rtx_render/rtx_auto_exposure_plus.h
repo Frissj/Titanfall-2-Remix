@@ -44,9 +44,21 @@ namespace dxvk {
   //
   // This is an exposure pass only. Linear HDR radiance in, linear HDR radiance out, multiplied
   // by a spatially varying gain. It performs no display transform of its own, so the tonemapper
-  // downstream - Remix's native curve, Hable, Psycho17, GT7 or PSDT - runs unchanged and simply
-  // receives a better exposed image. The one exception is the *local* tonemapper, which this
-  // pass overrides rather than stacks with; see forcesGlobalTonemapper() below for why.
+  // downstream - Remix's native curve, Hable, Psycho17 or GT7 - runs unchanged and simply
+  // receives a better exposed image.
+  //
+  // Two tonemappers are exceptions, both for the same reason: they are local dynamic range
+  // compressors themselves, and two of those in series flatten the image twice.
+  //
+  //   the local tonemapper  is overridden rather than stacked with. See forcesGlobalTonemapper().
+  //   PSDT                  suppresses this pass outright. See isEnabled().
+  //
+  // The second is the sharper case, because PSDT does not merely compress locally - it builds the
+  // same kind of multi-scale, temporally reprojected pyramid this pass does, over the same buffer.
+  // Keeping both meant maintaining two implementations of one idea and then splitting the budget
+  // between them. So while PSDT owns local adaptation this pass steps aside entirely, and the two
+  // things it did better - an edge-stopping pyramid collapse and an edge-aware downsample - live
+  // in PSDT's pooling and pyramid reduction instead.
   //
   // It runs before bloom rather than after. Bloom is a large radius smear of bright regions, so
   // measuring a bloomed image would inflate the key around every highlight and make the
@@ -190,7 +202,8 @@ namespace dxvk {
     RTX_OPTION("rtx.autoExposurePlus", bool, forceGlobalTonemapper, true,
                "Routes the display transform through the global tonemapper while this pass is active, overriding rtx.tonemappingMode without modifying it.\n"
                "The local tonemapper is itself a local dynamic range compressor, so running it after this pass compresses the image twice and washes it out. Disable only to deliberately stack the two.\n"
-               "While this is active the global tonemapper's native curve also gets an ACES finalize it would not otherwise have, so that the S-curve the local tonemapper applies by default is not lost in the swap. Selected operators (Hable, Psycho17, GT7, PerceptualTF2) supply their own and are left alone.");
+               "While this is active the global tonemapper's native curve also gets an ACES finalize it would not otherwise have, so that the S-curve the local tonemapper applies by default is not lost in the swap. Selected operators (Hable, Psycho17, GT7) supply their own and are left alone.\n"
+               "Has no effect while PSDT owns local adaptation, because this pass does not run at all then - see rtx.tonemap.psdt.localAdaptationOwner.");
 
     // Temporal accumulation
     RTX_OPTION("rtx.autoExposurePlus", bool, temporalAccumulation, true,
