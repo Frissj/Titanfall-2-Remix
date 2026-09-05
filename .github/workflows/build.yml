@@ -31,6 +31,14 @@ jobs:
       with:
         submodules: recursive
 
+    # NV-DXVK [EngineSymbols]: block re-introduced hardcoded game-module RVAs.
+    # A stale `client.dll + 0xRVA` looks exactly like the code around it, so it
+    # is not something diff review reliably catches -- the last one called a
+    # mid-function address and crashed every frame. Runs in under a second and
+    # before the build, so a violation fails fast.
+    - name: Check for hardcoded engine RVAs
+      run: python scripts-common/check_engine_rvas.py
+
     - name: Setup Meson
       run: pip install meson==1.1.0
 

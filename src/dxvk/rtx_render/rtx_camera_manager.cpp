@@ -668,41 +668,57 @@ namespace dxvk { namespace tf2 {
 
 #include "dxvk_device.h"
 #include "rtx_resources.h"
+#include "rtx_engine_symbols.h"
 
-// NV-DXVK [classify-eye-truth]: read the engine's stable eye position
-// (client.dll local-player + 0x3D6C). Used by the [CamMgr.classify]
-// diagnostic to compare each Main candidate's recovered camera position
-// against engine ground truth, so we can identify whether a draw is the
-// real player view vs. some other pass that's getting misclassified as
-// Main. Returns nullptr if accessor or local-player aren't yet resolvable.
+// NV-DXVK [classify-eye-truth]: the engine's ground-truth eye position, used
+// by the [CamMgr.classify] and [ZigCam] diagnostics to compare each Main
+// candidate's recovered camera position against what the engine actually
+// thinks the eye is.
+//
+// HISTORY -- why this no longer touches client.dll at all.
+//
+// This used to call a hardcoded `client.dll + 0x14EAE0` as a nullary
+// `void*(*)()` ("GetLocalPlayer") and read `player + 0x3D6C`. Both halves
+// were wrong on the shipped v2.0.11.0 build, and the first half was fatal:
+//
+//   * 0x14EAE0 is not a function entry on this build. It is +0x70 into an
+//     unrelated float-lerp on the player camera block. Calling it entered a
+//     function body having skipped the prologue that reserves stack and saves
+//     xmm6, so the epilogue's `movaps xmm6,[rsp]` hit a misaligned rsp and
+//     faulted -- reported by Windows as an access violation reading
+//     0xFFFFFFFFFFFFFFFF, which is the SSE alignment sentinel rather than a
+//     real bad pointer. Every frame, from CameraManager::onFrameEnd.
+//
+//     The old guards could not catch this. They proved the module was still
+//     loaded and the page was committed and executable -- both true of every
+//     byte inside every function. Nothing checked "is this a function ENTRY",
+//     which is the question that mattered.
+//
+//   * +0x3D6C is not a live eye field on this build either. The
+//     [classify-eye-truth] log showed it pinned at (14158,-10801,877) across
+//     46 km of player travel: a static script anchor.
+//
+// Re-deriving those two numbers for this build would work exactly until the
+// next game patch. So they are gone. The eye now comes from the viewmodel
+// pass's c_cameraOrigin -- Source's authoritative eye on this build, correct
+// in pilot-on-foot, titan-cockpit and rodeo -- which Remix already captures
+// per draw with no module offsets whatsoever. See dxvk::getEngineEyePosition
+// and rtx_engine_symbols.h for the resolution contract.
+//
+// Returns nullptr when no eye is available yet. It cannot crash: there is no
+// game code on this path any more.
 namespace {
   inline const float* GetEngineEyeCM() {
-    using GetLocalPlayerFn = void* (*)();
-    // Re-resolve client.dll EVERY call — do NOT cache the function pointer.
-    // On game quit the engine unloads client.dll while this diagnostic is
-    // still running on the dxvk CS thread (EndFrame -> CameraManager::onFrameEnd).
-    // A pointer cached across the module's lifetime then points into an unmapped
-    // page, and calling it faults with "access violation EXECUTING" at
-    // client.dll+0x14EAE0 — the quit-time crash/freeze. GetModuleHandleA returns
-    // null once client.dll is gone, so we bail instead of jumping into freed code.
-    HMODULE clientDll = GetModuleHandleA("client.dll");
-    if (!clientDll) return nullptr;
-    auto getLp = reinterpret_cast<GetLocalPlayerFn>(
-      reinterpret_cast<uint8_t*>(clientDll) + 0x14EAE0);
-    // Belt-and-suspenders for the mid-unload window (handle briefly non-null but
-    // the code page already decommitted): require committed + executable, no guard.
-    MEMORY_BASIC_INFORMATION mbi = {};
-    const DWORD execMask = PAGE_EXECUTE | PAGE_EXECUTE_READ
-                         | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-    if (VirtualQuery(reinterpret_cast<void*>(getLp), &mbi, sizeof(mbi)) == 0
-        || mbi.State != MEM_COMMIT
-        || (mbi.Protect & execMask) == 0
-        || (mbi.Protect & PAGE_GUARD))
+    // Thread-local so the returned pointer stays valid for the caller's
+    // formatting without handing out a pointer into shared mutable state.
+    // onFrameEnd (CS thread) and processCameraData both call this.
+    // Qualified: this anonymous namespace sits at global scope (the dxvk::tf2
+    // block above it is already closed), so the unqualified name would not
+    // find the declaration in namespace dxvk.
+    static thread_local float s_eye[3] = { 0.f, 0.f, 0.f };
+    if (!dxvk::getEngineEyePosition(s_eye))
       return nullptr;
-    void* lp = getLp();
-    if (!lp) return nullptr;
-    return reinterpret_cast<const float*>(
-      reinterpret_cast<const uint8_t*>(lp) + 0x3D6C);
+    return s_eye;
   }
 
   // (ViewModelEyeCache + eye-snap killswitch + ramp constants/globals all

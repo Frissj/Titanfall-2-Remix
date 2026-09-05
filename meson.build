@@ -812,6 +812,11 @@ if dxvk_is_ninja
   endif
 endif # dxvk_is_ninja
 
-if fs.is_dir('nv-private')
+# Guard on the build file, not the directory: nv-private/ can exist while
+# carrying only payload (e.g. hdremix/) and no meson.build, and subdir() on it
+# then aborts the whole configure. That fires on any reconfigure, not just a
+# fresh setup, so it shows up as an unrelated build failure the moment any
+# meson.build in the tree is touched.
+if fs.is_file('nv-private/meson.build')
   subdir('nv-private')
 endif

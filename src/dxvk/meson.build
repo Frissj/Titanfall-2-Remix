@@ -223,6 +223,8 @@ dxvk_src = files([
   'rtx_render/rtx_draw_call_cache.h',
   'rtx_render/rtx_dust_particles.cpp',
   'rtx_render/rtx_dust_particles.h',
+  'rtx_render/rtx_engine_symbols.cpp',
+  'rtx_render/rtx_engine_symbols.h',
   'rtx_render/rtx_env.cpp',
   'rtx_render/rtx_env.h',
   'rtx_render/rtx_file_watch.cpp',

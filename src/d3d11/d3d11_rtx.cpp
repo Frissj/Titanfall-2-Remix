@@ -1351,6 +1351,10 @@ namespace dxvk { namespace tf2 {
 
 #include "../dxvk/rtx_render/rtx_context.h"
 #include "../dxvk/rtx_render/rtx_options.h"
+// NV-DXVK [EngineSymbols]: build-independent resolution for every reach into
+// client.dll / engine.dll. rtx_engine_symbols_tf2.h is the ONLY place allowed
+// to name a location in a game module; see scripts-common/check_engine_rvas.py.
+#include "../dxvk/rtx_render/rtx_engine_symbols_tf2.h"
 // NV-DXVK [tf2_options]: TF2-only options kept OFF the PCH. Must come after
 // rtx_options.h (it needs rtx_option.h, and the rtx headers want
 // dxvk_device.h first -- see the include-order note above).
@@ -4228,24 +4232,30 @@ namespace dxvk {
     HMODULE cl = GetModuleHandleA("client.dll");
     HMODULE en = GetModuleHandleA("engine.dll");
     if (cl == nullptr || en == nullptr) return false;            // retry next frame
-    const uintptr_t clBase = reinterpret_cast<uintptr_t>(cl);
-    const uintptr_t enBase = reinterpret_cast<uintptr_t>(en);
-    g_rlpModelInfo = reinterpret_cast<void*>(enBase + 0x7D10D0);
-    g_rlpOrig      = reinterpret_cast<RlpSub1A8350_t>(clBase + 0x1A8350);
-    const uintptr_t site = clBase + 0x1A8278;                    // the `call` instruction
-    const uint8_t* cs = reinterpret_cast<const uint8_t*>(site);
-    if (cs[0] != 0xE8) {
-      Logger::warn(str::format("[RenderListProbe] site 0x", std::hex, site,
-                               " not E8 (", std::dec, uint32_t(cs[0]), "); abort"));
+
+    // The call site inside BuildRenderableRenderLists that this probe rewrites.
+    // Unregistered on the shipped build (the old RVA 0x1A8278 reads `shr eax,6`
+    // there now), so this resolves to 0 and the probe stays off. See
+    // rtx_engine_symbols_tf2.h.
+    const uintptr_t site = EngineSymbols::resolve(tf2sym::kRenderListProbeCallSite);
+    const uintptr_t modelInfo = EngineSymbols::resolve(tf2sym::kEngineModelInfo);
+    if (site == 0 || modelInfo == 0)
+      return true;                                               // disabled, logged once
+
+    g_rlpModelInfo = reinterpret_cast<void*>(modelInfo);
+
+    // Derive the callee out of the instruction rather than naming it: a
+    // signature-located call site gives up its own target, and that stays
+    // correct on every build.
+    EngineSymbols::ModuleView clView;
+    uintptr_t curTarget = 0;
+    if (!EngineSymbols::queryModule("client.dll", clView)
+     || !EngineSymbols::decodeRel32Target(clView, site, curTarget)) {
+      Logger::warn(str::format("[RenderListProbe] no decodable call at 0x",
+                               std::hex, site, std::dec, "; abort"));
       return true;
     }
-    int32_t curRel; std::memcpy(&curRel, cs + 1, 4);
-    const uintptr_t curTarget = site + 5 + static_cast<intptr_t>(curRel);
-    if (curTarget != clBase + 0x1A8350) {
-      Logger::warn(str::format("[RenderListProbe] call target 0x", std::hex, curTarget,
-                               " != 0x", clBase + 0x1A8350, "; abort"));
-      return true;
-    }
+    g_rlpOrig = reinterpret_cast<RlpSub1A8350_t>(curTarget);
     // Island within +-2GB: jmp qword ptr [rip+0]; dq renderListWrapper
     uint8_t* island = nullptr;
     for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
@@ -4810,16 +4820,25 @@ namespace dxvk {
     HMODULE cl = GetModuleHandleA("client.dll");
     if (cl == nullptr)
       return false;                                  // retry until client.dll is loaded
-    const uintptr_t base = reinterpret_cast<uintptr_t>(cl);
-    const uintptr_t fn   = base + 0xFE780;            // C_BaseAnimating::SetupBones
+
+    // C_BaseAnimating::SetupBones, located through the "SetupBonesOnBaseAnimating"
+    // literal it uses internally rather than by RVA. The old 0xFE780 reads
+    // `2B E0 83 ..` -- mid-instruction -- on the shipped build.
+    const uintptr_t fn = EngineSymbols::resolve(tf2sym::kSetupBones);
+    if (fn == 0)
+      return true;                                   // disabled, logged once
+
     uint8_t* csb = reinterpret_cast<uint8_t*>(fn);
     if (!studioMemReadable(csb, 5))
       return false;
-    // Expect first instruction: 44 89 44 24 <disp8>  (mov [rsp+disp8], r8d) â€” a
-    // self-contained, rsp-relative 5-byte insn (no RIP fixups). Steal exactly it.
+    // We steal the first instruction, so its ENCODING still has to be the one
+    // we can relocate: 44 89 44 24 <disp8> (mov [rsp+disp8], r8d), a
+    // self-contained rsp-relative 5-byte insn with no RIP fixups. The resolver
+    // proves we are at a function entry; this proves the entry is stealable.
     if (!(csb[0] == 0x44 && csb[1] == 0x89 && csb[2] == 0x44 && csb[3] == 0x24)) {
       Logger::warn(str::format(
-        "[SetupBoneMask] prologue mismatch at 0x", std::hex, fn, ": ",
+        "[SetupBoneMask] entry 0x", std::hex, fn, " does not start with a "
+        "relocatable 5-byte spill: ",
         uint32_t(csb[0]), " ", uint32_t(csb[1]), " ", uint32_t(csb[2]), " ",
         uint32_t(csb[3]), std::dec, "; abort"));
       return true;                                   // permanent abort (don't retry)
@@ -6116,7 +6135,13 @@ namespace dxvk {
     if (cl == nullptr || sr == nullptr) return false;                  // retry until both loaded
     const uintptr_t clBase = reinterpret_cast<uintptr_t>(cl);
     const uintptr_t srBase = reinterpret_cast<uintptr_t>(sr);
-    void** pObj = reinterpret_cast<void**>(clBase + 0x2E43A58);        // qword_182E43A58 (object ptr)
+    (void)clBase;
+
+    // Unregistered on the shipped build (old RVA 0x2E43A58).
+    const uintptr_t ctxPtrAddr = EngineSymbols::resolve(tf2sym::kStudioRenderContextPtr);
+    if (ctxPtrAddr == 0)
+      return true;                                                     // disabled, logged once
+    void** pObj = reinterpret_cast<void**>(ctxPtrAddr);
     if (!studioMemReadable(pObj, 8)) return false;
     void* obj = *pObj;
     if (!studioMemReadable(obj, 8)) return false;                      // ctx not constructed yet -> retry
@@ -7051,10 +7076,19 @@ namespace dxvk {
     return true;
   }
 
-  // Force r_lod. The ConVar object is client.dll+0x11C2E70 ("r_lod", default "-1"
-  // = auto/distance); sub_18026B070 reads the value through the parent pointer at
-  // +0x38, i.e. `*(int*)(*(void**)(obj+0x38) + 92)`, so we write it the same way
-  // rather than assuming obj is its own parent. +88 is the float mirror.
+  // Force r_lod ("-1" = auto/distance). The ConVar is located by NAME at
+  // runtime: a registered Source ConVar holds a pointer to its own name
+  // string, so EngineSymbols::findConVar finds that literal in read-only data,
+  // finds the single writable qword pointing at it (m_pszName), walks back to
+  // the object start, and identifies the value fields by cross-checking them
+  // against the ConVar's own default-value string. No offsets anywhere, and it
+  // stays correct across builds.
+  //
+  // This one is a genuine repair rather than only a safety change: the object
+  // moved from the hardcoded 0x11C2E70 to 0x11C30F0 on the shipped v2.0.11.0
+  // build, so the old code was reading a "parent" pointer out of unrelated
+  // memory and then (correctly) refusing to write once the value it found
+  // failed its LOD-range sanity check.
   // NV-DXVK [ResidentScene] slice 8: non-zero while the seed pass is holding
   // engine culling off so residency can harvest the level. Written by
   // D3D11Rtx::residentSeedUpdate and read by cullOffUpdate, both of which run on
@@ -7067,17 +7101,38 @@ namespace dxvk {
   static void cullOffSetStudioLod(bool force) {
     if (!force && !g_cullOffRLodForced)
       return;                                    // nothing to do; touch nothing
-    HMODULE cl = GetModuleHandleA("client.dll");
-    if (cl == nullptr)
+    EngineSymbols::ModuleView clView;
+    if (!EngineSymbols::queryModule("client.dll", clView))
       return;
-    void** parentSlot = reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(cl) + 0x11C2EA8);
-    if (!studioMemReadable(parentSlot, sizeof(void*)))
+
+    // Resolved once and cached for the module's lifetime: findConVar sweeps
+    // .rdata and .data, which is far too much work to repeat per frame.
+    static EngineSymbols::ConVarHandle s_rLod;
+    static uint64_t                    s_rLodGeneration = 0;
+    static bool                        s_rLodWarned     = false;
+    if (s_rLodGeneration != clView.generation) {
+      s_rLodGeneration = clView.generation;
+      if (!EngineSymbols::findConVar(clView, "r_lod", s_rLod)) {
+        s_rLod = EngineSymbols::ConVarHandle();
+        if (!s_rLodWarned) {
+          s_rLodWarned = true;
+          Logger::warn("[CullOff] r_lod ConVar not identifiable on this build; "
+                       "studio LOD forcing disabled");
+        }
+      } else {
+        Logger::info(str::format("[CullOff] r_lod ConVar at 0x", std::hex,
+                                 s_rLod.object, " (+0x", s_rLod.object - clView.base,
+                                 ") value at 0x", reinterpret_cast<uintptr_t>(s_rLod.intValue),
+                                 std::dec));
+      }
+    }
+    if (!s_rLod.valid())
       return;
-    void* cv = *parentSlot;
-    if (!studioMemReadable(cv, 96))
+
+    int*   pInt = s_rLod.intValue;
+    float* pFlt = s_rLod.floatValue;
+    if (!studioMemReadable(pInt, sizeof(int)) || !studioMemReadable(pFlt, sizeof(float)))
       return;
-    int*   pInt = reinterpret_cast<int*>(reinterpret_cast<uintptr_t>(cv) + 92);
-    float* pFlt = reinterpret_cast<float*>(reinterpret_cast<uintptr_t>(cv) + 88);
     if (force) {
       if (g_cullOffRLodForced)
         return;                                  // already forced
@@ -8078,14 +8133,21 @@ namespace dxvk {
     if (cl == nullptr) return false;
     const uintptr_t clBase = reinterpret_cast<uintptr_t>(cl);
     g_gateClBase = clBase;
-    g_gateOrig   = reinterpret_cast<GateFn_t>(clBase + 0x371590);
-    // sub_180371590 has THREE call sites; the dropship can draw via any of them
-    // (opaque sub_18036E2E0 @0x36E352, plus sub_18036E7B0 @0x36E83E and
-    // sub_18036E8D0 @0x36E9CB). Patch all three to the same wrapper â€” hooking
-    // only the opaque one missed the dropship entirely (it drew, GateProbe was
-    // silent). All sites sit within ~0x680 of each other, so one island reaches
-    // all of them (+-2GB).
-    const uintptr_t kSites[3] = { clBase + 0x36E352, clBase + 0x36E83E, clBase + 0x36E9CB };
+
+    // The renderable draw gate has THREE call sites; the dropship can draw via
+    // any of them, and hooking only the opaque one missed it entirely. All
+    // three plus the gate itself are unregistered on the shipped build -- the
+    // old RVAs (0x36E352 / 0x36E83E / 0x36E9CB) all read mid-instruction
+    // there -- so the probe stays off rather than rewriting arbitrary bytes.
+    const uintptr_t gateFn = EngineSymbols::resolve(tf2sym::kRenderableDrawGate);
+    const uintptr_t kSites[3] = {
+      EngineSymbols::resolve(tf2sym::kRenderableDrawGateCallSiteA),
+      EngineSymbols::resolve(tf2sym::kRenderableDrawGateCallSiteB),
+      EngineSymbols::resolve(tf2sym::kRenderableDrawGateCallSiteC),
+    };
+    if (gateFn == 0 || kSites[0] == 0 || kSites[1] == 0 || kSites[2] == 0)
+      return true;                                   // disabled, logged once
+    g_gateOrig = reinterpret_cast<GateFn_t>(gateFn);
     const uintptr_t anchor = kSites[0];
     uint8_t* island = nullptr;
     for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
@@ -8114,9 +8176,9 @@ namespace dxvk {
       }
       int32_t curRel; std::memcpy(&curRel, cs + 1, 4);
       const uintptr_t curTarget = site + 5 + static_cast<intptr_t>(curRel);
-      if (curTarget != clBase + 0x371590) {
+      if (curTarget != gateFn) {
         Logger::warn(str::format("[GateProbe] site 0x", std::hex, site, " target 0x", curTarget,
-                                 " != 0x", clBase + 0x371590, "; skip"));
+                                 " != 0x", gateFn, "; skip"));
         continue;
       }
       DWORD op = 0;
@@ -8920,7 +8982,16 @@ namespace dxvk {
     if (cl == nullptr) return false;
     const uintptr_t clBase = reinterpret_cast<uintptr_t>(cl);
     g_lodClBase = clBase;
-    void** pObj = reinterpret_cast<void**>(clBase + 0xB20338);          // off_180B20338 (object ptr)
+
+    // Both the owning object pointer and the vtable[1] entry we expect to find
+    // are unregistered on the shipped build (old RVAs 0xB20338 / 0x26B070), so
+    // this stays off rather than swapping a vtable slot we cannot identify.
+    const uintptr_t objPtrAddr = EngineSymbols::resolve(tf2sym::kModelRenderVtableOwner);
+    const uintptr_t expectDraw = EngineSymbols::resolve(tf2sym::kModelRenderDraw);
+    if (objPtrAddr == 0 || expectDraw == 0)
+      return true;                                                     // disabled, logged once
+
+    void** pObj = reinterpret_cast<void**>(objPtrAddr);
     if (!studioMemReadable(pObj, 8)) return false;
     void* obj = *pObj;
     if (!studioMemReadable(obj, 8)) return false;                       // object not constructed yet â†’ retry
@@ -8929,7 +9000,7 @@ namespace dxvk {
     void** slot = &vt[1];                                              // vtable[1]
     void* cur = *slot;
     if (cur == reinterpret_cast<void*>(&lodWrapper)) return true;       // already hooked
-    if (cur != reinterpret_cast<void*>(clBase + 0x26B070))
+    if (cur != reinterpret_cast<void*>(expectDraw))
       return false;                                                    // vtable not ready / wrong â†’ retry
     g_lodOrig = reinterpret_cast<LodDrawFn_t>(cur);
     g_lodVtableSlot = slot;
@@ -8962,11 +9033,22 @@ namespace dxvk {
     HMODULE cl = GetModuleHandleA("client.dll");
     if (cl == nullptr) return false;
     const uintptr_t clBase = reinterpret_cast<uintptr_t>(cl);
-    const uintptr_t site   = clBase + 0x26B21A;                        // detour plant site
-    const uint8_t*  cs     = reinterpret_cast<const uint8_t*>(site);
+
+    // Mid-function detour plant site. Unregistered on the shipped build (old
+    // RVA 0x26B21A reads `44 24 30 ..`, mid-instruction). Deliberately NOT
+    // given a thin signature: `A8 04 0F 84 ?? ?? ?? ??` is `test al,4; jz`
+    // with the branch displacement wildcarded, which occurs all over .text.
+    // The resolver fails safe on zero or multiple matches but cannot detect a
+    // single COINCIDENTAL one, and planting a detour on that would reproduce
+    // the original crash.
+    const uintptr_t site = EngineSymbols::resolve(tf2sym::kLodV10Site);
+    if (site == 0)
+      return true;                                                     // disabled, logged once
+
+    const uint8_t* cs = reinterpret_cast<const uint8_t*>(site);
     if (!studioMemReadable(cs, 8)) return false;
-    // Verify the 8 displaced bytes match what we decoded in IDA, else bail (wrong
-    // build / already patched) rather than corrupt the function.
+    // The 8 displaced bytes must still be the shape we relocate, else bail
+    // rather than corrupt the function.
     static const uint8_t kExpect[8] = { 0xA8, 0x04, 0x0F, 0x84, 0xE3, 0x04, 0x00, 0x00 };
     for (int i = 0; i < 8; ++i)
       if (cs[i] != kExpect[i]) {
@@ -8974,8 +9056,12 @@ namespace dxvk {
           " bytes mismatch (got 0x", uint32_t(cs[i]), " at +", std::dec, i, "); abort"));
         return true;                                                   // don't retry a wrong build forever
       }
-    const uintptr_t jzTarget   = clBase + 0x26B705;                    // original jz destination
-    const uintptr_t fallThrough = clBase + 0x26B222;                   // instruction after the jz
+    // Both derived from the site itself: the jz's own rel32 target and the
+    // instruction after it. No second address to go stale.
+    int32_t jzRel = 0;
+    std::memcpy(&jzRel, cs + 4, 4);
+    const uintptr_t fallThrough = site + 8;                            // instruction after the jz
+    const uintptr_t jzTarget    = fallThrough + static_cast<intptr_t>(jzRel);
 
     // Allocate an executable island within +-2GB of the site (rel32 reach).
     uint8_t* island = nullptr;
@@ -9068,8 +9154,16 @@ namespace dxvk {
     HMODULE cl = GetModuleHandleA("client.dll");
     if (cl == nullptr) return false;
     const uintptr_t clBase = reinterpret_cast<uintptr_t>(cl);
-    const uintptr_t site   = clBase + 0x1A8657;
-    const uint8_t*  cs     = reinterpret_cast<const uint8_t*>(site);
+
+    // Unregistered on the shipped build (old RVA 0x1A8657 reads `shr rax,6`).
+    // Its byte pattern `33 D2 F6 46 24 0C` is only six bytes of very ordinary
+    // code, too thin to identify a mid-function detour site safely, so it is
+    // intentionally left without a signature. See rtx_engine_symbols_tf2.h.
+    const uintptr_t site = EngineSymbols::resolve(tf2sym::kV9ProbeSite);
+    if (site == 0)
+      return true;                                                // disabled, logged once
+
+    const uint8_t* cs = reinterpret_cast<const uint8_t*>(site);
     if (!studioMemReadable(cs, 6)) return false;
     static const uint8_t kExpect[6] = { 0x33, 0xD2, 0xF6, 0x46, 0x24, 0x0C };
     for (int i = 0; i < 6; ++i)
@@ -9078,7 +9172,7 @@ namespace dxvk {
           " bytes mismatch (got 0x", uint32_t(cs[i]), " at +", std::dec, i, "); abort"));
         return true;                                              // don't retry a wrong build forever
       }
-    const uintptr_t fallThrough = clBase + 0x1A865D;              // the in-place jz
+    const uintptr_t fallThrough = site + 6;                       // the in-place jz
 
     uint8_t* island = nullptr;
     for (intptr_t step = 0x10000; step <= 0x40000000 && island == nullptr; step += 0x10000)
@@ -69160,6 +69254,20 @@ namespace dxvk {
             return !disabled;
           }();
 
+          // NV-DXVK [EngineSymbols] Phase 3: one self-documenting report per
+          // session, emitted after the game modules are up and the resolvers
+          // have run. It carries each module's fingerprint plus every symbol
+          // that was asked for and how it turned out (resolved, with its RVA
+          // on THIS build, or the reason it did not). On a new game build that
+          // report is the whole diagnosis -- paste it into a bug and the
+          // outstanding entries in rtx_engine_symbols_tf2.h are exactly the
+          // list of what needs re-anchoring.
+          {
+            static uint32_t s_symbolReportDelay = 240;   // ~4s: let hooks settle
+            if (s_symbolReportDelay > 0 && --s_symbolReportDelay == 0)
+              EngineSymbols::dumpReport();
+          }
+
           static const bool kEnableRenderListProbe = true;
           static bool s_renderListHookInstalled = false;
           if (kEngineHooksEnabled && kEnableRenderListProbe && !s_renderListHookInstalled) {
@@ -69949,10 +70057,12 @@ namespace dxvk {
             s_b30HookInstalled = true;
           if (!s_b30HookInstalled) {
             HMODULE cli = GetModuleHandleA("client.dll");
-            if (cli != nullptr) {
+            const uintptr_t target =
+              EngineSymbols::resolve(tf2sym::kVanishDiagRenderableWrapper);
+            if (cli != nullptr && target != 0) {
               const uintptr_t cliBase = reinterpret_cast<uintptr_t>(cli);
-              const uintptr_t target  = cliBase + 0x36BD30;  // sub_18036BD30
-              const uint8_t* tgt      = reinterpret_cast<const uint8_t*>(target);
+              (void)cliBase;
+              const uint8_t* tgt = reinterpret_cast<const uint8_t*>(target);
               // Two prolog encodings observed across client.dll builds:
               //   short:  53 48 83 EC 20            (5 bytes â€” IDA database)
               //   long:   40 53 48 83 EC 20         (6 bytes â€” actual runtime, redundant REX)
@@ -70152,10 +70262,12 @@ namespace dxvk {
             s_eb290HookInstalled = true;
           if (!s_eb290HookInstalled) {
             HMODULE cli = GetModuleHandleA("client.dll");
-            if (cli != nullptr) {
+            const uintptr_t target =
+              EngineSymbols::resolve(tf2sym::kVanishDiagBucketVis);
+            if (cli != nullptr && target != 0) {
               const uintptr_t cliBase = reinterpret_cast<uintptr_t>(cli);
-              const uintptr_t target  = cliBase + 0x2EB290;  // sub_1802EB290
-              const uint8_t* tgt      = reinterpret_cast<const uint8_t*>(target);
+              (void)cliBase;
+              const uint8_t* tgt = reinterpret_cast<const uint8_t*>(target);
               if (tgt[0] == 0x48 && tgt[1] == 0x8B && tgt[2] == 0xC4 &&
                   tgt[3] == 0x48 && tgt[4] == 0x89 && tgt[5] == 0x58 &&
                   tgt[6] == 0x08) {
