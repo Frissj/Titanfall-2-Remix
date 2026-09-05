@@ -805,6 +805,9 @@ def psdt_apply(rgb_in, st, pooled_log=None, adapt=None, glare_rgb=(0.0, 0.0, 0.0
     out_rgb = from_perceptual(from_polar(iab_preserve[0], compressed_chroma, hue_out), space, ref)
     if adapt_white:
         out_rgb = adapt_from_d65(out_rgb, gain)
+    # Snapshot before the clamp, so the clipping diagnostic can see undershoot
+    # as well as overflow. See the note in psdt_transform.slangh.
+    pre_clamp = list(out_rgb)
     out_rgb = [max(c, 0.0) for c in out_rgb]
     oy = max(luminance(out_rgb), 1e-8)
     out_rgb = [c * target_y / oy for c in out_rgb]
@@ -826,7 +829,7 @@ def psdt_apply(rgb_in, st, pooled_log=None, adapt=None, glare_rgb=(0.0, 0.0, 0.0
         highlightProgress=highlight_progress, displayY=display_y,
         targetY=target_y, filmY=film_y, trouble=trouble,
         adapted=adapt.adaptedLog, pooled=adapt.pooledLog,
-        curveSlope=base_slope, boost=boost, preFit=pre_fit,
+        curveSlope=base_slope, boost=boost, preFit=pre_fit, preClamp=pre_clamp,
         coarseTrust=adapt.coarseTrust)
 
 
@@ -958,20 +961,37 @@ def _gt7_curve(x):
     return GT7_KA + GT7_KB * math.exp(x * GT7_KC)
 
 
+# gt7.slangh spells its inverse out with six-digit constants rather than
+# reusing the exact ones PSDT carries. The difference is tiny, but a control
+# has to be a port of the shader that runs and not of a more precise cousin of
+# it, so these are the shader's own numbers. psdt_check.py compares them.
+GT7_ICTCP_TO_LMS = [[1.0, 0.00860904, 0.11103],
+                    [1.0, -0.00860904, -0.11103],
+                    [1.0, 0.560031, -0.320627]]
+GT7_LMS_TO_REC2020 = [[3.43661, -2.50645, 0.0698454],
+                      [-0.79133, 1.9836, -0.192271],
+                      [-0.0259499, -0.0989137, 1.12486]]
+
+
 def _gt7_ictcp(rgb, ref):
     lms = mul(REC2020_TO_LMS, rgb)
     return mul(LMS_TO_ICTCP, [pq_encode(c, ref, 1.0) for c in lms])
 
 
 def _gt7_from_ictcp(iab, ref):
-    lms = [pq_decode(c, ref, 1.0) for c in mul(ICTCP_TO_LMS, iab)]
-    return [max(c, 0.0) for c in mul(LMS_TO_REC2020, lms)]
+    lms = [pq_decode(c, ref, 1.0) for c in mul(GT7_ICTCP_TO_LMS, iab)]
+    return [max(c, 0.0) for c in mul(GT7_LMS_TO_REC2020, lms)]
 
 
 def gt7(rgb, ref=100.0):
     """
     The shipped port, faithfully - including its Rec.2020 input assumption,
     which is what makes it a control worth having rather than a second PSDT.
+
+    That assumption is not free, and this function is deliberately the version
+    with it: gt7.slangh feeds framebuffer RGB straight into a Rec.2020 -> LMS
+    matrix, and this renderer's framebuffer is Rec.709. See gt7_in_rec2020()
+    below and the `gt7space` section of the suite for what it costs.
     """
     skewed = [_gt7_curve(c) for c in rgb]
     ucs = _gt7_ictcp(rgb, ref)
@@ -979,3 +999,18 @@ def gt7(rgb, ref=100.0):
     scale = 1.0 - _gt7_smoothstep(ucs[0] / GT7_TARGET_UCS, GT7_FADE0, GT7_FADE1)
     scaled = _gt7_from_ictcp([skewed_ucs[0], ucs[1] * scale, ucs[2] * scale], ref)
     return [min((1.0 - GT7_BLEND) * s + GT7_BLEND * u, 1.0) for s, u in zip(skewed, scaled)]
+
+
+def gt7_in_rec2020(rgb, ref=100.0):
+    """
+    GT7 used the way its reference intends: convert the working space into
+    Rec.2020, run the operator there, convert the result back.
+
+    This is not what the shipped shader does. It is here so the cost of the
+    difference can be measured rather than argued about - the operator is a
+    scientific control, and a control whose input is mislabelled is measuring
+    something other than what it claims to.
+    """
+    r2020 = mul(REC709_TO_REC2020, [max(c, 0.0) for c in rgb])
+    out2020 = gt7(r2020, ref)
+    return [saturate(c) for c in mul(REC2020_TO_REC709, out2020)]

@@ -21,6 +21,7 @@
 */
 #include <cstring>
 #include <cmath>
+#include <algorithm>
 #include <cassert>
 #include <array>
 #include <chrono>
@@ -1443,12 +1444,35 @@ namespace dxvk {
 
   // NV-DXVK [TonemapProbe]: read the tonemap INPUT (m_compositeOutput, HDR radiance)
   // and OUTPUT (m_finalOutput, post-operator display colour) at a sparse pixel grid
-  // and log the in->out pairs. This makes the tonemap operator's effect directly
-  // observable: HDR input values > 1 mapped into [0,1] proves the curve ran, and
-  // the SAME input yielding DIFFERENT output when rtx.tonemap.operator changes
-  // proves the selected operator is what transforms the pixels. Both buffers are
-  // RGBA16F but may differ in resolution (upscaling), so sample by normalized pos.
-  // Async readback (fence + worker) so it never stalls the frame.
+  // and log what the operator did to them. Both buffers are RGBA16F but may differ
+  // in resolution (upscaling), so sample by normalized pos. Async readback
+  // (fence + worker) so it never stalls the frame.
+  //
+  // What it measures, and why it changed
+  // ------------------------------------
+  // The original version logged RGB and luma, which answers "did the curve run"
+  // and nothing else. That is the question you ask once. The questions an
+  // operator comparison actually turns on are how much chroma survived, whether
+  // the hue moved, and how much of the frame arrived at a limit - and none of
+  // those are visible in a luma number. So each sample now carries luminance,
+  // ICtCp chroma and hue on both sides, and the frame emits an aggregate line.
+  //
+  // The aggregate line has a fixed field order on purpose. Comparing operators
+  // properly means running the same scene under each configuration and diffing:
+  //
+  //     rtx.tonemap.operator      0 / 3 / 6 / 7 / 8 / 9 / 10
+  //     rtx.autoExposurePlus      on / off
+  //     rtx.tonemap.colorGrading  off, for any comparison to mean anything
+  //     rtx.bloom                 off, same reason
+  //
+  // `op=`, `plus=` and `grade=` are recorded on every line so a log can be
+  // attributed to a configuration rather than to a memory of what was set.
+  // Set rtx.tf2HeavyProbes for the per-sample [TonemapProbe.px] lines too.
+  //
+  // The probe reads the final image, so it sees what the operator produced
+  // after the operator's own internal clamp. Interior pre-clamp values are not
+  // observable from here by construction; for PSDT that is what
+  // rtx.tonemap.psdt.debugView 10 exists for.
   void RtxContext::captureTonemapProbe(const Resources::RaytracingOutput& rtOutput) {
     if (!RtxOptions::logSurfaceCoverage())
       return;
@@ -1505,6 +1529,13 @@ namespace dxvk {
     Rc<sync::Fence> fence = sFence;
     const uint32_t frameId = m_device->getCurrentFrameId();
     const uint32_t op = static_cast<uint32_t>(DxvkToneMapping::tonemapOperator());
+    // Recorded alongside every sample so a log can be attributed to a
+    // configuration rather than to a guess about what was enabled at the time.
+    // The four-way operator x Plus comparison is four runs and a diff of these
+    // lines; without them it is four runs and a memory.
+    const uint32_t plusActive = m_common->metaAutoExposurePlus().isActive() ? 1u : 0u;
+    const uint32_t gradingOn = DxvkToneMapping::colorGradingEnabled() ? 1u : 0u;
+    const uint32_t perPixel = RtxOptions::tf2HeavyProbes() ? 1u : 0u;
 
     for (auto it = sTasks.begin(); it != sTasks.end();) {
       if (it->valid() && it->wait_for(std::chrono::seconds(0)) == std::future_status::ready)
@@ -1514,7 +1545,8 @@ namespace dxvk {
     }
 
     sTasks.push_back(std::async(std::launch::async,
-      [bin, bout, fence, fv, Wi, Hi, Wo, Ho, frameId, op]() {
+      [bin, bout, fence, fv, Wi, Hi, Wo, Ho, frameId, op,
+       plusActive, gradingOn, perPixel]() {
         fence->wait(fv);
         const uint8_t* pin  = reinterpret_cast<const uint8_t*>(bin->mapPtr(0));
         const uint8_t* pout = reinterpret_cast<const uint8_t*>(bout->mapPtr(0));
@@ -1541,12 +1573,51 @@ namespace dxvk {
           }
           float f; std::memcpy(&f, &bits, sizeof(f)); return f;
         };
-        auto lum = [](float r, float g, float b) { return 0.2126f * r + 0.7152f * g + 0.0722f * b; };
+        // Luminance, chroma and hue - not RGB and luma.
+        //
+        // "Did the curve run" is answerable from luma alone and was all this
+        // probe ever answered. The questions an operator comparison actually
+        // turns on are not: how much chroma survived, whether the hue moved,
+        // and how much of the frame arrived at a limit. Those need a
+        // perceptual space, so the probe carries a small ICtCp of its own -
+        // the same one psdt_perceptual_space.slangh uses, at the same 100-nit
+        // reference, so a number logged here is comparable with a number from
+        // tools/psdt/ rather than merely similar to one.
+        auto lum = [](float r, float g, float b) {
+          return 0.2126390059f * r + 0.7151686788f * g + 0.0721923154f * b;
+        };
+        auto pqEncode = [](float v) {
+          const float y = std::max(v, 0.0f) * 100.0f / 10000.0f;
+          const float ym = std::pow(y, 2610.0f / 16384.0f);
+          return std::pow((0.8359375f + 18.8515625f * ym) / (1.0f + 18.6875f * ym),
+                          2523.0f / 4096.0f * 128.0f);
+        };
+        // Linear Rec.709 -> ICtCp, returning (I, chroma, hue in radians).
+        auto ictcp = [&](float r, float g, float b, float& chroma, float& hue) {
+          const float r2 = 0.6274039f * r + 0.3292830f * g + 0.0433131f * b;
+          const float g2 = 0.0690973f * r + 0.9195404f * g + 0.0113623f * b;
+          const float b2 = 0.0163914f * r + 0.0880132f * g + 0.8955953f * b;
+          const float l = pqEncode((1688.f * r2 + 2146.f * g2 + 262.f * b2) / 4096.f);
+          const float m = pqEncode((683.f * r2 + 2951.f * g2 + 462.f * b2) / 4096.f);
+          const float s = pqEncode((99.f * r2 + 309.f * g2 + 3688.f * b2) / 4096.f);
+          const float ct = (6610.f * l - 13613.f * m + 7003.f * s) / 4096.f;
+          const float cp = (17933.f * l - 17390.f * m - 543.f * s) / 4096.f;
+          chroma = std::sqrt(ct * ct + cp * cp);
+          hue = std::atan2(cp, ct);
+          return (2048.f * l + 2048.f * m) / 4096.f;
+        };
 
-        // Sparse normalized grid so input and output (possibly different res) sample
-        // the same screen points. Center band where the scene (not HUD) lives.
-        const float us[] = { 0.25f, 0.50f, 0.75f };
-        const float vs[] = { 0.35f, 0.55f };
+        // Sparse normalized grid so input and output (possibly different res)
+        // sample the same screen points. Wider than the original six: the
+        // aggregate below is only as good as its sample count, and a readback
+        // this size costs the same whatever is read out of it.
+        const float us[] = { 0.15f, 0.30f, 0.45f, 0.60f, 0.75f, 0.90f };
+        const float vs[] = { 0.25f, 0.40f, 0.55f, 0.70f };
+
+        uint32_t n = 0, clipHi = 0, clipLo = 0, negIn = 0;
+        float dHueSum = 0.0f, dHueMax = 0.0f, chromaRatioSum = 0.0f, chromaRatioN = 0.0f;
+        float inYMin = 1e30f, inYMax = -1e30f, outYMin = 1e30f, outYMax = -1e30f;
+
         for (float v : vs) {
           for (float u : us) {
             const uint32_t xi = uint32_t(u * (Wi - 1u)), yi = uint32_t(v * (Hi - 1u));
@@ -1555,12 +1626,70 @@ namespace dxvk {
             const uint16_t* op16 = reinterpret_cast<const uint16_t*>(pout + (VkDeviceSize(yo) * Wo + xo) * 8u);
             const float ir = halfToFloat(ip[0]),  ig = halfToFloat(ip[1]),  ib = halfToFloat(ip[2]);
             const float orr = halfToFloat(op16[0]), og = halfToFloat(op16[1]), ob = halfToFloat(op16[2]);
-            Logger::info(str::format(
-              "[TonemapProbe] f=", frameId, " op=", op,
-              " uv=(", u, ",", v, ")",
-              " in=(", ir, ",", ig, ",", ib, ") lumIn=", lum(ir, ig, ib),
-              " -> out=(", orr, ",", og, ",", ob, ") lumOut=", lum(orr, og, ob)));
+
+            float cIn = 0.0f, hIn = 0.0f, cOut = 0.0f, hOut = 0.0f;
+            ictcp(ir, ig, ib, cIn, hIn);
+            ictcp(orr, og, ob, cOut, hOut);
+            const float yIn = lum(ir, ig, ib), yOut = lum(orr, og, ob);
+
+            // Hue is undefined at zero chroma, so a sample that arrived at
+            // white contributes to the clipping count and not to the hue
+            // statistic. Averaging atan2 noise in would make a transform that
+            // correctly went white look like one with a hue problem.
+            float dHue = 0.0f;
+            const bool hueMeaningful = cIn > 0.02f && cOut > 0.02f;
+            if (hueMeaningful) {
+              dHue = hOut - hIn;
+              dHue -= 6.283185307f * std::floor(dHue / 6.283185307f + 0.5f);
+              dHue = std::abs(dHue) * 57.29577951f;
+              dHueSum += dHue;
+              dHueMax = std::max(dHueMax, dHue);
+              chromaRatioSum += cOut / cIn;
+              chromaRatioN += 1.0f;
+            }
+
+            // Item 10, the half of it that is observable from here: the
+            // renderer's own output can be negative (denoisers undershoot),
+            // and the operator's can sit exactly at a limit. Interior
+            // pre-clamp values are not visible from a readback of the final
+            // image at all - that needs shader instrumentation, which for PSDT
+            // is rtx.tonemap.psdt.debugView 10.
+            const bool anyNegIn = (ir < 0.0f) || (ig < 0.0f) || (ib < 0.0f);
+            const bool anyHi = (orr >= 0.999f) || (og >= 0.999f) || (ob >= 0.999f);
+            const bool anyLo = (orr <= 0.0f) || (og <= 0.0f) || (ob <= 0.0f);
+            negIn += anyNegIn ? 1u : 0u;
+            clipHi += anyHi ? 1u : 0u;
+            clipLo += anyLo ? 1u : 0u;
+
+            inYMin = std::min(inYMin, yIn);   inYMax = std::max(inYMax, yIn);
+            outYMin = std::min(outYMin, yOut); outYMax = std::max(outYMax, yOut);
+            ++n;
+
+            if (perPixel != 0u) {
+              Logger::info(str::format(
+                "[TonemapProbe.px] f=", frameId, " op=", op,
+                " uv=(", u, ",", v, ")",
+                " in=(", ir, ",", ig, ",", ib, ") Yin=", yIn, " Cin=", cIn,
+                " -> out=(", orr, ",", og, ",", ob, ") Yout=", yOut, " Cout=", cOut,
+                " dHue=", dHue, (hueMeaningful ? "" : " (achromatic)")));
+            }
           }
+        }
+
+        if (n != 0u) {
+          // One line per frame, fixed field order. This is the line to diff
+          // across the operator x Plus matrix.
+          Logger::info(str::format(
+            "[TonemapProbe] f=", frameId, " op=", op, " plus=", plusActive,
+            " grade=", gradingOn, " n=", n,
+            " Yin=[", inYMin, "..", inYMax, "]",
+            " Yout=[", outYMin, "..", outYMax, "]",
+            " clipHi=", clipHi, "/", n, " clipLo=", clipLo, "/", n,
+            " negIn=", negIn, "/", n,
+            " dHueMean=", (chromaRatioN > 0.0f ? dHueSum / chromaRatioN : 0.0f),
+            " dHueMax=", dHueMax,
+            " chromaOutIn=", (chromaRatioN > 0.0f ? chromaRatioSum / chromaRatioN : 0.0f),
+            " chromaSamples=", uint32_t(chromaRatioN)));
         }
       }));
   }

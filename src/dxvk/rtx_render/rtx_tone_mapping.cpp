@@ -234,9 +234,11 @@ namespace dxvk {
         "How much chroma the compression actually removed. Should be zero over most of the frame." },
       { DxvkToneMapping::PsdtDebugView::Glare, "Glare only",
         "The glare contribution on its own, without the image underneath it." },
-      { DxvkToneMapping::PsdtDebugView::Clipping, "Pre-clamp overflow",
-        "Per-channel overflow measured before the final gamut fit had a chance to hide it.\n"
-        "This is the honest picture of how much work the last clip is doing; it should be nearly black." },
+      { DxvkToneMapping::PsdtDebugView::Clipping, "Pre-clamp excess (signed)",
+        "Red is channels above peak - the colour-volume stage left work for the final clip.\n"
+        "Blue is channels below zero - a colour that does not exist on this display at all,\n"
+        "announcing itself on the way back from the perceptual round trip. Both halves matter;\n"
+        "sampling after the clamp, as v0.1 did, could only ever show the red one. Nearly black is good." },
       { DxvkToneMapping::PsdtDebugView::CurveSlope, "Curve slope",
         "d(display)/d(scene) at each pixel's base level, about 1.0. Orange above 1, blue below.\n"
         "Shows where the curve is adding contrast and where the shoulder and toe are taking it away." },

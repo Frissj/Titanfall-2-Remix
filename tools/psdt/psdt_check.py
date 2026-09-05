@@ -223,6 +223,141 @@ def check_shared_constants():
           f'shader={m_s.group(1) if m_s else "?"} reference={m_r.group(1) if m_r else "?"}')
 
 
+def check_gt7_port():
+    """
+    The GT7 control has to be a port of the shader that runs.
+
+    This does not verify gt7.slangh against Polyphony's published reference -
+    that needs the reference source and is a separate job. What it verifies is
+    the layer underneath: that the numbers psdt_suite prints beside PSDT's come
+    from the same operator the GPU would run, constant for constant. A control
+    that has quietly drifted from the shipped shader is worse than no control.
+    """
+    gt7 = read(os.path.join(TONEMAP_DIR, 'gt7.slangh'))
+    ref = read(REF)
+
+    pairs = [
+        ('gt7_midPoint', 'GT7_MID'), ('gt7_linearSection', 'GT7_LINEAR'),
+        ('gt7_toeStrength', 'GT7_TOE'), ('gt7_curveKA', 'GT7_KA'),
+        ('gt7_curveKB', 'GT7_KB'), ('gt7_curveKC', 'GT7_KC'),
+        ('gt7_fadeStart', 'GT7_FADE0'), ('gt7_fadeEnd', 'GT7_FADE1'),
+        ('gt7_blendRatio', 'GT7_BLEND'), ('gt7_targetUcs', 'GT7_TARGET_UCS'),
+    ]
+    bad = []
+    for shader_name, ref_name in pairs:
+        m = re.search(r'static const float\s+' + shader_name + r'\s*=\s*([-0-9.]+)\s*;', gt7)
+        # The reference declares several on one line, e.g. "A, B, C = 1, 2, 3".
+        r = re.search(r'^([A-Z0-9_, ]*\b' + ref_name + r'\b[A-Z0-9_, ]*)=\s*(.+)$', ref, re.M)
+        got = None
+        if r:
+            names = [n.strip() for n in r.group(1).split(',')]
+            values = [v.strip() for v in r.group(2).split(',')]
+            if ref_name in names and len(names) == len(values):
+                got = values[names.index(ref_name)]
+        if m is None or got is None or abs(float(m.group(1)) - float(got)) > 1e-9:
+            bad.append(f'{shader_name}={m.group(1) if m else "?"} vs {ref_name}={got}')
+    check('GT7 curve constants match between shader and reference', not bad, '; '.join(bad))
+
+    # The inverse ICtCp constants. gt7.slangh spells its own out to six digits
+    # rather than reusing the exact ones; the port has to use the shader's.
+    shader_inv = re.findall(r'ictCp\.x\s*[-+]\s*([0-9.]+)\s*\*\s*ictCp\.y', gt7)
+    ref_inv = re.search(r'GT7_ICTCP_TO_LMS\s*=\s*\[\[1\.0,\s*([0-9.]+)', ref)
+    ok = shader_inv and ref_inv and abs(float(shader_inv[0]) - float(ref_inv.group(1))) < 1e-12
+    check('GT7 inverse ICtCp constants match', bool(ok),
+          f'shader={shader_inv[0] if shader_inv else "?"} reference={ref_inv.group(1) if ref_inv else "?"}')
+
+    # The Rec.2020 input assumption, which is the thing the gt7space suite
+    # section measures. Assert that it is still what the shader says, so that
+    # if someone changes it the harness stops describing the old behaviour.
+    assumes_2020 = 'assumed to be linear Rec.2020' in gt7
+    ref_documents = 'gt7_in_rec2020' in ref
+    check('GT7\'s input-space assumption is documented and modelled',
+          assumes_2020 and ref_documents,
+          f'shader says Rec.2020={assumes_2020}, reference models both={ref_documents}')
+
+
+def check_probe_math():
+    """
+    Compile the TonemapProbe's ICtCp out of rtx_context.cpp and check it against
+    the reference.
+
+    The probe carries its own small colour-space implementation - it runs on a
+    worker thread with no shader includes in scope - and the whole value of it
+    is that a number logged from the game is comparable with a number from this
+    harness. That only holds if the two agree, and "it looks like the same
+    formula" is not agreement.
+
+    This lifts the three lambdas verbatim out of the .cpp, so what is compiled
+    is the text that is in the file. It also happens to be the only part of the
+    C++ in this change that can be compiled at all on this machine, which makes
+    it worth more than its size.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    cxx = shutil.which('g++') or shutil.which('clang++')
+    if cxx is None:
+        notes.append('probe maths not cross-checked: no C++ compiler available')
+        return
+
+    src = read(os.path.join(ROOT, 'src/dxvk/rtx_render/rtx_context.cpp'))
+    try:
+        start = src.index('        auto lum = [](float r, float g, float b) {')
+        end = src.index('        // Sparse normalized grid')
+    except ValueError:
+        check('TonemapProbe maths can be located in rtx_context.cpp', False,
+              'the lambdas moved; update check_probe_math')
+        return
+
+    probes = [(1, 1, 1), (0.5, 0.1, 0.1), (0.1, 0.5, 0.1),
+              (0.1, 0.1, 0.5), (0.18, 0.18, 0.18), (2, 0.5, 0.25)]
+    literal = ', '.join('{%ff,%ff,%ff}' % p for p in probes)
+    program = (
+        '#include <cmath>\n#include <cstdio>\n#include <algorithm>\nint main(){\n'
+        + src[start:end]
+        + f'\n  const float probes[{len(probes)}][3] = {{{literal}}};\n'
+        '  for (int i = 0; i < ' + str(len(probes)) + '; ++i) {\n'
+        '    float c = 0.f, h = 0.f;\n'
+        '    const float I = ictcp(probes[i][0], probes[i][1], probes[i][2], c, h);\n'
+        '    std::printf("%.8f %.8f %.8f %.8f\\n", I, c, h,\n'
+        '                lum(probes[i][0], probes[i][1], probes[i][2]));\n'
+        '  }\n  return 0;\n}\n')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cpp = os.path.join(tmp, 'probe.cpp')
+        exe = os.path.join(tmp, 'probe')
+        with open(cpp, 'w') as f:
+            f.write(program)
+        build = subprocess.run([cxx, '-O2', '-o', exe, cpp],
+                               capture_output=True, text=True)
+        if build.returncode != 0:
+            check('TonemapProbe maths compiles', False,
+                  build.stderr.strip().splitlines()[0] if build.stderr else 'unknown error')
+            return
+        check('TonemapProbe maths compiles', True)
+        out = subprocess.run([exe], capture_output=True, text=True).stdout
+
+    sys.path.insert(0, os.path.dirname(__file__))
+    import psdt_ref as P
+
+    worst_i = worst_c = worst_h = worst_y = 0.0
+    for line, rgb in zip(out.strip().splitlines(), probes):
+        ci, cc, ch, cy = (float(x) for x in line.split())
+        iab = P.rec709_to_ictcp(list(rgb), 100.0)
+        worst_i = max(worst_i, abs(ci - iab[0]))
+        worst_c = max(worst_c, abs(cc - P.chroma_of(iab)))
+        worst_y = max(worst_y, abs(cy - P.luminance(rgb)))
+        # Hue is undefined at zero chroma; the probe's own guard excludes those
+        # samples from its statistics, so they are excluded here too.
+        if min(cc, P.chroma_of(iab)) > 1e-3:
+            worst_h = max(worst_h, abs(ch - P.hue_of(iab)))
+
+    ok = worst_i < 1e-4 and worst_c < 1e-4 and worst_h < 1e-3 and worst_y < 1e-5
+    check('TonemapProbe ICtCp agrees with the reference', ok,
+          f'I {worst_i:.1e}, C {worst_c:.1e}, H {worst_h:.1e} (chromatic only), Y {worst_y:.1e}')
+
+
 def check_operators():
     """Operator ids must agree between the shader header and the C++ enum, and
     every id the dispatcher handles must be in the UI."""
@@ -325,7 +460,9 @@ if __name__ == '__main__':
     check_push_constants(psdt_h, cpp)
     print(' shader / reference agreement')
     check_shared_constants()
+    check_probe_math()
     print(' operators and options')
+    check_gt7_port()
     check_operators()
     check_options_documented()
     print(' syntax smoke test')

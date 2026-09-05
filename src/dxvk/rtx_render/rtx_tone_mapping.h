@@ -193,7 +193,7 @@ namespace dxvk {
       Demand,         // Colour volume demand. Green in gamut, red out of it.
       Pressure,       // Chroma actually given up.
       Glare,          // Glare contribution alone.
-      Clipping,       // Pre-clamp overflow, before the gamut fit hides it.
+      Clipping,       // Signed pre-clamp excess: red over peak, blue below zero.
       CurveSlope,     // d(display)/d(scene) at this pixel's base.
     };
 

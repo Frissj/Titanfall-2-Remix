@@ -8,6 +8,7 @@ has to answer before anyone looks at a screenshot: *is the maths right*, and
 python3 tools/psdt/psdt_check.py    # shader / header / C++ agree with each other
 python3 tools/psdt/psdt_suite.py    # the transform's own behaviour, measured
 python3 tools/psdt/psdt_sweep.py    # where a parameter's default should sit
+tools/psdt/regen_results.sh         # both of the above into RESULTS.txt
 ```
 
 `psdt_check.py` exits non-zero on failure and is the one to run first.
@@ -40,6 +41,7 @@ Thirteen sections. `python3 tools/psdt/psdt_suite.py <section>` runs one.
 | `classify` | the classifier can tell a neon sign from a sunlit wall, an emissive screen from a specular glint, and sky from either — and what it collapses to when the gbuffer is unavailable |
 | `illuminant` | radiance over albedo recovers the illuminant of a room whose materials are strongly biased, where grey-world reports the paint; and a surface neutral under a non-D65 light is still inside the display volume |
 | `gamut` | what the per-gamut achromatic axis and chroma normaliser fixed, and by how much |
+| `gt7space` | what GT7's Rec.2020 input assumption costs on a Rec.709 framebuffer — the number that decides whether GT7 is usable as a control |
 | `response` | the luminance transfer and clipping rate, against four controls |
 | `colour` | chroma retention as a colour runs out of display volume, and the four terms that decide when compression starts |
 | `hue` | the path to white, and whether it has a discontinuity anywhere in a 1/42-stop sweep |
@@ -62,6 +64,19 @@ Both of those need the GPU. The in-image debug views
 check in-game is the *classification* view rather than the final image: if the
 roles are wrong, everything downstream is answering the right question about
 the wrong pixels.
+
+### Measuring the real renderer
+
+Everything here runs on the CPU. The engine-side counterpart is
+`[TonemapProbe]`, which logs luminance, ICtCp chroma, hue, hue delta and
+clipping counts for the tonemapper's input/output pair, tagged with the
+operator id and whether Auto Exposure Plus and colour grading were on.
+
+That tagging is what makes the operator x Plus comparison tractable: run the
+same scene under each configuration with `rtx.tonemap.colorGradingEnabled=0`
+and bloom off, then diff the `[TonemapProbe]` lines. Enable it with
+`rtx.logSurfaceCoverage`; add `rtx.tf2HeavyProbes` for the per-sample
+`[TonemapProbe.px]` lines.
 
 ### Psycho17 is not in the comparison
 

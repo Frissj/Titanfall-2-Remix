@@ -322,7 +322,7 @@ static const uint psdtDebugDepth        = 6;   // Body depth, as the pooling see
 static const uint psdtDebugDemand       = 7;   // Colour volume demand. Green in, red out of gamut.
 static const uint psdtDebugPressure     = 8;   // Chroma actually given up.
 static const uint psdtDebugGlare        = 9;   // Glare contribution alone.
-static const uint psdtDebugClipping     = 10;  // Pre-clamp overflow, per channel, before the fit.
+static const uint psdtDebugClipping     = 10;  // Signed pre-clamp excess: red over peak, blue under zero.
 static const uint psdtDebugCurveSlope   = 11;  // d(display)/d(scene) at this pixel's base.
 static const uint psdtDebugCount        = 12;
 

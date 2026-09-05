@@ -451,7 +451,41 @@ disables it for anyone who wants to stack them deliberately.
 
 ---
 
-## Diagnostics
+## Diagnostics: the engine side
+
+`[TonemapProbe]`, enabled with `rtx.logSurfaceCoverage`, reads the tonemapper's
+input and output at a sparse grid and logs what the operator did. It used to log
+RGB and luma, which answers "did the curve run" and nothing else — the questions
+an operator comparison turns on are how much chroma survived, whether the hue
+moved, and how much of the frame arrived at a limit, and none of those are
+visible in a luma number.
+
+It now carries luminance, ICtCp chroma and hue on both sides, at the same
+100-nit reference `tools/psdt/` uses, so a number from the game is comparable
+with a number from the harness rather than merely similar to one. One aggregate
+line per frame, fixed field order:
+
+```
+[TonemapProbe] f=… op=8 plus=1 grade=0 n=24 Yin=[…] Yout=[…]
+               clipHi=3/24 clipLo=0/24 negIn=0/24
+               dHueMean=0.42 dHueMax=1.83 chromaOutIn=0.71 chromaSamples=19
+```
+
+`op=`, `plus=` and `grade=` are on every line so a log can be attributed to a
+configuration rather than to a memory of what was set. That is what makes the
+operator × Plus matrix tractable: run the same scene under each configuration
+with colour grading and bloom off, then diff these lines. `rtx.tf2HeavyProbes`
+adds per-sample `[TonemapProbe.px]` lines.
+
+Hue is only accumulated where both sides still carry visible chroma. Averaging
+`atan2` noise from samples that correctly arrived at white would make a
+well-behaved transform look like one with a hue problem.
+
+The probe reads the final image, so it sees the operator's output after the
+operator's own internal clamp. Interior pre-clamp values are not observable from
+a readback at all — that needs shader instrumentation, which is the next section.
+
+## Diagnostics: the shader side
 
 `rtx.tonemap.psdt.debugView` replaces the image with one of the transform's own
 intermediate values — the value it actually read on that pixel on the way past,
@@ -469,23 +503,53 @@ was needed.
  7 gamut demand          green in gamut, red out of it, hard edge at the boundary
  8 chroma given up       should be zero over most of the frame
  9 glare only            the halo without the image under it
-10 pre-clamp overflow    what the final gamut fit had to hide   <- then here
+10 pre-clamp excess      red over peak, blue under zero          <- then here
 11 curve slope           where the curve adds contrast and where it takes it away
 ```
 
 ---
 
-## A correction this makes, and does not propagate
+## A correction this makes, does not propagate, and now measures
 
 The renderer's working space is linear **Rec.709 / sRGB primaries**, D65. That
 is observable, not assumed: the histogram, the auto exposure and the colour
 grading all weight luminance with `calcBt709Luminance`, and the apply shader
 finishes with the sRGB OETF and no primary conversion.
 
-`gt7.slangh` and `psycho17.slangh` both treat the framebuffer as Rec.2020. That
-is wrong for this pipeline, and it desaturates. PSDT converts explicitly. **The
-other two are deliberately left alone**, because they are the controls, and a
-control you have quietly edited is not a control.
+`gt7.slangh` and `psycho17.slangh` both treat the framebuffer as Rec.2020. PSDT
+converts explicitly. **The other two are deliberately left alone**, because they
+are the controls, and a control you have quietly edited is not a control.
+
+But "left alone" is only defensible if the cost is known, so `gt7space` in the
+suite measures it. GT7's forward and inverse both use the Rec.2020 matrices, so
+they are mutually consistent and an untouched colour round-trips exactly — which
+is why this is invisible on a grey ramp and why it survived this long. The error
+enters only where the ICtCp values are *modified*, which is to say exactly where
+the operator does its work:
+
+```
+   swatch     Y shipped    Y reference       dY    C shipped   C reference    dHue
+   grey          0.8351         0.8351    +0.0%       0.0000        0.0000   n/a
+   red           0.3224         0.4090   +26.8%       0.1576        0.1302  +15.4d
+   blue          0.4107         0.5436   +32.4%       0.1094        0.0768  +10.9d
+   magenta       0.4228         0.4830   +14.2%       0.1659        0.1374   -0.9d
+   skin          0.7941         0.8028    +1.1%       0.0343        0.0340   +1.8d
+
+   worst over 11 swatches x 3 luminances:  32.4% luminance, 15.4 deg hue
+```
+
+`reference` is GT7 used the way its own reference intends — Rec.709 in,
+Rec.2020 for the operator, Rec.709 out.
+
+So: tens of percent of luminance on precisely the saturated colours a
+colour-volume comparison is about. **As wired today the GT7 branch is the GT7
+algorithm applied to relabelled numbers, not the GT7 reference applied to this
+renderer's colours**, and any conclusion drawn from PSDT-versus-GT7 inherits
+that. Correcting it changes how the operator looks for anyone using it, which is
+a decision rather than a bug fix — hence a measurement here and no edit there.
+
+`psycho17.slangh` has the same assumption and has not been measured; it is the
+current default operator, so that is the more consequential of the two.
 
 ---
 
@@ -620,18 +684,46 @@ the histogram on its way out.
 
 ## What v0.3 should be
 
+Everything left needs a GPU. That is not a coincidence — the CPU-side work is
+done, and what remains is verification against the real renderer.
+
 In order, and the first one is not optional:
 
 1. **Compile and run it.** Nothing below matters until the shaders have been
-   through slangc and a frame has gone through them.
+   through slangc and a frame has gone through them. `psdt_check.py` catches the
+   header/C++/shader mismatches that would stop a build; it cannot catch a Slang
+   syntax error, because there is no Slang compiler on this machine.
 2. **Look at the role classification in-game** before looking at the image. If
    the roles are wrong, every measurement downstream is answering the right
    question about the wrong pixels.
-3. **Profile it**, per stage, with the option toggles that already exist.
-4. **A Titanfall frame corpus**, captured through the debug views, so
+3. **Run the operator x Plus matrix.** The instrumentation is in place, so this
+   is mechanical: four runs of the same scene with
+   `rtx.tonemap.colorGradingEnabled=0`, bloom off, and
+   `rtx.logSurfaceCoverage=1`, then diff the `[TonemapProbe]` lines.
+
+   ```
+   operator 7 (GT7)       + Plus off
+   operator 7 (GT7)       + Plus on
+   operator 9 (Reinhard)  + Plus off
+   operator 9 (Reinhard)  + Plus on
+   ```
+
+   Add operators 6 and 8 to the same sweep and it also answers "is PSDT better
+   than the operator it would replace", which the synthetic suite cannot.
+4. **Decide the GT7 input-space question**, with the `gt7space` numbers in hand.
+   Either convert around the branch and accept that GT7 changes appearance, or
+   keep it and state in every comparison that the control is off by up to a
+   third of a stop on saturated colours. What is not defensible is leaving it
+   undecided, which is where it has been.
+5. **Measure Psycho17's input-space assumption too.** It has the same Rec.2020
+   comment and it is the current default operator, so it matters more than GT7's.
+6. **Profile it**, per stage, with the option toggles that already exist.
+7. **A Titanfall frame corpus**, captured through the debug views, so
    "does this look better" becomes a measurement.
-5. **Psycho17 in the comparison**, via GPU capture rather than a hand port.
-6. **Scene grading and display grading as separate operations.** The existing
+8. **Psycho17 in the comparison**, via GPU capture rather than a hand port.
+9. **Scene grading and display grading as separate operations.** The existing
    colour grading runs after PSDT and is a plain RGB operation that can undo the
    hue trajectory PSDT worked to produce. It is off by default, so this is
    latent rather than active.
+10. **GT7 parameters as options.** Non-blocking, and it touches an operator that
+    is deliberately frozen, so it wants a decision before an edit.

@@ -712,6 +712,15 @@ float3 psdtApply(
     outRgb = psdtAdaptFromD65(outRgb, adaptGain);
   }
 
+  // Snapshot for the clipping diagnostic, taken here because here is the last
+  // point at which the signal still carries its own overshoot *and* its
+  // undershoot. One line further on the max() destroys the negative half, and
+  // the negative half is the interesting half: it is where a colour coming
+  // back from the perceptual round trip announces that it does not exist on
+  // this display. v0.1's version was sampled after the clamp and could only
+  // ever report overflow, which is the half the gamut fit was already handling.
+  const float3 preClamp = outRgb;
+
   // The perceptual round trip is not luminance-exact once chroma has moved,
   // so restore the luminance the tone stage decided on. Chroma is what the
   // colour stage is allowed to change; brightness is not.
@@ -779,10 +788,25 @@ float3 psdtApply(
       case psdtDebugGlare:
         return saturate(glare.colour);
       case psdtDebugClipping:
-        // Pre-clamp overflow, per channel, measured before the gamut fit had a
-        // chance to hide it. This is the diagnostic that says whether the
-        // colour-volume stage is doing its job or the clip at the end is.
-        return saturate((preFit - peak) / max(peak, 1e-4));
+      {
+        // Signed pre-clamp excess, per channel, in both directions.
+        //
+        //   red   channels above peak - the colour-volume stage left something
+        //         for the final clip to take out
+        //   blue  channels below zero - the colour does not exist on this
+        //         display at all, and came back from the perceptual round trip
+        //         saying so
+        //
+        // Both halves matter and v0.1 could only show one, because it sampled
+        // after a max(x, 0). A frame that is blue here is a frame where the
+        // gamut mapper is being handed impossible colours; a frame that is red
+        // here is one where it is not finishing the job.
+        const float3 over = max(preFit - peak, 0.0) / max(peak, 1e-4);
+        const float3 under = max(-preClamp, 0.0) / max(peak, 1e-4);
+        return float3(saturate(max(max(over.r, over.g), over.b)),
+                      0.0,
+                      saturate(max(max(under.r, under.g), under.b)));
+      }
       case psdtDebugCurveSlope:
         return psdtSignedRamp(baseSlope - 1.0, 1.0);
       default:

@@ -1,5 +1,5 @@
 PSDT test suite output. Regenerate with:
-    python3 tools/psdt/psdt_suite.py > tools/psdt/RESULTS.txt
+    tools/psdt/regen_results.sh
 
 Consistency check (shader / header / C++ agreement):
 PSDT consistency check
@@ -32,7 +32,12 @@ PSDT consistency check
   [ok  ] chroma references match between shader and reference
   [ok  ] shoulder clamp present in both shader and reference   shader=True reference=True
   [ok  ] black-level epsilon matches   shader=1e-7 reference=1e-7
+  [ok  ] TonemapProbe maths compiles
+  [ok  ] TonemapProbe ICtCp agrees with the reference   I 2.2e-06, C 7.9e-06, H 3.6e-05 (chromatic only), Y 2.2e-08
  operators and options
+  [ok  ] GT7 curve constants match between shader and reference
+  [ok  ] GT7 inverse ICtCp constants match   shader=0.00860904 reference=0.00860904
+  [ok  ] GT7's input-space assumption is documented and modelled   shader says Rec.2020=True, reference models both=True
   [ok  ] operator ids agree between the C++ enum and the shader header
   [ok  ] every operator appears in the UI dropdown
   [ok  ] every pure operator is reachable from applyForkTonemap
@@ -138,6 +143,54 @@ CLASSIFY  can it tell a lamp from a sunlit wall
     distinct classifications without the gbuffer: 2 of 6
     (compactness still separates a glint from a wall, which is why it is kept as
      the fallback - but nothing separates a lamp from a wall, or sky from either)
+
+GT7SPACE  what GT7's Rec.2020 input assumption costs
+----------------------------------------------------
+  gt7.slangh says "input is assumed to be linear Rec.2020 frame-buffer RGB",
+  and feeds the framebuffer straight into a Rec.2020 -> LMS matrix. This
+  renderer's framebuffer is linear Rec.709 - observably, since the histogram,
+  the auto exposure and the colour grading all weight it with Rec.709 luma and
+  the apply shader ends with the sRGB OETF and no primary conversion.
+
+  The forward and inverse inside GT7 use the same (wrong) matrices, so an
+  untouched colour round-trips exactly and the error is invisible on a grey
+  ramp. It enters only where the ICtCp values are modified - the chroma fade
+  and the luminance substitution - which is to say, exactly where the operator
+  does its work.
+
+  shipped   = framebuffer fed straight in, as the branch runs today
+  reference = Rec.709 -> Rec.2020 in, operator, Rec.2020 -> Rec.709 out
+
+    swatch     scene Y  Y shipped     Y ref       dY  C shipped     C ref      dHue
+    grey          1.00     0.8351    0.8351    +0.0%     0.0000    0.0000   -13.87d
+    red           1.00     0.3224    0.4090   +26.8%     0.1576    0.1302   +15.43d
+    green         1.00     0.7110    0.7539    +6.0%     0.2230    0.2079    -1.70d
+    blue          1.00     0.4107    0.5436   +32.4%     0.1094    0.0768   +10.92d
+    yellow        1.00     0.8032    0.8148    +1.4%     0.2036    0.2025    -0.31d
+    cyan          1.00     0.7446    0.8034    +7.9%     0.0761    0.0658    -1.18d
+    magenta       1.00     0.4228    0.4830   +14.2%     0.1659    0.1374    -0.90d
+    skin          1.00     0.7941    0.8028    +1.1%     0.0343    0.0340    +1.75d
+    neon          1.00     0.7522    0.8061    +7.2%     0.0709    0.0602    -3.50d
+    muzzle        1.00     0.8072    0.8155    +1.0%     0.0850    0.0836    +0.43d
+    gunmetal      1.00     0.8350    0.8344    -0.1%     0.0110    0.0109    +0.14d
+
+  worst over 11 swatches x 3 luminances:
+    luminance    32.4%   (blue at 1x)
+    chroma     0.0419
+    hue         15.43 deg  (red at 1x), counting only samples
+               above a tenth of the display's chroma capacity - below that
+               hue is undefined and the number is meaningless
+
+  Verdict: a neutral is unaffected, so this never shows on a grey ramp, and it
+  is not a subtle bias either - it is tens of percent of luminance on exactly
+  the saturated colours a colour-volume comparison is about. As wired today the
+  GT7 branch is the GT7 algorithm applied to relabelled numbers, not the GT7
+  reference applied to this renderer's colours.
+
+  This section deliberately does not change gt7.slangh. Correcting it would
+  change how the operator looks for anyone using it, which is a decision rather
+  than a bug fix, and an edited control is not a control. What it does is put a
+  number on the question so the decision can be made with one.
 
 ILLUMINANT  the colour of the light, not the colour of the paint
 ----------------------------------------------------------------

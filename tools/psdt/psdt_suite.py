@@ -10,8 +10,8 @@ to beat.
     python3 tools/psdt/psdt_suite.py            # everything
     python3 tools/psdt/psdt_suite.py curve      # one section
 
-Sections: probe, curve, classify, illuminant, gamut, response, colour, hue,
-          contrast, glare, temporal, compare, invariants
+Sections: probe, curve, classify, illuminant, gamut, gt7space, response, colour,
+          hue, contrast, glare, temporal, compare, invariants
 
 What this can and cannot establish
 ----------------------------------
@@ -398,6 +398,75 @@ def section_gamut():
         v01 = P.chroma_reference(P.SPACE_ICTCP, P.GAMUT_709)
         print(f'    {gname:9s} correct {correct:.4f}   v0.1 used {v01:.4f}   '
               f'chroma term off by {100.0 * (v01 / correct - 1.0):+.0f}%')
+
+
+def section_gt7space():
+    rule('GT7SPACE  what GT7\'s Rec.2020 input assumption costs')
+
+    print('  gt7.slangh says "input is assumed to be linear Rec.2020 frame-buffer RGB",')
+    print('  and feeds the framebuffer straight into a Rec.2020 -> LMS matrix. This')
+    print('  renderer\'s framebuffer is linear Rec.709 - observably, since the histogram,')
+    print('  the auto exposure and the colour grading all weight it with Rec.709 luma and')
+    print('  the apply shader ends with the sRGB OETF and no primary conversion.')
+    print()
+    print('  The forward and inverse inside GT7 use the same (wrong) matrices, so an')
+    print('  untouched colour round-trips exactly and the error is invisible on a grey')
+    print('  ramp. It enters only where the ICtCp values are modified - the chroma fade')
+    print('  and the luminance substitution - which is to say, exactly where the operator')
+    print('  does its work.')
+    print()
+    print('  shipped   = framebuffer fed straight in, as the branch runs today')
+    print('  reference = Rec.709 -> Rec.2020 in, operator, Rec.2020 -> Rec.709 out')
+    print()
+    print(f'    {"swatch":9s} {"scene Y":>8s} {"Y shipped":>10s} {"Y ref":>9s} {"dY":>8s}'
+          f' {"C shipped":>10s} {"C ref":>9s} {"dHue":>9s}')
+
+    floor = 0.1 * P.chroma_reference(P.SPACE_ICTCP, P.GAMUT_709)
+    worst_dy = worst_dc = worst_dh = 0.0
+    worst_dy_at = worst_dh_at = ''
+    for sw in ('grey', 'red', 'green', 'blue', 'yellow', 'cyan', 'magenta',
+               'skin', 'neon', 'muzzle', 'gunmetal'):
+        for y in (0.18, 1.0, 4.0):
+            rgb = hdr(sw, y)
+            a, b = P.gt7(rgb), P.gt7_in_rec2020(rgb)
+            ya, yb = max(P.luminance(a), 1e-9), max(P.luminance(b), 1e-9)
+            ca = P.chroma_of(P.rec709_to_ictcp(a, 100.0))
+            cb = P.chroma_of(P.rec709_to_ictcp(b, 100.0))
+            dy = 100.0 * (yb / ya - 1.0)
+            d = P.hue_of(P.rec709_to_ictcp(b, 100.0)) - P.hue_of(P.rec709_to_ictcp(a, 100.0))
+            d -= 2 * math.pi * math.floor(d / (2 * math.pi) + 0.5)
+            deg = math.degrees(d)
+
+            if abs(dy) > worst_dy:
+                worst_dy, worst_dy_at = abs(dy), f'{sw} at {y:g}x'
+            worst_dc = max(worst_dc, abs(cb - ca))
+            # Hue is undefined at zero chroma, so only count samples where both
+            # results still carry something a viewer could see a hue in.
+            if min(ca, cb) > floor and abs(deg) > worst_dh:
+                worst_dh, worst_dh_at = abs(deg), f'{sw} at {y:g}x'
+
+            if y == 1.0:
+                print(f'    {sw:9s} {y:8.2f} {ya:10.4f} {yb:9.4f} {dy:+7.1f}%'
+                      f' {ca:10.4f} {cb:9.4f} {deg:+8.2f}d')
+
+    print()
+    print(f'  worst over 11 swatches x 3 luminances:')
+    print(f'    luminance  {worst_dy:6.1f}%   ({worst_dy_at})')
+    print(f'    chroma     {worst_dc:6.4f}')
+    print(f'    hue        {worst_dh:6.2f} deg  ({worst_dh_at}), counting only samples')
+    print(f'               above a tenth of the display\'s chroma capacity - below that')
+    print(f'               hue is undefined and the number is meaningless')
+    print()
+    print('  Verdict: a neutral is unaffected, so this never shows on a grey ramp, and it')
+    print('  is not a subtle bias either - it is tens of percent of luminance on exactly')
+    print('  the saturated colours a colour-volume comparison is about. As wired today the')
+    print('  GT7 branch is the GT7 algorithm applied to relabelled numbers, not the GT7')
+    print('  reference applied to this renderer\'s colours.')
+    print()
+    print('  This section deliberately does not change gt7.slangh. Correcting it would')
+    print('  change how the operator looks for anyone using it, which is a decision rather')
+    print('  than a bug fix, and an edited control is not a control. What it does is put a')
+    print('  number on the question so the decision can be made with one.')
 
 
 def section_response():
@@ -1083,6 +1152,7 @@ def section_invariants():
 
 SECTIONS = {
     'probe': section_probe, 'curve': section_curve, 'classify': section_classify,
+    'gt7space': section_gt7space,
     'illuminant': section_illuminant, 'gamut': section_gamut,
     'response': section_response, 'colour': section_colour, 'hue': section_hue,
     'contrast': section_contrast, 'glare': section_glare, 'temporal': section_temporal,
