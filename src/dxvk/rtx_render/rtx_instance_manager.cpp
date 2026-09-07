@@ -4170,6 +4170,12 @@ namespace dxvk {
             // camera moving. Anything else means the identity is chasing
             // something -- see the option's description.
             " newObjects=", ro.newObjects,
+            // OF WHICH, HOW MANY WE RETIRED OURSELVES. Read this BEFORE
+            // reading newObjects as identity churn -- freeObject drops the
+            // iaIdentity, so our own retirement manufactures "new" objects and
+            // quietFrames' own description names that hazard. reminted ~=
+            // newObjects means the key is fine; reminted ~0 means it is not.
+            " reminted=", ro.remintedObjects,
             " newPrims=", ro.newPrimitives,
             // Counted apart from newObjects on purpose. Expected non-zero.
             " ordinalShift=", ro.ordinalShift,

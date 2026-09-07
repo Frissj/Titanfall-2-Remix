@@ -86,6 +86,13 @@ namespace dxvk {
       if (it != m_objectsByIa.end() && it->second == id) {
         m_objectsByIa.erase(it);
       }
+      // REMEMBER WHAT WE JUST UN-NAMED. The erase above is what makes this
+      // object's next draw count as newObjects, so the identity is recorded
+      // here -- at the one place that causes it -- rather than inferred later
+      // from a correlation between two counters. See Stats::remintedObjects.
+      if (m_retiredIa.size() < 65536u) {
+        m_retiredIa.insert(o.iaIdentity);
+      }
     }
     if (o.engineHandle != 0ull) {
       const auto it = m_objectsByHandle.find(o.engineHandle);
@@ -280,6 +287,13 @@ namespace dxvk {
         ++m_stats.ordinalShift;
       } else {
         ++m_stats.newObjects;
+        // AND HOW MANY OF THOSE WE RETIRED OURSELVES. Counted alongside rather
+        // than instead of newObjects: newObjects stays comparable with every
+        // number recorded against it, and reminted says how much of it is this
+        // store's own retirement coming back rather than the key moving.
+        if (m_retiredIa.find(iaIdentity) != m_retiredIa.end()) {
+          ++m_stats.remintedObjects;
+        }
       }
     }
 

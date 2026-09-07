@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "rtx_constants.h"
 
@@ -294,6 +295,35 @@ namespace dxvk {
 
       uint32_t retiredPrimitives = 0;
       uint32_t retiredObjects = 0;
+
+      // NV-DXVK: HOW MANY OF newObjects ARE OBJECTS WE OURSELVES RETIRED.
+      //
+      // WHY THIS COUNTER AND NOT A LONGER quietFrames. newObjects means "an
+      // iaIdentity never seen before", and freeObject ERASES that identity from
+      // m_objectsByIa. So an object that goes quiet for quietFrames, retires,
+      // and is then drawn again is counted as new -- and quietFrames' own
+      // documentation names this hazard: "retiring early would show up as
+      // identity churn in newObjects and be indistinguishable from the failure
+      // that counter exists to detect".
+      //
+      // The 2026-09-07 capture is exactly that situation. [RsChurn] reads
+      // newIdent=10..22 per 300 frames with every head field 0, while
+      // [RenderObject] reads newObjects=12..152 per 60 -- an order of
+      // magnitude apart, so they cannot be measuring the same thing -- against
+      // retired=142..233 per window, and [InstReap] verdict=starved 56652 vs
+      // respawn 77, i.e. a population that predominantly stops being drawn.
+      //
+      // RAISING quietFrames WOULD ALSO ANSWER IT, AND IS THE WRONG INSTRUMENT.
+      // It changes the thing being measured, and it is the shape the standing
+      // note on numFramesToKeepBLAS already rejected: making a stale record
+      // survive instead of explaining why the record went away. This costs one
+      // hash-set probe on the retire path and nothing on the draw path, and it
+      // leaves the policy alone.
+      //
+      // READ IT AS: reminted ~= newObjects means the key is fine and this
+      // counter is measuring our own retirement. reminted ~= 0 with newObjects
+      // high means the identity really is chasing something.
+      uint32_t remintedObjects = 0;
       // CUMULATIVE and deliberately not reset with the rest, same argument as
       // ResidentScene::Stats::wiped: an eviction that happens and then reads 0
       // by the time the line comes out is how a policy hides.
@@ -332,6 +362,17 @@ namespace dxvk {
     std::vector<uint32_t> m_primitiveGen;
     std::vector<uint32_t> m_freeObjects;
     std::vector<uint32_t> m_freePrimitives;
+
+    // EVERY iaIdentity THIS STORE HAS RETIRED, so a later "new" object can be
+    // told from a genuinely new one. See Stats::remintedObjects.
+    //
+    // NOT ERASED ON RE-MINT, deliberately: an object that retires, comes back,
+    // and retires again is the same fact twice and must count twice, or a
+    // cyclical scene reads as a one-off. Bounded at the same 65536 the other
+    // identity maps here use; full means remintedObjects UNDER-counts, which
+    // biases toward "the key is at fault" -- the conservative direction for a
+    // counter whose job is to exonerate it.
+    std::unordered_set<uint64_t> m_retiredIa;
 
     std::unordered_map<uint64_t, RenderPrimitiveId> m_primitivesByKey;
 

@@ -3629,11 +3629,21 @@ namespace dxvk {
     // gap2, with distinct=27832 against drawKey's 2947: the fold takes ~9.4
     // values per geometry key and CYCLES, which is a different defect from the
     // pair the sample showed. The sample was not the failing population.
+    static constexpr uint32_t kRsMatSlots = 16u;
     struct MatParts {
       uint64_t ps    = 0ull;
       uint64_t srv   = 0ull;
       uint64_t samp  = 0ull;
       uint64_t state = 0ull;
+      // PER SLOT, so "the SRV accumulator moved" becomes "slot N moved".
+      // srvAcc is a hash over up to 18 views; it says something changed and
+      // nothing about which, and matParts srv{g1=0 gap=386} says every change
+      // is in the population that skipped a frame. This is that column one
+      // level down. Slots past kRsMatSlots fold into the accumulator as before
+      // and are counted in slotOver.
+      uint64_t slot[kRsMatSlots] = { };
+      uint32_t slotUsed = 0u;
+      uint32_t slotOver = 0u;
     };
     uint64_t residentMaterialFold(MatParts* parts = nullptr) const;
 
@@ -3652,6 +3662,28 @@ namespace dxvk {
     uint32_t m_rsPartsSrv   = 0u;
     uint32_t m_rsPartsSamp  = 0u;
     uint32_t m_rsPartsState = 0u;
+    // THE POPULATION THIS PROBE USED TO THROW AWAY. It compared only draws
+    // whose baseKey recurred on the very next frame -- the half that was
+    // already working -- and reported the material fold at "its own noise
+    // floor" on that basis. g1 is that old population; gap is the one it never
+    // sampled, which is the failing one. srvG1/srvGap split the SRV column the
+    // same way, because [RsIdent] upPlusMat now says the material fold is the
+    // only term still moving and the SRV accumulator is its largest component
+    // (srvFold folded=19068 of declared=23463, maxFold=18 per draw).
+    // The draw's index start BEFORE the upstream-keyed zeroing. Probe input
+    // only -- see the relRange candidate.
+    uint32_t m_rsDrawStartRaw = 0u;
+    uint32_t m_rsPartsG1     = 0u;
+    uint32_t m_rsPartsGap    = 0u;
+    uint32_t m_rsPartsSrvG1  = 0u;
+    uint32_t m_rsPartsSrvGap = 0u;
+    // WHICH SLOT MOVED, gapped population only -- the one srv{} says owns every
+    // change. slotCnt is per-slot moves; slotBoth counts draws where more than
+    // one slot moved at once, which separates "one texture is unstable" from
+    // "the whole binding set is different".
+    uint32_t m_rsMatSlotCnt[kRsMatSlots] = { };
+    uint32_t m_rsMatSlotBoth = 0u;
+    uint32_t m_rsMatSlotOver = 0u;
 
     // NV-DXVK [KeyParts]: THE SAME SPLIT, ON THE OTHER HALF OF THE KEY.
     //
@@ -3911,6 +3943,25 @@ namespace dxvk {
     uint32_t m_rsKpCandSame[kRsKpCands][kRsKeyKinds] = { };
     uint32_t m_rsKpCandGap[kRsKpCands][kRsKeyKinds]  = { };
     uint32_t m_rsKpCandNew[kRsKpCands][kRsKeyKinds]  = { };
+    // THE DISCRIMINATION COLUMN, WITHOUT WHICH THE THREE ABOVE CAN ONLY EVER
+    // ARGUE FOR THE COARSEST KEY.
+    //
+    // gap/same/new are all RECURRENCE, and recurrence is monotone in
+    // coarseness: drop enough terms and every candidate recurs perfectly. The
+    // standing note on the (model asset, o2w) candidate is what that costs --
+    // it improved every gap column, was built, and lost studio 14 points,
+    // because dropping the head made sub-draws with genuinely different
+    // geometry collide and the ordinal handed them each other's records.
+    // Nothing in gap/same/new can see that happen.
+    //
+    // coll counts draws landing at occurrence > 0 -- i.e. a draw this key
+    // could not tell apart from an earlier one in the SAME frame. Recorded for
+    // each candidate AND for the full head, so the pair reads directly: a
+    // candidate whose gap improves while its coll matches the head's has
+    // dropped noise, and one whose coll climbs above the head's has dropped
+    // discrimination and is the 14-point candidate again.
+    uint32_t m_rsKpCandColl[kRsKpCands][kRsKeyKinds] = { };
+    uint32_t m_rsKpHeadColl[kRsKeyKinds]             = { };
     // RESULT: noBuf gap=884/779/635/160 against the full head's 905/796/672/212
     // and noVs equal to the full head to the digit. BOTH CANDIDATES REFUTED.
     // No reduction of the head recovers the population, which means the draw's

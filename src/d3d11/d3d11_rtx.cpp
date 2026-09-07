@@ -2874,6 +2874,19 @@ namespace dxvk {
     thread_local Open     t_open[kDepthMax] = { };
     thread_local uint32_t t_top             = 0u;
 
+    // THE OPEN SPAN'S LOWEST RANGE START, or 0xFFFFFFFF when no span is open.
+    // Read by residentGateJudge's relRange candidate: drawStart is zeroed for
+    // upstream-keyed draws because the batch's BASE moves every frame, but the
+    // offset of a run WITHIN its own batch does not -- tile{tiled=12000
+    // abutted=12000 holed=0} says the runs abut into one range, so run k sits
+    // at a fixed distance from the batch's first index whenever the surface
+    // order holds. That distance is the only per-sub-draw term left that is not
+    // the ordinal, and the ordinal is measured as the churn.
+    inline uint32_t openSpanLo() {
+      return (t_top != 0u && t_top <= kDepthMax) ? t_open[t_top - 1u].lo
+                                                 : 0xFFFFFFFFu;
+    }
+
     // WHICH PASS THE SPAN ABOUT TO OPEN IS, SET BY THE PRODUCER ITSELF.
     //
     // THE MEASUREMENTS THAT MOVED IT HERE. Three D3D11-side discriminators were
@@ -3068,6 +3081,33 @@ namespace dxvk {
       // than being inferred from spans/keys.
       uint32_t frames = 0u, passSame = 0u, passMoved = 0u, passMax = 0u;
       uint64_t passTotal = 0ull;
+      // HOW THE RUN COUNT MOVES WHEN IT MOVES -- the last unnamed step in the
+      // chain, and the one the whole miss now rests on.
+      //
+      // WHAT IS ALREADY ESTABLISHED. [WorldBatch] reads batches=29700 and
+      // surfaces=120420 identical to the digit over four consecutive windows:
+      // the engine submits the SAME work every frame. held{moved=0} says that
+      // whenever a key is drawn the same number of times, its geometry is
+      // byte-identical. So nothing about the scene moves. What moves is
+      // passMoved -- (h.spans != a.spans) -- the number of runs the packer
+      // splits one surface set into, on ~3000 of ~9000 keys a window.
+      //
+      // WHY THAT IS THE WHOLE DEFECT. The occurrence ordinal is a function of
+      // the run count, so a set split 3 ways this frame and 2 the next leaves
+      // occurrence 2 absent -- which is exactly away{2=N 3=0 4+=0}, a strict
+      // two-frame absence with zero variance, in both populations and every
+      // window. It is also gHdAsset{gone}, ordinalShift, and missKey as the
+      // only miss. The handoff already took drawCount out of the key for this
+      // reason ("the set is stable; how the packer SPLITS it into runs is
+      // not") and it did not help, because the ORDINAL carries the same fact.
+      //
+      // WHAT THESE THREE DECIDE. If up/dn dominate and big is ~0 the split
+      // moves by exactly one run and alternates, which is a two-state toggle
+      // and can be cancelled. If big is large the split is genuinely variable
+      // and the ordinal has to be replaced rather than stabilised -- and that
+      // is the change sec 6.1 says must not be attempted without a
+      // discrimination column, which headColl/coll now supply.
+      uint32_t cntUp = 0u, cntDn = 0u, cntBig = 0u;
       // PRESENTS IN THIS WINDOW, stamped at emit off the frame thread's own
       // clock. frames is the same count taken on the BATCH thread, and the two
       // disagreeing is a measurement in its own right -- the first aggregated
@@ -3259,6 +3299,12 @@ namespace dxvk {
           else                s_w.gap3p += 1u;
 
           (passMoved  ? s_w.passMoved   : s_w.passSame)   += 1u;
+          // BY HOW MUCH, and in which direction. See Window::cntUp.
+          if (passMoved) {
+            if (a.spans == h.spans + 1u)      s_w.cntUp  += 1u;
+            else if (h.spans == a.spans + 1u) s_w.cntDn  += 1u;
+            else                              s_w.cntBig += 1u;
+          }
           (runsMoved  ? s_w.runsMoved   : s_w.runsSame)   += 1u;
           (sumMoved   ? s_w.sumMoved    : s_w.sumSame)    += 1u;
           (extMoved   ? s_w.extentMoved : s_w.extentSame) += 1u;
@@ -3554,7 +3600,11 @@ namespace dxvk {
                   / static_cast<uint64_t>(w.gap0 + w.gap1 + w.gap2 + w.gap3p + w.fresh)
               : 0ull),
         " max=", w.passMax,
-        " same=", w.passSame, " moved=", w.passMoved, "}",
+        " same=", w.passSame, " moved=", w.passMoved,
+        // HOW THE RUN COUNT MOVED. up+dn >> big and up ~= dn is a one-run
+        // two-state toggle -- cancellable. big large is a genuinely variable
+        // split and the ordinal has to be replaced instead. See Window::cntUp.
+        " d{up=", w.cntUp, " dn=", w.cntDn, " big=", w.cntBig, "}}",
         // THE CELL THE WHOLE QUESTION TURNS ON. pk{} is recurrence at
         // (key,pass); gap2 there is a pass that genuinely runs on alternate
         // frames, gap1 everywhere is the pass count having been an artifact of
@@ -3764,11 +3814,12 @@ namespace dxvk {
     // fired. See RecordEntry::worldKey for why it is kept regardless.
     //
     // 0 MEANS "NOT A WORLD BATCH DRAW", and also what it reads before the hook
-    // installs. THE INSTALL is what needs rtx.residentScene.logStats, not the
-    // latch: worldEnter is ungated, so once the patch is in the identity does
-    // not depend on whether a log line is being printed. With diagnostics off
-    // the hook never installs at all and residentDrawKey keeps the key it has
-    // always minted -- a real limitation of the current gating, not a hedge.
+    // installs. THE INSTALL FOLLOWS identityWanted(), NOT logStats -- it used to
+    // follow logStats, which meant this returned 0 for every draw in any run
+    // that was not being logged, and the caveat that used to sit here called
+    // that "a real limitation of the current gating". It was the same defect
+    // noteRecord had, and it outranked it: an ungated latch behind a gated
+    // install is still a gated identity.
     inline uint64_t currentWorldKey() {
       return t_worldKey != 0ull ? t_worldKey : t_worldReplayKey;
     }
@@ -3902,6 +3953,31 @@ namespace dxvk {
 
     inline bool enabled() {
       return RtxOptions::ResidentScene::logStats();
+    }
+
+    // WHAT THE HOOKS ARE FOR, AND IT IS NOT THE LOG. enabled() gates COUNTERS.
+    // This gates the LATCH MACHINERY -- which detours go into engine code, and
+    // whether qAllocWrapper records at all.
+    //
+    // They were the same flag until now, and that was noteRecord's defect two
+    // layers further out. noteRecord/noteReplay were ungated and it changed
+    // nothing in a shipping run, because their only caller returned early on
+    // !enabled(), the eight installs that create the latches all required
+    // logStats, and joinstack's census -- which those installs wait on -- only
+    // ARMS when logStats is on, so censusDone() never became true either.
+    // Three independent gates, one flag, same consequence: with logStats off,
+    // currentWorldKey() and currentStudioKey() returned 0 for every draw,
+    // residentDrawKey's zeroing clause never ran, and drawStart / drawBase /
+    // drawCount / vbOffset / ibOffset / ibPtr went straight back into the
+    // resident key -- the per-frame packing positions the whole design exists
+    // to keep out.
+    //
+    // The identity now follows the options that ASK for it. Both off is a real
+    // off switch and costs nothing; RTX_DISABLE_ENGINE_HOOKS=1 is still the
+    // blanket one. logStats only prints.
+    inline bool identityWanted() {
+      return RtxOptions::ResidentScene::worldBatchKey()
+          || RtxOptions::ResidentScene::studioModelKey();
     }
 
     // THE JOIN TABLE. Key is the address of the queue record; value is the
@@ -4658,7 +4734,13 @@ namespace dxvk {
         // ARM. Gameplay-gated on the same floor everything else here uses: a
         // census spent on menu and loading frames would rank the paths of a
         // scene with no world in it, and then never re-arm.
-        if (inGameplay && RtxOptions::ResidentScene::logStats()) {
+        // ARMS FOR THE INSTALLS TOO, not only for its own ranking. The eight
+        // identity hooks wait on censusDone(), so a census that only armed
+        // under logStats held every one of them off for the life of a run with
+        // diagnostics off -- the third of the three gates that made the
+        // upstream key diagnostics-only.
+        if (inGameplay && (RtxOptions::ResidentScene::logStats()
+                           || joinprobe::identityWanted())) {
           s.framesLeft = kFrames;
           Logger::warn(str::format(
             "[JoinStack] armed for ", kFrames, " frames at f=", fid,
@@ -4672,6 +4754,12 @@ namespace dxvk {
         return;
 
       s.done = true;
+
+      // THE CENSUS IS A PRECONDITION; THE RANKING IS A REPORT. The count-down
+      // above now runs whenever identity is wanted, because censusDone() gates
+      // the installs. Printing stays where it belongs.
+      if (!RtxOptions::ResidentScene::logStats())
+        return;
 
       // RANK BY DRAWS CARRIED. This is the output: which submission path
       // actually moves the frame. Reading these in any other order is what
@@ -9406,7 +9494,13 @@ namespace dxvk {
     // TESTED FIRST. The patch is never reverted once installed, so this stays
     // on every queued matsys command for the life of the process even after the
     // option goes off. One option read is the whole cost of that.
-    if (!joinprobe::enabled())
+    //
+    // identityWanted(), NOT enabled(). This is the PRODUCER of the join table:
+    // gating it on logStats made noteRecord's ungating a no-op, because the one
+    // call site below never ran. The studio key crosses the matsys queue and
+    // has no other route to the draw thread, so with this gated on diagnostics
+    // every queued studio draw arrived with no upstream key at all.
+    if (!joinprobe::identityWanted())
       return desc;
     // NO studioMemReadable HERE, and that is a decision rather than an
     // oversight. The guard is a cached VirtualQuery -- a syscall whenever it
@@ -9798,6 +9892,80 @@ namespace dxvk {
     // stable key that never survives the thread hop reads as a pass on the
     // first set and changes nothing, which is precisely the failure mode the
     // repaired queue hook was in for this whole session.
+    // THE MATERIAL SLICE, counted so its absence is visible rather than silent.
+    // matNone non-zero means a call site is not forwarding a4/a5 and those
+    // batches are back to the batch-wide key.
+    static std::atomic<uint32_t> s_matRuns    { 0u };
+    // Batch surface-set id -> its material slice, to see the grouping move
+    // under a set that does not. Under s_mtx with the other counters.
+    // HOW MANY DISTINCT SLICES ONE BATCH TAKES. 5880 of 6000 changes keep the
+    // material COUNT and change the pointers, and the material set is static
+    // (matNew=0), so these are engine.dll sub_1801B36E0's own rewrite --
+    // `*(_QWORD*)(&unk_193EC9850 + v32) = v34` where v34 is the variant that
+    // material's vtable+184 returns for this pass. If a batch only ever takes
+    // TWO slice values the variant is double-buffered and can be canonicalised;
+    // if it takes many, the variant pointer is not an identity at all and the
+    // key has to reach past it.
+    static constexpr uint32_t kSliceVals = 4u;
+    struct SliceRec {
+      uint64_t macc = 0ull;
+      uint32_t n = 0u;
+      uint64_t seen[kSliceVals] = { };
+      uint32_t used = 0u;
+      uint32_t over = 0u;
+      // The count that went with seen[0]. The canonical substitution below is
+      // only valid at the size it was learned at: a batch that regroups 1<->2
+      // is drawing a genuinely different set of materials, not the same set
+      // through a different variant pointer.
+      uint32_t n0 = 0u;
+    };
+    static std::unordered_map<uint64_t, SliceRec> s_sliceSeen;
+    static uint32_t s_sliceSame = 0u, s_sliceMoved = 0u, s_sliceSize = 0u;
+
+    // ---- CANONICALISATION, AND THE READING THAT REFUTES IT
+    //
+    // vals{ 1=0 2=5280 3=720 4=0 over=0 }, identical every window: each moving
+    // batch takes a BOUNDED set of slice values -- 88% exactly two, 12% three,
+    // none four or more. That is the "canonicalisable" branch the census was
+    // built to decide between, so fold the FIRST value the batch was ever seen
+    // with instead of this pass's, and the key stops tracking sub_1801B36E0's
+    // per-pass variant rewrite.
+    //
+    // THE FALSIFIER IS coll=. Substituting merges every slice value a batch
+    // takes at one size into one key. If two DIFFERENT material groups of one
+    // batch are live in the same frame at the same size, that merge is the
+    // §5.3 error -- one key for two runs that tile but are not interchangeable
+    // -- and coll counts exactly it: same canonical key, same frame, different
+    // raw slice. coll must stay 0. It it does not, this comes straight out; do
+    // not tune it.
+    //
+    // The second falsifier is already in the line beside it: gateSize climbed
+    // ~80-100/window all session and world sat at 58..72%. If both are
+    // unchanged the slice alternation was not the residual and the misses are
+    // elsewhere.
+    struct CanonSlot {
+      uint32_t frame = 0xFFFFFFFFu;
+      uint64_t raw = 0ull;
+    };
+    static std::unordered_map<uint64_t, CanonSlot> s_canonFrame;
+    static uint32_t s_canonSub = 0u;    // folded a value other than this pass's
+    static uint32_t s_canonSame = 0u;   // canonical == raw, nothing to do
+    static uint32_t s_canonSkip = 0u;   // size differs from n0, or set saturated
+    static uint32_t s_canonColl = 0u;   // THE FALSIFIER
+    // A census wipe drops every canonical and re-keys the world in one frame.
+    // distinctEver=1240 against a 65536 bound says it cannot fire, but a
+    // silent mass re-key is exactly the kind of thing that gets argued about
+    // instead of read, so it is counted rather than assumed impossible.
+    static uint32_t s_canonWipe = 0u;
+    static constexpr uint32_t kSliceHist = 8u;   // max=6 measured, +2 headroom
+    static uint32_t s_sliceHist[kSliceHist][kSliceHist] = { };
+    static uint32_t s_sliceHistOver = 0u;
+    static uint32_t s_sliceVals[kSliceVals] = { };
+    static uint32_t s_sliceValsOver = 0u;
+    static std::atomic<uint32_t> s_matNull    { 0u };
+    static std::atomic<uint32_t> s_matZero    { 0u };
+    static std::atomic<uint32_t> s_matBad     { 0u };
+    static std::atomic<uint32_t> s_maxMatCount { 0u };
     static std::atomic<uint32_t> s_keyedDirect { 0u };  // key live on the draw thread
     static std::atomic<uint32_t> s_keyedReplay { 0u };  // key recovered at replay
     // THE LARGEST RUN OF CONSECUTIVE D3D11 DRAWS SHARING ONE BATCH KEY, i.e. how
@@ -9849,14 +10017,254 @@ namespace dxvk {
     // THE PRODUCER HALF OF THE PASS ID. Tag alone for the surface batch: it is
     // driven through one factory-made renderer object, so there is no second
     // invocation of it in a frame to tell apart. See spancensus::t_pendingPass.
-    static uint64_t note(uint32_t count, const uint8_t* desc) {
+    // matCount / matList ARE THE RUN, AND THAT IS FROM THE BINARY RATHER THAN
+    // FROM A GUESS. engine.dll sub_1801B36E0 fills the descriptor array once
+    // per BATCH and then calls the draw once per MATERIAL GROUP:
+    //
+    //   v26 = qword_193F09850 + 112 * *(uint32*)(v25 + 4);   // persistent rec
+    //   *(_OWORD*)(&unk_193B894C0 + 208*v24)      = *v26;    // 7 OWORDs = 112B
+    //   ...
+    //   *(float*)(desc + 108) *= *(float*)(v25 + 8);         // the per-frame fade
+    //   ...
+    //   (**(v43 + 1376))(v43, v52, &unk_193B894C0,
+    //                    v30 - v38, &unk_193EC9850 + 32*v38, v23 < 1.0);
+    //
+    // so a4 is the material COUNT and a5 is a slice of a 32-byte-stride
+    // IMaterial* array. The descriptor array is the whole batch and does NOT
+    // vary per run; what varies is which materials this call draws it with.
+    // Bytes 112..207 of each descriptor are never written by that loop -- they
+    // are the previous batch's leftovers -- which is a second reason the hash
+    // below stops at 104.
+    //
+    // WHY THIS IS THE KEY. Every previous attempt to name a sub-draw was a
+    // function of the packing and was refuted on population: the occurrence
+    // ordinal 10.8x, the material fold 8x, the run's relative range 12x. The
+    // packer re-splits AND re-orders the same surface set every other frame.
+    // The material slice does not describe the split -- it describes what is
+    // being drawn -- so it is invariant under both. Both halves are persistent:
+    // [MatChurn] matTotal=321 matNew=0 and [WorldBatch] newIds=5..9.
+    //
+    // The pointers are read AFTER the engine's own rewrite at sub_1801B36E0's
+    // line 164 (`*(_QWORD*)(&unk_193EC9850 + v32) = v34`), which swaps each
+    // IMaterial* for the variant its vtable+184 returns for this pass. That is
+    // the value the draw actually uses and it is equally persistent.
+    static uint64_t note(uint32_t count, const uint8_t* desc,
+                         uint32_t matCount = 0u, const void* matList = nullptr) {
       spancensus::t_pendingPass = 0x5B47C8u;
       if (desc == nullptr || count == 0u || count > 16384u)
         return 0ull;
       uint64_t acc = 0ull;
       for (uint32_t i = 0; i < count; ++i)
         acc ^= XXH64(desc + static_cast<size_t>(i) * 208u, 104u, 0ull);
+
+      // NV-DXVK [SurfDesc]: WHERE IS THE MATERIAL IN THE 208-BYTE DESCRIPTOR.
+      //
+      // WHY THIS IS THE QUESTION. Every candidate that separates the sub-draws
+      // of a batch has been refuted on POPULATION -- the occurrence ordinal
+      // 10.8x, the material fold 8x, the run's relative range 12x -- because
+      // each is a function of how the packer split and ordered the batch, and
+      // that alternates every other frame on a scene [WorldBatch] reports
+      // bit-identical. identHead alone is stable (new~90 at 0%, distinct~4400
+      // flat) and its whole cost is the 34% it cannot separate in-frame.
+      //
+      // A key that does not ask about the split exists IF the descriptor
+      // carries the surface's material: for each distinct material in the
+      // batch, XOR the surfaces carrying it. Sub-draws are material groups and
+      // tile{holed=0} says the runs abut, so that key names exactly one run
+      // without ever knowing where the run boundaries were -- immune to both
+      // the re-split and the re-order, which is what killed relRange.
+      //
+      // FINDING IT WITHOUT IDA. A material id has a signature nothing else in
+      // this struct has: a few hundred distinct values across the level (321,
+      // per [MatChurn] matTotal), REPEATED across surfaces inside one batch,
+      // and stable frame to frame. A per-surface pointer has thousands of
+      // distinct values and one per surface; a constant has one. So count
+      // distinct values per 8-byte slot, level-wide, and count how many
+      // surfaces in a batch share a value at that slot. The material slot is
+      // the one with few distinct and high repetition.
+      //
+      // The window is the WHOLE 208 bytes, not the hashed 104: the material may
+      // well sit past the part the batch key already covers.
+      if (RtxOptions::ResidentScene::logStats()) {
+        static constexpr uint32_t kSlots = 26u;      // 208 / 8
+        static constexpr size_t   kMaxVals = 4096u;
+        static std::unordered_set<uint64_t> sVals[kSlots];
+        static uint64_t sRepeat[kSlots] = { };       // surfaces sharing a value
+        static uint32_t sSampled = 0u, sLastFrame = 0xFFFFFFFFu;
+        const uint32_t fid = g_remixFrameId.load(std::memory_order_relaxed);
+        // One batch a frame, capped: this walks count x 26 qwords and the
+        // point is a census, not a per-draw cost.
+        if (fid != sLastFrame && sSampled < 600u && count >= 2u) {
+          sLastFrame = fid;
+          sSampled += 1u;
+          std::unordered_set<uint64_t> inBatch;
+          for (uint32_t sl = 0; sl < kSlots; ++sl) {
+            inBatch.clear();
+            for (uint32_t i = 0; i < count; ++i) {
+              uint64_t v;
+              std::memcpy(&v, desc + static_cast<size_t>(i) * 208u + sl * 8u, 8u);
+              if (sVals[sl].size() < kMaxVals) sVals[sl].insert(v);
+              inBatch.insert(v);
+            }
+            // count - distinct-in-batch = how many surfaces shared a value with
+            // an earlier one. High for a material, ~0 for a per-surface field.
+            sRepeat[sl] += count - static_cast<uint32_t>(inBatch.size());
+          }
+          if (sSampled % 200u == 0u) {
+            std::string o;
+            for (uint32_t sl = 0; sl < kSlots; ++sl) {
+              o += " +" + std::to_string(sl * 8u) + "{d="
+                 + std::to_string(static_cast<uint32_t>(sVals[sl].size()))
+                 + (sVals[sl].size() >= kMaxVals ? "+SAT" : "")
+                 + " r=" + std::to_string(sRepeat[sl]) + "}";
+            }
+            Logger::warn(str::format(
+              "[SurfDesc] batches=", sSampled, o,
+              " | material = few distinct (~321) AND high repeat; per-surface"
+              " field = distinct ~= surfaces and repeat ~0"));
+          }
+        }
+      }
       uint64_t id = acc ^ (0x9E3779B97F4A7C15ull * count);
+
+      // THE RUN'S OWN NAME, folded on top of the batch's. XOR for the same
+      // reason the surfaces use it -- the group's order is the engine's
+      // business -- and the count so a group cannot collide with its own
+      // subset. 32-byte stride, pointer at +0, bounded and guarded because
+      // this dereferences engine memory on the packing thread.
+      if (matList != nullptr && matCount != 0u && matCount <= 256u
+          && studioMemReadable(matList, static_cast<size_t>(matCount) * 32u)) {
+        const uint8_t* const m = reinterpret_cast<const uint8_t*>(matList);
+        uint64_t macc = 0ull;
+        for (uint32_t i = 0; i < matCount; ++i) {
+          uint64_t p;
+          std::memcpy(&p, m + static_cast<size_t>(i) * 32u, 8u);
+          macc ^= XXH64(&p, sizeof(p), 0ull);
+        }
+        // What gets folded. Defaults to this pass's value, so with the option
+        // off the key is bit-identical to the build that measured 58..72%.
+        uint64_t mkey = macc;
+        // DOES THE SLICE MOVE UNDER A STABLE SURFACE SET. The material slice
+        // took world from 6.6% to ~63% and the residual is still away{2=N 3=0
+        // 4+=0}, a strict two-state alternation on 41% of draws, with up=534
+        // saying the run key itself moves on 11%. [MatChurn] matNew=0 says the
+        // material SET is static, so if the run key still moves the slice's
+        // MEMBERSHIP must -- a run covering {A,B} one frame and {A},{B} the
+        // next is three keys for one surface set.
+        //
+        // Keyed on the batch id BEFORE the material fold, so this is exactly
+        // "same surfaces, different material grouping". cnt counts the slice
+        // changing; cntN counts it changing size, which separates a regroup
+        // from a reorder of the same members.
+        {
+          std::lock_guard<std::mutex> mlock(s_mtx);
+          if (s_sliceSeen.size() > 65536u) {
+            s_sliceSeen.clear();
+            s_canonFrame.clear();
+            s_canonWipe += 1u;
+          }
+          auto sit = s_sliceSeen.find(id);
+          // THE COUNT IS ITS OWN FIELD. The first version packed it as
+          // `macc ^ (matCount << 32)`, so the high half read
+          // (macc >> 32) ^ matCount -- i.e. it moved whenever macc did, which
+          // made sized== moved== by construction and sent every sample into
+          // the histogram's over= bucket with max=6 on the same line. A
+          // derived field that cannot disagree with the one it is meant to
+          // discriminate against is not a measurement.
+          const SliceRec cur { macc, matCount };
+          if (sit == s_sliceSeen.end()) {
+            { SliceRec r = cur; r.seen[0] = cur.macc; r.used = 1u; r.n0 = matCount;
+              sit = s_sliceSeen.emplace(id, r).first; }
+          } else if (sit->second.macc != cur.macc || sit->second.n != cur.n) {
+            s_sliceMoved += 1u;
+            // Distinct slice values this batch has ever taken, capped.
+            {
+              SliceRec& r = sit->second;
+              uint32_t k = 0;
+              for (; k < r.used; ++k) if (r.seen[k] == cur.macc) break;
+              if (k == r.used) {
+                if (r.used < kSliceVals) r.seen[r.used++] = cur.macc;
+                else r.over += 1u;
+              }
+              if (r.used >= 1u && r.used <= kSliceVals) s_sliceVals[r.used - 1u] += 1u;
+              if (r.over != 0u) s_sliceValsOver += 1u;
+            }
+            if (sit->second.n != cur.n) {
+              s_sliceSize += 1u;
+              // WHICH SIZE TRANSITION. moved==sized to the digit says the
+              // grouping only ever splits or merges, never reorders, on 6000
+              // of 29700 batch draws a window -- 100 a frame, constant. If a
+              // single pair dominates (1<->2 say) the regroup is one boundary
+              // moving and can be cancelled by naming the union; a spread
+              // means the whole grouping is rebuilt each frame and only the
+              // batch-wide material union is invariant.
+              const uint32_t a = sit->second.n;
+              const uint32_t b = cur.n;
+              if (a < kSliceHist && b < kSliceHist) s_sliceHist[a][b] += 1u;
+              else s_sliceHistOver += 1u;
+            }
+            // ONLY THE CURRENT VALUE, NOT THE WHOLE RECORD. `sit->second = cur`
+            // assigned the accumulated seen[]/used/over away every time, so the
+            // distinct-value census reset on each change and reported 1=6000 --
+            // "every batch has taken exactly one slice value" on the same line
+            // that counted 6000 changes to it. A struct assignment that carries
+            // history must not be built from a value that has none.
+            sit->second.macc = cur.macc;
+            sit->second.n    = cur.n;
+          } else {
+            s_sliceSame += 1u;
+          }
+
+          // The value actually folded. Only substitutes at the size the
+          // canonical was learned at, and only while the batch's value set is
+          // still bounded -- over != 0 is the census saying the variant
+          // pointer is not an identity at all, and there is then nothing to
+          // canonicalise TO.
+          if (RtxOptions::ResidentScene::worldCanonicalMaterialSlice()) {
+            const SliceRec& r = sit->second;
+            if (r.used != 0u && r.over == 0u && r.n0 == matCount) {
+              mkey = r.seen[0];
+              if (mkey != macc) s_canonSub += 1u; else s_canonSame += 1u;
+              // THE MERGE TEST. Same canonical, same frame, different raw slice
+              // = two material groups of one batch collapsed into one key.
+              if (s_canonFrame.size() > 65536u) s_canonFrame.clear();
+              // The SAME expression the fold below uses, not an XOR proxy for
+              // it: a falsifier that can fire on a collision the real key does
+              // not have would revert a change that was right.
+              const uint64_t ck =
+                XXH64(&mkey, sizeof(mkey), id ^ (0x9E3779B97F4A7C15ull * matCount));
+              const uint32_t fid = g_remixFrameId.load(std::memory_order_relaxed);
+              CanonSlot& cs = s_canonFrame[ck];
+              if (cs.frame == fid && cs.raw != macc) s_canonColl += 1u;
+              cs.frame = fid;
+              cs.raw   = macc;
+            } else {
+              s_canonSkip += 1u;
+            }
+          }
+        }
+        id = XXH64(&mkey, sizeof(mkey), id ^ (0x9E3779B97F4A7C15ull * matCount));
+        s_matRuns.fetch_add(1u, std::memory_order_relaxed);
+        uint32_t seen = s_maxMatCount.load(std::memory_order_relaxed);
+        while (matCount > seen
+               && !s_maxMatCount.compare_exchange_weak(seen, matCount,
+                                                       std::memory_order_relaxed))
+          ;
+      } else if (matList == nullptr) {
+        // No list forwarded at all -- worldBatchEnter, the SITE hook, which is
+        // patched at a call instruction and only has rdx/r8/r10. runs+none is
+        // exactly s_batches, so each draw takes one path or the other and this
+        // is the population the callee hook does not reach.
+        s_matNull.fetch_add(1u, std::memory_order_relaxed);
+      } else if (matCount == 0u) {
+        // A list with no entries. If this dominates, the draw carries an
+        // implicit single material and the count is not where it was read.
+        s_matZero.fetch_add(1u, std::memory_order_relaxed);
+      } else {
+        // Forwarded, non-empty, and refused by the bound or the readability
+        // guard -- which would mean a5 is not the array this assumed.
+        s_matBad.fetch_add(1u, std::memory_order_relaxed);
+      }
       // Never hand back the sentinel, the same clause residentDrawKey ends on:
       // a one-in-2^64 collision with 0 would otherwise mean this batch silently
       // falls back to the position-dependent key forever.
@@ -9868,7 +10276,7 @@ namespace dxvk {
       s_surfaces += count;
       if (count > s_maxBatch)
         s_maxBatch = count;
-      if (s_seen.insert(id).second)
+      if (s_seen.size() < 65536u && s_seen.insert(id).second)
         s_newIds += 1u;
       return id;
     }
@@ -9959,7 +10367,7 @@ namespace dxvk {
 
       std::lock_guard<std::mutex> lock(s_mtx);
       s_depthPasses += 1u;
-      if (s_seen.insert(id).second)
+      if (s_seen.size() < 65536u && s_seen.insert(id).second)
         s_newIds += 1u;
       return id;
     }
@@ -9994,7 +10402,7 @@ namespace dxvk {
 
       std::lock_guard<std::mutex> lock(s_mtx);
       s_depthPasses += 1u;
-      if (s_seen.insert(id).second)
+      if (s_seen.size() < 65536u && s_seen.insert(id).second)
         s_newIds += 1u;
       return id;
     }
@@ -10080,7 +10488,7 @@ namespace dxvk {
 
       std::lock_guard<std::mutex> lock(s_mtx);
       s_meshListPasses += 1u;
-      if (s_seen.insert(id).second)
+      if (s_seen.size() < 65536u && s_seen.insert(id).second)
         s_newIds += 1u;
       return id;
     }
@@ -10101,7 +10509,7 @@ namespace dxvk {
         id = 1ull;
       std::lock_guard<std::mutex> lock(s_mtx);
       s_flushPasses += 1u;
-      if (s_seen.insert(id).second)
+      if (s_seen.size() < 65536u && s_seen.insert(id).second)
         s_newIds += 1u;
       return id;
     }
@@ -10132,10 +10540,45 @@ namespace dxvk {
         // inert -- which is a DIFFERENT failure from newIds climbing, and the
         // two would be indistinguishable without this pair.
         " keyed{direct=", direct, " replay=", replay, "}",
+        " mat{runs=", s_matRuns.exchange(0u, std::memory_order_relaxed),
+        " null=", s_matNull.exchange(0u, std::memory_order_relaxed),
+        " zero=", s_matZero.exchange(0u, std::memory_order_relaxed),
+        " bad=", s_matBad.exchange(0u, std::memory_order_relaxed),
+        " max=", s_maxMatCount.load(std::memory_order_relaxed), "}",
+        " slice{same=", s_sliceSame, " moved=", s_sliceMoved,
+        " sized=", s_sliceSize, "}",
+        [&]() -> std::string {
+          std::string o;
+          for (uint32_t a = 0; a < kSliceHist; ++a)
+            for (uint32_t b = 0; b < kSliceHist; ++b)
+              if (s_sliceHist[a][b] != 0u)
+                o += " " + std::to_string(a) + ">" + std::to_string(b) + "="
+                   + std::to_string(s_sliceHist[a][b]);
+          o += " } vals{";
+          for (uint32_t k = 0; k < kSliceVals; ++k)
+            o += " " + std::to_string(k + 1) + "=" + std::to_string(s_sliceVals[k]);
+          o += " over=" + std::to_string(s_sliceValsOver);
+          return " sliceHist{" + o + " }";
+        }(),
+        // ON THE SAME LINE AS THE THING IT DISCRIMINATES AGAINST. sub= should
+        // land near slice{moved=}, because the substitution is precisely what
+        // stops those from becoming new keys -- and coll= must be 0.
+        " canon{sub=", s_canonSub, " same=", s_canonSame,
+        " skip=", s_canonSkip, " coll=", s_canonColl,
+        " wipe=", s_canonWipe, "}",
         " maxDrawRun=", s_maxDrawRun.load(std::memory_order_relaxed),
         " | newIds ~0 under a fixed-position sweep = the key is stable;"
         " keyed ~= batches = it reaches the draw; maxDrawRun > 1 = one batch"
-        " splits into several draws and they share an identity"));
+        " splits into several draws and they share an identity;"
+        " canon coll > 0 = the canonical slice merged two live material groups"
+        " and comes straight out"));
+      s_sliceSame = s_sliceMoved = s_sliceSize = 0u;
+      for (uint32_t a = 0; a < kSliceHist; ++a)
+        for (uint32_t b = 0; b < kSliceHist; ++b) s_sliceHist[a][b] = 0u;
+      s_sliceHistOver = 0u;
+      for (uint32_t k = 0; k < kSliceVals; ++k) s_sliceVals[k] = 0u;
+      s_sliceValsOver = 0u;
+      s_canonSub = s_canonSame = s_canonSkip = s_canonColl = s_canonWipe = 0u;
       s_batches = s_surfaces = s_newIds = s_depthPasses = s_flushPasses = 0u;
       s_meshListPasses = 0u;
     }
@@ -10522,7 +10965,8 @@ namespace dxvk {
   // here. Written once from the render thread, read from the frame thread.
   static std::atomic<void*> g_worldDrawCallee { nullptr };
 
-  static void worldBatchEnter(uint32_t count, const void* desc, void* vtable) {
+  static void worldBatchEnter(uint32_t count, const void* desc, void* vtable,
+                              uint32_t matCount, const void* matList) {
     // DISCOVERY IS A SIDE EFFECT OF THE HOOK THAT ALREADY EXISTS. The callee is
     // not knowable statically -- the object is returned by a factory, so its
     // vtable is only a real address once the game is running -- but at this
@@ -10542,7 +10986,8 @@ namespace dxvk {
       }
     }
     joinprobe::worldEnter(
-        worldbatch::note(count, reinterpret_cast<const uint8_t*>(desc)));
+        worldbatch::note(count, reinterpret_cast<const uint8_t*>(desc),
+                         matCount, matList));
   }
 
   static void worldBatchLeave() {
@@ -10591,7 +11036,11 @@ namespace dxvk {
     // registers and the caller's shadow slots hold whatever they held, this
     // reads those same values and writes those same values back, so the callee
     // observes a byte-identical argument list either way.
-    joinprobe::worldEnter(worldbatch::note(count, reinterpret_cast<const uint8_t*>(desc)));
+    // a4/a5 FORWARDED, not dropped. See worldbatch::note: they are the run's
+    // material count and material list, and they are what makes the key name a
+    // sub-draw instead of the whole batch.
+    joinprobe::worldEnter(worldbatch::note(count, reinterpret_cast<const uint8_t*>(desc),
+                                           static_cast<uint32_t>(a4), a5));
     if (g_worldDrawTramp != nullptr)
       g_worldDrawTramp(ctx, count, desc, a4, a5, a6);
     joinprobe::worldLeave();
@@ -11171,22 +11620,41 @@ namespace dxvk {
     // its own shadow space at [rsp,rsp+20h). 0x50 also keeps rsp 16-byte
     // aligned across the call. r10 is saved with the rest because it is
     // volatile and the replayed call needs it.
+    // THE SAVES MOVED UP 8 BYTES TO MAKE ROOM FOR A FIFTH ARGUMENT.
+    //
+    // r9d is the RUN'S MATERIAL COUNT and the caller's [rsp+20h] is its
+    // material list -- engine.dll sub_1801B36E0 ends on
+    //   (**(v43 + 1376))(v43, v52, &unk_193B894C0,
+    //                    v30 - v38, &unk_193EC9850 + 32*v38, v23 < 1.0)
+    // so those two name WHICH RUN of the batch this call draws. Dropping them
+    // is why 11760 batches a window (mat{null=}) were still keyed batch-wide
+    // while the callee hook's 17940 took world from 6.6% to ~60%.
+    //
+    // FRAME LAYOUT, and the collision this avoids: the C call needs arg5 at
+    // [rsp+20h], which is where rcx used to be saved. So the five saves shift
+    // to [rsp+28h..50h) -- exactly the 0x28 bytes left above the shadow space
+    // and the argument slot -- and the frame stays 0x50, 16-byte aligned.
+    // The caller's own [rsp+20h] is at [rsp+70h] after the sub, which is where
+    // the material list is read from.
     emit({0x48, 0x83, 0xEC, 0x50});             // sub  rsp, 50h
-    emit({0x48, 0x89, 0x4C, 0x24, 0x20});       // mov  [rsp+20h], rcx
-    emit({0x48, 0x89, 0x54, 0x24, 0x28});       // mov  [rsp+28h], rdx    count
-    emit({0x4C, 0x89, 0x44, 0x24, 0x30});       // mov  [rsp+30h], r8     descriptors
-    emit({0x4C, 0x89, 0x4C, 0x24, 0x38});       // mov  [rsp+38h], r9
-    emit({0x4C, 0x89, 0x54, 0x24, 0x40});       // mov  [rsp+40h], r10    vtable
+    emit({0x48, 0x89, 0x4C, 0x24, 0x28});       // mov  [rsp+28h], rcx
+    emit({0x48, 0x89, 0x54, 0x24, 0x30});       // mov  [rsp+30h], rdx    count
+    emit({0x4C, 0x89, 0x44, 0x24, 0x38});       // mov  [rsp+38h], r8     descriptors
+    emit({0x4C, 0x89, 0x4C, 0x24, 0x40});       // mov  [rsp+40h], r9     matCount
+    emit({0x4C, 0x89, 0x54, 0x24, 0x48});       // mov  [rsp+48h], r10    vtable
+    emit({0x48, 0x8B, 0x44, 0x24, 0x70});       // mov  rax, [rsp+70h]    caller arg5
+    emit({0x48, 0x89, 0x44, 0x24, 0x20});       // mov  [rsp+20h], rax    arg5 = matList
     emit({0x8B, 0xCA});                         // mov  ecx, edx          arg1 = count
     emit({0x4C, 0x89, 0xC2});                   // mov  rdx, r8           arg2 = descriptors
     emit({0x4D, 0x89, 0xD0});                   // mov  r8,  r10          arg3 = vtable
+    emit({0x45, 0x89, 0xC9});                   // mov  r9d, r9d          arg4 = matCount
     emit({0x48, 0xB8}); imm64(reinterpret_cast<uint64_t>(&worldBatchEnter));
     emit({0xFF, 0xD0});                         // call rax
-    emit({0x4C, 0x8B, 0x54, 0x24, 0x40});       // mov  r10, [rsp+40h]
-    emit({0x4C, 0x8B, 0x4C, 0x24, 0x38});       // mov  r9,  [rsp+38h]
-    emit({0x4C, 0x8B, 0x44, 0x24, 0x30});       // mov  r8,  [rsp+30h]
-    emit({0x48, 0x8B, 0x54, 0x24, 0x28});       // mov  rdx, [rsp+28h]
-    emit({0x48, 0x8B, 0x4C, 0x24, 0x20});       // mov  rcx, [rsp+20h]
+    emit({0x4C, 0x8B, 0x54, 0x24, 0x48});       // mov  r10, [rsp+48h]
+    emit({0x4C, 0x8B, 0x4C, 0x24, 0x40});       // mov  r9,  [rsp+40h]
+    emit({0x4C, 0x8B, 0x44, 0x24, 0x38});       // mov  r8,  [rsp+38h]
+    emit({0x48, 0x8B, 0x54, 0x24, 0x30});       // mov  rdx, [rsp+30h]
+    emit({0x48, 0x8B, 0x4C, 0x24, 0x28});       // mov  rcx, [rsp+28h]
     // THE FRAME COMES DOWN BEFORE THE DRAW, and it always did: the callee reads
     // args 5 and 6 off the CALLER's [rsp+20h]/[rsp+28h], so the draw has to run
     // at the rsp the original call site had. That is why the leave below builds
@@ -41977,6 +42445,10 @@ namespace dxvk {
     k.ibFormat = static_cast<uint32_t>(ia.indexBuffer.format);
     k.ilPtr    = reinterpret_cast<uint64_t>(ia.inputLayout.ptr());
     k.drawStart = start;
+    // KEPT RAW ALONGSIDE, because the clause below zeroes k.drawStart for
+    // upstream-keyed draws and the relRange candidate needs the un-zeroed
+    // value to subtract the batch base from. Not in any key.
+    m_rsDrawStartRaw = start;
     k.drawCount = count;
     k.drawBase  = base;
     k.indexed   = indexed ? 1u : 0u;
@@ -42750,6 +43222,17 @@ namespace dxvk {
       const uint64_t slotted = v ^ (static_cast<uint64_t>(i) << 56);
       fold = XXH64(&slotted, sizeof(slotted), fold);
       srvAcc = XXH64(&slotted, sizeof(slotted), srvAcc);
+      // KEPT PER SLOT so the comparison downstream can name one. Recorded in
+      // ARRIVAL order, not by register index: a set that binds the same views
+      // to shifted registers would otherwise read as every slot moving, and
+      // telling those two apart is the whole point of the column.
+      if (parts != nullptr) {
+        if (parts->slotUsed < kRsMatSlots) {
+          parts->slot[parts->slotUsed++] = slotted;
+        } else {
+          parts->slotOver += 1u;
+        }
+      }
       foldedSrv += 1u;
     }
 
@@ -42803,6 +43286,62 @@ namespace dxvk {
       parts->state = XXH64(stateObjects, sizeof(stateObjects), 0ull);
     }
     return fold;
+  }
+
+  // NV-DXVK [VsResidency]: DID THE CAMERA MOVE THIS FRAME, asked of the camera
+  // rather than of a constant buffer.
+  //
+  // WHY THIS EXISTS. The camStill/camMoved split below used to read
+  // `cbContentMovedMask & kCensusCameraSlotMask` -- the camera constant
+  // window's own bytes. The 2026-09-07 capture read camStill{n=0} on EVERY
+  // shader in EVERY window while [W2vStable] on the same frames read
+  // w2vSame=1 o2wSame=1 dT=0: the camera was provably at rest and its constant
+  // window differed every frame regardless. A discriminator whose "still"
+  // column can never collect a sample cannot answer the question it was added
+  // for, and the question is load-bearing -- it is what separates "the content
+  // key is sound" from "the content key is a camera key", which is the third
+  // time this file has had to ask that.
+  //
+  // The source is g_engineMainW2v, the engine-hook view the rest of this file
+  // already treats as the stable camera (see engineEye and [ZigVmO2w], where
+  // the per-draw m_lastGoodTransforms view was measured wobbling +-1u against
+  // it). Compared as bytes for the same reason [W2vStable] does: an epsilon
+  // threshold here would be a second guess layered on the first.
+  //
+  // LATCHED ONCE PER FRAME with the same compare_exchange [W2vStable] uses,
+  // because censusRecordDraw runs on whichever thread submits and several may
+  // reach the first draw of a frame together. Only the winner hashes, so
+  // s_prevHash has a single writer.
+  //
+  // ONE STATED IMPRECISION: a thread that loses the CAS and reads s_still
+  // before the winner has stored it gets the PREVIOUS frame's answer. That is
+  // at most one draw per thread per frame against judged counts in the
+  // hundreds, and it can only mislabel which column a verdict lands in -- it
+  // cannot change the verdict. Worth naming rather than being rediscovered as
+  // a two-sample discrepancy later.
+  // File-scope rather than a member: it reads a file-scope global and its own
+  // statics, so a header entry would buy nothing but a rebuild of every TU
+  // that includes d3d11_rtx.h.
+  static bool censusCameraStill(uint32_t frame) {
+    static std::atomic<uint32_t> s_frame { 0xFFFFFFFFu };
+    static uint64_t s_prevHash = 0ull;
+    static std::atomic<bool> s_still { false };
+
+    uint32_t seen = s_frame.load(std::memory_order_acquire);
+    if (frame != seen
+        && s_frame.compare_exchange_strong(seen, frame, std::memory_order_acq_rel)) {
+      float w2v[16];
+      for (int i = 0; i < 16; ++i) {
+        w2v[i] = g_engineMainW2v[i];
+      }
+      const uint64_t h = XXH64(w2v, sizeof(w2v), 0ull);
+      // FIRST FRAME COUNTS AS MOVED, not as still. s_prevHash starts at 0 and
+      // a genuine hash of 0 is possible, so a first-sight "still" would be an
+      // unearned sample in exactly the column that currently has none.
+      s_still.store(s_prevHash != 0ull && h == s_prevHash, std::memory_order_release);
+      s_prevHash = h;
+    }
+    return s_still.load(std::memory_order_acquire);
   }
 
   void D3D11Rtx::censusRecordDraw(bool indexed, UINT count, UINT start, INT base) {
@@ -43110,8 +43649,21 @@ namespace dxvk {
             // Aimed with rtx.findSimilarProbeVsHashes, which already exists and
             // is settable without a rebuild. It currently names the sub-view
             // shader; point it at the shader under investigation instead.
-            if (RtxOptions::ResidentScene::logStats()
-             && lookupHash(RtxOptions::findSimilarProbeVsHashes(),
+            //
+            // THE HASH LIST IS THE GATE, AND logStats IS NO LONGER PART OF IT.
+            // findSimilarProbeVsHashes defaults to {}, so this is off until
+            // someone aims it -- a strictly tighter gate than logStats, which
+            // is on-or-off for forty other probes at once. Requiring BOTH is
+            // why this probe has never produced a reading: the run that needed
+            // it had logStats off, and turning logStats on to get one line
+            // means accepting the whole [ResidentGate] / [RsChurn] / [Join]
+            // flood at the same time.
+            //
+            // Aim it at the two shaders carrying the population -- the
+            // 2026-09-07 capture reads judged=1140 on 0x29dbd7a391271d3c and
+            // judged=1085 on 0x2af9b90d63850ec3, both at cleanObjPct=0 with
+            // cleanContentPct 100 and 94.
+            if (lookupHash(RtxOptions::findSimilarProbeVsHashes(),
                            static_cast<XXH64_hash_t>(vsHash))) {
               constexpr size_t kMaxDwords = 64;
               constexpr size_t kMaxWatch = 8;
@@ -43127,8 +43679,23 @@ namespace dxvk {
               static std::unordered_map<uint64_t, DwordWatch> sDw;
               static uint32_t sDwLastDump = 0xFFFFFFFFu;
 
+              // (vs, slot) ONLY -- modelKey IS OUT, AND ITS PRESENCE IS WHY
+              // THIS PROBE HAS PRODUCED ONE READING IN THREE RUNS.
+              //
+              // kMaxWatch is 8. With modelKey in the key, a shader with 110
+              // models needs 440 watches and gets 8, all of them claimed by
+              // whichever two models draw first -- so aiming the option at a
+              // second shader produced NOTHING, twice, while [VsResidency]
+              // showed that shader reaching this exact code with
+              // cbContentRead=0xf. The cap was never the visible limit; the
+              // key was.
+              //
+              // The question is "does this SHADER's constant window carry
+              // per-frame data", which is a property of the window, not of
+              // which model is in it. Four watches per shader, whatever the
+              // model count. If a per-model split is ever wanted it needs its
+              // own cap, not a finer key against this one.
               const uint64_t dwKey = vsHash
-                                   ^ (modelKey * 0x9E3779B97F4A7C15ull)
                                    ^ (static_cast<uint64_t>(i) << 56);
               const size_t nDw = std::min<size_t>(len / 4u, kMaxDwords);
 
@@ -43137,6 +43704,9 @@ namespace dxvk {
               if (dwIt == sDw.end() && sDw.size() < kMaxWatch) {
                 dwIt = sDw.emplace(dwKey, DwordWatch{}).first;
                 dwIt->second.vs = vsHash;
+                // The FIRST model seen in this window, kept only so the line
+                // names something concrete. The watch now spans every model
+                // that binds this slot -- see dwKey.
                 dwIt->second.model = modelKey;
                 dwIt->second.slot = i;
               }
@@ -43189,6 +43759,38 @@ namespace dxvk {
                       shape += static_cast<char>('0' + decile);
                     }
                   }
+                  // THE VALUES OF THE MOVERS, AS BOTH BITS AND FLOAT. The shape
+                  // says WHERE the window moves; it cannot say WHAT is there,
+                  // and that is the question standing between here and a
+                  // content-based dirty test. 0x2af9b90d63850ec3 reads
+                  // 332333232223 twice over dwords 0..23 -- two 3x4 matrices --
+                  // AND 33333333333211102221 over dwords 32..51, which is the
+                  // branch the note above says must not be folded until it is
+                  // identified. Guessing produced a viewmodel flicker once.
+                  //
+                  // Movers only, past the twin-matrix region, capped: the
+                  // matrices are already identified and printing them would
+                  // push the interesting half off the line.
+                  std::string vals;
+                  {
+                    uint32_t shown = 0u;
+                    for (uint32_t d = 24u; d < w.dwords && shown < 24u; ++d) {
+                      if (w.chg[d] == 0u) {
+                        continue;
+                      }
+                      // The last value seen, which is what w.prev holds after
+                      // the compare above. Both readings, because a per-frame
+                      // counter and a coordinate are the same 32 bits and only
+                      // the float tells them apart.
+                      float f;
+                      std::memcpy(&f, &w.prev[d], sizeof(f));
+                      char buf[48];
+                      std::snprintf(buf, sizeof(buf), " [%u]=0x%08x/%.4g",
+                                    d, w.prev[d], f);
+                      vals += buf;
+                      shown += 1u;
+                    }
+                  }
                   Logger::warn(str::format(
                     "[CbDwords] f=", fid,
                     " vs=0x", std::hex, w.vs,
@@ -43198,7 +43800,8 @@ namespace dxvk {
                     " dwords=", w.dwords,
                     " always=", always,
                     " never=", never,
-                    " shape=", shape));
+                    " shape=", shape,
+                    " vals{", vals, " }"));
                 }
               }
             }
@@ -43258,8 +43861,7 @@ namespace dxvk {
       if (!objMoved)      { ve.cleanObj += 1; }
       if (!contentMoved)  { ve.cleanContent += 1; }
       // SPLIT THE VERDICT BY CAMERA MOTION -- the discriminator the last capture
-      // demands, and it costs nothing because slot 2 IS the camera and its
-      // content-moved bit is already computed above.
+      // demands.
       //
       // raw dirtyPct swung 100 -> 6 across two adjacent windows with no code
       // change: the camera came to rest. If cleanContentPct is ~90 when the
@@ -43270,7 +43872,13 @@ namespace dxvk {
       //
       // If instead both columns read ~90, camera motion is incidental and the
       // content key is sound. Only these two numbers separate those.
-      const bool camMoved = (cbContentMovedMask & kCensusCameraSlotMask) != 0u;
+      //
+      // ASKED OF THE CAMERA, NOT OF SLOT 2. The comment here used to say the
+      // split "costs nothing because slot 2 IS the camera and its content-moved
+      // bit is already computed above" -- which is what made camStill{n=0} on
+      // every shader in every window of the 2026-09-07 capture, with the camera
+      // held. See censusCameraStill.
+      const bool camMoved = !censusCameraStill(fid);
       // Stashed for censusRecordO2w, which runs at the end of SubmitDrawTail on
       // this same thread once objectToWorld is final. Only ONE draw per key per
       // frame reaches here (the early return above), so the o2w verdict inherits
@@ -43771,7 +44379,23 @@ namespace dxvk {
           " ps=", m_rsPartsPs,
           " srv=", m_rsPartsSrv,
           " samp=", m_rsPartsSamp,
-          " state=", m_rsPartsState, "}",
+          " state=", m_rsPartsState,
+          // THE SPLIT THE gap==1 FILTER USED TO HIDE. g1 is the population this
+          // probe used to be restricted to; gap is the one it discarded, which
+          // is the failing one. srv{} the same, because that is the component
+          // [RsIdent] upPlusMat now points at.
+          " g1=", m_rsPartsG1, " gap=", m_rsPartsGap,
+          " srv{g1=", m_rsPartsSrvG1, " gap=", m_rsPartsSrvGap, "}",
+          [&]() -> std::string {
+            std::string o;
+            for (uint32_t sl = 0; sl < kRsMatSlots; ++sl) {
+              if (m_rsMatSlotCnt[sl] != 0u) {
+                o += " " + std::to_string(sl) + "=" + std::to_string(m_rsMatSlotCnt[sl]);
+              }
+            }
+            return " srvSlot{" + o + " multi=" + std::to_string(m_rsMatSlotBoth)
+                 + " setDiff=" + std::to_string(m_rsMatSlotOver) + " }}";
+          }(),
           // WHICH TERM OF THE KEY MOVES, split world / studio, consecutive
           // frames only. same= is the key's non-material half holding; up / pass
           // / tgt are the components that changed against the SAME head at the
@@ -43817,12 +44441,18 @@ namespace dxvk {
                 out += "=" + std::to_string(m_rsKpHdMask[i][mi]);
               }
               out += "}";
+              // headColl FIRST, because every coll below is read against it and
+              // a candidate column alone says nothing.
+              out += " headColl=" + std::to_string(m_rsKpHeadColl[i]);
               out += " noVs{gap=" + std::to_string(m_rsKpCandGap[0][i]);
-              out += " new=" + std::to_string(m_rsKpCandNew[0][i]) + "}";
+              out += " new=" + std::to_string(m_rsKpCandNew[0][i]);
+              out += " coll=" + std::to_string(m_rsKpCandColl[0][i]) + "}";
               out += " noBuf{gap=" + std::to_string(m_rsKpCandGap[1][i]);
-              out += " new=" + std::to_string(m_rsKpCandNew[1][i]) + "}";
+              out += " new=" + std::to_string(m_rsKpCandNew[1][i]);
+              out += " coll=" + std::to_string(m_rsKpCandColl[1][i]) + "}";
               out += " asset{gap=" + std::to_string(m_rsKpCandGap[2][i]);
-              out += " new=" + std::to_string(m_rsKpCandNew[2][i]) + "}";
+              out += " new=" + std::to_string(m_rsKpCandNew[2][i]);
+              out += " coll=" + std::to_string(m_rsKpCandColl[2][i]) + "}";
               out += " coll{same=" + std::to_string(m_rsKpCollSame[i]);
               out += " diff=" + std::to_string(m_rsKpCollDiff[i]) + "}";
               out += " p0="   + std::to_string(m_rsKpPass0[i]);
@@ -43933,6 +44563,10 @@ namespace dxvk {
         m_rsMatSampledUsage = 0u;
         m_rsPartsSame = m_rsPartsPs = m_rsPartsSrv = 0u;
         m_rsPartsSamp = m_rsPartsState = 0u;
+        m_rsPartsG1 = m_rsPartsGap = 0u;
+        m_rsPartsSrvG1 = m_rsPartsSrvGap = 0u;
+        for (uint32_t sl = 0; sl < kRsMatSlots; ++sl) m_rsMatSlotCnt[sl] = 0u;
+        m_rsMatSlotBoth = m_rsMatSlotOver = 0u;
         for (uint32_t i = 0; i < kRsKeyKinds; ++i) {
           m_rsKpDraws[i] = m_rsKpSame[i] = m_rsKpUp[i] = 0u;
           m_rsKpPass[i] = m_rsKpTgt[i] = m_rsKpNew[i] = m_rsKpGap[i] = 0u;
@@ -43944,9 +44578,10 @@ namespace dxvk {
           m_rsKpVsFlipPs[i] = m_rsKpVsFlipSame[i] = 0u;
           m_rsKpVsFlipFlg[i] = m_rsKpVsFlipNoFlg[i] = m_rsKpDirect[i] = 0u;
           m_rsKpCollSame[i] = m_rsKpCollDiff[i] = 0u;
+          m_rsKpHeadColl[i] = 0u;
           for (uint32_t cv = 0; cv < kRsKpCands; ++cv) {
             m_rsKpCandSame[cv][i] = m_rsKpCandGap[cv][i] = 0u;
-            m_rsKpCandNew[cv][i] = 0u;
+            m_rsKpCandNew[cv][i] = m_rsKpCandColl[cv][i] = 0u;
           }
           for (uint32_t mi = 0; mi < kRsKpMaskSlots; ++mi) {
             m_rsKpHdMask[i][mi] = 0u;
@@ -44108,7 +44743,30 @@ namespace dxvk {
         m_rsMatParts.emplace(m_rsDrawBaseKey, MatPartsRec { rsParts, pf });
       } else {
         MatPartsRec& pr = pit->second;
-        if (pr.frame + 1u == pf) {
+        // THE gap==1 FILTER IS GONE, AND IT WAS THE WHOLE REASON THIS PROBE
+        // READ CLEAN WHILE THE FOLD IT MEASURES WAS THE CHURN.
+        //
+        // `pr.frame + 1u == pf` skips any baseKey that did NOT recur on the
+        // very next frame -- which is precisely the failing population. This
+        // probe therefore sampled the draws that were already working and
+        // reported srv=10..21 as "the material fold is at its own noise
+        // floor", and that reading has been quoted as settled ever since.
+        //
+        // WHAT THE UNFILTERED NUMBERS SAY, from [RsIdent] on the same runs:
+        //   identHead    new=124..148   distinct=3173..3297
+        //   hdPlusMat    new=1356..1556 distinct=20348..21704
+        //   upPlusMat    new=1356..1556 distinct=19542..20898
+        // upPlusMat drops the ENTIRE head -- buffers, shader, input layout,
+        // draw range -- and reads identical to hdPlusMat to the digit, on new
+        // AND on gap3plus. Both partners are independently stable
+        // ([WorldBatch] newIds=5..9, identHead new~140) and the pair churns
+        // ~1400 a window either way, so the material fold is the sole moving
+        // term and this filter is why that was never visible here.
+        //
+        // The gap is now REPORTED instead, so the two populations stay
+        // separable without one of them being discarded. Anything below is a
+        // comparison across whatever gap the draw actually had.
+        {
           const bool cps = (pr.parts.ps    != rsParts.ps);
           const bool csr = (pr.parts.srv   != rsParts.srv);
           const bool csa = (pr.parts.samp  != rsParts.samp);
@@ -44118,6 +44776,37 @@ namespace dxvk {
           if (csa) m_rsPartsSamp  += 1u;
           if (cst) m_rsPartsState += 1u;
           if (!cps && !csr && !csa && !cst) m_rsPartsSame += 1u;
+          // SPLIT BY GAP, because the old filter's one true observation was
+          // that a comparison across an absence means something different
+          // from one across a frame. Reported, not used to discard.
+          if (pr.frame + 1u == pf) {
+            m_rsPartsG1 += 1u;
+            if (csr) m_rsPartsSrvG1 += 1u;
+          } else {
+            m_rsPartsGap += 1u;
+            if (csr) m_rsPartsSrvGap += 1u;
+            // WHICH SLOT, and only here -- srv{g1=0} says the consecutive
+            // population has nothing to name.
+            if (csr) {
+              uint32_t moved = 0u;
+              const uint32_t n = std::min(pr.parts.slotUsed, rsParts.slotUsed);
+              for (uint32_t sl = 0; sl < n; ++sl) {
+                if (pr.parts.slot[sl] != rsParts.slot[sl]) {
+                  m_rsMatSlotCnt[sl] += 1u;
+                  moved += 1u;
+                }
+              }
+              // A DIFFERENT NUMBER OF VIEWS IS NOT A SLOT MOVING, it is a
+              // different binding set, and folding it into a slot column would
+              // read as whichever slot happened to be last.
+              if (pr.parts.slotUsed != rsParts.slotUsed
+                  || pr.parts.slotOver != 0u || rsParts.slotOver != 0u) {
+                m_rsMatSlotOver += 1u;
+              } else if (moved > 1u) {
+                m_rsMatSlotBoth += 1u;
+              }
+            }
+          }
         }
         pr.parts = rsParts;
         pr.frame = pf;
@@ -44245,6 +44934,12 @@ namespace dxvk {
             cr.count     = 0u;
           }
           const uint32_t cOcc = cr.count++;
+          // Occurrence 0 is the first draw of this key this frame; anything
+          // above it is a draw the candidate could not separate. See
+          // m_rsKpCandColl.
+          if (cOcc != 0u) {
+            m_rsKpCandColl[cv][ki] += 1u;
+          }
           const uint64_t cAnchor = XXH64(&cOcc, sizeof(cOcc), ch);
           auto cit = m_rsKpAnchorCand[cv].find(cAnchor);
           if (cit == m_rsKpAnchorCand[cv].end()) {
@@ -44317,6 +45012,12 @@ namespace dxvk {
         hr.count     = 0u;
       }
       const uint32_t occ = hr.count++;
+      // THE BASELINE THE CANDIDATE coll COLUMNS ARE READ AGAINST. Same rule,
+      // same population, same window -- so "the candidate collides more than
+      // the head does" is a subtraction rather than an argument.
+      if (occ != 0u) {
+        m_rsKpHeadColl[ki] += 1u;
+      }
       const uint64_t anchor = XXH64(&occ, sizeof(occ), m_rsDrawKeyParts.head);
       // Was this head drawn on the immediately preceding frame at all. Read
       // below to split gap=; taken here because hr is rolled above and the
@@ -45685,14 +46386,71 @@ namespace dxvk {
     // needs a discrimination column beside it -- gap0, or failSize -- or it can
     // only ever argue for the coarsest key available.
 
-    ResidentOccupancy& occ = m_residentOccupancy[narrowed];
+    // NV-DXVK: THE ORDINAL IS COUNTED PER MATERIAL FOR WORLD BATCH DRAWS, AND
+    // THAT IS THE WHOLE OF THIS FIX.
+    //
+    // WHAT THE ORDINAL COSTS, MEASURED. [RsIdent] carries the same population
+    // twice, differing ONLY in whether the ordinal is folded:
+    //
+    //   drawKey     new=111  (0%)  gap0=24593  gap3plus=1213   distinct=3430
+    //   keyWithOrd  new=2029 (3%)  gap0=0      gap3plus=15811  distinct=37190
+    //
+    // 60756 draws. The ordinal multiplies new identities 18x, the identity
+    // population 10.8x and gap3plus 13x. It is not a contributor to the churn,
+    // it is the churn -- on a scene [WorldBatch] reports as bit-identical
+    // (batches=29700 surfaces=120420 to the digit over five windows) and that
+    // [SpanCensus] held{moved=0} says never moves a byte of geometry.
+    //
+    // WHY IT CHURNS. The ordinal is a function of how many RUNS the packer
+    // splits one surface set into, and that count alternates: passMoved --
+    // (h.spans != a.spans) -- fires on ~40% of keys a window, d{up~1250
+    // dn~1500 big~1400} so a third of the changes move it by more than one run.
+    // A set split three ways this frame and two the next leaves occurrence 2
+    // with nowhere to be, which is away{2=N 3=0 4+=0} -- a strict two-frame
+    // absence with ZERO variance, in both populations, every window.
+    //
+    // WHY NOT COALESCE THE SPAN, which is what [SpanCensus]'s own TILED verdict
+    // prescribes. tile{tiled=12000 abutted=12000 holed=0} does hold -- the runs
+    // abut into one contiguous range, always -- but the sub-draws of a world
+    // batch are THE BATCH'S SURFACES GROUPED BY MATERIAL (see the pass
+    // discriminator's note). One draw over the merged range would paint all of
+    // them with the first run's material. The verdict is right that the runs
+    // tile and wrong that they are interchangeable.
+    //
+    // WHAT REPLACES IT. If the runs are material groups then the MATERIAL is
+    // what distinguishes them, and unlike the ordinal it is a property of the
+    // surfaces rather than of how the packer split them -- so it does not move
+    // when the split does. The ordinal stays, demoted to breaking ties between
+    // repeated materials inside one span, which is a far smaller and far more
+    // stable number than "which run am I".
+    //
+    // PRICED BEFORE BUILDING, both columns, per sec 6.1:
+    //   hdPlusMat   new=1255 (2%)  gap0=14787  distinct=24012
+    // against keyWithOrd's 2029 / 0 / 37190. Better on new and on population,
+    // and its gap0 is the in-frame collision the residual ordinal now covers.
+    //
+    // FALSIFIER: [RsIdent] drawKey distinct must stay ~3430 and [ResidentGate]
+    // hit must rise off ~15%. If distinct climbs instead, materials repeat
+    // within a span more than gap0 suggests and the residual ordinal is back to
+    // counting runs -- revert, do not tune.
+    //
+    // WORLD ONLY. Studio sub-draws are not material groups; p0 says every
+    // studio draw carries pass 0 and coll{diff=0} says its in-frame collisions
+    // are all same-pass, which is a different problem and not this one.
+    uint64_t ordGroup = narrowed;
+    if (m_rsDrawKeyParts.kind == 1u
+        && RtxOptions::ResidentScene::worldOrdinalByMaterial()) {
+      ordGroup = XXH64(&m_rsDrawMat, sizeof(m_rsDrawMat), narrowed);
+    }
+
+    ResidentOccupancy& occ = m_residentOccupancy[ordGroup];
     if (occ.frame != frameId) {
       occ.frame = frameId;
       occ.counter = 0u;
     }
     const uint32_t rsOrdinal = occ.counter++;
 
-    uint64_t key = XXH64(&rsOrdinal, sizeof(rsOrdinal), narrowed);
+    uint64_t key = XXH64(&rsOrdinal, sizeof(rsOrdinal), ordGroup);
     if (key == 0ull) {
       key = 1ull;   // never the no-record sentinel
     }
@@ -45829,7 +46587,7 @@ namespace dxvk {
       // it would then be worth writing. Near keyWithOrd's 31325 says sub-draw
       // order within a copy is not stable either, and there is nothing left
       // to name a studio sub-draw with.
-      constexpr uint32_t kVariants = 10;
+      constexpr uint32_t kVariants = 12;
       constexpr size_t kMaxTracked = 100000;
       constexpr uint32_t kIdentDumpFrames = 300u;
       struct Recur {
@@ -45839,6 +46597,56 @@ namespace dxvk {
       };
       static Recur sIdent[kVariants];
       static uint32_t sIdentLastDump = 0xFFFFFFFFu;
+
+      // NV-DXVK [RsGap0]: WHAT ARE THE DRAWS hdPlusMat CANNOT SEPARATE IN-FRAME.
+      //
+      // THE NUMBER. hdPlusMat gap0=7689 a window against keyWithOrd gap0=0.
+      // That 7689 is the entire price of the occurrence ordinal and the only
+      // reason it cannot come out of residentKey -- the ordinal buys exactly
+      // this and nothing else, at 33590 keys against 21993 and a population
+      // that grows 80-100 a window forever on a scene [WorldBatch] reports
+      // bit-identical.
+      //
+      // WHY A PERCENTAGE OF IT IS NOT A FINDING. "7689 draws collide" says
+      // nothing about what to do. Each of these buckets has a DIFFERENT action
+      // and they are not orderable without the split:
+      //
+      //   same=   every term visible in D3D11 state is identical. Then no key
+      //           can separate them, the ordinal is irreplaceable, and the
+      //           answer is record GRANULARITY -- one resident record per key
+      //           covering both sub-draws -- which is the only direction on
+      //           the by-elimination list below that does not make the
+      //           population worse.
+      //   batch=  the batch keys differ, so the material slice did NOT reach
+      //           hdPlusMat for these. That is a wiring defect, not an
+      //           identity one, and it is cheap to fix.
+      //   start=  same batch, different draw range: two runs of one batch.
+      //           relRange named these and was refuted on population (12x), so
+      //           this bucket is the one that needs granularity, not a term.
+      //   pass= ps=  the two draws are in different passes and the pass term
+      //           is not in this key. §5.4 priced naming the pass at 1.5% with
+      //           coll{diff=0}; if this bucket is large that pricing was taken
+      //           on the wrong population and is worth re-reading.
+      //   mat= head=  the fold lost a term it was given. Same shape as batch=.
+      //
+      // ONE BUCKET PER COLLISION, by fixed priority, with multi= counting the
+      // draws that differ in more than one so the priority cannot quietly
+      // absorb a second cause. Split by kind because world and studio are at
+      // 67% and 100% and averaging them has hidden things before.
+      struct Gap0Rec {
+        uint32_t frame = 0xFFFFFFFFu;
+        uint64_t batch = 0ull;
+        uint64_t head  = 0ull;
+        uint64_t pass  = 0ull;
+        uint64_t mat   = 0ull;
+        uint32_t start = 0u;
+        uint32_t hasPs = 0u;
+      };
+      static std::unordered_map<uint64_t, Gap0Rec> sGap0;
+      // [0] world, [1] studio, [2] neither
+      static uint32_t sG0Same[3]  = { }, sG0Batch[3] = { }, sG0Start[3] = { };
+      static uint32_t sG0Pass[3]  = { }, sG0Ps[3]    = { }, sG0Mat[3]   = { };
+      static uint32_t sG0Head[3]  = { }, sG0Multi[3] = { };
       // hdPlusO2w SEPARATES THE LAST TWO READINGS OF THE MATERIAL CHURN.
       //
       // [MatChurnSlot] established that a single identHead, drawn exactly once
@@ -45865,7 +46673,7 @@ namespace dxvk {
       // final until the tail -- the same reason censusRecordO2w is taken there.
       static const char* const kIdentName[kVariants] =
         { "identHead", "drawKey", "hdPlusMat", "hdPlusO2w", "keyPlusPlace", "keyWithOrd", "o2wPlusMat",
-          "assetPlusO2w", "assetO2wMat", "assetO2wOrd" };
+          "assetPlusO2w", "assetO2wMat", "assetO2wOrd", "upPlusMat", "relRange" };
 
       // NV-DXVK [O2wDelta]: HOW FAR THE TRANSFORM ACTUALLY MOVES, in units,
       // for one identity between consecutive frames.
@@ -46076,6 +46884,98 @@ namespace dxvk {
           }
           const uint32_t oc = sOcc[g]++;
           return XXH64(&oc, sizeof(oc), g);
+        }(),
+        // NV-DXVK `upPlusMat`: THE PRODUCER'S SURFACE-SET KEY AND THE MATERIAL,
+        // AND NOTHING THAT DEPENDS ON HOW THE PACKER SPLIT THE BATCH.
+        //
+        // No head, no buffers, no shader, no draw range, no ordinal.
+        //
+        // WHY THESE TWO. Everything measured on this scene says the inputs are
+        // static and only their PAIRING moves:
+        //   [WorldBatch] newIds=5..9, distinctEver flat  -- surface set stable
+        //   [RsIdent] identHead new=141 distinct=3217    -- head stable
+        //   [MatChurn] matNew=0 matTotal=321 matActive=321 -- material set static
+        //   [SpanCensus] held{moved=0}                   -- geometry never moves
+        //   [WorldBatch] batches=29700 surfaces=120420   -- submission identical
+        // and yet hdPlusMat reads new=1255 distinct=24012, i.e. 7.5 material
+        // values per head with the head itself flat. The packer regroups the
+        // same surfaces into different material runs every other frame, so the
+        // head<->material PAIR churns while both halves are stable. That is the
+        // same re-split that produces away{2=N 3=0 4+=0} and the ordinal churn;
+        // this is its third symptom, not a third defect.
+        //
+        // The head is what carries the split -- it is per-run state. The
+        // producer's key names the whole surface set and does not. So this pairs
+        // the one stable name for WHAT with the one stable name for WHICH
+        // MATERIAL, and is by construction invariant under a re-split.
+        //
+        // ACCEPTANCE, and gateSize goes in it this time. distinct= IS the
+        // population: it must LEVEL OFF near matActive x batches, not climb.
+        // Read it against identHead's 3217 and hdPlusMat's 24012, and read gap0
+        // as the cost -- with no head this cannot separate two batches that
+        // share a surface-set key and a material, and assetPlusO2w's gap0=41188
+        // is the warning that a two-term key collides hard. If gap0 is that
+        // high the ordinal is back to doing the separating and nothing is won.
+        XXH64(&m_rsDrawMat, sizeof(m_rsDrawMat), m_rsDrawKeyParts.up),
+        // NV-DXVK `relRange`: THE RUN'S OFFSET WITHIN ITS OWN BATCH, replacing
+        // the occurrence ordinal.
+        //
+        // WHY THE ORDINAL HAS TO GO: keyWithOrd new=2029 distinct=37190
+        // against drawKey's 111 / 3430 -- 18x the churn, 10.8x the population --
+        // because the ordinal counts which RUN a draw is and the packer
+        // re-splits the same surface set every other frame.
+        //
+        // WHY THE HEAD CANNOT REPLACE IT: identHead gap0=23604 of 60495, so the
+        // head alone fails to separate 39% of draws in-frame; the material
+        // halves that to 13994 and no further. The remaining colliders are
+        // sub-draws of one batch sharing head AND material, and the only thing
+        // that distinguishes them is their index range -- which is zeroed,
+        // because the batch's BASE moves every frame.
+        //
+        // The base moves; the offset within the batch does not, as long as the
+        // packer emits surfaces in a stable order. tile{tiled=12000
+        // abutted=12000 holed=0} says the runs abut into one contiguous range,
+        // so run k is at a fixed distance from the batch's first index. This
+        // subtracts the batch base and keeps that distance.
+        //
+        // REFUTED, AND IT WAS THE LAST NON-ORDINAL CANDIDATE. Built and run,
+        // camera held, 60573 draws:
+        //
+        //   identHead  new=94   (0%)  gap0=21219  distinct=4441
+        //   hdPlusMat  new=1040 (1%)  gap0=11519  distinct=34164
+        //   relRange   new=1707 (2%)  gap0=7113   distinct=52772
+        //
+        // It separates -- gap0 falls 38% -- and it costs 12x identHead's
+        // population, climbing. So the offset of a run within its own batch is
+        // NOT stable, which means the packer does not merely re-split the set,
+        // it emits the surfaces in a different ORDER. tile{holed=0} says the
+        // runs abut; it never said they abut in the same sequence.
+        //
+        // WHAT THIS CLOSES BY ELIMINATION. Every term that separates sub-draws
+        // is a function of the packing: the occurrence ordinal (keyWithOrd,
+        // 10.8x population), the material grouping (hdPlusMat, 8x) and now the
+        // relative range (12x). The packing alternates every other frame on a
+        // scene [WorldBatch] reports bit-identical. There is no stable
+        // per-sub-draw discriminator in D3D11 state, and the producer cannot
+        // supply one either -- worldbatch::note sees the surface SET, not which
+        // indices each run will cover.
+        //
+        // WHAT IS LEFT, and it is the only direction not yet refuted:
+        // identHead alone IS stable -- new=84..94 at 0%, distinct=4347..4441,
+        // flat. Its whole cost is gap0=21219, the 34% of draws it cannot
+        // separate in-frame. Stop trying to separate them: one resident record
+        // per identHead, covering every sub-draw under it, makes the collision
+        // harmless instead of fatal. That is a record-granularity change, not a
+        // key change, and it is the only thing on this list that does not make
+        // the population worse.
+        [&]() -> uint64_t {
+          const uint32_t lo = spancensus::openSpanLo();
+          if (lo == 0xFFFFFFFFu || m_rsDrawKeyParts.kind != 1u) {
+            return narrowed;   // not a world span draw; unchanged
+          }
+          const uint32_t rel = (m_rsDrawStartRaw >= lo)
+                             ? (m_rsDrawStartRaw - lo) : 0u;
+          return XXH64(&rel, sizeof(rel), narrowed);
         }()
       };
 
@@ -46088,6 +46988,7 @@ namespace dxvk {
           r.lastFrame.clear();
           r.cleared += 1u;
         }
+        if (v == 2u && sGap0.size() > kMaxTracked) sGap0.clear();
         auto rIt = r.lastFrame.find(candId[v]);
         if (rIt == r.lastFrame.end()) {
           r.nw += 1u;
@@ -46096,6 +46997,31 @@ namespace dxvk {
           const uint32_t gap = frameId - rIt->second;
           if (gap == 0u) {
             r.g0 += 1u;
+            // Billed for hdPlusMat only -- it is the ordinal-free key the
+            // decision is actually about. See [RsGap0] above.
+            if (v == 2u) {
+              const uint32_t b = (m_rsDrawKeyParts.kind == 1u) ? 0u
+                               : (m_rsDrawKeyParts.kind == 2u) ? 1u : 2u;
+              auto gIt = sGap0.find(candId[v]);
+              if (gIt != sGap0.end() && gIt->second.frame == frameId) {
+                const Gap0Rec& q = gIt->second;
+                uint32_t diffs = 0u;
+                if (q.batch != joinprobe::t_worldKey)   diffs += 1u;
+                if (q.head  != m_rsDrawKeyParts.head)   diffs += 1u;
+                if (q.pass  != m_rsDrawKeyParts.pass)   diffs += 1u;
+                if (q.hasPs != m_rsDrawKeyParts.hasPs)  diffs += 1u;
+                if (q.mat   != m_rsDrawMat)             diffs += 1u;
+                if (q.start != m_rsDrawStartRaw)        diffs += 1u;
+                if (diffs > 1u) sG0Multi[b] += 1u;
+                if (diffs == 0u)                             sG0Same[b]  += 1u;
+                else if (q.batch != joinprobe::t_worldKey)   sG0Batch[b] += 1u;
+                else if (q.head  != m_rsDrawKeyParts.head)   sG0Head[b]  += 1u;
+                else if (q.pass  != m_rsDrawKeyParts.pass)   sG0Pass[b]  += 1u;
+                else if (q.hasPs != m_rsDrawKeyParts.hasPs)  sG0Ps[b]    += 1u;
+                else if (q.mat   != m_rsDrawMat)             sG0Mat[b]   += 1u;
+                else                                         sG0Start[b] += 1u;
+              }
+            }
           } else if (gap == 1u) {
             r.g1 += 1u;
           } else if (gap == 2u) {
@@ -46104,6 +47030,20 @@ namespace dxvk {
             r.g3 += 1u;
           }
           rIt->second = frameId;
+        }
+        // AFTER the compare, never before. The first version of this stored the
+        // current draw and then compared against it, which made diffs==0 by
+        // construction and would have printed same= for the whole population --
+        // the same shape as the sized==moved and vals{1=6000} bugs.
+        if (v == 2u) {
+          Gap0Rec& g = sGap0[candId[v]];
+          g.frame = frameId;
+          g.batch = joinprobe::t_worldKey;
+          g.head  = m_rsDrawKeyParts.head;
+          g.pass  = m_rsDrawKeyParts.pass;
+          g.mat   = m_rsDrawMat;
+          g.start = m_rsDrawStartRaw;
+          g.hasPs = m_rsDrawKeyParts.hasPs;
         }
       }
 
@@ -46129,6 +47069,34 @@ namespace dxvk {
             " distinct=", static_cast<uint32_t>(r.lastFrame.size()),
             " cleared=", r.cleared));
           r.nw = r.g0 = r.g1 = r.g2 = r.g3 = 0u;
+        }
+        {
+          static const char* const kG0Kind[3] = { "world", "studio", "other" };
+          std::string o;
+          for (uint32_t b = 0; b < 3u; ++b) {
+            const uint32_t tot = sG0Same[b] + sG0Batch[b] + sG0Head[b]
+                               + sG0Pass[b] + sG0Ps[b] + sG0Mat[b] + sG0Start[b];
+            if (tot == 0u) continue;
+            o += str::format(
+              " ", kG0Kind[b], "{tot=", tot,
+              " same=", sG0Same[b], " batch=", sG0Batch[b], " head=", sG0Head[b],
+              " pass=", sG0Pass[b], " ps=", sG0Ps[b], " mat=", sG0Mat[b],
+              " start=", sG0Start[b], " multi=", sG0Multi[b], "}");
+          }
+          if (!o.empty()) {
+            Logger::warn(str::format(
+              "[RsGap0] f=", frameId, " cand=hdPlusMat", o,
+              " | same= high = NO key can separate these and the ordinal is"
+              " irreplaceable; fix RECORD GRANULARITY, one record per key."
+              " batch/head/mat = a term the key was given did not reach it,"
+              " which is a wiring fix. start= = two runs of one batch, which"
+              " relRange named and lost on population. pass/ps = re-read §5.4,"
+              " it priced the pass on the consecutive population only"));
+          }
+          for (uint32_t b = 0; b < 3u; ++b) {
+            sG0Same[b] = sG0Batch[b] = sG0Head[b] = sG0Pass[b] = 0u;
+            sG0Ps[b] = sG0Mat[b] = sG0Start[b] = sG0Multi[b] = 0u;
+          }
         }
       }
 
@@ -73780,16 +74748,17 @@ namespace dxvk {
           // reason: the island has no unwind information, so a [JoinStack]
           // walk that crosses it before the census finishes reports garbage.
           //
-          // THE CENSUS GATE IS ALSO WHY THE IDENTITY IS DIAGNOSTICS-ONLY. This
-          // install needs logStats, and so does the record/replay join that
-          // carries the key to the draw thread, so a run with diagnostics off
-          // keys world draws exactly as it always did. Promoting the identity
-          // out of that regime is a separate decision from making it correct,
-          // and it should be taken against the gate readings rather than ahead
-          // of them.
+          // PROMOTED OUT OF THE DIAGNOSTICS REGIME, which is what the note here
+          // used to defer. It said this install needs logStats "so a run with
+          // diagnostics off keys world draws exactly as it always did", and
+          // treated that as a separate decision from making the join correct.
+          // It was not separate: rtx.conf now ships logStats = False, so that
+          // sentence described the ONLY configuration anyone runs. The install
+          // follows joinprobe::identityWanted() -- see it for the three gates
+          // this was one of.
           static bool s_worldBatchInstalled = false;
           if (kEngineHooksEnabled && !s_worldBatchInstalled
-              && RtxOptions::ResidentScene::logStats()
+              && joinprobe::identityWanted()
               && joinstack::censusDone()) {
             if (worldBatchInstallHook())
               s_worldBatchInstalled = true;
@@ -73804,7 +74773,7 @@ namespace dxvk {
           // symbols and a failure to anchor one must not disable the other.
           static bool s_depthMeshInstalled = false;
           if (kEngineHooksEnabled && !s_depthMeshInstalled
-              && RtxOptions::ResidentScene::logStats()
+              && joinprobe::identityWanted()
               && joinstack::censusDone()) {
             if (depthMeshInstallHook())
               s_depthMeshInstalled = true;
@@ -73812,7 +74781,7 @@ namespace dxvk {
 
           static bool s_rangePassInstalled = false;
           if (kEngineHooksEnabled && !s_rangePassInstalled
-              && RtxOptions::ResidentScene::logStats()
+              && joinprobe::identityWanted()
               && joinstack::censusDone()) {
             if (rangePassInstallHook())
               s_rangePassInstalled = true;
@@ -73820,7 +74789,7 @@ namespace dxvk {
 
           static bool s_meshListInstalled = false;
           if (kEngineHooksEnabled && !s_meshListInstalled
-              && RtxOptions::ResidentScene::logStats()
+              && joinprobe::identityWanted()
               && joinstack::censusDone()) {
             if (meshListInstallHook())
               s_meshListInstalled = true;
@@ -73828,7 +74797,7 @@ namespace dxvk {
 
           static bool s_matsysFlushInstalled = false;
           if (kEngineHooksEnabled && !s_matsysFlushInstalled
-              && RtxOptions::ResidentScene::logStats()
+              && joinprobe::identityWanted()
               && joinstack::censusDone()) {
             if (matsysFlushInstallHook())
               s_matsysFlushInstalled = true;
@@ -73841,7 +74810,7 @@ namespace dxvk {
           // is every dispatch. See studioDrawInstallHook.
           static bool s_studioDrawInstalled = false;
           if (kEngineHooksEnabled && !s_studioDrawInstalled
-              && RtxOptions::ResidentScene::logStats()
+              && joinprobe::identityWanted()
               && joinstack::censusDone()) {
             if (studioDrawInstallHook())
               s_studioDrawInstalled = true;
@@ -73849,7 +74818,7 @@ namespace dxvk {
 
           static bool s_studioArrayInstalled = false;
           if (kEngineHooksEnabled && !s_studioArrayInstalled
-              && RtxOptions::ResidentScene::logStats()
+              && joinprobe::identityWanted()
               && joinstack::censusDone()) {
             if (studioArrayInstallHook())
               s_studioArrayInstalled = true;
@@ -73866,6 +74835,19 @@ namespace dxvk {
               s_worldDrawCalleeInstalled = true;
           }
 
+          // DELIBERATELY NOT GATED ON logStats, AND THIS WAS GATED FOR ONE
+          // REVISION BEFORE THE READING BELOW UNDID IT.
+          //
+          // keyed{direct|replay} IS THE FALSIFIER for the install above. The
+          // install now follows identityWanted(), so the question "did the
+          // producer key actually reach a draw" has to be answerable in the
+          // configuration that ships -- which is logStats OFF. Gating these
+          // three on logStats put the only readout of the thing behind the
+          // flag whose removal from the identity path is the entire point.
+          //
+          // Two lines a second against a defect that cost this feature its
+          // whole measurement history. If they ever need silencing, give them
+          // their own option; do not put them back behind logStats.
           if (s_worldBatchInstalled || s_depthMeshInstalled || s_rangePassInstalled
               || s_meshListInstalled || s_matsysFlushInstalled) {
             worldbatch::logStats(m_context->m_device->getCurrentFrameId());
@@ -73880,7 +74862,7 @@ namespace dxvk {
 
           static bool s_joinHookInstalled = false;
           if (kEngineHooksEnabled && !s_joinHookInstalled
-              && RtxOptions::ResidentScene::logStats()
+              && joinprobe::identityWanted()
               && joinstack::censusDone()) {
             if (queuedDrawInstallHook())
               s_joinHookInstalled = true;
