@@ -130,11 +130,30 @@ namespace dxvk {
     // fills the best one available and records which; the object is the join.
     //
     // engineHandle  sec 7 slice B. Authoritative when present. 0 = absent.
+    //
+    //               AND THE WORLD-BATCH KEY IS NOT ONE, which is worth saying
+    //               because it is the obvious-looking place to put it. That key
+    //               (d3d11_rtx.cpp, the [WorldBatch] block) names the SET of
+    //               surfaces packed into one engine batch draw. A handle here
+    //               claims "these primitives are one object" and is the anchor
+    //               m_objectsByHandle merges on; a batch is many objects in one
+    //               draw, so putting it here would merge every pass over that
+    //               set under a single object and assert a grouping that is
+    //               false in the direction sec 1.3 cares about. It is fed as
+    //               iaIdentity instead -- see below -- which is the honest
+    //               claim: a stable NAME for a draw.
     // iaIdentity    residentDrawKey's baseKey -- the XXH64 of ResidentKeyHead.
     //               Always available, camera- and animation-invariant BY
     //               CONSTRUCTION (the fields are engine allocations made at
     //               level/entity spawn), which is exactly the property rungs 1
     //               and 2 of the ladder lacked.
+    //
+    //               FOR BATCHED WORLD DRAWS IT IS THE SURFACE-SET KEY, folded
+    //               over a head whose packing positions have been zeroed. Those
+    //               draws were the population the invariance claim above was
+    //               FALSE for: drawStart/vbOffset are positions in this frame's
+    //               packing, not engine allocations, and they are what made
+    //               newObjects read 300-900/window on a fixed-position sweep.
     // occurrence    which copy of a multi-copy identity this is. Only
     //               meaningful while engineHandle is absent, and it is the
     //               known-weak part: sec 1.2 rung 4 records that the ordinal

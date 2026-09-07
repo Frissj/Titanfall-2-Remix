@@ -422,7 +422,7 @@ namespace dxvk {
     // Pattern
     // ==================================================================
 
-    Pattern::Pattern(const char* idaStyle) {
+    Pattern::Pattern(const char* idaStyle, size_t minBytes, size_t minConcrete) {
       if (idaStyle == nullptr)
         return;
 
@@ -456,14 +456,17 @@ namespace dxvk {
         p += 2;
       }
 
-      // A pattern that is entirely wildcards, or shorter than 6 bytes, cannot
-      // uniquely identify anything in a multi-megabyte .text. Reject it here
-      // rather than let it produce a confident wrong answer.
+      // A pattern that is entirely wildcards, or shorter than the caller's
+      // floor, cannot uniquely identify anything in the haystack it is about
+      // to be scanned over. Reject it here rather than let it produce a
+      // confident wrong answer. The floor is a parameter because the haystack
+      // is: see the constructor's declaration for why a chained symbol is
+      // allowed a shorter one.
       size_t concrete = 0;
       for (uint8_t w : m_wild) {
         if (!w) ++concrete;
       }
-      if (m_bytes.size() < 6 || concrete < 5) {
+      if (m_bytes.size() < minBytes || concrete < minConcrete) {
         m_bytes.clear();
         m_wild.clear();
       }
@@ -705,8 +708,14 @@ namespace dxvk {
       // Find every position in [begin,end) holding a disp32 that, interpreted
       // as a rip-relative operand of an instruction ending 4 bytes later,
       // points at `target`. Requires the caller to have proven readability.
+      // Collects up to `maxOut` reference sites and returns how many were
+      // found (which may exceed maxOut, so the caller can tell "capped" from
+      // "exactly this many").
+      //
+      // A RAW ARRAY, NOT A VECTOR, ON PURPOSE: this body sits inside __try,
+      // and MSVC rejects objects requiring unwinding there (C2712).
       size_t scanRipRefGuarded(uintptr_t begin, uintptr_t end, uintptr_t target,
-                               uintptr_t* firstOut, size_t stopAfter) {
+                               uintptr_t* out, size_t maxOut) {
         size_t hits = 0;
         if (end <= begin || end - begin < 4)
           return 0;
@@ -719,9 +728,13 @@ namespace dxvk {
             std::memcpy(&disp, reinterpret_cast<const void*>(q), sizeof(disp));
             if (q + 4 + static_cast<intptr_t>(disp) != static_cast<intptr_t>(target))
               continue;
-            if (hits == 0 && firstOut != nullptr)
-              *firstOut = q;
-            if (++hits >= stopAfter)
+            if (out != nullptr && hits < maxOut)
+              out[hits] = q;
+            ++hits;
+            // One past the cap is enough to prove "more than can be
+            // cross-checked"; keep bounding the scan rather than walking the
+            // rest of .text to count references we are going to reject.
+            if (hits > maxOut)
               break;
           }
 #ifdef _MSC_VER
@@ -733,11 +746,13 @@ namespace dxvk {
       }
     } // anonymous namespace
 
-    bool findStringRef(const ModuleView& m, const char* text,
-                       uintptr_t& stringAddrOut, uintptr_t& dispSiteOut) {
+    bool findStringRefs(const ModuleView& m, const char* text,
+                        uintptr_t& stringAddrOut,
+                        uintptr_t* sitesOut, size_t maxSites,
+                        size_t& siteCountOut) {
       stringAddrOut = 0;
-      dispSiteOut   = 0;
-      if (!m.valid() || text == nullptr)
+      siteCountOut  = 0;
+      if (!m.valid() || text == nullptr || sitesOut == nullptr || maxSites == 0)
         return false;
 
       const size_t len = std::strlen(text);
@@ -766,12 +781,28 @@ namespace dxvk {
       if (!readable(reinterpret_cast<const void*>(m.codeBegin), m.codeEnd - m.codeBegin))
         return false;
 
-      uintptr_t site = 0;
-      if (scanRipRefGuarded(m.codeBegin, m.codeEnd, strAddr, &site, 2) != 1)
+      // EVERY reference site, not the unique one.
+      //
+      // Requiring uniqueness here was wrong, and 'BuildRenderableRenderLists'
+      // is the case that proves it: client.dll registers that job from TWO
+      // near-identical registrar functions, both naming the SAME job function.
+      // The old rule rejected that as ambiguous and disabled the feature, even
+      // though the two sites agree on the answer.
+      //
+      // Ambiguity that matters is DISAGREEMENT ABOUT THE ANSWER, not plurality
+      // of references. So the sites are all returned and the caller resolves
+      // each one and requires them to agree -- which is strictly stronger than
+      // the single-site rule ever was, because a lone site was accepted with
+      // nothing to check it against.
+      const size_t total =
+        scanRipRefGuarded(m.codeBegin, m.codeEnd, strAddr, sitesOut, maxSites);
+      if (total == 0)
         return false;
+      if (total > maxSites)
+        return false;   // implausibly many for a literal; treat as not found
 
       stringAddrOut = strAddr;
-      dispSiteOut   = site;
+      siteCountOut  = total;
       return true;
     }
 
@@ -821,9 +852,61 @@ namespace dxvk {
       return false;
     }
 
+    // A TAIL-CALL THUNK IS A LEGITIMATE POINTER TARGET, and refusing one is
+    // what kept BuildRenderableRenderLists unresolved on the shipped build.
+    //
+    // The job is registered as a pointer to a 9-byte frameless thunk:
+    //     mov rcx, rdx ; mov edx, 20h ; jmp <the real body>
+    // Nothing there allocates stack, saves a nonvolatile register or calls, so
+    // MSVC is free to emit no unwind data for it -- and looksLikeFunctionEntry
+    // is authoritative on .pdata, so it correctly answers "not a function
+    // entry" and the pointer was thrown away.
+    //
+    // This is NOT a relaxation of that check. It is a different shape test of
+    // the same strength: the target must be placed like a function AND consist
+    // of a short run ending in a jmp rel32 whose destination IS a real .pdata
+    // function entry. An incidental disp32 landing in .text does not satisfy
+    // that, which is the property the entry test exists to provide.
+    bool looksLikeThunkToFunction(const ModuleView& m, uintptr_t addr,
+                                  uintptr_t& finalTargetOut) {
+      finalTargetOut = 0;
+      if (!m.valid() || !m.containsCode(addr))
+        return false;
+      if (!readable(reinterpret_cast<const void*>(addr), 16))
+        return false;
+
+      // Placed like a function: aligned, or preceded by inter-function padding.
+      bool placementOk = (addr & 0xF) == 0;
+      if (!placementOk && addr > m.codeBegin
+          && readable(reinterpret_cast<const void*>(addr - 1), 1)) {
+        const uint8_t prev = *reinterpret_cast<const uint8_t*>(addr - 1);
+        placementOk = (prev == 0xCC) || (prev == 0x90);
+      }
+      if (!placementOk)
+        return false;
+
+      // A thunk is short. Find the jmp rel32 within it and follow it.
+      const uint8_t* p = reinterpret_cast<const uint8_t*>(addr);
+      for (uint32_t i = 0; i + 5 <= 16u; ++i) {
+        if (p[i] != 0xE9)
+          continue;
+        uintptr_t target = 0;
+        if (!decodeRel32Target(m, addr + i, target))
+          continue;
+        if (!looksLikeFunctionEntry(m, target))
+          continue;
+        finalTargetOut = target;
+        return true;
+      }
+      return false;
+    }
+
     bool findCodePointerNear(const ModuleView& m, uintptr_t dispSite,
-                             int32_t before, int32_t after, uintptr_t& functionOut) {
+                             int32_t before, int32_t after, uintptr_t& functionOut,
+                             CodePointerScan* scanOut) {
       functionOut = 0;
+      if (scanOut != nullptr)
+        *scanOut = CodePointerScan();
       if (!m.valid() || !m.containsCode(dispSite))
         return false;
       if (before < 0 || after < 0 || before > 256 || after > 256)
@@ -854,14 +937,36 @@ namespace dxvk {
         // incidental disp32 that happens to land inside .text.
         if (!m.containsCode(target))
           continue;
-        if (!looksLikeFunctionEntry(m, target))
-          continue;
 
-        if (hits == 0)
+        if (scanOut != nullptr)
+          scanOut->inCode += 1;
+
+        if (!looksLikeFunctionEntry(m, target)) {
+          // Not a .pdata entry. It may still be a tail-call thunk, which is a
+          // real registration target -- see looksLikeThunkToFunction.
+          uintptr_t via = 0;
+          if (!looksLikeThunkToFunction(m, target, via)) {
+            if (scanOut != nullptr)
+              scanOut->rejectedNotEntry += 1;
+            continue;
+          }
+          if (scanOut != nullptr)
+            scanOut->acceptedThunks += 1;
+        }
+
+        if (hits == 0) {
           found = target;
-        else if (target != found)
+        } else if (target != found) {
+          if (scanOut != nullptr)
+            scanOut->distinct += 1;
           return false;                 // two different candidates: ambiguous
+        }
         ++hits;
+      }
+
+      if (scanOut != nullptr) {
+        scanOut->accepted = hits;
+        scanOut->distinct = (hits != 0) ? 1 : 0;
       }
 
       if (found == 0)
@@ -1162,6 +1267,20 @@ namespace dxvk {
       ModuleView mod;
       const bool haveModule = queryModule(desc.moduleName, mod);
 
+      // A CHAINED SYMBOL RESOLVES ITS BASE BEFORE THE LOCK IS TAKEN, and both
+      // reasons are fatal if this is moved down:
+      //   - stateMutex() is a plain std::mutex, not a recursive one, so a
+      //     nested resolve() under the lock self-deadlocks;
+      //   - `entry` below is a reference INTO symbolCache(), and a nested
+      //     resolve() inserting its own key can rehash the map and leave that
+      //     reference dangling.
+      // Resolving here costs nothing when base is null, which is every symbol
+      // that existed before chaining.
+      uintptr_t baseAddr = 0;
+      if (desc.base != nullptr) {
+        baseAddr = resolve(*desc.base);
+      }
+
       std::lock_guard<std::mutex> lock(stateMutex());
       SymbolCacheEntry& entry = symbolCache()[desc.name];
 
@@ -1201,20 +1320,70 @@ namespace dxvk {
         if (desc.anchorString == nullptr)
           return fail("string-anchored symbol has no anchor string");
 
-        uintptr_t strAddr = 0, site = 0;
-        if (!findStringRef(mod, desc.anchorString, strAddr, site))
+        // A literal may legitimately be referenced from several places -- a job
+        // registered by two registrars, a scope name used on two paths. What
+        // must be unique is the ANSWER, so every site is resolved and they are
+        // required to agree. Disagreement is the real ambiguity and still fails.
+        constexpr size_t kMaxAnchorSites = 8;
+        uintptr_t strAddr = 0;
+        uintptr_t sites[kMaxAnchorSites] = { };
+        size_t    nSites = 0;
+        if (!findStringRefs(mod, desc.anchorString, strAddr,
+                            sites, kMaxAnchorSites, nSites))
           return fail(str::format("anchor string \"", desc.anchorString,
-                                  "\" absent or referenced from 2+ sites"));
+                                  "\" absent, or referenced from more sites than",
+                                  " can be cross-checked"));
 
         uintptr_t fn = 0;
-        const bool ok = (desc.kind == SymbolKind::StringAnchoredFunction)
-          ? findCodePointerNear(mod, site, desc.searchBefore, desc.searchAfter, fn)
-          : findEnclosingFunction(mod, site,
-                                  desc.searchBefore ? uint32_t(desc.searchBefore) : 0x1000u, fn);
-        if (!ok)
-          return fail(desc.kind == SymbolKind::StringAnchoredFunction
-                        ? "no unique function pointer beside the anchor reference"
-                        : "could not walk back to an enclosing function entry");
+        size_t agreed = 0, disagreed = 0;
+        CodePointerScan scanTotal;
+        for (size_t i = 0; i < nSites; ++i) {
+          uintptr_t cand = 0;
+          CodePointerScan scan;
+          const bool got = (desc.kind == SymbolKind::StringAnchoredFunction)
+            ? findCodePointerNear(mod, sites[i], desc.searchBefore, desc.searchAfter,
+                                  cand, &scan)
+            : findEnclosingFunction(mod, sites[i],
+                                    desc.searchBefore ? uint32_t(desc.searchBefore) : 0x1000u,
+                                    cand);
+          scanTotal.inCode           += scan.inCode;
+          scanTotal.rejectedNotEntry += scan.rejectedNotEntry;
+          scanTotal.acceptedThunks   += scan.acceptedThunks;
+          scanTotal.accepted         += scan.accepted;
+          if (!got || cand == 0)
+            continue;   // this site carries no answer; another one may
+
+          if (fn == 0) {
+            fn = cand;
+            agreed = 1;
+          } else if (cand == fn) {
+            ++agreed;
+          } else {
+            ++disagreed;
+          }
+        }
+
+        if (fn == 0) {
+          if (desc.kind != SymbolKind::StringAnchoredFunction)
+            return fail(str::format("could not walk back to a function entry from any of the ",
+                                    nSites, " anchor reference(s)"));
+          // Say WHICH failure it was. inCode=0 means the window is wrong or too
+          // small; inCode>0 with everything rejected means the target is not
+          // shaped like an entry or a thunk; accepted>1 with no answer means
+          // the sites disagreed inside a single window.
+          return fail(str::format(
+            "no function pointer beside any of the ", nSites, " anchor reference(s)"
+            " [window -", desc.searchBefore, "/+", desc.searchAfter,
+            " intoCode=", scanTotal.inCode,
+            " rejectedNotEntry=", scanTotal.rejectedNotEntry,
+            " thunks=", scanTotal.acceptedThunks,
+            " accepted=", scanTotal.accepted, "]"));
+        }
+        if (disagreed != 0)
+          return fail(str::format("anchor references DISAGREE: ", nSites,
+                                  " site(s), ", agreed, " agreeing on 0x",
+                                  std::hex, fn, std::dec, " and ", disagreed,
+                                  " naming something else"));
 
         entry.address  = fn;
         entry.resolved = true;
@@ -1232,16 +1401,64 @@ namespace dxvk {
       if (desc.pattern == nullptr)
         return fail("no signature registered for this build");
 
-      const Pattern pat(desc.pattern);
+      // The specificity floor tracks the haystack: strict for a module-wide
+      // scan, relaxed for one confined to a base symbol's window.
+      const Pattern pat = (desc.base != nullptr)
+        ? Pattern(desc.pattern, 3, 3)
+        : Pattern(desc.pattern);
       if (!pat.valid())
         return fail("malformed or insufficiently specific signature");
 
+      // THE HAYSTACK. Module-wide by default; a window around the base symbol
+      // when this symbol is chained. The clamp keeps a generous searchAfter
+      // from running off the end of .text rather than rejecting it.
+      uintptr_t scanBegin = mod.codeBegin;
+      uintptr_t scanEnd   = mod.codeEnd;
+      if (desc.base != nullptr) {
+        if (baseAddr == 0)
+          return fail(str::format("base symbol '", desc.base->name, "' unresolved"));
+        if (!mod.containsCode(baseAddr))
+          return fail("base symbol resolved outside this module's .text");
+
+        // THE WINDOW IS ALWAYS RELATIVE TO THE BASE. searchBefore == 0 means
+        // "start AT the base symbol", never "start at the beginning of .text"
+        // -- an earlier version of this fell back to mod.codeBegin when
+        // searchBefore was zero, which silently turned every forward-only
+        // chained scan into a module-wide one. It then failed as
+        // "ambiguous: 2+ matches in the base symbol's window" while scanning
+        // several megabytes that were not in the window at all, which is a
+        // uniquely misleading way to be wrong.
+        scanBegin = baseAddr;
+        if (desc.searchBefore > 0) {
+          const uintptr_t back = static_cast<uintptr_t>(desc.searchBefore);
+          scanBegin = (baseAddr > mod.codeBegin + back) ? (baseAddr - back)
+                                                        : mod.codeBegin;
+        }
+
+        const uintptr_t hi = baseAddr + static_cast<uintptr_t>(desc.searchAfter);
+        scanEnd = (hi < mod.codeEnd) ? hi : mod.codeEnd;
+        if (scanEnd <= scanBegin)
+          return fail("chained search window is empty (searchAfter too small?)");
+      }
+
       uintptr_t first = 0;
-      const size_t hits = pat.countMatches(mod.codeBegin, mod.codeEnd, &first, 2);
+      const size_t hits = pat.countMatches(scanBegin, scanEnd, &first, 2);
+      // The window is printed as module RVAs, because a scan that is not the
+      // window you meant is otherwise indistinguishable from a binary that
+      // does not contain what you expected.
+      const auto windowText = [&]() -> std::string {
+        if (desc.base == nullptr)
+          return " in .text";
+        return str::format(" in window [+0x", std::hex, scanBegin - mod.base,
+                           ", +0x", scanEnd - mod.base, ") around '",
+                           desc.base->name, "' (+0x", baseAddr - mod.base, ")",
+                           std::dec);
+      };
+
       if (hits == 0)
-        return fail("no match in .text");
+        return fail(str::format("no match", windowText()));
       if (hits > 1)
-        return fail("ambiguous: 2+ matches in .text");
+        return fail(str::format("ambiguous: 2+ matches", windowText()));
 
       uintptr_t address = first + static_cast<intptr_t>(desc.addend);
 

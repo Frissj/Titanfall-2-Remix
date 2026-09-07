@@ -41,6 +41,7 @@
 // forward-declares RtInstance and pulls in nothing from this tree except
 // rtx_constants.h, so it cannot cycle.
 #include "rtx_render_object.h"
+#include "rtx_engine_renderables.h"
 
 namespace dxvk
 {
@@ -1032,9 +1033,17 @@ public:
   // this pipeline is missing.
   RenderObjectDB& getRenderObjectDB() { return m_renderObjectDB; }
   const RenderObjectDB& getRenderObjectDB() const { return m_renderObjectDB; }
+
+  // sec 7 slice B. Exposed const-only on purpose: this publishes a
+  // VisibilitySource, and the ONLY route from it to anything that can retire
+  // an object is ExistenceSourcePromotion, which will not hand one back until
+  // the flatness evidence exists. Handing out a mutable reference would be the
+  // first step in routing around that.
+  const RenderableEnum& getRenderableEnum() const { return m_renderableEnum; }
 private:
   ResidentScene m_residentScene;
   RenderObjectDB m_renderObjectDB;
+  RenderableEnum m_renderableEnum;
   // [Perf.PushInst] tallies, dxvk-cs only.
   uint32_t m_piBatches = 0, m_piHit = 0, m_piMissKey = 0, m_piMissInput = 0;
   uint32_t m_piMissInvalid = 0, m_piServedInst = 0, m_piFail = 0;

@@ -2550,6 +2550,119 @@ namespace dxvk {
                  "why misses missed (key vs generation), and -- while verify is on -- FAIL counts with\n"
                  "the component that disagreed. FAIL=0 across a pitch-and-yaw sweep is the gate for\n"
                  "turning verify off.");
+
+      RTX_OPTION("rtx.residentScene", bool, worldBatchKey, true,
+                 "Identify batched WORLD draws by the SET OF SURFACES in the batch instead of by the\n"
+                 "draw range. engine.dll packs N visible surfaces into one scratch array and issues a\n"
+                 "single draw, so drawStart/vbOffset name where the batch landed in THIS FRAME'S\n"
+                 "packing, not what it is -- which is why ~25-48% of the frame minted a fresh identity\n"
+                 "whenever visibility upstream of it moved. Measured at zero new keys over 31,920\n"
+                 "consecutive batch draws on a held view.\n"
+                 "NO EFFECT UNLESS THE [Join] HOOKS ARE IN, which needs rtx.residentScene.logStats:\n"
+                 "the key is minted on the thread that packs the batch and carried to the thread that\n"
+                 "draws it by the record/replay join, and that join only runs while diagnostics are on.\n"
+                 "Exists so a capture can A/B the identity without a rebuild; read it against\n"
+                 "[WorldBatch] keyed=, [ResidentGate] hitPct and [RenderObject] newObjects.");
+
+      RTX_OPTION("rtx.residentScene", bool, worldTrustProducerIndices, true,
+                 "Stop folding the index buffer's MAP GENERATION into the geometry dirty test for\n"
+                 "world batch draws that carry a producer key.\n"
+                 "\n"
+                 "WHY THE SENSOR IS WRONG HERE. GetMapGeneration() reports that a buffer was\n"
+                 "WRITTEN, not that its contents changed. TF2 builds each frame's world index\n"
+                 "list into a rotating scratch index buffer, so the generation moves every frame\n"
+                 "whether or not a single index differs -- the same mistake the material fold made\n"
+                 "with render-target content hashes, one layer down.\n"
+                 "\n"
+                 "MEASURED. After worldDropIbPtr, world's misses are ~847 a window of which\n"
+                 "missKey is ~320 and missGen ~495: the dominant world failure is no longer\n"
+                 "identity, it is this sensor.\n"
+                 "\n"
+                 "WHY IT IS SAFE TO DROP, and this is an argument about PROOF, not a heuristic.\n"
+                 "The gen fold exists so that 'the geometry cannot have changed' is provable\n"
+                 "rather than assumed. For an upstream-keyed world draw that proof already exists\n"
+                 "upstream: every world producer's key is content-derived over WHICH SURFACES OR\n"
+                 "MESHES WERE SELECTED -- indices into a persistent table, hashed in order -- so\n"
+                 "if the index list changes, the producer key changes, the resident key changes,\n"
+                 "and no record is found at all. The vertex side is untouched and stays folded;\n"
+                 "vbPtr moves on 0.05% of world draws, so the pool is static and its generation\n"
+                 "is real evidence.\n"
+                 "\n"
+                 "SCOPE: class 1 only, and only when a producer key is present. A world draw with\n"
+                 "no upstream key keeps the full fold, because then nothing else proves the\n"
+                 "selection. Studio is untouched -- its upstream key names the model ASSET, not\n"
+                 "which meshes were chosen, so it does not carry this proof.\n"
+                 "\n"
+                 "FALSIFIER. This RELAXES a safety proof, so recurrence is not the reading that\n"
+                 "matters: watch missMat and [RsFailSize], both currently at zero, and watch for\n"
+                 "geometry corruption in-game. Either leaving zero means a stale serve is getting\n"
+                 "through and this comes straight out.");
+
+      RTX_OPTION("rtx.residentScene", bool, worldDropIbPtr, true,
+                 "Take the index-buffer POINTER out of the resident key for world batch draws.\n"
+                 "\n"
+                 "TF2 draws world surfaces out of a static vertex pool and builds each frame's\n"
+                 "index list into a rotating scratch index buffer, so ibPtr names WHERE THIS\n"
+                 "FRAME'S INDEX LIST LANDED rather than which geometry is being drawn. Measured\n"
+                 "over 1,609,444 world draws, per-field head churn against the same batch at the\n"
+                 "same occurrence on the next frame:\n"
+                 "\n"
+                 "  ibPtr    143412      vsHash    17633      vbPtr      860\n"
+                 "  ilPtr     17633      vbStride     30\n"
+                 "\n"
+                 "vbPtr moves on 0.05% of draws and ibPtr on 8.9% -- the vertex side is frozen\n"
+                 "and the index side is an allocation. World gHd (head absent on the previous\n"
+                 "frame) is 210987 over the same draws, the same order as the ibPtr column.\n"
+                 "\n"
+                 "This is the known-bad shape the drawStart/drawCount/vbOffset/ibOffset zeroing\n"
+                 "in the same clause already covers -- a position in a per-frame packing -- at\n"
+                 "the buffer-object level instead of the offset level.\n"
+                 "\n"
+                 "NOT sec 5.3. upstreamNameOnly dropped vbPtr, ibPtr AND ilPtr for world and\n"
+                 "studio at once, leaving the upstream key alone to name the draw, and cost\n"
+                 "studio twenty points. This drops ibPtr only, for world only, and keeps vbPtr,\n"
+                 "ilPtr, vsHash, ibFormat, indexed, the producer's surface-set key and the pass.\n"
+                 "\n"
+                 "FALSIFIER, and it is not gap recurrence -- that lesson is written up at the\n"
+                 "reverted studio fold. Removing a term can only MERGE keys, so a coarser key\n"
+                 "recurs better by construction and proves nothing on its own. The reading that\n"
+                 "matters is whether a merged key serves a WRONG record: watch missGen and\n"
+                 "[RsFailSize] against their pre-change rates, and world hitPct. newKeys can\n"
+                 "only fall here; if it rises, this reasoning is wrong outright.");
+
+      RTX_OPTION("rtx.residentScene", bool, worldPassKey, true,
+                 "Separate the several draws one world surface set produces per frame by WHICH PASS\n"
+                 "drew them, instead of by their occurrence ordinal. A set is drawn 1.3 times a frame\n"
+                 "on average and up to 9 -- depth, shadow cascades, main -- so those draws collide on\n"
+                 "one resident key and the ordinal, a POSITION IN THE FRAME, was the only thing\n"
+                 "telling them apart. When a set is drawn three times one frame and twice the next,\n"
+                 "the ordinal-2 key is absent and misses without minting a new key, which is the\n"
+                 "newKeys=0 against missKey=1600-3500 the gate has been reading, and the r=0.90\n"
+                 "lockstep between the world and studio hit rates.\n"
+                 "THE PASS COMES FROM THE PRODUCER, not from D3D11 state, and that was measured\n"
+                 "rather than chosen: the viewport churns without bound in position AND size because\n"
+                 "the shadow atlas varies resolution per caster, and blend/depth-stencil state is\n"
+                 "material state that varies between the sub-draws of a single batch. Only the\n"
+                 "render-target set was stable, at two values for a session, and it is folded in\n"
+                 "alongside the producer's own persistent context.\n"
+                 "MEASURED: [SpanCensus] pk{} reads 1=18481 against 2=529 and 3+=99, so 97% of\n"
+                 "(key,pass) pairs recur every frame. The residual 3% at gap2 is a genuinely\n"
+                 "alternating pass and is NOT addressed by this -- that needs the gate to learn a\n"
+                 "period. Watch [ResidentGate] by{} world pct and studio pct, and ordinalShift.");
+
+      RTX_OPTION("rtx.residentScene", bool, studioModelKey, true,
+                 "Identify STUDIO MODEL draws (~29% of the frame) by the model asset plus the\n"
+                 "client renderable that drew it, instead of by the draw range. Latched around\n"
+                 "IStudioRenderContext::DrawModel and carried to the draw thread by the same\n"
+                 "record/replay join the renderable uses.\n"
+                 "PARTIAL BY CONSTRUCTION, AND THE LOG SAYS BY HOW MUCH. DrawModelInfo_t names the\n"
+                 "model ASSET, not which copy of it this is, so the instance half can only come\n"
+                 "from an enclosing IClientRenderable::DrawModel span. Draws with no such span --\n"
+                 "static props, world models -- are keyed by asset alone and their copies stay\n"
+                 "separated by the occurrence ordinal exactly as before. Read [StudioModel]\n"
+                 "noRend= for the size of that population and [RenderObject] ordinalShift for what\n"
+                 "it costs; those two numbers are what a real static-prop identity must beat.\n"
+                 "NO EFFECT UNLESS THE [Join] HOOKS ARE IN, which needs rtx.residentScene.logStats.");
     };
 
     // NV-DXVK [JobGraph] -- ARCHITECTURE_OVERHAUL.md slice 6.
@@ -2610,6 +2723,36 @@ namespace dxvk {
                  "occurrence, which is expected and non-zero because engine culling renumbers the\n"
                  "copies of a multi-copy identity. High ordinalShift says wait for the engine handle;\n"
                  "high newObjects says the key is wrong. Opposite responses, so never sum them.");
+    };
+
+    // ==================================================================
+    // NV-DXVK [RenderableEnum] -- RESIDENT_SCENE_PLAN sec 7 slice B.
+    //
+    // Reads client.dll's renderable registry directly. Unlike RenderObject
+    // this one DOES have a master enable, and the asymmetry is deliberate:
+    // RenderObject mirrors data this process already owns, while this walks
+    // another module's memory. An enable is the difference between a feature
+    // that can be turned off and a page fault that cannot.
+    // ==================================================================
+    struct RenderableEnum {
+      friend class ImGUI;
+      friend class RtxOptions;
+
+      RTX_OPTION("rtx.renderableEnum", bool, enable, false,
+                 "Read client.dll's renderable registry once per frame and publish it as a\n"
+                 "VisibilitySource. Costs one walk of a bitmask plus one 8-byte read per occupied\n"
+                 "slot; NOTHING is retired from it and no pointer read out of it is ever\n"
+                 "dereferenced. Resolves through EngineSymbols, so on a build where the chain\n"
+                 "breaks this disables itself and says which link failed.");
+
+      RTX_OPTION("rtx.renderableEnum", bool, logStats, false,
+                 "One [RenderableEnum] line per second. THE GATE FOR SLICE B is flatFrames:\n"
+                 "listed= must hold EXACTLY still for 600 frames under a fixed-position\n"
+                 "pitch-and-yaw sweep before the list may be promoted to an ExistenceSource and\n"
+                 "allowed to retire anything. listed= moving while fixedCam=1 is direct evidence\n"
+                 "that culling is leaking into the list, which is the failure that kept rung 5\n"
+                 "unsolved -- and it is evidence FOR that reading, not against it.\n"
+                 "breaks= counts how many times the run of flat frames was interrupted.");
     };
 
     // Resolve Options

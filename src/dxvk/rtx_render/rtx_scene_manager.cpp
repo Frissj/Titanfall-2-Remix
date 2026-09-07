@@ -4507,9 +4507,19 @@ namespace dxvk {
         // MIRROR ONLY. The id is bound to the resident key and then dropped.
         // Nothing reads it back yet, deliberately: slice 1's whole job is to
         // let [RenderObject] be watched for a window before anything is allowed
-        // to depend on an id. engineHandle is 0 because sec 7 slice B has not
-        // landed -- see rtx_render_object.h on why no grouping signal is safe
-        // before it does.
+        // to depend on an id.
+        //
+        // engineHandle IS STILL 0, and that is now a narrower statement than it
+        // used to be. Slice B has landed -- the pre-cull renderable registry is
+        // read and passes its gate -- but it publishes a VisibilitySource and
+        // retires nothing, and no record carries a handle yet, so there is
+        // nothing to pass here. Wiring one is a separate step from this one.
+        //
+        // WHAT DID CHANGE IS residentIdentity. For batched world draws it is
+        // now the surface-set key rather than the draw range, which is the
+        // population newObjects was churning on -- see the [WorldBatch] block
+        // in d3d11_rtx.cpp, and rtx_render_object.h on why that key is fed here
+        // as an IA identity and deliberately NOT as an engineHandle.
         RenderObjectDB& objectDb = m_instanceManager.getRenderObjectDB();
         const RenderPrimitiveId prim =
             objectDb.resolve(drawCallState.residentIdentity,

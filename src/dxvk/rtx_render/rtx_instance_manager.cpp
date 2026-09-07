@@ -1905,6 +1905,10 @@ namespace dxvk {
     // allocation. That is the same class as carrying a stale RtInstance* across
     // a clear, one level up.
     m_renderObjectDB.clear();
+    // The registry itself belongs to client.dll and survives our clear, but the
+    // promotion evidence must not: a level change moves the object population,
+    // and a flat run measured across it would be flat for the wrong reason.
+    m_renderableEnum.clear();
     m_viewModelCandidates.clear();
     m_playerModelInstances.clear();
   }
@@ -4136,6 +4140,20 @@ namespace dxvk {
       m_renderObjectDB.onFrameEnd(probeFrame,
                                   RtxOptions::RenderObject::quietFrames(),
                                   RtxOptions::RenderObject::maxObjects());
+
+      // NV-DXVK [RenderableEnum] sec 7 slice B. Read the engine's registry
+      // beside the two stores that will eventually consume it. Self-gated on
+      // rtx.renderableEnum.enable and a no-op when the symbol chain is
+      // unresolved, so this is one predicate on the default path.
+      //
+      // The camera position is passed in rather than sampled inside because
+      // the promotion gate is defined over a FIXED position -- see sec 3.1 and
+      // the note in rtx_engine_renderables.cpp on why the harness owns that
+      // decision and the enumeration does not.
+      m_renderableEnum.update(
+        probeFrame,
+        m_device->getCommon()->getSceneManager().getCameraManager()
+          .getCamera(CameraType::Main).getPosition(false));
 
       if (RtxOptions::RenderObject::logStats()) {
         static uint32_t sRoLastLogFrame = 0u;

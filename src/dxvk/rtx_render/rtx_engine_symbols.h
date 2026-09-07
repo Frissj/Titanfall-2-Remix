@@ -159,7 +159,18 @@ namespace dxvk {
     class Pattern {
     public:
       Pattern() = default;
-      explicit Pattern(const char* idaStyle);
+
+      // `minBytes`/`minConcrete` are the specificity floor. The defaults are
+      // the module-wide ones and should be left alone for any unscoped scan.
+      // A CHAINED symbol (SymbolDesc::base) passes a lower floor on purpose:
+      // the floor exists because a short pattern "cannot uniquely identify
+      // anything in a multi-megabyte .text", and a scan confined to a few
+      // hundred bytes inside one string-anchored function is not that. Keeping
+      // the strict floor there would force padding the pattern with
+      // register-allocation-dependent bytes, which is LESS build-stable, not
+      // more -- the opposite of what the floor is for.
+      explicit Pattern(const char* idaStyle,
+                       size_t minBytes = 6, size_t minConcrete = 5);
 
       bool   valid() const { return !m_bytes.empty(); }
       size_t size()  const { return m_bytes.size(); }
@@ -260,25 +271,55 @@ namespace dxvk {
     // A function that is registered, named or logged by a literal can be found
     // through that literal on any build that still contains it.
     //
-    // findStringRef() locates the unique read-only occurrence of `text`, then
-    // the unique instruction in .text whose rip-relative operand points at it.
+    // findStringRefs() locates the unique read-only occurrence of `text`, then
+    // EVERY instruction in .text whose rip-relative operand points at it.
     // findCodePointerNear() then reads the *other* rip-relative operand in the
     // surrounding window -- which is how a job/callback registration gives up
     // the function it registers:
     //
-    //     lea rax, aBuildRenderableRenderLists   <- found by findStringRef
+    //     lea rax, aBuildRenderableRenderLists   <- a site from findStringRefs
     //     lea rdx, sub_1801A82A0                 <- the job, by findCodePointerNear
     //     call JTGuts_RegisterJobType
     //
-    // Both require exactly one candidate and return false otherwise.
+    // WHY ALL THE SITES AND NOT THE UNIQUE ONE. A literal can be referenced
+    // from several places without being ambiguous: client.dll registers
+    // BuildRenderableRenderLists from two near-identical registrars that name
+    // the SAME job function. Demanding a single reference rejected that and
+    // disabled the feature over a distinction with no difference.
+    //
+    // The caller therefore resolves every site and requires them to AGREE.
+    // That is strictly stronger than the old rule, which accepted a lone site
+    // with nothing to cross-check it against. Disagreement is the ambiguity
+    // that actually matters, and it still fails.
+    //
+    // The string itself must still be unique, and findCodePointerNear() still
+    // requires exactly one candidate within any single window.
     // ------------------------------------------------------------------
-    bool findStringRef(const ModuleView& m, const char* text,
-                       uintptr_t& stringAddrOut, uintptr_t& dispSiteOut);
+    bool findStringRefs(const ModuleView& m, const char* text,
+                        uintptr_t& stringAddrOut,
+                        uintptr_t* sitesOut, size_t maxSites,
+                        size_t& siteCountOut);
+
+    // Why a window scan came back empty. Populated on request so a failure
+    // says which of the two very different causes it was -- "nothing in the
+    // window pointed at code" and "several things did, disagreeing" need
+    // opposite responses, and a bare false cannot tell them apart. That
+    // ambiguity cost a whole build/run cycle once; it should not cost another.
+    struct CodePointerScan {
+      uint32_t inCode           = 0;  // disp32s in the window aimed into .text
+      uint32_t rejectedNotEntry = 0;  // ...that were neither entry nor thunk
+      uint32_t acceptedThunks   = 0;  // ...accepted via the tail-call form
+      uint32_t accepted         = 0;  // candidates that qualified
+      uint32_t distinct         = 0;  // distinct targets among them
+    };
 
     // Search [site - before, site + after] for rip-relative operands whose
     // target lands in the module's executable range. Exactly one must qualify.
+    // A qualifying target is a .pdata function entry, or a tail-call thunk
+    // that jumps to one -- registration commonly hands over the latter.
     bool findCodePointerNear(const ModuleView& m, uintptr_t dispSite,
-                             int32_t before, int32_t after, uintptr_t& functionOut);
+                             int32_t before, int32_t after, uintptr_t& functionOut,
+                             CodePointerScan* scanOut = nullptr);
 
     // Walk back from an address INSIDE a function to that function's entry,
     // for the other common case: the literal is used by the function (a VPROF
@@ -362,8 +403,32 @@ namespace dxvk {
       int32_t     addend       = 0;        // added to the match address
       uint8_t     dispOffset   = 0;        // RipRelativeData: disp32 offset within the match
       uint8_t     instrLength  = 0;        // RipRelativeData: length of the matched instruction
-      int32_t     searchBefore = 0;        // StringAnchoredFunction: window, bytes before
-      int32_t     searchAfter  = 0;        // StringAnchoredFunction: window, bytes after
+      int32_t     searchBefore = 0;        // window, bytes before (see `base`)
+      int32_t     searchAfter  = 0;        // window, bytes after  (see `base`)
+
+      // CHAINED RESOLUTION -- the answer to "this signature is too thin to
+      // register safely".
+      //
+      // When `base` is set, the byte scan is confined to
+      //     [base - searchBefore, base + searchAfter)
+      // instead of the whole of .text, and every other field keeps its meaning:
+      // the `kind` switch below runs on the match exactly as it always has. So
+      // a chained symbol is not a new kind, it is an existing kind given a
+      // smaller haystack.
+      //
+      // WHY THIS IS THE SAFETY FIX AND NOT A CONVENIENCE. The file header warns
+      // that a thin pattern cannot be registered because the resolver fails
+      // safe on zero or 2+ matches but cannot detect a single COINCIDENTAL
+      // match across 13 MB of .text. Scoped to a few hundred bytes inside one
+      // string-anchored function, that coincidence is gone: `48 8D 0D` is
+      // hopelessly ambiguous module-wide and provably unique inside one known
+      // body. Chaining is therefore how a short, register-allocation-free
+      // pattern becomes registerable at all.
+      //
+      // Resolution is recursive and cached per link, so each step logs its own
+      // address and a break anywhere in the chain disables the dependent
+      // feature with the failing link named.
+      const SymbolDesc* base = nullptr;
     };
 
     // Resolve (and cache) a symbol. Returns 0 when unavailable for ANY reason:

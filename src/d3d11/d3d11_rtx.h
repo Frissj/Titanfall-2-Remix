@@ -3398,6 +3398,98 @@ namespace dxvk {
     uint32_t m_rsNoKey     = 0;  // no usable identity (no VB/IB bound)
     uint32_t m_rsLastLogFrame = 0;
 
+    // ==================================================================
+    // [ResidentGate] by{} -- THE SAME VERDICT, BILLED TO THE POPULATION THAT
+    // EARNED IT.
+    //
+    // hitPct is one number over four populations that behave nothing alike, and
+    // without the split it cannot say where the loss is. [SpanCensus] settled
+    // the world half on measurement -- newIds=0, gap1 at 98.7%, held{moved}=0 --
+    // yet hitPct sat at 19-30 in the same capture, which means the misses are
+    // somewhere hitPct cannot name. World is only ~846 of ~7000 judged draws a
+    // frame; a fix aimed at it on the strength of hitPct alone would be aimed at
+    // 12% of the problem.
+    //
+    // This is [Join.who]'s iaOnly= argument applied to the gate rather than to
+    // coverage: a percentage with no worklist attached is not actionable.
+    // Indexed by joinprobe::t_keyClass, so slot 0 stays empty by construction --
+    // a draw with no key never reaches the judge -- and is printed anyway,
+    // because a nonzero reading there would mean the carry is broken.
+    // [ResidentGate] ord{} -- THE PREMISE THIS INVESTIGATION HAS BEEN ASSUMING,
+    // FINALLY MEASURED.
+    //
+    // Every step from "the ordinal is a position" onwards rests on one unstated
+    // claim: that the misses land on the HIGH occurrence ordinals, because a set
+    // drawn three times one frame and twice the next leaves ordinal 2 absent.
+    // That claim was never tested, and folding the pass into the key -- which
+    // should have collapsed most groups to a single occurrence -- moved world's
+    // hit rate not at all (55.5 -> 54.1, inside the noise) while [RenderObject]
+    // newObjects did fall 104 -> 27. So the RT side improved and the gate did
+    // not, which means the gate's misses are not where they were assumed to be.
+    //
+    // HOW TO READ IT. miss concentrated on ord>=1 with ord0 near zero confirms
+    // the premise and the ordinal is the thing to replace. miss at ord0 being
+    // the bulk REFUTES it outright: an ordinal-0 draw is the FIRST occurrence of
+    // its identity in the frame, so nothing about occurrence counting can
+    // explain it missing, and the cause is that the identity itself was not
+    // judged last frame -- a different problem with a different fix.
+    //
+    // Hits are bucketed on the same axis because the miss counts alone have no
+    // denominator: ord0 dominating the misses would mean nothing if ord0 also
+    // dominates the population.
+    // How many bound SRVs the material fold sentinels as render targets, and how
+    // many of those the old `<= 2x2` bound would have missed. Mutable because
+    // residentMaterialFold is const and this is a count of what it saw, not
+    // state it acts on. big=0 would mean the broadened rule changed nothing and
+    // the churn is elsewhere; big large is the population that was re-keying
+    // every frame on content the material path never reads.
+    mutable uint32_t m_rsMatAttachSrv    = 0u;
+    mutable uint32_t m_rsMatBigAttachSrv = 0u;
+    // OR of the usage bits of every SRV image still contributing a CONTENT HASH.
+    // If the material fold keeps alternating, the bit this sentinel is missing
+    // is in here -- which is the difference between naming the next cause and
+    // guessing it for a fourth time.
+    mutable uint32_t m_rsMatSampledUsage = 0u;
+    // WHICH SRV SLOTS ACTUALLY REACHED THE FOLD WITH A CONTENT HASH, one bit per
+    // slot. [MatChurnSlot]'s srv=/img=/hash= histograms report the RAW bindings,
+    // so they show a slot moving whether or not the sentinel then threw it away
+    // -- which is exactly the ambiguity left after the attachment fix: slot 30
+    // moves 8 times and slot 22 once, and neither histogram can say which of
+    // them still drives matA/matB.
+    //
+    // A bit SET means that slot contributed a content hash and can move the
+    // fold. A bit CLEAR means it was sentinelled or absent and cannot. Read it
+    // against the histogram: the driver is a slot that moves AND has its bit
+    // set. If bit 30 is clear, the 1x1 attachment is handled and slot 22 is the
+    // cause; if it is set, the sentinel is not catching what it was aimed at.
+    mutable uint64_t m_rsMatHashSlots[2] = { };
+    // WHAT THE SMALL IMAGES REACHING THE FOLD ACTUALLY ARE. hashSlots says slot
+    // 30 still contributes a content hash, so it is not a colour or depth
+    // attachment in this scene -- but [SeqTex] recorded slot 30 as a 1x1
+    // R16_UNORM COLOUR ATTACHMENT, so the two disagree and one more inference on
+    // top of that is worth nothing. This records the extent and usage of every
+    // hashed image of 4x4 or smaller, which is the scratch/dummy class the
+    // material path rejects outright, and prints them per slot.
+    //
+    // A 1x1 with no attachment bit is an engine scratch or a role dummy and the
+    // two need opposite treatment: a scratch must be sentinelled, a dummy must
+    // NOT be, because the RDEF path uses which dummy a role resolves to. The
+    // format and usage printed here are what tells them apart.
+    static constexpr uint32_t kRsMatSmallSlots = 128u;
+    mutable uint32_t m_rsMatSmallW    [kRsMatSmallSlots] = { };
+    mutable uint32_t m_rsMatSmallH    [kRsMatSmallSlots] = { };
+    mutable uint32_t m_rsMatSmallUsage[kRsMatSmallSlots] = { };
+
+    static constexpr uint32_t kRsOrdBuckets = 4u;   // 0, 1, 2, 3+
+    uint32_t m_rsMissByOrd[kRsOrdBuckets] = { };
+    uint32_t m_rsHitByOrd [kRsOrdBuckets] = { };
+
+    static constexpr uint32_t kRsClasses = 4u;
+    uint32_t m_rsByClassDraws  [kRsClasses] = { };
+    uint32_t m_rsByClassHit    [kRsClasses] = { };
+    uint32_t m_rsByClassMissKey[kRsClasses] = { };
+    uint32_t m_rsByClassNewKey [kRsClasses] = { };
+
     // Eviction tallies. CUMULATIVE over the session, deliberately NOT reset
     // with the per-window counters above -- same reason [Perf.SplitXf]'s
     // evict{} is cumulative: wipes>0 at ANY point is the finding, and a
@@ -3472,6 +3564,18 @@ namespace dxvk {
     // needs it to group the draws that share one IA identity within a frame,
     // and XXH64(ordinal, baseKey) cannot be run backwards to recover it.
     uint64_t m_rsDrawBaseKey = 0ull;
+    // WHICH POPULATION THIS DRAW'S KEY CAME FROM, carried the same way
+    // m_rsDrawBaseKey is rather than read off joinprobe::t_keyClass in the
+    // judge. The latch is thread-local and residentDrawKey runs in SubmitDraw
+    // while the judge is the last statement of SubmitDrawTail; copying it here
+    // makes the join a member of the draw instead of a property of the thread,
+    // which is the same reason the key itself is carried and not re-derived.
+    // Values are joinprobe::t_keyClass's: 1 world, 2 studio, 3 IA-only.
+    uint32_t m_rsDrawKeyClass = 0u;
+    // Did this draw carry a producer key. Read by residentGeomGenFold to
+    // decide whether the index selection is already proven upstream, so it
+    // is written unconditionally rather than under logStats.
+    bool m_rsDrawUpstreamKeyed = false;
     // [RsChurn]: the FIELDS m_rsDrawBaseKey was hashed from, kept so the churn
     // probe can say WHICH one moved. A hash cannot be run backwards, and the
     // number this exists to explain -- ~1.3 brand-new identities a frame in a
@@ -3515,7 +3619,373 @@ namespace dxvk {
     uint64_t residentGeomGenFold() const;
     // Fold over the pixel-shader state a material is derived from. The MATERIAL
     // half; see the body.
-    uint64_t residentMaterialFold() const;
+    // THE FOUR THINGS THE MATERIAL FOLD IS MADE OF, kept apart so a churning
+    // fold can NAME its cause instead of being sampled at.
+    //
+    // WHY THIS EXISTS. [MatChurnSlot] watches a handful of base keys and reports
+    // matA/matB with matOther=0, which reads as a clean period-2 alternation --
+    // and three separate fixes were aimed at that reading, all measured worse.
+    // [RsIdent] says the population that actually fails is gap3plus=28515, NOT
+    // gap2, with distinct=27832 against drawKey's 2947: the fold takes ~9.4
+    // values per geometry key and CYCLES, which is a different defect from the
+    // pair the sample showed. The sample was not the failing population.
+    struct MatParts {
+      uint64_t ps    = 0ull;
+      uint64_t srv   = 0ull;
+      uint64_t samp  = 0ull;
+      uint64_t state = 0ull;
+    };
+    uint64_t residentMaterialFold(MatParts* parts = nullptr) const;
+
+    // GEOMETRY KEY -> the material parts it carried last frame. Keyed on the
+    // key WITHOUT material, so the same geometry recurring with a different fold
+    // is exactly what this catches, and the four counters say which component
+    // moved. Compared only across CONSECUTIVE frames: a gap is a different
+    // question and would report a stale part as a change.
+    struct MatPartsRec {
+      MatParts parts;
+      uint32_t frame = 0u;
+    };
+    std::unordered_map<uint64_t, MatPartsRec> m_rsMatParts;
+    uint32_t m_rsPartsSame  = 0u;
+    uint32_t m_rsPartsPs    = 0u;
+    uint32_t m_rsPartsSrv   = 0u;
+    uint32_t m_rsPartsSamp  = 0u;
+    uint32_t m_rsPartsState = 0u;
+
+    // NV-DXVK [KeyParts]: THE SAME SPLIT, ON THE OTHER HALF OF THE KEY.
+    //
+    // matParts split the material fold and closed it -- srv=10..21 against
+    // ps=20 samp=22 state=11 is four components at one noise floor. The gate did
+    // not follow: studio alternates 66/67/68 against 91/92/96 on a HELD camera,
+    // with ord{1} m=79 -> m=543 tracking it and ord1 hit flat. studio{draws}
+    // moves 2469 -> 2553 across the two modes, so the extra 380 ordinal-1 draws
+    // are not extra draws -- they are draws MERGING onto a key that already
+    // occurred that frame. The key loses discrimination on alternate frames.
+    //
+    // These are the three terms that could lose it, since the material is
+    // cleared and the head is the anchor: the upstream producer key, the pass,
+    // and the render-target set. See the diff site for the anchor's design and
+    // for the falsifier.
+    struct KeyParts {
+      uint64_t head = 0ull;   // ResidentKeyHead hash, BEFORE the three folds
+      uint64_t up   = 0ull;   // upstream producer key
+      uint64_t pass = 0ull;   // joinprobe::t_worldPass; 0 = no pass term at all
+      uint64_t tgt  = 0ull;   // dsv / rtv0 / maxRtv
+      uint32_t kind = 0u;     // 1 world, 2 studio; 0 = not an upstream draw
+      // IS THERE A PIXEL SHADER, which is this population's only free proxy for
+      // WHICH PASS a studio draw is in. noTailBy{NoPixelShader=6570} is most of
+      // the studio draw stream, so depth-only and shaded are the two passes that
+      // matter and a null PS separates them exactly. See vsFlip{}.
+      uint32_t hasPs = 0u;
+      // joinprobe::t_studioPass -- the producer's own STUDIORENDER_DRAW_* word,
+      // taken off the DrawModel argument the detours already receive.
+      uint32_t sflags = 0u;
+      // 1 = the studio span was live on this thread, 0 = the key and pass came
+      // back off the queue record. See currentStudioPass().
+      uint32_t direct = 0u;
+    };
+    // Written in residentDrawKey under logStats, beside m_rsDrawKeyHead and for
+    // the same reason: that is the only place all four terms exist at once.
+    KeyParts m_rsDrawKeyParts = { };
+    struct KeyPartsRec {
+      KeyParts parts;
+      uint32_t frame = 0u;
+    };
+    // ANCHOR -> the terms it carried last frame. The anchor is the IA head plus
+    // its occurrence within the frame, NOT the key: anchoring on the key would
+    // be circular, and the head alone would pair copy 0 of a prop with copy 3.
+    std::unordered_map<uint64_t, KeyPartsRec> m_rsKeyParts;
+    // Head -> how many times it has been drawn THIS frame, and how many times it
+    // was drawn on the frame it was last seen. NOT cleared per frame: the
+    // previous count is the whole point, and a frame stamp does the clearing
+    // that a wipe used to.
+    //
+    // WHY THE PREVIOUS COUNT IS CARRIED. keyParts' first run put the entire
+    // studio swing in gap= -- 14 draws on a 96% window against 1723 on a 46%
+    // one, monotone across 34 windows -- with up/pass/tgt flat. gap= says the
+    // head/occurrence pair was not drawn last frame, and that has two completely
+    // different causes which it cannot separate:
+    //
+    //   the head was drawn last frame, FEWER TIMES.  The occurrence index is a
+    //       position in a per-frame packing, which is the first entry on
+    //       CLAUDE.md's known-bad list, and the gate's own occurrence ordinal
+    //       has exactly the same defect -- ord{1} m=81 -> m=790 tracks gap to
+    //       the window. Fixable at the key.
+    //   the head was not drawn at all last frame.  The engine is submitting a
+    //       different set, and no key change touches it. A ceiling.
+    //
+    // prevCount is what tells the two apart, and it is one field.
+    struct KpHeadRec {
+      uint32_t frame     = 0u;   // frame this head was last drawn
+      uint32_t count     = 0u;   // occurrences so far on `frame`
+      uint32_t prevFrame = 0xFFFFFFFFu;
+      uint32_t prevCount = 0u;   // total occurrences on prevFrame
+    };
+    std::unordered_map<uint64_t, KpHeadRec> m_rsKpOcc;
+    static constexpr uint32_t kRsKeyKinds = 2u;   // 0 world, 1 studio
+    uint32_t m_rsKpDraws[kRsKeyKinds]    = { };
+    uint32_t m_rsKpSame[kRsKeyKinds]     = { };
+    uint32_t m_rsKpUp[kRsKeyKinds]       = { };
+    uint32_t m_rsKpPass[kRsKeyKinds]     = { };
+    uint32_t m_rsKpTgt[kRsKeyKinds]      = { };
+    uint32_t m_rsKpNew[kRsKeyKinds]      = { };
+    uint32_t m_rsKpGap[kRsKeyKinds]      = { };
+    // gap= split by its two causes. gapCnt = the head WAS drawn last frame and
+    // is being drawn more times this frame, so only the occurrence index is
+    // absent. gapHead = the head itself was not drawn last frame.
+    uint32_t m_rsKpGapCnt[kRsKeyKinds]   = { };
+    uint32_t m_rsKpGapHead[kRsKeyKinds]  = { };
+    // gHd billed to DISTINCT HEADS rather than draws, and to how long the head
+    // was away: [0] gone 2 frames, [1] 3, [2] 4 or more. The keep depth is the
+    // only lever on an absent head, so whether the absences are bounded is the
+    // whole decision -- see the diff site.
+    uint32_t m_rsKpGapHeadKeys[kRsKeyKinds] = { };
+    uint32_t m_rsKpGapAway[kRsKeyKinds][3]  = { };
+
+    // NV-DXVK [KeyParts] hdFld{}: WHICH FIELD OF THE HEAD THE ASSET SWAPPED.
+    //
+    // away{} closed the previous question and opened this one. Studio gHd is
+    // away{2=1012 3=0 4+=0} -- EVERY absent head is away for exactly one frame
+    // and then returns, on a held camera in a static scene. Nothing about
+    // visibility alternates at period 2; something the engine rotates does.
+    //
+    // WHY [RsChurn] CANNOT SEE IT and reads every field 0. It asks whether an
+    // identity is NEW. Both halves of a period-2 pair were minted long ago, so
+    // neither is ever new and newIdent stays at 22 per 300 frames while the pair
+    // ping-pongs forever. The question here is the other one: for the SAME
+    // asset, one appearance to the next, which field changed value.
+    //
+    // ANCHORED ON THE UPSTREAM KEY, not on the head, because the head is the
+    // thing under test -- anchoring on it would make the diff vacuous. The
+    // upstream key names the studio model ASSET (sec 5.3), which is exactly the
+    // level "the same model came back with a different buffer" is asked at, and
+    // the occurrence index separates its copies as it does for heads.
+    //
+    // The packing fields cannot appear here: residentDrawKey zeroes vbOffset,
+    // ibOffset, drawStart, drawCount and drawBase for every upstream draw. Any
+    // count they carry would be a bug in that zeroing, which is why they are
+    // still diffed rather than assumed.
+    struct KpAssetRec {
+      ResidentKeyHead head = { };
+      uint32_t frame  = 0u;
+      uint32_t hasPs  = 0u;
+      uint32_t sflags = 0u;
+    };
+    // NV-DXVK vsFlip{}: IS THE VERTEX-SHADER SWAP A PASS REMAP.
+    //
+    // hdFld put the studio swing in vsHash -- vs=0 at spct=96 against vs=648 at
+    // spct=67, with ilPtr tracking it to within 3% and vbPtr/ibPtr not tracking
+    // at all. The premise that follows, and it is only a premise: the studio key
+    // has NO pass term (p0 reads 100% of draws every window, because
+    // joinprobe::studioEnter never sets t_worldPass the way worldEnter does), so
+    // an asset's depth-prepass draw and its shaded draw are separated ONLY by
+    // the occurrence index. Any change in pass composition re-maps occurrence i
+    // onto the other pass, and the other pass has a different vertex shader.
+    //
+    // ps= counts the vsHash changes where the pixel shader went null<->non-null
+    // with it, i.e. the draw changed pass. same= counts the ones where it did
+    // not, i.e. the asset genuinely swapped vertex shader inside one pass --
+    // an LOD or skinning toggle, which is a different defect with a different
+    // fix. One of these two columns has essentially all of it, and that decides
+    // which.
+    uint32_t m_rsKpVsFlipPs[kRsKeyKinds]   = { };
+    uint32_t m_rsKpVsFlipSame[kRsKeyKinds] = { };
+    // THE SAME SPLIT AGAINST THE PRODUCER'S FLAGS WORD, and this is the one the
+    // fix hangs on. flg= counts vsHash changes where t_studioPass changed with
+    // it, i.e. the flags word NAMES the remap. nflg= counts the ones where it
+    // did not. The PS-presence bit was tried as the pass discriminator and cost
+    // twelve points with newKeys leaving zero -- it is a property of the draw,
+    // not of the pass. This asks whether the producer's own argument does what
+    // the D3D11 state could not, BEFORE anything folds it into a key.
+    uint32_t m_rsKpVsFlipFlg[kRsKeyKinds]  = { };
+    uint32_t m_rsKpVsFlipNoFlg[kRsKeyKinds] = { };
+    uint32_t m_rsKpDirect[kRsKeyKinds]      = { };
+    // DOES THE FLAGS WORD SEPARATE ANYTHING, which is the question the pixel
+    // shader's presence never got asked and cost twelve points for it.
+    //
+    // sflags has now passed the three tests a key term has to pass: bounded
+    // (used=6 over=0, counts steady window to window), producer-derived rather
+    // than read back off D3D11 state, and STABLE per asset-occurrence --
+    // vsFlip{flg} reads 0-8 against nflg=170, so folding it cannot churn the
+    // key the way the PS bit did. None of that says it is WORTH folding.
+    //
+    // This is that test. Within one frame, a draw whose baseKey has already
+    // been used is separated from the earlier one only by the occurrence
+    // ordinal. diff= counts those whose flags word differs from the first
+    // occurrence's -- exactly the population a fold would give a key of its
+    // own -- and same= counts the ones it would leave merged.
+    //
+    // diff near zero means the fold buys nothing and must not be written: the
+    // collisions are between draws of the SAME pass, and the ordinal is
+    // separating passes that were never distinct to begin with.
+    std::unordered_map<uint64_t, uint32_t> m_rsKpKeyFlag;   // baseKey -> first sflags
+    uint32_t m_rsKpKeyFlagFrame = 0xFFFFFFFFu;
+    uint32_t m_rsKpCollSame[kRsKeyKinds] = { };
+    uint32_t m_rsKpCollDiff[kRsKeyKinds] = { };
+    // WHICH HEAD FIELDS MOVE *TOGETHER*, and this separates two mechanisms the
+    // per-field columns cannot.
+    //
+    // hdFld reads vbPtr=317 ibPtr=317 against vsHash=170 ilPtr=176
+    // vbStride=116 on the same window. Those cannot all be the same draws, so
+    // the population is mixed:
+    //
+    //   vb|ib|vs|il|stride all set   a DIFFERENT MESH was drawn -- new buffers,
+    //       new vertex format, new shader. That is what an LOD change looks
+    //       like, and sub_180015D10 clamps a caller-supplied LOD byte into the
+    //       info struct at +42 before dispatching, so the engine picks it. If
+    //       this dominates, the geometry genuinely alternates and no key term
+    //       recovers it -- the BLAS for one LOD really is stale when the other
+    //       draws, and that is a ceiling to state rather than a bug to fix.
+    //   vs|il only                   the SAME mesh through a different shader
+    //       permutation. That is a material-side swap over stable geometry and
+    //       is a different problem with a different answer.
+    //
+    // Counted as a mask so the combinations are read off the log instead of
+    // inferred from five independent totals that cannot be cross-referenced.
+    // Bit 0 vbPtr, 1 ibPtr, 2 vsHash, 3 ilPtr, 4 vbStride.
+    static constexpr uint32_t kRsKpMaskSlots = 32u;
+    uint32_t m_rsKpHdMask[kRsKeyKinds][kRsKpMaskSlots] = { };
+    // WHAT DROPPING vsHash+ilPtr WOULD BUY, priced as a CANDIDATE rather than
+    // done. Sec 5.3 is the warning: vbPtr/ibPtr/ilPtr were removed on the
+    // reasoning that a pointer is not a name, studio fell twenty points, and
+    // they went back. No head field comes out of this key on an argument again.
+    //
+    // WHY THIS ONE IS WORTH PRICING. hdMask over 197 settled windows:
+    //   vsil        total=51222  r(studioPct) = -0.71   <- largest, strongest
+    //   vbibvsilst  total=19829  r(studioPct) = +0.35   <- POSITIVE; not it
+    //   vbib        total=21001  r(studioPct) = -0.16
+    // vsil is the class where the vertex and index buffers, the stride and the
+    // format all hold and ONLY the shader and its input layout move. The
+    // geometry is byte-identical by construction, so vsHash is carrying a
+    // material-side permutation inside a geometry identity -- which is what
+    // residentMaterialFold exists to hold separately.
+    //
+    // The mirror runs the same anchor and the same consecutive-frame rule
+    // against a head with vsHash and ilPtr taken out. gap= falling against the
+    // full head's is the size of the prize; gap= unchanged means the vsil
+    // population was failing for some other reason and the term is innocent.
+    //
+    // NOTHING IS REMOVED FROM THE KEY IN THIS BUILD.
+    // RESULT, 143 settled windows: noVs gap=33310 against the full head's
+    // 33331. A delta of 21 in 33 thousand. vsHash and ilPtr are INNOCENT and
+    // stay in the key; the vsil population that correlated at -0.71 was
+    // tracking the misses, not causing them. Kept as a standing candidate so
+    // the refutation stays measured rather than remembered.
+    //
+    // WHICH LEAVES THE BUFFERS. noVs failing means the draws that produce the
+    // gap are the ones where vbPtr/ibPtr move -- hdMask's vb-bearing classes
+    // are 59310 of the changes against vsil's 51222, and only the former can
+    // survive a mirror that drops vs and il. Candidate 1 drops the buffer
+    // pointers instead and keeps vsHash, ilPtr, stride and format, which is
+    // NOT what sec 5.3 tried: upstreamNameOnly dropped vbPtr, ibPtr AND ilPtr
+    // together, for world and studio at once, leaving the upstream key alone
+    // to name the draw. This keeps three discriminators and touches nothing.
+    // CANDIDATE 2, AND IT IS THE ONE THE MEASUREMENTS POINT AT.
+    //
+    // gHdAsset over 137 settled windows: here=178 r=-0.79, gCnt=112 r=-0.83,
+    // gone=97 r=-0.33 against gap=387 r=-0.89. here+gCnt is 290 of the 387, so
+    // three quarters of the studio miss is a draw whose MODEL was submitted
+    // last frame -- a key problem -- and only gone is a real cadence.
+    //
+    // WHY 0 AND 1 BOTH FAILED. hdMask's vb-bearing classes vbibvsil=15800 and
+    // vbibvsilst=19829 move the buffers AND the shader together, so a mirror
+    // that drops only vs/il or only vb/ib leaves the other half churning. Both
+    // read gap within a few percent of the full head, which is exactly what a
+    // half-measure against a two-field swap looks like.
+    //
+    // SO CANDIDATE 2 DROPS ALL FOUR and names the draw by the model asset plus
+    // the vertex format. What separates two copies of one model is then the
+    // candidate's own occurrence index, which is a position in submission order
+    // rather than a pointer into a per-frame allocation.
+    //
+    // THIS IS NOT SEC 5.3. upstreamNameOnly dropped vbPtr/ibPtr/ilPtr but KEPT
+    // vsHash, for world and studio at once -- so studio draws stayed split by a
+    // shader that hdMask now shows alternating, and world lost pointers it
+    // needed. This is studio-shaped and drops the shader too. It is also only a
+    // MIRROR: new= is the tripwire, and a candidate that merges copies which
+    // genuinely differ will show it there before anything reaches the key.
+    static constexpr uint32_t kRsKpCands = 3u;   // 0 no vs/il, 1 no vb/ib, 2 asset+format
+    std::unordered_map<uint64_t, KpHeadRec> m_rsKpOccCand[kRsKpCands];
+    std::unordered_map<uint64_t, uint32_t>  m_rsKpAnchorCand[kRsKpCands];
+    uint32_t m_rsKpCandSame[kRsKpCands][kRsKeyKinds] = { };
+    uint32_t m_rsKpCandGap[kRsKpCands][kRsKeyKinds]  = { };
+    uint32_t m_rsKpCandNew[kRsKpCands][kRsKeyKinds]  = { };
+    // RESULT: noBuf gap=884/779/635/160 against the full head's 905/796/672/212
+    // and noVs equal to the full head to the digit. BOTH CANDIDATES REFUTED.
+    // No reduction of the head recovers the population, which means the draw's
+    // whole identity -- geometry AND pipeline -- is absent on the previous
+    // frame. The engine did not submit it. The head is exonerated and no head
+    // field is to be removed on any argument; both mirrors stay as controls.
+    //
+    // SO BILL THE ABSENCE TO A VIEW. away{2} is ~100% of gHd and s{draws} holds
+    // at ~6760 across both modes, so one set of studio draws is being swapped
+    // for another of the same size every frame. The two things that name a view
+    // are the render-target set and the producer's own pass word, and neither
+    // has been asked about the ABSENT population specifically -- s{tgt} and
+    // vsFlip{flg} both measure only the draws that DID recur.
+    //
+    // A staggered shadow cascade would look exactly like this: alternating
+    // updates, constant total, stable identities, and nothing wrong with the
+    // key at all. If gHd concentrates on one target set or one flags value,
+    // that names it. If it is spread evenly across both, it is not a view.
+    static constexpr uint32_t kRsKpBillSlots = 8u;
+    uint64_t m_rsKpGhTgtVal[kRsKpBillSlots] = { };
+    uint32_t m_rsKpGhTgtHit[kRsKpBillSlots] = { };
+    uint32_t m_rsKpGhTgtUsed = 0u;
+    uint32_t m_rsKpGhTgtOver = 0u;
+    uint32_t m_rsKpGhFlgVal[kRsKpBillSlots] = { };
+    uint32_t m_rsKpGhFlgHit[kRsKpBillSlots] = { };
+    uint32_t m_rsKpGhFlgUsed = 0u;
+    uint32_t m_rsKpGhFlgOver = 0u;
+    // gHd split by whether the MODEL was there. here= is a key problem -- the
+    // asset drew last frame and only its head moved. gone= is a submission
+    // cadence and a ceiling. See the roll hoist for why this is asked.
+    uint32_t m_rsKpGhAssetHere[kRsKeyKinds] = { };
+    uint32_t m_rsKpGhAssetGone[kRsKeyKinds] = { };
+    // IS THE FLAGS WORD BOUNDED. The viewport died because it was unbounded in
+    // position AND size; the target set was bounded but at two values that did
+    // not align with the passes. A pass name must be a small fixed set, so the
+    // distinct values are collected and PRINTED rather than counted -- an
+    // unbounded one is visible immediately instead of being inferred.
+    static constexpr uint32_t kRsKpFlagSlots = 12u;
+    uint32_t m_rsKpFlagVal[kRsKpFlagSlots] = { };
+    uint32_t m_rsKpFlagHit[kRsKpFlagSlots] = { };
+    uint32_t m_rsKpFlagUsed = 0u;
+    uint32_t m_rsKpFlagOver = 0u;   // draws whose value did not fit a slot
+    std::unordered_map<uint64_t, KpAssetRec> m_rsKpAsset;
+    // Upstream key -> occurrences so far this frame, same roll as KpHeadRec.
+    std::unordered_map<uint64_t, KpHeadRec> m_rsKpAssetOcc;
+    uint32_t m_rsKpFldSame[kRsKeyKinds] = { };
+    uint32_t m_rsKpFld[kRsKeyKinds][kResidentKeyFields] = { };
+    uint32_t m_rsKpPass0[kRsKeyKinds]    = { };
+    uint32_t m_rsKpPassLost[kRsKeyKinds] = { };
+    uint32_t m_rsKpPassGain[kRsKeyKinds] = { };
+
+    // IS THE FOLD HASHING SLOTS THIS SHADER DOES NOT READ.
+    //
+    // matParts put 98.6% of all material churn in the SRV term (srv=1418 against
+    // ps=20 samp=33 state=10, and 1418/(1418+9064) = 13.5%, which is [RsIdent]'s
+    // gap3plus to the decimal). Textures are not changing identity while it
+    // happens -- [MatChurn] texNew=0 imgNew=0 with texTotal flat at 2105 -- so
+    // it is the SET OF BINDINGS that moves, not their contents.
+    //
+    // D3D11 SRV bindings are STICKY: a slot stays bound until someone rebinds
+    // it, and the fold walks all 128 slots and hashes every non-null one. So a
+    // draw's material fold includes whatever earlier draws left lying in slots
+    // its own shader never reads -- which makes the fold a function of DRAW
+    // ORDER rather than of this draw's material, and produces a cycle rather
+    // than the clean A/B pair [MatChurnSlot]'s sample kept showing.
+    //
+    // folded counts what the fold hashed; declared counts what the pixel
+    // shader's resource list actually asks for. folded >> declared confirms it.
+    // folded == declared refutes it and the SRV churn is real material.
+    // mutable for the same reason m_rsMatAttachSrv is: residentMaterialFold is
+    // const and these count what it saw, not state it acts on.
+    mutable uint64_t m_rsSrvFolded   = 0ull;
+    mutable uint64_t m_rsSrvDeclared = 0ull;
+    mutable uint32_t m_rsSrvDraws    = 0u;
+    mutable uint32_t m_rsSrvMaxFold  = 0u;
     // Entry half: mint the key, take the cheap folds, stash them. Decides nothing.
     void     residentGateBegin(bool indexed, UINT count, UINT start, INT base);
     // Tail half: the verdict, against the now-final object-to-world transform.

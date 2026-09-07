@@ -111,21 +111,26 @@ ZERO_TOLERANCE_MODULES = {'client.dll', 'engine.dll'}
 # Known-outstanding hits, by repo-relative path.
 #
 # client.dll and engine.dll are DONE -- see ZERO_TOLERANCE_MODULES. What is
-# left is studiorender.dll (22) and materialsystem_dx11.dll (44).
+# left is studiorender.dll (22) and materialsystem_dx11.dll (35).
 #
-# Those are a genuinely different case from the others, and the reason they are
-# listed rather than disabled: their RVAs are still CORRECT on the shipped
-# build. Checked against studiorender.dll v2.0.11.0, 0xDE10, 0x11CB0, 0x120B0,
-# 0x15A60, 0x15C00 and 0x15D10 are all exact function entries, so those hooks
-# install and work today. client.dll and engine.dll had drifted to a different
-# compilation; these two modules had not.
+# CORRECTION, 2026-09-06. This block used to say the remaining RVAs were "still
+# CORRECT on the shipped build", so there was "nothing to repair here, only
+# brittleness to remove". That was true of studiorender.dll and FALSE of
+# materialsystem_dx11.dll, and the game log said so:
 #
-# So there is nothing to repair here, only brittleness to remove -- and
-# swapping a working hook for an unverified signature would trade a latent
-# problem for an immediate one. They need anchors derived against their own
-# binaries, then the literal dropped and this number lowered.
+#     [Join] dispatcher body at matsys+0x87F80 does not match the expected
+#            bytes; nothing patched
+#
+# The [Join] queued-draw cluster had moved +0xF0, so the hook had been silently
+# refusing to install -- the byte check did its job while the literals rotted
+# behind it. Nine of those literals are now resolved through EngineSymbols
+# (matsys.QueuedDraw.*) and the count drops 66 -> 57.
+#
+# The lesson for whoever does studiorender next: "the RVA still lands on a
+# function entry" is not evidence the hook works. Only the log is. Verify
+# against a run, not against a disassembly.
 BASELINE = {
-    'src/d3d11/d3d11_rtx.cpp': 66,
+    'src/d3d11/d3d11_rtx.cpp': 57,
 }
 
 
