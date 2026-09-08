@@ -456,8 +456,9 @@ namespace dxvk {
       // could have skipped; fail counts those where the record disagreed with
       // what the full path actually resolved.
       //
-      // THE ARMING GATE IS fail - failNoRecEmpty, NOT fail, AND THE DIFFERENCE
-      // IS NOT A TOLERANCE. A draw that resolves to no instance is never filed:
+      // THE ARMING GATE IS fail - failNoRecEmpty - failLostErased, NOT fail,
+      // AND THE DIFFERENCE IS NOT A TOLERANCE. A draw that resolves to no
+      // instance is never filed:
       // processDrawCallState skips build() on an empty list, deliberately,
       // because a record serving an empty touch reads as a hit and does nothing.
       // The inputs of such a draw are perfectly stable, so the gate predicts a
@@ -489,9 +490,9 @@ namespace dxvk {
       //                   position. The strictest failure, and the one the
       //                   ordinal exists to prevent.
       //
-      // failSize + failMember are the two that would have kept the wrong
-      // objects alive and let the right ones retire. THOSE must reach zero
-      // across a full pitch-and-yaw sweep before verify goes off.
+      // failLostNever, failSize and failMember are the disagreements the live
+      // scene-side check cannot explain as a known fallback. Those must reach
+      // zero across a full pitch-and-yaw sweep before verify goes off.
       uint32_t predicted  = 0;
       uint32_t fail       = 0;
       uint32_t failNoRecEmpty = 0;
@@ -502,9 +503,14 @@ namespace dxvk {
       // cannot -- see the bodies in score() for what each one implies.
       //
       // failLostErased is the one to read sceptically: it is the count of
-      // records that were filed and then erased, which while verify is on is
-      // largely residency being disabled rather than residency being wrong.
+      // records that were filed and then erased. The unsafe subset was
+      // deliberately excluded from retention and cannot be a resident lifetime
+      // failure; a safe erased record is the population that needs explaining.
       uint32_t failLostErased = 0;
+      // Subset of failLostErased whose last record was deliberately excluded
+      // from both hold and skip. These are ordinary unsafe-instance retirement,
+      // not resident lifetime loss.
+      uint32_t failLostErasedUnsafe = 0;
       uint32_t failLostNever  = 0;
       // AND THE SPLIT THAT DECIDES WHETHER failSize IS A FAILURE AT ALL.
       //
@@ -604,18 +610,20 @@ namespace dxvk {
     // away" from "this key never had a record", which are opposite findings that
     // the missing-record count alone reports identically.
     //
-    // Kept for a few frames and no longer. The question it answers is always
-    // about the immediately preceding frame -- the gate only predicts on a key
-    // it judged last frame -- so a long history would cost memory to answer
-    // nothing, and an unbounded one would be a leak in exactly the churning
-    // scene where it fills fastest.
-    static constexpr uint32_t kTombstoneFrames = 4u;
-    void recordTombstone(uint64_t key, uint32_t frame);
+    // Kept for the session, within the hard cap in recordTombstone(). The gate
+    // may admit gaps longer than one frame (8 by default, unbounded when
+    // configured as 0), so expiring this history by age turns a known erasure
+    // into a false "never". A rebuilt live record takes precedence in score().
+    struct Tombstone {
+      uint32_t frame = 0u;
+      bool skipUnsafe = false;
+    };
+    void recordTombstone(uint64_t key, uint32_t frame, bool skipUnsafe);
     void detachRecord(uint64_t key, Record& record);
 
     std::unordered_map<uint64_t, Record> m_records;
     std::unordered_map<const RtInstance*, std::unordered_set<uint64_t>> m_instanceRecords;
-    std::unordered_map<uint64_t, uint32_t> m_tombstones;
+    std::unordered_map<uint64_t, Tombstone> m_tombstones;
     Stats m_stats;
   };
 

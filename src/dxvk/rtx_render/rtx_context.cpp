@@ -5630,8 +5630,10 @@ namespace dxvk {
       // on screen. Every key experiment run under verify is a live change, not
       // a dry run. Read holdsInstance() before assuming otherwise.
       //
-      // Nothing is skipped until [ResidentScene] reads FAIL=0 with the record
-      // count plateaued across a pitch-and-yaw sweep. That ordering is what the
+      // Nothing is skipped until [ResidentScene] reads realFail=0 with the
+      // record count plateaued across a pitch-and-yaw sweep. realFail excludes
+      // erased records because touch() safely falls back when one is absent.
+      // That ordering is what the
       // [PropIdKeepLong attempt reverted] note exists to enforce: a long keep on
       // an unstable identity made things measurably WORSE, not merely no better.
       if (drawCallState.residentPredictHit

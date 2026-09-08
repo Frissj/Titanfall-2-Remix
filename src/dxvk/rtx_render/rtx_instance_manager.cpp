@@ -4198,6 +4198,12 @@ namespace dxvk {
         if (probeFrame - sRsLastLogFrame >= 10u) {
           sRsLastLogFrame = probeFrame;
           const ResidentScene::Stats& rs = m_residentScene.stats();
+          // Missing records that were previously filed are a safe live-path
+          // fallback: touch() returns false and the draw commits in full. They
+          // cannot make a skip serve the wrong instances, so they do not block
+          // arming. See RESIDENT_SCENE_BIBLE.md section 2.
+          const uint32_t armingFail =
+            rs.fail - rs.failNoRecEmpty - rs.failLostErased;
           Logger::warn(str::format(
             "[ResidentScene] f=", probeFrame,
             // hold = the keep is armed and the skip is not, which is what
@@ -4258,7 +4264,10 @@ namespace dxvk {
             // long as the level is loaded. That number is permanent, benign and
             // handled by the live path (touch finds nothing, the draw commits in
             // full), so including it means waiting for a zero that cannot
-            // arrive. See ResidentScene::Stats for the full four-way split.
+            // arrive. An erased record is equally safe: touch() observes that
+            // it is missing and falls through to the full path. Only a record
+            // that was never filed, a size mismatch, or a member mismatch can
+            // make the prediction disagree with the scene-side resolution.
             //
             // realFail must read 0, not "low", across a full pitch-and-yaw
             // sweep before rtx.residentScene.verify goes off. Then read WHICH:
@@ -4267,10 +4276,13 @@ namespace dxvk {
             // record that existed and went away -- check evicted/wiped first.
             " | predicted=", rs.predicted,
             " FAIL=", rs.fail,
-            " realFail=", (rs.fail - rs.failNoRecEmpty),
+            " realFail=", armingFail,
             " fail{noRecEmpty=", rs.failNoRecEmpty,
             " noRecLost=", rs.failNoRecLost,
-            "(erased=", rs.failLostErased, " never=", rs.failLostNever, ")",
+            "(erased=", rs.failLostErased,
+            " unsafe=", rs.failLostErasedUnsafe,
+            " safe=", (rs.failLostErased - rs.failLostErasedUnsafe),
+            " never=", rs.failLostNever, ")",
             " size=", rs.failSize,
             // over/under split the size failures by SIGN, and the sign is what
             // says whether a size failure is a defect at all: over= keeps extra

@@ -391,12 +391,14 @@ namespace dxvk {
         // AND WHICH KIND OF MISSING, because the two want opposite responses and
         // the difference is invisible from the count alone.
         //
-        // A record that was FILED AND THEN ERASED is this measurement fighting
-        // itself: while verify is on the keep clause is off, so an instance that
-        // misses a frame retires on numFramesToKeepInstances, invalidateFor
-        // clears its record and onFrameEnd erases it. That failure is caused by
-        // residency being disabled, and arming the keep is what removes it --
-        // so counting it against the gate that guards arming is circular.
+        // A record that was FILED AND THEN ERASED cannot authorize a wrong
+        // skip: touch() looks the key up again on the CS side, finds nothing and
+        // returns false, so the draw commits in full. It therefore does not
+        // belong in the correctness gate. It is still a lifetime/coverage
+        // defect when it repeats in a held scene. The resident keep is active
+        // during verification, so verification itself cannot explain it;
+        // [ResidentInvalidate] and [RsLost] correlate the erased key with the
+        // instance-side invalidation that removed it.
         //
         // A key that NEVER had a record is a real disagreement: the frame thread
         // says it judged this draw last frame, and the CS side never filed
@@ -406,8 +408,24 @@ namespace dxvk {
         const auto tomb = m_tombstones.find(key);
         if (tomb != m_tombstones.end()) {
           m_stats.failLostErased += 1;
+          if (tomb->second.skipUnsafe) {
+            m_stats.failLostErasedUnsafe += 1;
+          }
         } else {
           m_stats.failLostNever += 1;
+        }
+        if (RtxOptions::ResidentScene::logStats()) {
+          static std::atomic<uint32_t> sLostLines { 0u };
+          const uint32_t line = sLostLines.fetch_add(1u, std::memory_order_relaxed);
+          if (line < 512u || (line & 1023u) == 0u) {
+            Logger::info(str::format(
+              "[RsLost] key=0x", std::hex, key, std::dec,
+              " ord=", ordinal,
+              " prodN=", static_cast<uint32_t>(produced.size()),
+              " erased=", (tomb != m_tombstones.end() ? 1 : 0),
+              " unsafe=", (tomb != m_tombstones.end() && tomb->second.skipUnsafe ? 1 : 0),
+              " tombFrame=", (tomb != m_tombstones.end() ? tomb->second.frame : 0u)));
+          }
         }
       }
       m_stats.fail += 1;
@@ -915,6 +933,35 @@ namespace dxvk {
       const auto it = m_records.find(key);
       if (it != m_records.end()) {
         if (it->second.valid) {
+          if (RtxOptions::ResidentScene::logStats()) {
+            static std::atomic<uint32_t> sInvalidateLines { 0u };
+            const uint32_t line = sInvalidateLines.fetch_add(1u, std::memory_order_relaxed);
+            if (line < 512u || (line & 1023u) == 0u) {
+              const Record& rec = it->second;
+              const bool unlinked = instance->isUnlinkedForGC();
+              const BlasEntry* blas = unlinked ? nullptr : instance->getBlas();
+              const bool blasSame = blas != nullptr
+                && rec.builtBlas == static_cast<const void*>(blas);
+              const bool posSame = blas != nullptr && rec.builtPosHash != 0ull
+                && blas->modifiedGeometryData.hashes[HashComponents::VertexPosition]
+                    == rec.builtPosHash;
+              Logger::info(str::format(
+                "[ResidentInvalidate] key=0x", std::hex, key, std::dec,
+                " owner=0x", std::hex, lastKey, std::dec,
+                " instId=", instance->getId(),
+                " currentKey=", key == lastKey ? 1 : 0,
+                " refs=", static_cast<uint32_t>(keys.size()),
+                " skipUnsafe=", rec.skipUnsafe ? 1 : 0,
+                " noBaseline=", rec.builtPosHash == 0ull ? 1 : 0,
+                " unlinked=", unlinked ? 1 : 0,
+                " marked=", instance->m_isMarkedForGC ? 1 : 0,
+                " blasSame=", blasSame ? 1 : 0,
+                " posSame=", posSame ? 1 : 0,
+                " lastUpd=", instance->getFrameLastUpdated(),
+                " recSeen=", rec.frameLastSeen,
+                " recBuilt=", rec.frameLastBuilt));
+            }
+          }
           ++m_stats.invalidated;
           if (key != lastKey) {
             ++m_stats.invalidatedOtherKey;
@@ -1031,7 +1078,7 @@ namespace dxvk {
 
       if (erase) {
         detachRecord(it->first, it->second);
-        recordTombstone(it->first, frame);
+        recordTombstone(it->first, frame, it->second.skipUnsafe);
         it = m_records.erase(it);
         m_stats.evicted += 1;
       } else {
@@ -1099,7 +1146,7 @@ namespace dxvk {
               && frame > it->second.frameLastSeen
               && (frame - it->second.frameLastSeen) > maxAge) {
             detachRecord(it->first, it->second);
-            recordTombstone(it->first, frame);
+            recordTombstone(it->first, frame, it->second.skipUnsafe);
             it = m_records.erase(it);
             m_stats.evicted += 1;
           } else {
@@ -1135,26 +1182,16 @@ namespace dxvk {
       }
     }
 
-    // Age out the tombstones, in the same pass that produced them. The window is
-    // kTombstoneFrames because the only question asked of this map is about the
-    // immediately preceding frame.
-    for (auto it = m_tombstones.begin(); it != m_tombstones.end(); ) {
-      if (frame > it->second && (frame - it->second) > kTombstoneFrames) {
-        it = m_tombstones.erase(it);
-      } else {
-        ++it;
-      }
-    }
   }
 
-  void ResidentScene::recordTombstone(uint64_t key, uint32_t frame) {
+  void ResidentScene::recordTombstone(uint64_t key, uint32_t frame, bool skipUnsafe) {
     // Bounded for the same reason the buffer-death queue is: this fills fastest
     // in exactly the churning scene where it would hurt most, and dropping a
     // tombstone only costs the diagnostic its precision -- a dropped entry reads
     // as failLostNever, which is the conservative direction because it reports
     // the more serious of the two findings rather than the excusable one.
     if (m_tombstones.size() < 131072u) {
-      m_tombstones[key] = frame;
+      m_tombstones[key] = Tombstone { frame, skipUnsafe };
     }
   }
 
