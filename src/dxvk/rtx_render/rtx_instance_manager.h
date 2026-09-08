@@ -1123,7 +1123,8 @@ private:
   // the caller can feed it to SpatialKeyHint regardless of the outcome.
   RtInstance* findSimilarInstance(BlasEntry& blas, const MaterialData& material, const Matrix4& firstInstanceObjectToWorld, CameraType::Enum cameraType, const RayPortalManager& rayPortalManager, uint64_t stablePropId = 0, DrawCallCache* drawCallCache = nullptr, const Matrix4* prevObjectToWorld = nullptr, XXH64_hash_t* outQueryMatrixHash = nullptr,
                                   // [PrevFarHit] probe only -- see FanoutSplit::batchTransforms.
-                                  const std::vector<Matrix4>* batchTransforms = nullptr);
+                                    const std::vector<Matrix4>* batchTransforms = nullptr,
+                                    uint64_t residentKey = 0);
 
   // NV-DXVK [perf] 2026-08-07: the per-DRAW inputs an instance update needs.
   //

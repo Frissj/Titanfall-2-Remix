@@ -422,6 +422,30 @@ namespace dxvk {
       SymbolKind::CodeSite, 0, 0, 0, 0, 0 };
 
     // ------------------------------------------------------------------
+    // Material bind, verified against the installed v2.0.11.0 DLL on 2026-09-08
+    // (SHA256 1afffb8dfe2a97a00ca3c5a68ca5277249176c2fd51ee7c5ad70f6eb699a6050).
+    // Bind is a .pdata function entry: substitute the fallback for null rdx,
+    // store the effective material at this+0x18 and the proxy at this+0x20.
+    // No string anchor occurs in its body. Both patterns are unique in .text.
+    inline const SymbolDesc kMatRenderContextBind {
+      "matsys.MatRenderContext.Bind", "materialsystem_dx11.dll",
+      "48 83 EC 28 48 85 D2 75 ?? 48 8B 15 ?? ?? ?? ??"
+      " 48 85 D2 74 ?? 48 39 51 18 74 ?? 48 89 51 18"
+      " 48 8B 01 4C 89 41 20 FF 90 C0 05 00 00",
+      nullptr, SymbolKind::Function, 0, 0, 0, 0, 0 };
+
+    // Constructor installs this RIP-relative vtable, then its secondary table.
+    // RTTI identifies CMatRenderContext; slot 16 is the unique .rdata pointer
+    // to the Bind function above. The installer cross-checks that relationship.
+    inline const SymbolDesc kMatRenderContextVtable {
+      "matsys.MatRenderContext.vtable", "materialsystem_dx11.dll",
+      "48 8D 05 ?? ?? ?? ?? 48 89 03 48 8D 05 ?? ?? ?? ??"
+      " 48 8D 8B 08 01 00 00 45 33 C0 33 D2 48 89 43 08"
+      " E8 ?? ?? ?? ??",
+      nullptr, SymbolKind::RipRelativeData, 0, 3, 7, 0, 0 };
+    inline constexpr uint32_t kMatRenderContextBindSlot = 16;
+
+    // ------------------------------------------------------------------
     // [Join] QUEUED-DRAW HOOK in materialsystem_dx11.dll. REGISTERED 2026-09-06.
     //
     // These replace eight hardcoded `matsys + 0xRVA` literals. Read back

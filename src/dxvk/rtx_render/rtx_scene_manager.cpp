@@ -4901,14 +4901,27 @@ namespace dxvk {
     const auto t2bPar = std::chrono::steady_clock::now();
 
     // ---- ORDERED TAIL (Step 6), arena order ------------------------------
+    // Apply every worker-recorded map operation before any continuation can
+    // migrate an instance between BLAS entries. Applying per item allowed a
+    // later item's stale operation to reinsert a migrated instance into its old
+    // map. Its owner then named the new map, so destruction removed only one
+    // entry and left a freed RtInstance* in the old nearest-neighbour cells.
+    for (ShardedDrawBatchItem& item : batch) {
+      ShardedDrawInfo& info = *item.info;
+      if (info.route != ShardedDrawInfo::Route::kSharded || info.pBlas == nullptr) {
+        continue;
+      }
+      for (const DeferredSpatialOp& op : info.spatialOps) {
+        m_instanceManager.applyDeferredSpatialOp(op);
+      }
+      info.spatialOps.clear();
+    }
+
     uint32_t nDeferred = 0;
     for (ShardedDrawBatchItem& item : batch) {
       if (item.info->route == ShardedDrawInfo::Route::kSharded && item.info->pBlas != nullptr) {
-        if (item.info->needsTailContinuation || !item.info->deferredPlacements.empty()
-            || !item.info->spatialOps.empty()) {
-          if (item.info->needsTailContinuation || !item.info->deferredPlacements.empty()) {
-            ++nDeferred;
-          }
+        if (item.info->needsTailContinuation || !item.info->deferredPlacements.empty()) {
+          ++nDeferred;
           runShardedDrawTail(item);
         }
       }
@@ -5071,19 +5084,12 @@ namespace dxvk {
     t_shardPhase = ShardedInstancePhase {};
   }
 
-  // NV-DXVK [Phase2b]: the ordered-tail body for one item — apply the
-  // parallel-phase deferred ops, then run any miss continuation in allowMiss
-  // mode (creation/migration/map writes inline; CS-domain work still recorded
-  // into pendingOps for the record step), then apply what the continuation
-  // recorded. Single-threaded, arena order.
+  // NV-DXVK [Phase2b]: the ordered-tail continuation for one item. All worker
+  // spatial ops for the batch were applied before entering this function, so a
+  // migration cannot be followed by another item's stale operation.
   void SceneManager::runShardedDrawTail(ShardedDrawBatchItem& item) {
     DrawCallState& dcs = *item.dcs;
     ShardedDrawInfo& info = *item.info;
-
-    for (const DeferredSpatialOp& op : info.spatialOps) {
-      m_instanceManager.applyDeferredSpatialOp(op);
-    }
-    info.spatialOps.clear();
 
     if (!info.needsTailContinuation && info.deferredPlacements.empty()) {
       return;

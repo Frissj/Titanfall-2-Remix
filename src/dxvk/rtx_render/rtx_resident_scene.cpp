@@ -1,9 +1,11 @@
 #include "rtx_resident_scene.h"
 
 #include <algorithm>
+#include <cassert>
 #include <iterator>
 #include <mutex>
 #include <unordered_set>
+#include <utility>
 
 #include "../../util/thread.h"
 
@@ -109,19 +111,17 @@ namespace dxvk {
 
     Record& rec = m_records[key];
 
-    // Drop the back-pointers of the PREVIOUS occupants first. An instance that
-    // was in the old list and is not in the new one would otherwise keep
-    // naming this key, and a later removeInstance would invalidate a record
-    // that no longer describes it -- which is harmless on its own, but it also
-    // means the instance itself never gets its stale key cleared, so the key
-    // survives into whatever record later hashes to it.
-    for (RtInstance* inst : rec.instances) {
-      if (inst != nullptr && inst->m_residentKey == key) {
-        inst->m_residentKey = 0ull;
+    // Stable rebuilds do not need to churn the reverse index.
+    if (rec.instances != instances) {
+      detachRecord(key, rec);
+      rec.instances.assign(instances.begin(), instances.end());
+      for (RtInstance* inst : rec.instances) {
+        if (inst != nullptr) {
+          m_instanceRecords[inst].insert(key);
+        }
       }
     }
 
-    rec.instances.assign(instances.begin(), instances.end());
     rec.srcGenHash = srcGenHash;
     rec.srcVertexBuffer = srcVertexBuffer;
     rec.srcIndexBuffer = srcIndexBuffer;
@@ -878,26 +878,7 @@ namespace dxvk {
       // what makes that legal.
       rec.valid = false;
 
-      // AND DROP THE POINTERS, exactly as invalidateFor does and for exactly
-      // the [FanoutUAF, 2026-08-21] reason recorded there: marking the record
-      // invalid does NOT empty it, and three sites walk rec.instances and
-      // dereference every element without checking `valid`. A record retired
-      // here is retired while its instances are still live -- nothing is being
-      // destroyed on this path -- so clearing the back-pointer is also what
-      // releases them to the ordinary lifetime clause, which is the whole
-      // intent: their object is gone, so they should age out normally rather
-      // than stay exempt.
-      //
-      // Guarded on the key matching for the same reason invalidateFor guards
-      // it: an instance may have been rebuilt under a different record since
-      // this one was filed, and clearing that instance's key would retire it
-      // out of a record that is still good.
-      for (RtInstance* inst : rec.instances) {
-        if (inst != nullptr && inst->m_residentKey == kv.first) {
-          inst->m_residentKey = 0ull;
-        }
-      }
-      rec.instances.clear();
+      detachRecord(kv.first, rec);
 
       // Counted in BOTH places on purpose. invalidated= is "records that went
       // invalid this window, whatever did it" and is what the eviction and
@@ -919,50 +900,50 @@ namespace dxvk {
     if (instance == nullptr) {
       return;
     }
-    const uint64_t key = instance->m_residentKey;
-    if (key == 0ull) {
+    const uint64_t lastKey = instance->m_residentKey;
+    instance->m_residentKey = 0ull;
+    const auto refs = m_instanceRecords.find(instance);
+    if (refs == m_instanceRecords.end()) {
       return;
     }
-    // Clear this instance's own key first and unconditionally, so the loop
-    // below skips this (dying) entry for free.
-    instance->m_residentKey = 0ull;
 
-    const auto it = m_records.find(key);
-    if (it != m_records.end()) {
-      // INVALIDATE THE WHOLE RECORD, never erase one element. The list is only
-      // meaningful as the complete output of one resolution pass; a list with a
-      // hole would stamp some of an object's instances and let the rest retire,
-      // which is the s2s "two views" failure shape -- alive but not refreshed,
-      // with no FAIL to catch it.
-      it->second.valid = false;
-      m_stats.invalidated += 1;
+    // Detaching records also edits the reverse index. Take this instance's
+    // keys out first so those edits cannot invalidate our traversal.
+    const auto keys = std::move(refs->second);
+    m_instanceRecords.erase(refs);
+    for (const uint64_t key : keys) {
+      const auto it = m_records.find(key);
+      if (it != m_records.end()) {
+        if (it->second.valid) {
+          ++m_stats.invalidated;
+          if (key != lastKey) {
+            ++m_stats.invalidatedOtherKey;
+          }
+        }
+        // A partial draw output cannot be replayed: retire the whole record.
+        it->second.valid = false;
+        detachRecord(key, it->second);
+      }
+    }
+  }
 
-      // NV-DXVK [FanoutUAF, 2026-08-21]: and DROP THE POINTERS, which marking
-      // the record invalid does not do. Three places walk rec.instances and
-      // dereference every element -- the rebuild in insert(), the eviction in
-      // the age sweep, and dropRecord() -- none of them checking `valid`. A
-      // pointer left here by a destroyed instance is read by whichever runs
-      // first. The `inst != nullptr` guards at those sites do not help: a freed
-      // instance is not a null pointer.
-      //
-      // This is the same defect that crashed the FANOUT record path at
-      // InstanceManager::onFrameEnd (rtx_instance_manager.cpp:3465) on
-      // 2026-08-21. It has not fired here only because residency is inert; the
-      // removeInstance comment is right that it would matter MORE once armed,
-      // since a resident record is designed to outlive an unbounded number of
-      // frames without being rebuilt.
-      //
-      // Safe here for the same reason as the fanout fix: removeInstance calls
-      // this BEFORE destroying the instance, so every pointer in the list is
-      // still live, and a sibling destroyed earlier in the same GC pass already
-      // ran this and emptied the list (we then return early on key == 0).
-      for (RtInstance* other : it->second.instances) {
-        if (other != nullptr && other->m_residentKey == key) {
-          other->m_residentKey = 0ull;
+  void ResidentScene::detachRecord(uint64_t key, Record& record) {
+    for (RtInstance* inst : record.instances) {
+      if (inst == nullptr) {
+        continue;
+      }
+      if (inst->m_residentKey == key) {
+        inst->m_residentKey = 0ull;
+      }
+      const auto refs = m_instanceRecords.find(inst);
+      if (refs != m_instanceRecords.end()) {
+        refs->second.erase(key);
+        if (refs->second.empty()) {
+          m_instanceRecords.erase(refs);
         }
       }
-      it->second.instances.clear();
     }
+    record.instances.clear();
   }
 
   void ResidentScene::onFrameEnd(uint32_t frame) {
@@ -1049,11 +1030,7 @@ namespace dxvk {
       }
 
       if (erase) {
-        for (RtInstance* inst : it->second.instances) {
-          if (inst != nullptr && inst->m_residentKey == it->first) {
-            inst->m_residentKey = 0ull;
-          }
-        }
+        detachRecord(it->first, it->second);
         recordTombstone(it->first, frame);
         it = m_records.erase(it);
         m_stats.evicted += 1;
@@ -1091,17 +1068,6 @@ namespace dxvk {
     // AND THE CEILING BEING HIT AT ALL IS THE FINDING. In a stationary scene it
     // means the KEY is churning (trap 3), not that the scene is large. Read
     // [ResidentGate] newKeys before touching maxRecords.
-    const auto dropRecord = [](std::unordered_map<uint64_t, Record>::iterator it) {
-      // Clear the back-pointers before erasing. An instance whose m_residentKey
-      // still names an erased record would never be invalidated again, and that
-      // stale key would collide with whatever later hashes into the same slot.
-      for (RtInstance* inst : it->second.instances) {
-        if (inst != nullptr && inst->m_residentKey == it->first) {
-          inst->m_residentKey = 0ull;
-        }
-      }
-    };
-
     // AND THE SWEEP IS BOUNDED BY THE OVERAGE, NOT BY THE RUNG. The rung says
     // WHICH records may go; the cap says HOW MANY. Without the size test in the
     // inner loop the first rung that fires removes EVERY record past it,
@@ -1110,7 +1076,7 @@ namespace dxvk {
     // cliff", described that intent rather than the code.
     //
     // AN EVICTION HERE DESTROYS GEOMETRY, which is what makes the overshoot a
-    // defect rather than a cache inefficiency. dropRecord() zeroes
+    // defect rather than a cache inefficiency. detachRecord() zeroes
     // m_residentKey, holdsInstance() then refuses, and with engine culling on
     // nothing redraws an off-screen object to rebuild the record -- so the
     // instances starve on numFramesToKeepInstances and do not come back.
@@ -1132,7 +1098,7 @@ namespace dxvk {
           if (it->second.frameLastSeen != kInvalidFrameIndex
               && frame > it->second.frameLastSeen
               && (frame - it->second.frameLastSeen) > maxAge) {
-            dropRecord(it);
+            detachRecord(it->first, it->second);
             recordTombstone(it->first, frame);
             it = m_records.erase(it);
             m_stats.evicted += 1;
@@ -1155,7 +1121,7 @@ namespace dxvk {
       // DIFFERENT finding from key churn and wants the opposite response.
       if (m_records.size() > maxRecords) {
         for (auto it = m_records.begin(); it != m_records.end(); ++it) {
-          dropRecord(it);
+          detachRecord(it->first, it->second);
         }
         m_stats.evicted += static_cast<uint32_t>(m_records.size());
         m_records.clear();
@@ -1194,12 +1160,9 @@ namespace dxvk {
 
   void ResidentScene::clear() {
     for (auto& [k, rec] : m_records) {
-      for (RtInstance* inst : rec.instances) {
-        if (inst != nullptr && inst->m_residentKey == k) {
-          inst->m_residentKey = 0ull;
-        }
-      }
+      detachRecord(k, rec);
     }
+    assert(m_instanceRecords.empty());
     m_records.clear();
     m_tombstones.clear();
   }

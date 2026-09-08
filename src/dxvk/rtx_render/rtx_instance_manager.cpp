@@ -4223,6 +4223,7 @@ namespace dxvk {
             // everywhere and the reason is one of those four, not the key.
             " missUnsafe=", rs.touchMissUnsafe,
             " invalidated=", rs.invalidated,
+            " invalidatedOtherKey=", rs.invalidatedOtherKey,
             " evicted=", rs.evicted,
             // CUMULATIVE. Non-zero means maxRecords is too small for the scene,
             // which is the OPPOSITE finding from key churn and wants raising the
@@ -6025,7 +6026,8 @@ namespace dxvk {
         ? &split->prevObjectToWorld
         : nullptr;
       currentInstance = findSimilarInstance(blas, materialData, firstInstanceObjectToWorld, drawCall.cameraType, rayPortalManager, lookupStablePropId, drawCallCache, prevO2W, &queryMatrixHash,
-                                           (split != nullptr) ? split->batchTransforms : nullptr);
+                                           (split != nullptr) ? split->batchTransforms : nullptr,
+                                           drawCall.residentKey);
 
       // NV-DXVK [Phase2b]: findSimilarInstance raised the defer sentinel (full
       // miss, portal teleport, or migration candidate) — this draw/placement is
@@ -7077,7 +7079,7 @@ namespace dxvk {
   }
 
   RtInstance* InstanceManager::findSimilarInstance(BlasEntry& blas, const MaterialData& material, const Matrix4& firstInstanceObjectToWorld, CameraType::Enum cameraType, const RayPortalManager& rayPortalManager, uint64_t stablePropId, DrawCallCache* drawCallCache, const Matrix4* prevObjectToWorld, XXH64_hash_t* outQueryMatrixHash,
-                                                 const std::vector<Matrix4>* batchTransforms) {
+                                                 const std::vector<Matrix4>* batchTransforms, uint64_t residentKey) {
     // NV-DXVK [perf] handoff v7 sec 4a: cleared up front so every early return
     // below leaves it defined. The exact stage overwrites it unconditionally a
     // few dozen lines down, before any of them can be taken; 0 is the safe value
@@ -7389,6 +7391,30 @@ namespace dxvk {
     const bool isMtnProbe = !kFindSimMtnDenied
                          && (vsHashProbe == 0x29146e1dd50b0314ull);
 
+    // Shared by record-directed and fallback class migration. Both must retain
+    // the previous bake and unlink the old spatial entry before changing BLAS.
+    const auto migrateInstance = [&](RtInstance* instance, BlasEntry& from) {
+      if (RtxOptions::firstBakeHold()
+          && blas.modifiedGeometryData.pendingSrcBake
+          && from.dynamicBlas.ptr() != nullptr
+          && from.dynamicBlas->accelerationStructureReference != 0) {
+        if (instance->m_prevBlasKeepAlive.ptr() == nullptr
+            || !from.modifiedGeometryData.pendingSrcBake) {
+          instance->m_prevBlasKeepAlive = from.dynamicBlas;
+        }
+      } else {
+        instance->m_prevBlasKeepAlive = nullptr;
+      }
+      instance->removeFromSpatialCache();
+      from.unlinkInstance(instance);
+      instance->setBlas(blas);
+      blas.linkInstance(instance);
+      const Vector3 centroid =
+        blas.input.getGeometryData().boundingBox.getTransformedCentroid(firstInstanceObjectToWorld);
+      instance->m_spatialCacheHash = blas.getSpatialMap().insert(
+        centroid, firstInstanceObjectToWorld, instance, stablePropId, currentFrameIdx);
+    };
+
     // Search the BLAS for an instance matching ours
     {
       // Search for an exact match. stablePropId (passed in from the
@@ -7400,6 +7426,85 @@ namespace dxvk {
       // resolves to an instance that will still be re-filed under THIS matrix by
       // onTransformChanged, so the hash is just as reusable on a miss.
       result = const_cast<RtInstance*>(blas.getSpatialMap().getDataAtTransform(firstInstanceObjectToWorld, stablePropId, outQueryMatrixHash));
+      // RecordChoice measured 140 exact hits bypassing an eligible recorded
+      // instance on another BLAS. Resolve identity before accepting that hit.
+      // Only serial lookup may migrate across maps; workers retain their path.
+      if (residentKey != 0 && drawCallCache != nullptr && blas.engineClassKey != 0
+          && !inShardedInstancePhase()) {
+        const auto* rec = m_residentScene.find(residentKey);
+        if (rec != nullptr && rec->valid && rec->instances.size() == 1) {
+          RtInstance* expected = rec->instances.front();
+          if (expected != nullptr && expected != result
+              && !expected->isUnlinkedForGC() && !expected->m_isCreatedByRenderer
+              && instanceIsEligibleMatch(expected, material, currentFrameIdx)) {
+            BlasEntry* owner = expected->getBlas();
+            // A migration into an occupied transform slot is collision-bumped.
+            // On the next draw, keep selecting the recorded member already on
+            // this BLAS rather than reverting to the original slot occupant.
+            const bool samePlacement = expected->m_stablePropId == stablePropId
+              && memcmp(expected->surface.objectToWorld.data,
+                        firstInstanceObjectToWorld.data, sizeof(Matrix4)) == 0;
+            if (owner != nullptr
+                && owner->engineClassKey == blas.engineClassKey
+                && ((owner == &blas && samePlacement)
+                    || owner->getSpatialMap().getDataAtTransform(firstInstanceObjectToWorld, stablePropId) == expected)) {
+              if (isProbeVS) {
+                static uint32_t sRecordRelink = 0;
+                const uint32_t sample = sRecordRelink++;
+                if (sample < 400u || (sample & 1023u) == 0u) {
+                  Logger::info(str::format(
+                    "[RecordRelink] f=", currentFrameIdx,
+                    " key=0x", std::hex, residentKey, " vs=0x", vsHashProbe, std::dec,
+                    " replacedExact=", result != nullptr,
+                    " migrated=", owner != &blas,
+                    " instId=", expected->getId()));
+                }
+              }
+              if (owner != &blas) {
+                migrateInstance(expected, *owner);
+              }
+              result = expected;
+            }
+          }
+        }
+      }
+      // Measure the choice before any instance is updated. A same-entry,
+      // same-transform unclaimed record member displaced by an exact hit
+      // supports an ambiguous-map selection bug. Different entry/transform or
+      // material refutes that explanation. Cross-entry reads stay off workers.
+      if (isProbeVS && residentKey != 0 && !inShardedInstancePhase()) {
+        const auto* rec = m_residentScene.find(residentKey);
+        if (rec != nullptr && rec->valid && rec->instances.size() == 1) {
+          const RtInstance* expected = rec->instances.front();
+          if (expected != nullptr && expected != result) {
+            static uint32_t sRecordChoice = 0;
+            const uint32_t sample = sRecordChoice++;
+            if (sample < 400u || (sample & 1023u) == 0u) {
+              const BlasEntry* owner = expected->isUnlinkedForGC() ? nullptr : expected->getBlas();
+              const RtInstance* ownerExact = owner != nullptr
+                ? owner->getSpatialMap().getDataAtTransform(firstInstanceObjectToWorld, stablePropId)
+                : nullptr;
+              const uint64_t queryKey = stablePropId != 0 ? stablePropId
+                : XXH64(&firstInstanceObjectToWorld, sizeof(Matrix4), 0);
+              Logger::info(str::format(
+                "[RecordChoice] f=", currentFrameIdx,
+                " key=0x", std::hex, residentKey, " vs=0x", vsHashProbe, std::dec,
+                " exactHit=", result != nullptr,
+                " recSameBlas=", owner == &blas,
+                " recUnlinked=", expected->isUnlinkedForGC(),
+                " recClaimed=", expected->getFrameLastUpdated() == currentFrameIdx,
+                " recXfSame=", memcmp(expected->surface.objectToWorld.data,
+                                      firstInstanceObjectToWorld.data, sizeof(Matrix4)) == 0,
+                " recMatSame=", expected->m_materialHash == material.getHash(),
+                " recEligible=", instanceIsEligibleMatch(expected, material, currentFrameIdx),
+                " recSlotSame=", expected->m_spatialCacheHash == queryKey,
+                " ownerExact=", ownerExact == expected,
+                " pickedClaimed=", result != nullptr && result->getFrameLastUpdated() == currentFrameIdx,
+                " pickedMatSame=", result != nullptr && result->m_materialHash == material.getHash()));
+            }
+          }
+        }
+      }
       const bool exactHit = (result != nullptr);
       // See RtInstance::m_claimStage. Stamped at the claim rather than at the
       // caller, because only here is it known WHICH stage produced the match.
@@ -8421,12 +8526,30 @@ namespace dxvk {
       return nullptr;
     }
 
+    // 2026-09-08: all 2,795 targeted MtnDedup misses queried empty maps.
+    // Test why cross-entry recovery fails before changing matching policy.
+    // classKey=0/cache=0 means it never ran; siblings without exact candidates
+    // refute filter rejection. Rejection counts overlap when several fail.
+    const bool probeRelinkMiss = result == nullptr && isProbeVS;
+    uint32_t relinkSiblings = 0, relinkExact = 0;
+    uint32_t relinkFrame = 0, relinkMat = 0, relinkSub = 0, relinkRenderer = 0;
     if (result == nullptr && drawCallCache != nullptr && blas.engineClassKey != 0) {
+      // Measured 3,586 migrations outside an existing valid record (2026-09-08).
+      // Material + transform identifies a class, not which member belongs to
+      // this draw. Prefer the recorded member among otherwise eligible matches;
+      // retain the old first match when no recorded member qualifies.
+      const auto* rec = residentKey != 0 ? m_residentScene.find(residentKey) : nullptr;
+      const bool haveRecord = rec != nullptr && rec->valid && !rec->instances.empty();
+      bool relinkMatchedRecord = false;
+      bool relinkChangedChoice = false;
       RtInstance* migrated = nullptr;
       BlasEntry* migratedFrom = nullptr;
       drawCallCache->forEachEngineClassSibling(blas.engineClassKey, [&](BlasEntry& sibling) {
-        if (&sibling == &blas || migrated != nullptr) {
+        if (&sibling == &blas || relinkMatchedRecord || (migrated != nullptr && !haveRecord)) {
           return;
+        }
+        if (probeRelinkMiss) {
+          ++relinkSiblings;
         }
         const RtInstance* cand =
           sibling.getSpatialMap().getDataAtTransform(firstInstanceObjectToWorld, stablePropId);
@@ -8434,6 +8557,13 @@ namespace dxvk {
           return;
         }
         RtInstance* c = const_cast<RtInstance*>(cand);
+        if (probeRelinkMiss) {
+          ++relinkExact;
+          relinkFrame += c->m_frameLastUpdated == currentFrameIdx ? 1u : 0u;
+          relinkMat += c->m_materialHash != material.getHash() ? 1u : 0u;
+          relinkSub += c->m_primInstanceOwner.isSubPrim() ? 1u : 0u;
+          relinkRenderer += c->m_isCreatedByRenderer ? 1u : 0u;
+        }
         // Same acceptance filters as the nearest-stage search above.
         if (c->m_frameLastUpdated == currentFrameIdx
             || c->m_materialHash != material.getHash()
@@ -8441,41 +8571,37 @@ namespace dxvk {
             || c->m_isCreatedByRenderer) {
           return;
         }
-        migrated = c;
-        migratedFrom = &sibling;
+        const bool recorded = haveRecord
+          && std::find(rec->instances.begin(), rec->instances.end(), c) != rec->instances.end();
+        if (migrated == nullptr || recorded) {
+          relinkChangedChoice = migrated != nullptr && migrated != c;
+          migrated = c;
+          migratedFrom = &sibling;
+          relinkMatchedRecord = recorded;
+        }
       });
       if (migrated != nullptr) {
-        // NV-DXVK [FirstBakeHold — flicker fix]: if the DESTINATION entry's
-        // first bake is still source-pending, its BLAS content is not
-        // trustworthy this frame — stash the FROM-entry's built BLAS so
-        // AccelManager can render the previous geometry for the handover
-        // frame instead of a collapsed bake (see RtInstance member comment).
-        // If the instance already carries a stash (chained re-batches on
-        // consecutive frames — the observed paired dedup-miss pattern), only
-        // overwrite it when the FROM entry's own bake is NOT pending:
-        // otherwise we would replace a known-good BLAS with a garbage one.
-        if (RtxOptions::firstBakeHold()
-            && blas.modifiedGeometryData.pendingSrcBake
-            && migratedFrom->dynamicBlas.ptr() != nullptr
-            && migratedFrom->dynamicBlas->accelerationStructureReference != 0) {
-          if (migrated->m_prevBlasKeepAlive.ptr() == nullptr
-              || !migratedFrom->modifiedGeometryData.pendingSrcBake) {
-            migrated->m_prevBlasKeepAlive = migratedFrom->dynamicBlas;
-          }
-        } else {
-          migrated->m_prevBlasKeepAlive = nullptr;
+        // A successful material/transform match need not belong to this draw.
+        // Compare BEFORE relinking or rebuilding the record. shared=1 clears
+        // this migration; valid=1 shared=0 measures record reassignment.
+        // Use the caller's draw key, not BlasEntry::input (shared across draws).
+        if (probeRelinkMiss) {
+          const bool shared = rec != nullptr
+            && std::find(rec->instances.begin(), rec->instances.end(), migrated) != rec->instances.end();
+          Logger::info(str::format(
+            "[ClassRelinkRecord] f=", currentFrameIdx,
+            " vs=0x", std::hex, vsHashProbe,
+            " key=0x", residentKey, " candidateKey=0x", migrated->m_residentKey,
+            " fromBlas=0x", reinterpret_cast<uintptr_t>(migratedFrom),
+            " toBlas=0x", reinterpret_cast<uintptr_t>(&blas), std::dec,
+            " instId=", migrated->getId(),
+            " record=", rec != nullptr ? 1 : 0,
+            " valid=", rec != nullptr && rec->valid ? 1 : 0,
+            " recN=", rec != nullptr ? rec->instances.size() : size_t(0),
+            " shared=", shared ? 1 : 0,
+            " preferred=", relinkChangedChoice ? 1 : 0));
         }
-        // Order matters: the spatial-cache erase must run while the instance
-        // still points at the OLD entry (it erases from m_linkedBlas's map).
-        migrated->removeFromSpatialCache();
-        migratedFrom->unlinkInstance(migrated);
-        migrated->setBlas(blas);
-        blas.linkInstance(migrated);
-        const Vector3 newCentroid =
-          blas.input.getGeometryData().boundingBox.getTransformedCentroid(firstInstanceObjectToWorld);
-        migrated->m_spatialCacheHash =
-          blas.getSpatialMap().insert(newCentroid, firstInstanceObjectToWorld, migrated, stablePropId,
-                                      currentFrameIdx);
+        migrateInstance(migrated, *migratedFrom);
         if (isProbeVS) {
           static thread_local uint32_t sRelinkProbe = 0;
           if (sRelinkProbe < 64 || (sRelinkProbe & 0x3FF) == 0) {
@@ -8491,6 +8617,20 @@ namespace dxvk {
         }
         result = migrated;
       }
+    }
+
+    if (probeRelinkMiss && result == nullptr) {
+      Logger::info(str::format(
+        "[ClassRelinkMiss] f=", currentFrameIdx,
+        " vs=0x", std::hex, vsHashProbe,
+        " blas=0x", reinterpret_cast<uintptr_t>(&blas),
+        " residentKey=0x", residentKey,
+        " classKey=0x", blas.engineClassKey,
+        " engineMat=0x", blas.input.engineMaterialPtr, std::dec,
+        " cache=", drawCallCache != nullptr ? 1 : 0,
+        " siblings=", relinkSiblings, " exact=", relinkExact,
+        " rejFrame=", relinkFrame, " rejMat=", relinkMat,
+        " rejSub=", relinkSub, " rejRenderer=", relinkRenderer));
     }
 
     return result;
@@ -8655,6 +8795,17 @@ namespace dxvk {
   // exactly like the inline code did. Single-threaded by contract (the tail).
   void InstanceManager::applyDeferredSpatialOp(const DeferredSpatialOp& op) {
     RtInstance* inst = op.instance;
+    if (op.kind != DeferredSpatialOp::Kind::kDecalOrder
+        && (inst == nullptr || op.targetBlas == nullptr || inst->isUnlinkedForGC()
+            || inst->getBlas() != op.targetBlas)) {
+      // A map op is valid only while its target still owns the instance. This
+      // guards the invariant at the single write gateway: violating it would
+      // put the pointer in one map while destruction erases it from another.
+      ONCE(Logger::err("[Shard2b] rejected deferred spatial op after BLAS ownership changed"));
+      if (inst != nullptr)
+        inst->m_spatialOpPendingFrame = kInvalidFrameIndex;
+      return;
+    }
     switch (op.kind) {
       case DeferredSpatialOp::Kind::kMove:
         inst->m_spatialCacheHash = op.targetBlas->getSpatialMap().move(
@@ -11226,7 +11377,7 @@ namespace dxvk {
     // survive an UNBOUNDED number of frames without being rebuilt, so a
     // dangling RtInstance* left here would be written through by the bulk
     // stamp for as long as the record lives -- which is forever, by design.
-    // No-op when residency is off (m_residentKey stays 0).
+    // No-op when the instance has no resident references.
     m_residentScene.invalidateFor(instance);
 
     // Always clean up replacement instance references, even for renderer-created instances

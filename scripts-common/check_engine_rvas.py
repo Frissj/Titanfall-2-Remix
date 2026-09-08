@@ -130,7 +130,7 @@ ZERO_TOLERANCE_MODULES = {'client.dll', 'engine.dll'}
 # function entry" is not evidence the hook works. Only the log is. Verify
 # against a run, not against a disassembly.
 BASELINE = {
-    'src/d3d11/d3d11_rtx.cpp': 57,
+    'src/d3d11/d3d11_rtx.cpp': 54,
 }
 
 

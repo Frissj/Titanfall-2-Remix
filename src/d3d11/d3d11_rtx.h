@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "d3d11_include.h"
 // NV-DXVK [DrawSnapshot]: DrawSnapshot stores D3D11VertexBufferBinding /
@@ -3564,6 +3564,8 @@ namespace dxvk {
     // needs it to group the draws that share one IA identity within a frame,
     // and XXH64(ordinal, baseKey) cannot be run backwards to recover it.
     uint64_t m_rsDrawBaseKey = 0ull;
+    // Range-table content belongs in the dirty test once identity names a sub-draw.
+    uint64_t m_rsDrawSelectionHash = 0ull;
     // WHICH POPULATION THIS DRAW'S KEY CAME FROM, carried the same way
     // m_rsDrawBaseKey is rather than read off joinprobe::t_keyClass in the
     // judge. The latch is thread-local and residentDrawKey runs in SubmitDraw
@@ -3673,6 +3675,436 @@ namespace dxvk {
     // The draw's index start BEFORE the upstream-keyed zeroing. Probe input
     // only -- see the relRange candidate.
     uint32_t m_rsDrawStartRaw = 0u;
+    // The producer's persistent name for the surface this sub-draw covers:
+    // engine.dll's 112-byte record index, read out of the descriptor at +50 and
+    // biased by 1 so 0 means "no name". Unlike m_rsDrawStartRaw above it is not
+    // a position in the packing -- see worldbatch::subDrawRecIdx for the two
+    // IDA sightings that identify the field, and runVsDesc{} for the falsifier
+    // on the sub-draw -> descriptor mapping.
+    uint32_t m_rsDrawRecIdx = 0u;
+    // The emitted range group's ordinal, biased by 1 so 0 means "no mapping".
+    // Diagnostic only; it is a per-call position and never enters the key.
+    uint32_t m_rsDrawRangeEntry = 0u;
+    // Hash of the exact 16-byte group sub_1800B8670 emits after filtering and
+    // merging: first qw0/start plus last end. Retains the old member name to
+    // keep the surrounding diagnostics and option wiring stable.
+    uint64_t m_rsDrawRangeQw0 = 0ull;
+    // How many draws took the range-entry key instead of the ordinal this
+    // window. Printed on [ResidentGate] so the option's reach is visible
+    // beside the pct it is meant to move -- a change that silently applied to
+    // nothing would otherwise read as "no effect".
+    uint32_t m_rsRangeKeyed = 0u;
+
+    // NV-DXVK [RsMiss]: WHY A missKey MISSED, attributed rather than counted.
+    //
+    // THE HOLE THIS FILLS. Nothing in this file measures missKey's CAUSE.
+    // gap0 is an in-frame collision, keyParts gap is a wider population, and
+    // both were shown to move independently of missKey -- turning
+    // rangeEntryKey off cut gap 8x (2530 -> 316) while missKey stayed at
+    // 385..735. Five candidate identities were refuted in a row because they
+    // were aimed at those proxies. See RESIDENT_SCENE_BIBLE.md §3.
+    //
+    // THE ANCHOR IS identHead, because it is the only thing on the candidate
+    // table that does not move: new=162 (0%), distinct=3773, flat all session.
+    // So "what did this draw's head look like last time we saw it" is a
+    // question with a stable subject.
+    //
+    // WHAT IT SEPARATES, and the two halves want opposite fixes:
+    //   absent{}  the head was NOT drawn last frame. The key is innocent; the
+    //             producer did not submit this draw. That is away{2=N 3=0
+    //             4+=0} and no key term can ever fix it.
+    //   present{} the head WAS drawn last frame, so the draw exists and its
+    //             key changed. Billed to the term that changed -- and if that
+    //             is ord= alone, the occurrence ordinal renumbering is finally
+    //             measured rather than assumed, which is the premise CLAUDE.md
+    //             §8 records four builds dying on.
+    // present{same=} would mean the head was there, every term this tracks is
+    // identical, and the key still missed -- a contradiction that says the key
+    // contains something not on this list. It must read 0.
+    struct MissAnchor {
+      uint32_t frame    = 0xFFFFFFFFu;
+      uint64_t key      = 0ull;
+      uint64_t mat      = 0ull;
+      uint64_t up       = 0ull;
+      uint64_t pass     = 0ull;
+      uint64_t tgt      = 0ull;
+      uint64_t gens     = 0ull;
+      uint64_t o2w      = 0ull;
+      uint32_t ordinal  = 0u;
+      uint32_t startRaw = 0u;
+      uint32_t producer = 0u;
+      // For [AnchorLife], below: which occurrence of its head this anchor is,
+      // and how many distinct frames it has ever been drawn in.
+      uint32_t occ      = 0u;
+      uint32_t seen     = 0u;
+    };
+    // head -> (frame, count) so the anchor can be keyed on WHICH OCCURRENCE of
+    // the head this is. Keyed on the head alone, the first cut of this probe
+    // had to exclude every 2nd+ draw of a head in a frame -- dupHead=741 of
+    // tot=1084, i.e. 68% unattributed -- because it would otherwise have
+    // compared this frame's sub-draw 0 against last frame's sub-draw 2.
+    // NV-DXVK [RsOcc]: DOES A HEAD'S SUB-DRAW COUNT CHANGE ON A STATIC SCENE.
+    //
+    // THE QUESTION absent{4+=460} RAISES. The camera is held, [SpanCensus]
+    // reads held{moved=0}, [WorldBatch] reads batches=29700 surfaces=120420 to
+    // the digit and [MatChurn] matNew=0. Nothing is created, destroyed or
+    // moved. So NO head should ever be absent, and yet 460 misses a window are
+    // heads last drawn four or more frames ago.
+    //
+    // The anchor is keyed on (head, occurrence). If head H is drawn three times
+    // one frame and twice the next, anchor (H,2) is not refreshed -- so an
+    // absence can mean the head's sub-draw COUNT shrank rather than the head
+    // going away. Those are different defects and this separates them:
+    //   up/dn non-zero  the count varies frame to frame. The highest
+    //                   occurrences then intermittently do not exist, and ANY
+    //                   key carrying an occurrence index must miss them. The
+    //                   fix is record granularity -- one record per head
+    //                   covering all its sub-draws -- not another key term.
+    //   same dominates  the count is stable and the head genuinely is not
+    //                   submitted, which is a producer question.
+    struct OccRec {
+      uint32_t frame = 0xFFFFFFFFu;
+      uint32_t cur   = 0u;   // occurrences so far this frame
+      uint32_t prev  = 0u;   // the completed count from the previous frame
+      // The highest completed count this head has EVER reached. prev compares
+      // consecutive frames and [HeadFrame] proved that comparison is confounded
+      // -- half the frames submit a strict subset, so dn is the partial frame
+      // and not the packer. peak is immune to that: a subset cannot exceed it.
+      uint32_t peak  = 0u;
+      // [KeySet], below. fold accumulates over the frame; peakFold is the last
+      // completed fold taken on a frame where the head was AT its peak, and
+      // peakFoldFrame is when that was. Comparing only peak-to-peak is what
+      // keeps a partial frame out of the comparison.
+      uint64_t fold          = 0ull;
+      uint64_t peakFold      = 0ull;
+      uint32_t peakFoldFrame = 0u;
+      // A draw that mints no key still folds, because it is still part of what
+      // the head submitted -- but it folds as a CONSTANT, so a head that merely
+      // shifts draws between keyed and keyless would report as renamed. These
+      // two carry the keyless count so that case is separable instead of
+      // silently inflating diff.
+      uint32_t zero          = 0u;
+      uint32_t peakZero      = 0u;
+    };
+    std::unordered_map<uint64_t, OccRec> m_rsMissOcc;
+    // CONFOUNDED, AND NOT YET CORRECTED -- do not build on occ{} alone.
+    //
+    // This counter lives in residentGateJudge, and noTail=4708..5215 of
+    // draws=7355 says ~65% of draws never reach it (noTailBy{NoPixelShader
+    // =3438 NoRenderTarget=910 NoInputLayout=230 CharDepthPrepass=184}). So it
+    // measures "how many of this head's draws reached the JUDGE this frame",
+    // not how many sub-draws the head had, and the noTail set varies per frame.
+    // up=0 with dn=12..148 in every single window is the signature of that: a
+    // one-sided asymmetry no steady state can produce, because a count that
+    // only ever falls would reach zero.
+    //
+    // AND THE SAME APPLIES TO THE LIVE KEY, which is the part that matters.
+    // rsOrdinal comes from m_residentOccupancy[ordGroup].counter++ in the same
+    // function, so it also counts only judged draws -- meaning a draw that is
+    // noTail one frame and not the next SHIFTS the ordinal of every later draw
+    // in its group, re-keying all of them. That is a mechanical source of
+    // ordinal instability nobody has measured, and [RenderObject] ordinalShift
+    // (260..282 a window) may already be reporting it. Check that before
+    // treating occ{}'s asymmetry as a property of the packer.
+    uint32_t m_rsOccSame = 0u, m_rsOccUp = 0u, m_rsOccDn = 0u;
+    uint32_t m_rsOccMaxDelta = 0u, m_rsOccFresh = 0u;
+    // Which occurrence index the missing draws sit at. If the misses pile up on
+    // the high indices while occurrence 0 hits, the count is the whole story.
+    uint32_t m_rsMissOccIdx[4] = { };
+
+    // NV-DXVK [AnchorLife]: HOW MUCH OF gateSize IS KEYS THAT NEVER RECUR.
+    //
+    // THE MECHANISM THIS PRICES. occ{} shows a head's sub-draw count is
+    // usually stable (same~800/window) but spikes -- maxDelta reaching 29 --
+    // and missOcc{3+=390 of 610} shows two thirds of misses sit on the high
+    // occurrence indices. anchors (+96/window) and gateSize (+91/window) grow
+    // at the same rate on a scene [WorldBatch] reports bit-identical. So the
+    // occurrence index is unbounded not because it RENUMBERS -- present{ord=0}
+    // killed that -- but because its RANGE keeps expanding, and every spike
+    // mints keys that are drawn once and never again.
+    //
+    // WHAT THIS DECIDES, and it is the difference between a safe change and a
+    // guess. If the high-occurrence anchors are overwhelmingly once=, they are
+    // pure gateSize garbage: clamping the ordinal costs nothing because those
+    // keys never serve a second draw anyway. If they are many=, they DO recur
+    // and clamping would merge live records -- §5.3's error, where sub-draws
+    // tile but are not interchangeable.
+    //
+    // Walks the anchor map at report time, ~31k entries once per ten frames.
+    uint32_t m_rsAnchorOnce[4] = { };
+    uint32_t m_rsAnchorMany[4] = { };
+    uint32_t m_rsAnchorMaxOcc = 0u;
+
+    // NV-DXVK [HeadGap]: IS THE GEOMETRY ACTUALLY ABSENT, OR ONLY THAT
+    // OCCURRENCE OF IT.
+    //
+    // THE CONTRADICTION THIS RESOLVES. absent{32+=231 max=3387} says heads go
+    // missing for up to 56 seconds and come back, on a scene where
+    // [SpanCensus] reads held{moved=0}, [WorldBatch] reads batches=29700
+    // surfaces=120420 to the digit and [MatChurn] reads matNew=0. Nothing is
+    // created, destroyed or moved. Intermittent geometry cannot exist here, so
+    // one of the two readings is wrong.
+    //
+    // The suspect is the anchor itself. It is keyed on (head, OCCURRENCE), and
+    // the occurrence comes from a counter in residentGateJudge that only ever
+    // sees the ~35% of draws reaching it -- noTail=4708..5215 of draws=7355.
+    // So an "absence" may be occurrence 7 of a head not existing this frame
+    // while the head itself is drawn every frame without fail.
+    //
+    // This tracks the HEAD alone, with no occurrence in the key, so the two
+    // gaps can be read side by side on the same miss:
+    //   headGap 0/1 dominant   the head was there; only the OCCURRENCE INDEX
+    //                          moved. Nothing is intermittent, and the entire
+    //                          miss population is the ordinal, not the scene.
+    //   headGap large          the head genuinely is not submitted, and the
+    //                          producer is dropping work on a still scene --
+    //                          a different and much bigger question.
+    std::unordered_map<uint64_t, uint32_t> m_rsHeadSeen;
+    static constexpr uint32_t kRsHeadGapB = 5u;   // 0, 1, 2-3, 4-15, 16+
+    uint32_t m_rsHeadGap[kRsHeadGapB] = { };
+    uint32_t m_rsHeadGapMax = 0u;
+    uint32_t m_rsHeadGapNew = 0u;
+
+    // NV-DXVK [OccSrc]: DOES THE HEAD'S DRAW COUNT MOVE, OR ONLY ITS JUDGED
+    // DRAW COUNT.
+    //
+    // headGap{0=394 of 426} proved the miss population is the OCCURRENCE
+    // INDEX -- the head is drawn earlier in the very same frame and only the
+    // index differs. This asks why the index moves, and there is one obvious
+    // suspect: the ordinal comes from m_residentOccupancy[ordGroup].counter++
+    // inside residentGateJudge, which noTail=4708..5215 of draws=7355 says
+    // ~65% of draws never reach. A draw that is noTail one frame and judged the
+    // next shifts the ordinal of every later draw in its group.
+    //
+    // residentDrawKey runs in residentGateBegin, which EVERY draw reaches, so
+    // the head is available before any of that filtering. Counting there gives
+    // the same same/up/dn histogram over the whole population:
+    //   all stable, judged moves  the filter is the cause. The ordinal counts
+    //                             a population that varies for reasons nothing
+    //                             to do with the geometry, and the fix is to
+    //                             assign it where every draw is still present.
+    //   both move                 the draw count genuinely varies and the
+    //                             producer is doing something else.
+    std::unordered_map<uint64_t, OccRec> m_rsOccAll;
+    uint32_t m_rsOccAllSame = 0u, m_rsOccAllUp = 0u, m_rsOccAllDn = 0u;
+    uint32_t m_rsOccAllMaxDelta = 0u;
+
+    // NV-DXVK [OccPeak]: DOES THE SUB-DRAW COUNT GROW, OR ONLY FALL SHORT.
+    //
+    // occAll{} above reads same=79.1% up=6.5% dn=14.4% maxDelta=29, and the dn
+    // bias is now accounted for: [HeadFrame] showed that on 807 of 807 low->full
+    // transitions the full frame's gap-1 heads equal the preceding partial
+    // frame's head count to within 1.4%, so a head drawn 5x on a full frame and
+    // 2x on a partial one bills dn=3 for no defect at all. Every consecutive-
+    // frame comparison in this file inherits that confound.
+    //
+    // Comparing against the head's own historical peak removes it, because a
+    // subset can never exceed the peak. What is left is the only motion that
+    // mints identity:
+    //   part  cur < peak   the frame was partial for this head. Benign.
+    //   full  cur == peak  the head submitted everything it has ever had.
+    //   grew  cur > peak   the head reached a sub-draw count it has NEVER had,
+    //                      and every slot above the old peak is an occurrence
+    //                      index minted for the first time.
+    //
+    // WHY IT IS THE RIGHT COUNTER NOW. anchorLife reads occ3+{once=16842
+    // many=6080} out of anchors=29884 -- 77% of the whole anchor map is
+    // occurrence 3 or higher, and 73% of those were drawn in exactly ONE frame
+    // ever. A key that never recurs cannot be made to hit by renaming it, which
+    // is the same wall present{}=0 has been reporting from the other side.
+    // grew{} says whether count growth is what mints them.
+    //
+    // THE FALSIFIER: grew ~0 once the scene is warm. Then sub-draw counts never
+    // exceed what the head has already had, every occurrence slot is old, and
+    // the one-frame anchors come from somewhere other than the packer -- which
+    // sends this back to what the occurrence index is computed FROM. first{} is
+    // carried separately so warm-up cannot be mistaken for growth.
+    uint32_t m_rsPeakFirst = 0u, m_rsPeakFull = 0u;
+    uint32_t m_rsPeakPart  = 0u, m_rsPeakGrew = 0u;
+    uint32_t m_rsPeakGrowMax = 0u;
+
+    // NV-DXVK [KeySet]: DOES A HEAD SUBMIT THE SAME KEYS TWICE.
+    //
+    // THIS DOES NOT CHANGE THE KEY. Three rounds have now proposed replacing a
+    // term of residentDrawKey and all three died against ord{}, which on the
+    // 01:50 run still reads ord0{m=12657 h=71687} -- 65.7% of misses at a 15.0%
+    // rate, on the LOWEST ordinal. A fourth guess is not worth a build. This
+    // measures the premise every one of those rounds assumed and none checked:
+    // that the same geometry comes back under a different key.
+    //
+    // WHY THE QUESTION IS STILL OPEN AFTER present{}=0. present{} asks whether
+    // a draw that WAS there had its key move, and the answer is no, every time.
+    // It cannot see a key that is simply never offered again -- and that is the
+    // whole residual, which reads absent{8-15,16-31,32+} with dupHead=92.5%:
+    // the head is present, its sibling sub-draw is not.
+    //
+    // HOW. Every draw folds its FINAL gate key into the head's accumulator, so
+    // this tests exactly what the gate looks up, not a proxy for it. The fold
+    // is commutative, so submission order cannot make a stable set look
+    // unstable -- and it is a sum rather than an XOR because XOR cancels
+    // duplicate keys in pairs and would erase the very multiplicity under test.
+    //
+    // Compared ONLY peak-to-peak. cur < peak means the head short-submitted and
+    // its fold is legitimately smaller; including those would rediscover
+    // [HeadFrame]'s partial frames and call them churn. gapMax carries how far
+    // apart the two compared appearances were, so a diff across 400 frames is
+    // not read as per-frame churn.
+    //
+    // THE FALSIFIER, both ways:
+    //   same dominant  the head offers an identical key set every time it is
+    //                  whole. The key is not the defect and nothing upstream of
+    //                  it is -- the record was there and went away, which makes
+    //                  this a RECORD STORE question (evict{}, maxRecords, the
+    //                  keep policy) and no key term can help.
+    //   diff dominant  the same whole head genuinely renames its sub-draws
+    //                  between frames. Only THEN is a key change justified, and
+    //                  by evidence rather than by a fourth guess.
+    // NV-DXVK [GapBill]: WHAT REMOVING THE BOUND ACTUALLY BOUGHT, AND WHERE.
+    //
+    // maxGapFrames is 0 (no bound) because [KeySet] read same=277852 diff=31
+    // over gaps to 2634 frames -- the key a whole head offers is the key it
+    // offered last time it was whole, so the gap carries no staleness evidence
+    // the four content tests do not carry better. That argument justifies
+    // REMOVING the bound; it does not say the removal pays, and "world went up"
+    // would be a percentage with no worklist.
+    //
+    //   servedGap  every serve, billed to the gap it was admitted at
+    //   staleGap   draws that CLEARED the gap and then failed a content test
+    //
+    // NEITHER OF THESE IS THE SAFETY CHECK -- touchMiss is, because a predict
+    // hit skips the draw and ResidentScene::touch acts on its own return value.
+    // These two answer the separate question of whether the removal PAYS.
+    //
+    // HOW TO READ THEM TOGETHER:
+    //   served concentrated in 2..31   a small bound would have done, and the
+    //                                  unbounded setting is carrying risk for
+    //                                  nothing. Set the bound to that band.
+    //   served spread into 128+        the deep sub-draws are the gain, which
+    //                                  is what [OccPeak] part=67.8% predicts.
+    //   stale rising with the band     the bound was doing real work after all
+    //                                  and the number to reach for is a bound,
+    //                                  not a revert to 8.
+    // stale is billed at all four sensors, so it cannot report clean because
+    // one of them was the one that fired.
+    static constexpr uint32_t kRsGapB = 8u;  // 1,2,3-7,8-15,16-31,32-127,128-1023,1024+
+    static uint32_t rsGapBucket(uint32_t g) {
+      if (g <= 1u)    return 0u;
+      if (g == 2u)    return 1u;
+      if (g <= 7u)    return 2u;
+      if (g <= 15u)   return 3u;
+      if (g <= 31u)   return 4u;
+      if (g <= 127u)  return 5u;
+      if (g <= 1023u) return 6u;
+      return 7u;
+    }
+    uint32_t m_rsServedGap[kRsGapB] = { };
+    uint32_t m_rsStaleGap[kRsGapB]  = { };
+    uint32_t m_rsServedGapMax = 0u;
+
+    uint32_t m_rsFoldSame = 0u, m_rsFoldDiff = 0u, m_rsFoldFirst = 0u;
+    uint32_t m_rsFoldGapMax = 0u, m_rsFoldDiffGapMax = 0u;
+    // Of the diffs, how many ALSO moved their keyless count. zdiff ~= diff
+    // means the keyless split moved and the renaming reading is not available.
+    uint32_t m_rsFoldZDiff = 0u;
+
+    // IS THE MISSING DRAW SIMPLY ONE THE HEAD DID NOT HAVE LAST FRAME.
+    //
+    // occAll{up=84 dn=441 maxDelta=6..29} says a head's draw count genuinely
+    // moves on a still scene, and headGap{0=394 of 426} says the head IS drawn
+    // in the very frame its occurrence misses. Put together, the prediction is
+    // that the missing draws are the ones PAST the count the head had last
+    // frame -- occurrence 22 of a head that had 20 draws last frame has no
+    // record because it did not exist to make one.
+    //
+    //   beyond dominant  the miss is arithmetic, not identity: there are more
+    //                    draws than there were records. No key term can fix
+    //                    that, because the draw is genuinely new each time the
+    //                    count grows. Only not keying on occurrence can.
+    //   within dominant  the occurrence existed last frame and still missed,
+    //                    which sends this back to the key after all.
+    uint32_t m_rsMissBeyond = 0u, m_rsMissWithin = 0u;
+
+    // NV-DXVK [HeadCadence]: HOW OFTEN IS EACH HEAD ACTUALLY DRAWN.
+    //
+    // THE CENSUS THAT SHOULD HAVE COME FIRST. Every absence reading so far has
+    // been taken on the MISS population, which is selected, and headGap=0 was
+    // then read as "the head was drawn this frame so nothing is intermittent".
+    // That was an over-read: headGap=0 only means the draw was not the first of
+    // its head this frame. It says nothing about the previous frame.
+    //
+    // This is unfiltered -- every head, every frame, hits included, taken in
+    // residentGateBegin before noTail removes 65% of draws. It answers the
+    // question directly: on a scene where held{moved=0} and batches=29700 hold
+    // to the digit, is every head drawn every frame?
+    //   cadence[0] ~= everything  nothing is intermittent, and the whole miss
+    //                             population is occurrence-index instability
+    //                             INSIDE a frame
+    //   a real tail               heads genuinely come and go, and the still
+    //                             scene is not submitting still work
+    static constexpr uint32_t kRsCadB = 5u;   // 1, 2, 3, 4-15, 16+
+    uint32_t m_rsHeadCadence[kRsCadB] = { };
+    uint32_t m_rsHeadCadenceMax = 0u;
+
+    // NV-DXVK [HeadFrame]: THE SAME CENSUS AT FRAME RESOLUTION.
+    //
+    // cadence{} above answered its question and then raised a harder one it
+    // cannot itself settle. Over the 2026-09-08 01:31 run it read
+    //   1=69.5% 2=29.1% 3=0.08% 4-15=0.76% 16+=0.53%
+    // A gap of exactly 2 on 29% of heads with a gap of exactly 3 on 0.08% is
+    // not a tail -- a tail decays. Heads ALTERNATE. And the window-to-window
+    // swing of the 2 bucket (4.4% .. 61.3%) tracks the window's head total at
+    // r=0.892 over 233 windows, which on a held scene is the defect itself.
+    //
+    // But cadence{} ACCUMULATES OVER THE TEN-FRAME WINDOW and resets at print,
+    // so that 0.892 is a correlation between window sums. Reading a two-frame
+    // period off a ten-frame accumulator is the probe error of section 4 in a
+    // new costume, and it is the reason this exists instead of another
+    // histogram: sixteen frames of history, kept per frame, never accumulated.
+    //
+    // n  = heads whose FIRST draw of the frame landed in that frame
+    // g2 = how many of those had cadence exactly 2
+    //
+    // THE FALSIFIER, so a bad reading reports itself in the same line: if n is
+    // FLAT across the sixteen frames, the head population does not oscillate,
+    // the 0.892 was an artifact of the window, and the alternation is per-head
+    // phase rather than per-frame submission. That kills this line in one run.
+    // If n swings, the frame is what alternates and the question becomes what
+    // the engine is doing on the small frames.
+    //
+    // The slot self-clears on frame change, so there is no reset at print and
+    // no frame-change detection: consecutive prints ten frames apart overlap by
+    // six frames, which cross-checks the ring against itself for free.
+    static constexpr uint32_t kRsHeadFrames = 16u;   // power of two, masked
+    uint32_t m_rsHeadFrameFid[kRsHeadFrames] = { };
+    uint32_t m_rsHeadFrameN[kRsHeadFrames]   = { };
+    uint32_t m_rsHeadFrameG2[kRsHeadFrames]  = { };
+    std::unordered_map<uint64_t, MissAnchor> m_rsMissAnchor;
+    static constexpr uint32_t kRsMissCls = 3u;   // 0 world, 1 studio, 2 other
+    uint32_t m_rsMissTot[kRsMissCls]     = { };
+    uint32_t m_rsMissNoAnchor[kRsMissCls] = { };
+    uint32_t m_rsMissDupHead[kRsMissCls] = { };  // 2nd+ draw of its head this frame
+    // HOW LONG THE HEAD WAS GONE. The 4+ bucket swallowed 423 of 462 misses,
+    // which decides nothing: a head gone for 4 frames is recoverable by
+    // widening the gate's gap tolerance, one gone for 200 is not. Split so the
+    // tolerance can be chosen from the distribution instead of guessed.
+    static constexpr uint32_t kRsAbsBuckets = 6u;  // 2,3,4-7,8-15,16-31,32+
+    uint32_t m_rsMissAbsent[kRsMissCls][kRsAbsBuckets] = { };
+    uint32_t m_rsMissAbsMax[kRsMissCls] = { };
+    uint32_t m_rsMissOrd[kRsMissCls]     = { };
+    uint32_t m_rsMbMat[kRsMissCls]     = { };
+    uint32_t m_rsMissUp[kRsMissCls]      = { };
+    uint32_t m_rsMissPass[kRsMissCls]    = { };
+    uint32_t m_rsMissTgt[kRsMissCls]     = { };
+    uint32_t m_rsMissGens[kRsMissCls]    = { };
+    uint32_t m_rsMissO2wP[kRsMissCls]    = { };
+    uint32_t m_rsMissStart[kRsMissCls]   = { };
+    uint32_t m_rsMissProd[kRsMissCls]    = { };
+    uint32_t m_rsMissSame[kRsMissCls]    = { };
+    uint32_t m_rsMissMulti[kRsMissCls]   = { };
+    uint32_t m_rsMissWipe = 0u;
+    // Draws the one-frame-gap relaxation admitted that the strict rule would
+    // have rejected. Printed on [ResidentGate] beside the pct it should move.
+    uint32_t m_rsGap2Served = 0u;
     uint32_t m_rsPartsG1     = 0u;
     uint32_t m_rsPartsGap    = 0u;
     uint32_t m_rsPartsSrvG1  = 0u;
@@ -3705,6 +4137,12 @@ namespace dxvk {
       uint64_t pass = 0ull;   // joinprobe::t_worldPass; 0 = no pass term at all
       uint64_t tgt  = 0ull;   // dsv / rtv0 / maxRtv
       uint32_t kind = 0u;     // 1 world, 2 studio; 0 = not an upstream draw
+      // WHICH world producer, because kind==1 is SIX of them and they do not
+      // behave alike: [DescMap] reads start and base at zero on every draw
+      // under worldbatch::note, while [RsGap0] finds the raw start differing on
+      // 4588 world collisions. Billing only, never a key term.
+      // 1 batch, 2 depth, 3 range, 4 meshList, 5 object, 6 array.
+      uint32_t producer = 0u;
       // IS THERE A PIXEL SHADER, which is this population's only free proxy for
       // WHICH PASS a studio draw is in. noTailBy{NoPixelShader=6570} is most of
       // the studio draw stream, so depth-only and shaded are the two passes that

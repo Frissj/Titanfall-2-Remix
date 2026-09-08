@@ -2920,6 +2920,28 @@ namespace dxvk {
     // always runs first and the latch is always current at open().
     thread_local uint64_t t_pendingPass = 0ull;
 
+    // WHICH OF THE FIVE WORLD PRODUCERS OPENED THIS SPAN, as a small id rather
+    // than a hash.
+    //
+    // THE MEASUREMENT THAT FORCED IT. [DescMap] reads zero{start=234 base=234}
+    // on 234 of 234 sampled sub-draws -- every draw under worldbatch::note
+    // issues with StartIndexLocation AND BaseVertexLocation at zero -- while
+    // [RsGap0] bills 4588 of 6332 world in-frame collisions to the raw start
+    // DIFFERING, with startNZ=4626 confirming it really is non-zero there.
+    // Both are correct, so kind==1 is not one population: joinprobe::worldEnter
+    // sets it for all five note* producers and only one of them is the surface
+    // batch. t_pendingPass already separates them but four of the five hash it,
+    // so it cannot be read as a label.
+    //
+    // WHY THIS MATTERS MORE THAN THE COUNTER SUGGESTS. Every identity candidate
+    // for this population -- the ordinal, the material fold, relRange, the
+    // material slice, recIdx -- was designed around the surface batch and
+    // priced on `world`. If the collisions live under a different producer,
+    // all of them were aimed at draws that were never the problem.
+    thread_local uint32_t t_pendingProducer = 0u;   // 1 batch, 2 depth,
+                                                    // 3 range, 4 meshList,
+                                                    // 5 object, 6 array
+
     // WHAT THE SPAN LOOKED LIKE LAST TIME, per batch key. Three numbers and a
     // frame stamp: everything the verdict needs and nothing else, so the map
     // stays the same order as worldbatch::s_seen (distinctEver has read 2419).
@@ -3762,6 +3784,10 @@ namespace dxvk {
     // t_worldKey does. Its value is produced by the note* that opened the span;
     // see spancensus::t_pendingPass for why no D3D11 term could supply it.
     thread_local uint64_t t_worldPass          = 0ull;
+    // Not stacked with t_worldPass: this is a label for billing, and a nested
+    // span restoring the outer producer would only matter if it were in a key.
+    // It is not, and must not become one -- see spancensus::t_pendingProducer.
+    thread_local uint32_t t_worldProducer      = 0u;
     thread_local uint64_t t_worldPassStack[kSpanMax] = {};
     thread_local uint64_t t_studioStack[kSpanMax] = {};
     thread_local uint32_t t_studioTop             = 0u;
@@ -4293,6 +4319,7 @@ namespace dxvk {
       t_worldTop += 1u;
       t_worldKey  = key;
       t_worldPass = spancensus::t_pendingPass;
+      t_worldProducer = spancensus::t_pendingProducer;
       // [SpanCensus] PUSHES UNCONDITIONALLY AND CARRIES THE GATE AS THE KEY,
       // rather than skipping the push when the probe is off. logStats is a live
       // tunable, so a gated push would unbalance the census stack the moment it
@@ -6974,16 +7001,25 @@ namespace dxvk {
       t_matsysMatPtr = a2;
   }
   static bool matBindInstallHook() {
-    HMODULE ms = GetModuleHandleA("materialsystem_dx11.dll");
-    if (ms == nullptr) return false;
-    const uintptr_t base = reinterpret_cast<uintptr_t>(ms);
-    void** slot = reinterpret_cast<void**>(base + 0x1D54C8);    // vtable 0x1D5448 + 0x80
-    if (!studioMemReadable(slot, 8)) return false;
+    // The old RVAs rejected the shipped DLL, leaving engineMaterialPtr zero
+    // on all 1,310 measured ClassRelinkMiss events. Resolve code and table
+    // independently: a callable slot alone does not establish Bind's identity.
+    dxvk::EngineSymbols::ModuleView ms;
+    if (!dxvk::EngineSymbols::queryModule("materialsystem_dx11.dll", ms)) return false;
+    const uintptr_t bind = dxvk::EngineSymbols::resolve(dxvk::tf2sym::kMatRenderContextBind);
+    const uintptr_t table = dxvk::EngineSymbols::resolve(dxvk::tf2sym::kMatRenderContextVtable);
+    if (bind == 0 || table == 0) return true; // resolver logs once; leave unpatched
+    void** slot = reinterpret_cast<void**>(table) + dxvk::tf2sym::kMatRenderContextBindSlot;
+    if (!ms.containsRData(reinterpret_cast<uintptr_t>(slot))
+        || !dxvk::EngineSymbols::readable(slot, sizeof(*slot))) {
+      Logger::warn("[MatBind] resolved slot is not readable .rdata; abort");
+      return true;
+    }
     void* cur = *slot;
     if (cur == reinterpret_cast<void*>(&matBindWrapper)) return true;          // already hooked
-    if (cur != reinterpret_cast<void*>(base + 0x71E80)) {
+    if (cur != reinterpret_cast<void*>(bind)) {
       Logger::warn(str::format("[MatBind] slot holds 0x", std::hex, reinterpret_cast<uintptr_t>(cur),
-        " != sub_180071E80; abort", std::dec));
+        " != resolved Bind 0x", bind, "; abort", std::dec));
       return true;
     }
     g_matBindOrig = reinterpret_cast<MatBind_t>(cur);
@@ -6993,7 +7029,7 @@ namespace dxvk {
     *slot = reinterpret_cast<void*>(&matBindWrapper);
     DWORD tmp = 0; VirtualProtect(slot, 8, op, &tmp);
     Logger::warn(str::format("[MatBind] installed: slot=0x", std::hex,
-      reinterpret_cast<uintptr_t>(slot), " orig=0x", base + 0x71E80, std::dec));
+      reinterpret_cast<uintptr_t>(slot), " orig=0x", bind, std::dec));
     return true;
   }
 
@@ -9986,6 +10022,356 @@ namespace dxvk {
     // keyed/batches never moved. See residentDrawKey's head.
     static std::atomic<uint32_t> s_maxDrawRun  { 0u };
 
+    // ---- THE PRODUCER'S OWN NAME FOR A SURFACE, from IDA rather than from the
+    // D3D11 side, and it is the term [RsGap0] says has to come from up there.
+    //
+    // WHAT [RsGap0] ESTABLISHED. Of the draws the ordinal-free key cannot
+    // separate in one frame: batch=0 head=0 pass=0 ps=0 mat=0 multi=0 -- every
+    // term the key was GIVEN reaches it -- leaving world 73% start= (differing
+    // only in m_rsDrawStartRaw, a per-frame packing position, which relRange
+    // already named and lost 12x on population) and world 27% / studio 100%
+    // same= (nothing in D3D11 state differs at all). No D3D11-side field is
+    // left. That is a statement about the instrumented fields, NOT a proof that
+    // no identity exists -- and the producer has one.
+    //
+    // WHERE IT IS. engine.dll:
+    //
+    //   sub_1801B8120   builds a 112-byte record array by deserialising the
+    //                   level stream (sub_180420BD0(a2, v13, 64)) and reads
+    //                   qword_193F09850 + 112 * *((uint16*)v13 + 25)
+    //   sub_1801B55A0   walks a 112-byte-stride array reading the uint16 at
+    //                   +50 and uses it the same way:
+    //                   v7 = qword_193F09850 + 112 * v5
+    //   sub_1801B36E0   copies record bytes 0..111 verbatim into each 208-byte
+    //                   descriptor before the draw
+    //
+    // Two independent sightings agree that the record's uint16 at +50 is its
+    // own index into qword_193F09850, and the third puts that field inside the
+    // descriptor array this function already receives. So the surface's
+    // persistent name is desc[i] + 50, and it is invariant under the re-split
+    // AND the re-order because it names the SOURCE RECORD rather than any
+    // position in the packing. It is neither of §8's known-bad shapes.
+    //
+    // WHAT IS ASSUMED AND WHAT PROVES IT. That the k'th D3D11 draw of a batch
+    // covers the k'th descriptor is an ASSUMPTION -- the engine calls the draw
+    // once per material group and the material system splits it further, and
+    // maxDrawRun=44..46 says it splits a lot. runVsDesc{} below is that
+    // assumption's falsifier and it is printed on the same line: eq= is the
+    // 1:1 case this rests on, and if lt=/gt= carry the mass the mapping is
+    // wrong and cand=recIdx's own population will say so too.
+    static constexpr uint32_t kMaxSubDraw = 512u;
+    static thread_local uint16_t t_recIdx[kMaxSubDraw];
+    static thread_local uint32_t t_recCount = 0u;
+    // recChk: +50 must be a per-surface INDEX. dup= counts two descriptors of
+    // one batch sharing it, which a per-surface index cannot do and which would
+    // mean +50 is a shared field (a group id, a flag word) misread as one.
+    static std::atomic<uint32_t> s_recDup { 0u };
+    static std::atomic<uint32_t> s_recOver { 0u };
+    // Atomic because noteRunVsDesc runs on the DRAW thread while note() and
+    // logStats hold s_mtx on the batch thread. world reads keyed{replay=0}
+    // today, i.e. the two are the same thread, but that is a property of the
+    // current queue wiring and not something a counter should depend on.
+    static std::atomic<uint32_t> s_runEq { 0u }, s_runLt { 0u }, s_runGt { 0u };
+
+    // ---- NV-DXVK [DescMap]: WHICH DESCRIPTOR FIELD IS THE SUB-DRAW'S RANGE
+    //
+    // WHAT THE LAST BUILD ACTUALLY REFUTED. cand=recIdx died on two counters,
+    // runVsDesc{eq=10320 lt=12240 gt=9812} and dup=9360, and those say two
+    // different things. dup killed the FIELD -- descriptor +50 is a reference
+    // from one record to another, so many surfaces legitimately share it, and
+    // it is not a per-surface name. eq=32% killed the MAPPING -- the k'th
+    // D3D11 draw of a batch is not the k'th descriptor.
+    //
+    // The field question is already answered and needs no search: descriptor
+    // bytes 0..111 are a verbatim copy of qword_193F09850[idx], so
+    // XXH64(desc + 208*k, 104) IS a per-surface name, and it is the value
+    // note() has been XOR-folding across the whole batch all along. Nothing
+    // upstream has to be hooked to get it.
+    //
+    // SO THE ONLY MISSING PIECE IS THE MAPPING, and it does not have to be
+    // guessed either. A sub-draw covers a range of the index buffer and the
+    // descriptor must carry that range for the material system to issue it.
+    // residentDrawKey has the D3D11 draw's own start and count as parameters.
+    // So: for one sampled batch a frame, keep every descriptor's raw dwords and
+    // words, and for each of its sub-draws ask WHICH OFFSET holds a value equal
+    // to that draw's start, and which to its count.
+    //
+    // This is a search with its own control built in: an offset that carries
+    // the range hits on ~100% of sub-draws, and every unrelated offset hits at
+    // the rate two arbitrary 32-bit values collide, i.e. never. There is no
+    // threshold to argue about and no way for it to report a false positive
+    // quietly -- if NO offset lights up, the range is not in the descriptor and
+    // that is a real answer too.
+    //
+    // Words as well as dwords because a batch is ~4 surfaces and a per-surface
+    // index count fits in 16 bits; a uint16 field would be invisible to a
+    // dword-only scan that straddles it.
+    // TWO PRODUCERS, SEPARATELY. [RsGap0] byProducer split the world residual
+    // and it is not one problem:
+    //
+    //   batch{tot=1095 same=1095 start=0}      100% indistinguishable
+    //   range{tot=4560 same=26   start=4534}   99.4% differ only in raw start
+    //
+    // depth, meshList and object contribute zero. So 80% of the world in-frame
+    // collisions belong to noteRangePass, whose key names a whole contiguous
+    // run of 16-byte table entries while its sub-draws are separated only by
+    // their draw start -- and unlike the batch, those starts are genuinely
+    // non-zero (startNZ=4560), so the same search that was aimed at a constant
+    // last time has something to find here.
+    //
+    // The range's entries live at `table + 16*(lo+1)` and the table is
+    // persistent by that function's own comment, so if a 4-byte field of entry
+    // k equals sub-draw k's start, the sub-draw's name is that entry.
+    static constexpr uint32_t kDmDw   = 52u;    // 208 / 4, the batch stride
+    static constexpr uint32_t kDmW    = 104u;   // 208 / 2
+    static constexpr uint32_t kDmDesc = 64u;
+    static constexpr uint32_t kDmProd = 2u;     // [0] batch, [1] range
+    static thread_local uint32_t t_dmDw[kDmDesc][kDmDw];
+    static thread_local uint16_t t_dmW[kDmDesc][kDmW];
+    static thread_local uint32_t t_dmN = 0u;
+    // Offsets actually valid for the captured stride: 52/104 for the batch's
+    // 208-byte descriptor, 4/8 for the range's 16-byte entry. Searching past
+    // the stride would read the NEXT entry and manufacture matches.
+    static thread_local uint32_t t_dmNDw = 0u;
+    static thread_local uint32_t t_dmNW  = 0u;
+    static thread_local uint32_t t_dmSlot = 0u;
+    static std::atomic<uint32_t> s_dmTick { 0u };
+    static std::atomic<uint32_t> s_dmStartDw[kDmProd][kDmDw];
+    static std::atomic<uint32_t> s_dmCountDw[kDmProd][kDmDw];
+    static std::atomic<uint32_t> s_dmBaseDw[kDmProd][kDmDw];
+    static std::atomic<uint32_t> s_dmStartW[kDmProd][kDmW];
+    static std::atomic<uint32_t> s_dmCountW[kDmProd][kDmW];
+    static std::atomic<uint32_t> s_dmBaseW[kDmProd][kDmW];
+    static std::atomic<uint32_t> s_dmBaseZero[kDmProd];
+    static std::atomic<uint32_t> s_dmStartZeroP[kDmProd];
+    static std::atomic<uint32_t> s_dmCountZeroP[kDmProd];
+    static std::atomic<uint32_t> s_dmDrawsP[kDmProd];
+    static std::atomic<uint32_t> s_dmBatchesP[kDmProd];
+
+    // THE THIRD AXIS, AND THE ONE THE FIRST TWO RUNS SAY IT HAD TO BE.
+    //
+    // zero{start=232 count=0} on 232 of 232 sampled sub-draws: every world
+    // batch sub-draw issues with StartIndexLocation == 0. So the index start
+    // was never going to be found in the descriptor -- it does not vary. TF2
+    // sub-allocates meshes out of pooled buffers, which is exactly the shape
+    // where the per-surface offset lives in BaseVertexLocation instead, and
+    // residentDrawKey already carries it as a parameter.
+    // ---- THE RANGE PASS'S SUB-DRAW NAME, and [DescMap] found the field.
+    //
+    //   prod=range draws=212 zero{start=4} dw+8{s=208 c=4 b=0} dw+12{s=204}
+    //   prod=batch draws=237 zero{start=237 base=237} over5pct: none
+    //
+    // dw+8 matches on 208 of the 208 range sub-draws that have a non-zero start
+    // -- every one of them -- while the batch control finds nothing, which is
+    // what makes the hit a field and not an artefact of the search. dw+12 is
+    // the end: consecutive entries tile, so entry k's end is entry k+1's start,
+    // and it trails at 204. c=4 b=0 says it is the START specifically.
+    //
+    // SO THE NAME IS THE ENTRY'S POSITION IN THE TABLE, not its contents. The
+    // table is persistent (noteRangePass's own head says the range index is an
+    // index into it), so absolute entry index lo+1+k is a persistent name.
+    // Hashing the entry's BYTES would be the known-bad shape instead -- +8/+12
+    // are index-buffer offsets, i.e. a position in a per-frame packing, and
+    // they are exactly what churns.
+    // RESULT: THE MAPPING HOLDS, THE NAME DOES NOT.
+    //
+    //   rangeMap{hit=3185 miss=0 dup=0 over=0}   every sub-draw attributed
+    //   identHead   new=145  (0%)  gap0=18691  distinct=3121
+    //   hdPlusMat   new=1630 (2%)  gap0=8843   distinct=20064
+    //   keyWithOrd  new=2696 (4%)  gap0=0      distinct=30624
+    //   rangeEntry  new=2907 (4%)  gap0=4283   distinct=32144
+    //
+    // miss=0 dup=0 says [DescMap] found the right field and the attribution is
+    // exact. The candidate still loses: it halves gap0 as designed but costs
+    // MORE than the ordinal it would replace, 32144 against 30624, while
+    // cutting less. So the absolute index lo+1+k is not persistent -- `lo` is
+    // re-partitioned every frame and the name is a per-frame position, §8's
+    // first known-bad shape. That was asserted from noteRangePass's comment
+    // (which says the range INDEX is an index into a persistent table, not that
+    // lo is stable) instead of measured.
+    //
+    // IDA shows that sub_1800B8670 does not issue one draw per input entry. It
+    // filters on (entry.qw0 & uint16(mask)), then merges adjacent accepted
+    // entries while qw0's upper 48 bits match. The emitted record retains the
+    // first entry's qw0/start and the last entry's end. Capture that exact
+    // 16-byte record: qw0 alone aliases distinct ranges and caused the visual
+    // corruption seen when it was promoted into the live key.
+    static constexpr uint32_t kRmMax = 1024u;
+    static thread_local uint32_t t_rmStart[kRmMax];
+    static thread_local uint64_t t_rmGroupHash[kRmMax];
+    static thread_local uint32_t t_rmN    = 0u;
+    static std::atomic<uint32_t> s_rmHit  { 0u };
+    static std::atomic<uint32_t> s_rmMiss { 0u };
+    static std::atomic<uint32_t> s_rmDup  { 0u };
+    static std::atomic<uint32_t> s_rmOver { 0u };
+    static std::atomic<uint32_t> s_rmQw0Zero { 0u };
+
+    static void rangeCapture(const uint8_t* first, uint32_t n, uint32_t mask) {
+      t_rmN = 0u;
+      if (first == nullptr || n == 0u)
+        return;
+      if (n > kRmMax) {
+        s_rmOver.fetch_add(1u, std::memory_order_relaxed);
+        return;
+      }
+      uint64_t group[2] = {};
+      bool haveGroup = false;
+      bool mayMerge = false;
+      const auto flushGroup = [&]() {
+        if (!haveGroup)
+          return;
+        t_rmStart[t_rmN] = static_cast<uint32_t>(group[1]);
+        t_rmGroupHash[t_rmN] = XXH64(group, sizeof(group), 0xB7CF0ull);
+        if (t_rmGroupHash[t_rmN] == 0ull) {
+          s_rmQw0Zero.fetch_add(1u, std::memory_order_relaxed);
+          t_rmGroupHash[t_rmN] = 1ull;
+        }
+        ++t_rmN;
+      };
+      for (uint32_t k = 0; k < n; ++k) {
+        uint64_t entry[2];
+        std::memcpy(entry, first + static_cast<size_t>(k) * 16u, sizeof(entry));
+        if ((entry[0] & static_cast<uint16_t>(mask)) == 0ull) {
+          mayMerge = false;
+          continue;
+        }
+        if (mayMerge && (group[0] & 0xFFFFFFFFFFFF0000ull)
+                       == (entry[0] & 0xFFFFFFFFFFFF0000ull)) {
+          group[1] = (group[1] & 0xFFFFFFFFull) | (entry[1] & 0xFFFFFFFF00000000ull);
+        } else {
+          flushGroup();
+          group[0] = entry[0];
+          group[1] = entry[1];
+          haveGroup = true;
+        }
+        mayMerge = true;
+      }
+      flushGroup();
+      // AMBIGUITY IS THE FALSIFIER FOR THE MAPPING. If two entries of one range
+      // carry the same start, the draw cannot be attributed to either and the
+      // name is a coin flip. Quadratic, so bounded to the small ranges.
+      if (t_rmN <= 256u) {
+        for (uint32_t i = 1; i < t_rmN; ++i) {
+          bool hit = false;
+          for (uint32_t j = 0; j < i; ++j)
+            if (t_rmStart[i] == t_rmStart[j]) { hit = true; break; }
+          if (hit) { s_rmDup.fetch_add(1u, std::memory_order_relaxed); break; }
+        }
+      }
+    }
+
+    // Emitted group ordinal for diagnostics and its complete identity hash.
+    // The ordinal is never folded into the live key.
+    static uint32_t rangeEntryName(uint32_t drawStart, uint64_t* groupHashOut) {
+      *groupHashOut = 0ull;
+      if (t_rmN == 0u)
+        return 0u;
+      for (uint32_t k = 0; k < t_rmN; ++k) {
+        if (t_rmStart[k] == drawStart) {
+          s_rmHit.fetch_add(1u, std::memory_order_relaxed);
+          *groupHashOut = t_rmGroupHash[k];
+          return k + 1u;
+        }
+      }
+      s_rmMiss.fetch_add(1u, std::memory_order_relaxed);
+      return 0u;
+    }
+
+    // Capture `n` entries of `stride` bytes for the offset search, or clear the
+    // capture when this call is not a sample. ALWAYS called, sampled or not:
+    // leaving a previous capture live would match the next producer's draws
+    // against another producer's table.
+    static void dmCapture(uint32_t slot, const uint8_t* base, uint32_t n,
+                          uint32_t stride, bool take) {
+      t_dmN = 0u;
+      if (!take || base == nullptr || n == 0u || stride == 0u)
+        return;
+      const uint32_t cap = (n < kDmDesc) ? n : kDmDesc;
+      const uint32_t ndw = (stride / 4u < kDmDw) ? stride / 4u : kDmDw;
+      const uint32_t nw  = (stride / 2u < kDmW)  ? stride / 2u : kDmW;
+      for (uint32_t k = 0; k < cap; ++k) {
+        const uint8_t* const e = base + static_cast<size_t>(k) * stride;
+        std::memcpy(t_dmDw[k], e, ndw * 4u);
+        std::memcpy(t_dmW[k],  e, nw  * 2u);
+      }
+      t_dmN    = cap;
+      t_dmNDw  = ndw;
+      t_dmNW   = nw;
+      t_dmSlot = slot;
+      s_dmBatchesP[slot].fetch_add(1u, std::memory_order_relaxed);
+    }
+
+    static void noteDescMatch(uint32_t start, uint32_t count, int32_t baseSigned) {
+      const uint32_t base = static_cast<uint32_t>(baseSigned);
+      if (t_dmN == 0u)
+        return;
+      // ZERO MATCHES ZERO, AND THAT IS NOT A FINDING. The first run of this
+      // probe flagged 33 offsets at s=100%, nearly all of them in descriptor
+      // bytes 112..207 -- the region sub_1801B36E0 never writes, which is
+      // therefore full of zeroes and stale leftovers. Every one of those hits
+      // was start==0 matching a zero field. So a comparison only counts when
+      // BOTH sides are non-zero, and the degenerate inputs are counted
+      // separately instead of being silently folded into the histogram.
+      const uint32_t p = t_dmSlot;
+      s_dmDrawsP[p].fetch_add(1u, std::memory_order_relaxed);
+      if (start == 0u) s_dmStartZeroP[p].fetch_add(1u, std::memory_order_relaxed);
+      if (count == 0u) s_dmCountZeroP[p].fetch_add(1u, std::memory_order_relaxed);
+      if (base  == 0u) s_dmBaseZero[p].fetch_add(1u, std::memory_order_relaxed);
+      const bool wantS = (start != 0u);
+      const bool wantC = (count != 0u);
+      const bool wantB = (base  != 0u);
+      if (!wantS && !wantC && !wantB)
+        return;
+      for (uint32_t o = 0; o < t_dmNDw; ++o) {
+        bool hs = false, hc = false, hb = false;
+        for (uint32_t k = 0; k < t_dmN && !(hs && hc && hb); ++k) {
+          const uint32_t v = t_dmDw[k][o];
+          if (v == 0u) continue;
+          if (wantS && v == start) hs = true;
+          if (wantC && v == count) hc = true;
+          if (wantB && v == base)  hb = true;
+        }
+        if (hs) s_dmStartDw[p][o].fetch_add(1u, std::memory_order_relaxed);
+        if (hc) s_dmCountDw[p][o].fetch_add(1u, std::memory_order_relaxed);
+        if (hb) s_dmBaseDw[p][o].fetch_add(1u, std::memory_order_relaxed);
+      }
+      // Only meaningful when the value actually fits, otherwise every word
+      // offset would be compared against a truncation and could match by
+      // accident -- a false positive this probe must not be able to produce.
+      const bool wantSw = wantS && start <= 0xFFFFu;
+      const bool wantCw = wantC && count <= 0xFFFFu;
+      const bool wantBw = wantB && base  <= 0xFFFFu;
+      if (wantSw || wantCw || wantBw) {
+        for (uint32_t o = 0; o < t_dmNW; ++o) {
+          bool hs = false, hc = false, hb = false;
+          for (uint32_t k = 0; k < t_dmN && !(hs && hc && hb); ++k) {
+            const uint32_t v = t_dmW[k][o];
+            if (v == 0u) continue;
+            if (wantSw && v == start) hs = true;
+            if (wantCw && v == count) hc = true;
+            if (wantBw && v == base)  hb = true;
+          }
+          if (hs) s_dmStartW[p][o].fetch_add(1u, std::memory_order_relaxed);
+          if (hc) s_dmCountW[p][o].fetch_add(1u, std::memory_order_relaxed);
+          if (hb) s_dmBaseW[p][o].fetch_add(1u, std::memory_order_relaxed);
+        }
+      }
+    }
+
+    // The k'th sub-draw's producer name, or 0 when this draw is not under a
+    // batch whose descriptors were captured on this thread.
+    static uint32_t subDrawRecIdx(uint32_t run1Based) {
+      if (run1Based == 0u || run1Based > t_recCount)
+        return 0u;
+      return t_recIdx[run1Based - 1u] + 1u;   // +1: 0 stays "no name"
+    }
+    static void noteRunVsDesc(uint32_t runLen) {
+      if (t_recCount == 0u) return;
+      if (runLen == t_recCount)     s_runEq.fetch_add(1u, std::memory_order_relaxed);
+      else if (runLen < t_recCount) s_runLt.fetch_add(1u, std::memory_order_relaxed);
+      else                          s_runGt.fetch_add(1u, std::memory_order_relaxed);
+    }
+
     // Called from residentDrawKey, on the draw thread, once per draw that
     // actually used a batch key.
     static void noteKeyed(bool direct, uint32_t runLen) {
@@ -10050,12 +10436,62 @@ namespace dxvk {
     // the value the draw actually uses and it is equally persistent.
     static uint64_t note(uint32_t count, const uint8_t* desc,
                          uint32_t matCount = 0u, const void* matList = nullptr) {
+      spancensus::t_pendingProducer = 1u;
       spancensus::t_pendingPass = 0x5B47C8u;
+      // BEFORE the early return, not after. A rejected batch that left the
+      // previous batch's list in place would hand the next draw someone else's
+      // producer names -- the same stale-carry the descriptor's own bytes
+      // 112..207 have, and the reason note()'s hash stops at 104.
+      t_recCount = 0u;
       if (desc == nullptr || count == 0u || count > 16384u)
         return 0ull;
       uint64_t acc = 0ull;
       for (uint32_t i = 0; i < count; ++i)
         acc ^= XXH64(desc + static_cast<size_t>(i) * 208u, 104u, 0ull);
+
+      // The producer's per-surface name, captured for the draw thread. See the
+      // block at s_recDup. t_recCount was cleared at the head, so an oversized
+      // batch leaves it at 0 and its draws get no name rather than a stale one.
+      if (count <= kMaxSubDraw) {
+        for (uint32_t i = 0; i < count; ++i) {
+          uint16_t r;
+          std::memcpy(&r, desc + static_cast<size_t>(i) * 208u + 50u, 2u);
+          t_recIdx[i] = r;
+        }
+        t_recCount = count;
+        // dup is the falsifier for "+50 is a per-surface index". Quadratic, so
+        // only on the small batches -- maxBatch=87 and the check is a census,
+        // not a per-draw cost.
+        if (count <= 96u) {
+          for (uint32_t i = 1; i < count; ++i)
+            for (uint32_t j = 0; j < i; ++j)
+              if (t_recIdx[i] == t_recIdx[j]) {
+                s_recDup.fetch_add(1u, std::memory_order_relaxed);
+                i = count;   // one report per batch
+                break;
+              }
+        }
+      } else {
+        s_recOver.fetch_add(1u, std::memory_order_relaxed);
+      }
+
+      // [DescMap] sample: EVERY 64TH BATCH, on a plain tick, with no dependency
+      // on the frame id.
+      //
+      // The first version gated on g_remixFrameId changing and took ONE sample
+      // in a whole run -- batches=1 draws=2 across 73 windows -- while
+      // [SurfDesc], six lines up and reading the same global in the same
+      // function, reached its 600-distinct-frame cap. Whatever the difference
+      // is, a search probe should not be the thing that depends on it. 495
+      // note() calls a frame makes this ~8 samples a frame, which is more than
+      // the frame gate was ever going to give.
+      //
+      // Cleared first, so a batch this tick does not select leaves t_dmN at 0
+      // and its draws contribute nothing rather than matching against whatever
+      // batch this thread sampled last.
+      dmCapture(0u, desc, count, 208u,
+                count >= 2u
+                && (s_dmTick.fetch_add(1u, std::memory_order_relaxed) % 64u) == 0u);
 
       // NV-DXVK [SurfDesc]: WHERE IS THE MATERIAL IN THE 208-BYTE DESCRIPTOR.
       //
@@ -10314,6 +10750,7 @@ namespace dxvk {
       // persistent slot rather than per-frame scratch. Two cascades therefore
       // separate here even when they draw the identical mesh set, which is the
       // case no D3D11 term could reach.
+      spancensus::t_pendingProducer = 2u;
       spancensus::t_pendingPass =
           XXH64(&view, sizeof(view), 0xDEB7u);
       if (view == nullptr || worldDataPtr == nullptr)
@@ -10381,7 +10818,12 @@ namespace dxvk {
       // The range index is already an index into a persistent table, and the
       // mask is a filter selector -- both are names, not allocations.
       const uint64_t rp[2] = { mask, index };
+      spancensus::t_pendingProducer = 3u;
       spancensus::t_pendingPass = XXH64(rp, sizeof(rp), 0x8670u);
+      // Clear the offset-search capture before any early return, so a rejected
+      // range cannot leave the previous one live for this pass's draws.
+      dmCapture(1u, nullptr, 0u, 0u, false);
+      rangeCapture(nullptr, 0u, 0u);
       if (table == nullptr || !studioMemReadable(table, 8u + 4u * (index + 2u)))
         return 0ull;
       const int32_t lo = *reinterpret_cast<const int32_t*>(table + 4u * index);
@@ -10393,6 +10835,15 @@ namespace dxvk {
       if (!studioMemReadable(first, static_cast<size_t>(n) * 16u))
         return 0ull;
 
+      // THE 80% CASE. This key names the whole run; its sub-draws are named by
+      // nothing and collide 4534 times a window on the raw start alone. If one
+      // dword of entry k equals sub-draw k's start, the entry IS the name.
+      dmCapture(1u, first, n, 16u,
+                (s_dmTick.fetch_add(1u, std::memory_order_relaxed) % 16u) == 0u);
+      // Not sampled -- every range pass, because this one feeds a key candidate
+      // rather than a search.
+      rangeCapture(first, n, mask);
+
       uint64_t acc = XXH64(first, static_cast<size_t>(n) * 16u, 0xB8670ull);
       const uint64_t tag[2] = { mask, index };
       acc = XXH64(tag, sizeof(tag), acc);
@@ -10401,6 +10852,54 @@ namespace dxvk {
         id = 1ull;
 
       std::lock_guard<std::mutex> lock(s_mtx);
+      if (RtxOptions::ResidentScene::logStats()) {
+        // Compare the same table/filter/range across calls. The resident
+        // samples bill growth to this producer; identify the changing input
+        // before removing any part of its identity. Lane hashes retain order.
+        struct RangeInput {
+          uint64_t id = 0;
+          uint64_t raw = 0;
+          uint64_t lanes[4] = {};
+          uint32_t count = 0;
+          int32_t lo = 0;
+        };
+        static std::unordered_map<uint64_t, RangeInput> sRangeInputs;
+        static uint32_t sRangeChanges = 0;
+        const uint64_t location[3] = { reinterpret_cast<uintptr_t>(table), mask, index };
+        const uint64_t locationKey = XXH64(location, sizeof(location), 0);
+        auto prev = sRangeInputs.find(locationKey);
+        if (prev != sRangeInputs.end() || sRangeInputs.size() < 4096u) {
+          RangeInput current;
+          current.id = id;
+          current.raw = XXH64(first, size_t(n) * 16u, 0);
+          current.count = n;
+          current.lo = lo;
+          for (uint32_t entry = 0; entry < n; ++entry) {
+            for (uint32_t lane = 0; lane < 4u; ++lane) {
+              current.lanes[lane] = XXH64(first + size_t(entry) * 16u + lane * 4u,
+                                        4u, current.lanes[lane]);
+            }
+          }
+          if (prev != sRangeInputs.end() && prev->second.raw != current.raw) {
+            uint32_t changed = 0;
+            for (uint32_t lane = 0; lane < 4u; ++lane) {
+              if (prev->second.lanes[lane] != current.lanes[lane]) changed |= 1u << lane;
+            }
+            const uint32_t sample = sRangeChanges++;
+            if (sample < 64u || (sample & 63u) == 0u) {
+              Logger::info(str::format(
+                "[RangeInputChange] table=0x", std::hex, reinterpret_cast<uintptr_t>(table),
+                " old=0x", prev->second.id, " new=0x", id, std::dec,
+                " mask=", mask, " index=", index,
+                " oldLo=", prev->second.lo, " lo=", lo,
+                " oldN=", prev->second.count, " n=", n,
+                " effectiveChanged=", prev->second.id != id,
+                " changedDwords=", changed));
+            }
+          }
+          sRangeInputs[locationKey] = current;
+        }
+      }
       s_depthPasses += 1u;
       if (s_seen.size() < 65536u && s_seen.insert(id).second)
         s_newIds += 1u;
@@ -10445,6 +10944,7 @@ namespace dxvk {
       // invocation is. a1 is deliberately not in here: it is the caller's entry
       // list and may be per-frame scratch, which is the churn this whole
       // discriminator has been chasing.
+      spancensus::t_pendingProducer = 4u;
       spancensus::t_pendingPass = XXH64(&flags, sizeof(flags), 0xB7960u);
       // 65536 is a bound, not a measurement: the function's own group scratch
       // caps at 2048 and it cannot emit more groups than it walks entries, so
@@ -10500,6 +11000,7 @@ namespace dxvk {
 
     static uint64_t noteObjectPass(const void* obj) {
       // A persistent render object, so it is its own pass name.
+      spancensus::t_pendingProducer = 5u;
       spancensus::t_pendingPass = XXH64(&obj, sizeof(obj), 0x6F130u);
       if (obj == nullptr)
         return 0ull;
@@ -10566,6 +11067,21 @@ namespace dxvk {
         " canon{sub=", s_canonSub, " same=", s_canonSame,
         " skip=", s_canonSkip, " coll=", s_canonColl,
         " wipe=", s_canonWipe, "}",
+        // THE FALSIFIER FOR cand=recIdx, printed before its population column
+        // is worth reading. eq= is the 1:1 sub-draw -> descriptor mapping the
+        // candidate rests on. dup= says the descriptor's +50 is not a
+        // per-surface index at all, which would invalidate the field itself
+        // rather than the mapping -- two different failures, so two counters.
+        " rangeMap{hit=", s_rmHit.exchange(0u, std::memory_order_relaxed),
+        " miss=", s_rmMiss.exchange(0u, std::memory_order_relaxed),
+        " dup=", s_rmDup.exchange(0u, std::memory_order_relaxed),
+        " over=", s_rmOver.exchange(0u, std::memory_order_relaxed),
+        " qw0zero=", s_rmQw0Zero.exchange(0u, std::memory_order_relaxed), "}",
+        " runVsDesc{eq=", s_runEq.exchange(0u, std::memory_order_relaxed),
+        " lt=", s_runLt.exchange(0u, std::memory_order_relaxed),
+        " gt=", s_runGt.exchange(0u, std::memory_order_relaxed),
+        " dup=", s_recDup.exchange(0u, std::memory_order_relaxed),
+        " over=", s_recOver.exchange(0u, std::memory_order_relaxed), "}",
         " maxDrawRun=", s_maxDrawRun.load(std::memory_order_relaxed),
         " | newIds ~0 under a fixed-position sweep = the key is stable;"
         " keyed ~= batches = it reaches the draw; maxDrawRun > 1 = one batch"
@@ -10579,6 +11095,54 @@ namespace dxvk {
       for (uint32_t k = 0; k < kSliceVals; ++k) s_sliceVals[k] = 0u;
       s_sliceValsOver = 0u;
       s_canonSub = s_canonSame = s_canonSkip = s_canonColl = s_canonWipe = 0u;
+
+      // [DescMap] on its own line -- it is a search over 156 offsets and does
+      // not belong crammed into the batch line. Only offsets above 5% are
+      // printed: the field carrying the range hits near 100% and everything
+      // else hits at the rate two arbitrary values collide, so a SILENT report
+      // means the range is not in the descriptor, which is itself the answer.
+      {
+        static const char* const kDmName[kDmProd] = { "batch", "range" };
+        for (uint32_t p = 0; p < kDmProd; ++p) {
+          const uint32_t dmDraws = s_dmDrawsP[p].exchange(0u, std::memory_order_relaxed);
+          const uint32_t dmB = s_dmBatchesP[p].exchange(0u, std::memory_order_relaxed);
+          const uint32_t floor = (dmDraws / 20u) + 1u;
+          std::string o;
+          for (uint32_t i = 0; i < kDmDw; ++i) {
+            const uint32_t hs = s_dmStartDw[p][i].exchange(0u, std::memory_order_relaxed);
+            const uint32_t hc = s_dmCountDw[p][i].exchange(0u, std::memory_order_relaxed);
+            const uint32_t hb = s_dmBaseDw[p][i].exchange(0u, std::memory_order_relaxed);
+            if (dmDraws != 0u && (hs >= floor || hc >= floor || hb >= floor))
+              o += " dw+" + std::to_string(i * 4u) + "{s=" + std::to_string(hs)
+                 + " c=" + std::to_string(hc) + " b=" + std::to_string(hb) + "}";
+          }
+          for (uint32_t i = 0; i < kDmW; ++i) {
+            const uint32_t hs = s_dmStartW[p][i].exchange(0u, std::memory_order_relaxed);
+            const uint32_t hc = s_dmCountW[p][i].exchange(0u, std::memory_order_relaxed);
+            const uint32_t hb = s_dmBaseW[p][i].exchange(0u, std::memory_order_relaxed);
+            if (dmDraws != 0u && (hs >= floor || hc >= floor || hb >= floor))
+              o += " w+" + std::to_string(i * 2u) + "{s=" + std::to_string(hs)
+                 + " c=" + std::to_string(hc) + " b=" + std::to_string(hb) + "}";
+          }
+          const uint32_t zs = s_dmStartZeroP[p].exchange(0u, std::memory_order_relaxed);
+          const uint32_t zc = s_dmCountZeroP[p].exchange(0u, std::memory_order_relaxed);
+          const uint32_t zb = s_dmBaseZero[p].exchange(0u, std::memory_order_relaxed);
+          if (dmDraws == 0u)
+            continue;
+          Logger::warn(str::format(
+            "[DescMap] f=", frame, " prod=", kDmName[p],
+            " spans=", dmB, " draws=", dmDraws,
+            " zero{start=", zs, " count=", zc, " base=", zb, "}",
+            " over5pct:", o.empty() ? std::string(" none") : o,
+            " | s ~= draws = that offset holds the sub-draw's index start, so"
+            " the entry it matches NAMES the sub-draw and the key is"
+            " XXH64(entry). prod=range is the 80% -- [RsGap0] bills 4534 of its"
+            " collisions to the raw start with only 26 same=, so unlike the"
+            " batch its sub-draws really are distinguishable and something has"
+            " to hold that distinction. READ zero{} FIRST: a field that is"
+            " always 0 cannot be found, which is what killed the batch search"));
+        }
+      }
       s_batches = s_surfaces = s_newIds = s_depthPasses = s_flushPasses = 0u;
       s_meshListPasses = 0u;
     }
@@ -10817,6 +11381,57 @@ namespace dxvk {
     return r;
   }
 
+  // ============================================================
+  // Entry-detour displacement, for every `bytes[..] = 0xE9` installer below.
+  //
+  // A 5-byte `jmp rel32` reaches +-2GB and NOTHING here was checking that it
+  // did. Every wrapper in this file lives in d3d11.dll; the patched entries
+  // live in client.dll, engine.dll, materialsystem_dx11.dll and
+  // studiorender.dll. The first three land within ~160MB of us and so the
+  // displacement always fitted -- by luck of the loader, not by construction.
+  // studiorender.dll does not: on 2026-09-08 ASLR put it at 0x7FFFCC3F0000
+  // against d3d11.dll at 0x7FFF420E0000, 2.15GB above, and the displacement to
+  // studioDrawWrapper (-2,313,062,453) overflowed int32 and truncated to
+  // +0x762177CB. The entry at studiorender+0x15D10 became
+  //     E9 CB 77 21 76    jmp 0x80004261D4E0
+  // which has bit 47 set and bits 63:48 clear -- non-canonical, so the CPU
+  // raises #GP and Windows reports it as the read that never happened:
+  //     0xC0000005: Access violation reading location 0xFFFFFFFFFFFFFFFF
+  // The intended target was 0x00007FFF4261D4E0. Identical low 32 bits; that is
+  // the signature. It reproduced on some launches and not others because it is
+  // purely where the loader put the two modules.
+  //
+  // The trampoline allocator above each call site already guarantees a 64-byte
+  // PAGE_EXECUTE_READWRITE stub within +-2GB of fn, and uses at most 16 of
+  // those bytes. So when the direct displacement does not fit, park a 14-byte
+  // absolute jump in the stub's spare room at +32 and aim the entry there:
+  //     FF 25 00 00 00 00        jmp qword ptr [rip+0]
+  //     <8-byte absolute target>
+  // The island is reachable by the same guarantee that made the trampoline
+  // reachable, so the fallback cannot itself be out of range -- but it is
+  // still checked, and a caller that gets false patches nothing.
+  //
+  // patchOff is where the E9 goes relative to fn (the word-aligned installers
+  // patch at fn+lead, not fn).
+  static bool hookEntryRel32(uintptr_t fn, uint32_t patchOff, void* wrapper,
+                             uint8_t* tramp, int32_t& relOut) {
+    const intptr_t from = static_cast<intptr_t>(fn + patchOff) + 5;
+    intptr_t rel = reinterpret_cast<intptr_t>(wrapper) - from;
+    if (rel < INT32_MIN || rel > INT32_MAX) {
+      uint8_t* const island = tramp + 32;             // stub is 64B, tramp uses <=16
+      island[0] = 0xFF;                               // jmp qword ptr [rip+0]
+      island[1] = 0x25;
+      std::memset(island + 2, 0, 4);
+      std::memcpy(island + 6, &wrapper, sizeof(wrapper));
+      FlushInstructionCache(GetCurrentProcess(), island, 16);
+      rel = reinterpret_cast<intptr_t>(island) - from;
+      if (rel < INT32_MIN || rel > INT32_MAX)
+        return false;                                 // allocator guarantees this cannot happen
+    }
+    relOut = static_cast<int32_t>(rel);
+    return true;
+  }
+
   static bool studioArrayInstallHook() {
     const uintptr_t fn = EngineSymbols::resolve(tf2sym::kStudioArrayEnqueue);
     if (fn == 0)
@@ -10858,8 +11473,13 @@ namespace dxvk {
 
     uint8_t bytes[8];
     std::memcpy(bytes, reinterpret_cast<const void*>(fn), sizeof(bytes));
-    const int32_t rel = static_cast<int32_t>(
-        reinterpret_cast<intptr_t>(&studioArrayWrapper) - (static_cast<intptr_t>(fn) + 5));
+    int32_t rel = 0;
+    if (!hookEntryRel32(fn, 0u, reinterpret_cast<void*>(&studioArrayWrapper), tramp, rel)) {
+      Logger::warn("[StudioModel] array wrapper unreachable; nothing patched");
+      g_studioArrayTramp = nullptr;
+      VirtualFree(tramp, 0, MEM_RELEASE);
+      return true;
+    }
     bytes[0] = 0xE9;
     std::memcpy(bytes + 1, &rel, 4);
 
@@ -10929,8 +11549,13 @@ namespace dxvk {
 
     uint8_t bytes[8];
     std::memcpy(bytes, reinterpret_cast<const void*>(fn), sizeof(bytes));
-    const int32_t rel = static_cast<int32_t>(
-        reinterpret_cast<intptr_t>(&studioDrawWrapper) - (static_cast<intptr_t>(fn) + 5));
+    int32_t rel = 0;
+    if (!hookEntryRel32(fn, 0u, reinterpret_cast<void*>(&studioDrawWrapper), tramp, rel)) {
+      Logger::warn("[StudioModel] wrapper unreachable; nothing patched");
+      g_studioDrawTramp = nullptr;
+      VirtualFree(tramp, 0, MEM_RELEASE);
+      return true;
+    }
     bytes[0] = 0xE9;
     std::memcpy(bytes + 1, &rel, 4);
 
@@ -11136,8 +11761,13 @@ namespace dxvk {
 
     uint8_t bytes[8];
     std::memcpy(bytes, reinterpret_cast<const void*>(word), sizeof(bytes));
-    const int32_t rel = static_cast<int32_t>(
-        reinterpret_cast<intptr_t>(&worldDrawWrapper) - (static_cast<intptr_t>(fn) + 5));
+    int32_t rel = 0;
+    if (!hookEntryRel32(fn, 0u, reinterpret_cast<void*>(&worldDrawWrapper), tramp, rel)) {
+      Logger::warn("[WorldBatch] draw callee wrapper unreachable; nothing patched");
+      g_worldDrawTramp = nullptr;
+      VirtualFree(tramp, 0, MEM_RELEASE);
+      return true;
+    }
     bytes[lead] = 0xE9;
     std::memcpy(bytes + lead + 1, &rel, 4);
 
@@ -11285,8 +11915,13 @@ namespace dxvk {
 
     uint8_t bytes[8];
     std::memcpy(bytes, reinterpret_cast<const void*>(fn), sizeof(bytes));
-    const int32_t rel = static_cast<int32_t>(
-        reinterpret_cast<intptr_t>(&rangePassWrapper) - (static_cast<intptr_t>(fn) + 5));
+    int32_t rel = 0;
+    if (!hookEntryRel32(fn, 0u, reinterpret_cast<void*>(&rangePassWrapper), tramp, rel)) {
+      Logger::warn("[RangePass] wrapper unreachable; nothing patched");
+      g_rangePassTramp = nullptr;
+      VirtualFree(tramp, 0, MEM_RELEASE);
+      return true;
+    }
     bytes[0] = 0xE9;
     std::memcpy(bytes + 1, &rel, 4);
 
@@ -11366,8 +12001,13 @@ namespace dxvk {
 
     uint8_t bytes[8];
     std::memcpy(bytes, reinterpret_cast<const void*>(fn), sizeof(bytes));
-    const int32_t rel = static_cast<int32_t>(
-        reinterpret_cast<intptr_t>(&matsysFlushWrapper) - (static_cast<intptr_t>(fn) + 5));
+    int32_t rel = 0;
+    if (!hookEntryRel32(fn, 0u, reinterpret_cast<void*>(&matsysFlushWrapper), tramp, rel)) {
+      Logger::warn("[MatsysFlush] wrapper unreachable; nothing patched");
+      g_matsysFlushTramp = nullptr;
+      VirtualFree(tramp, 0, MEM_RELEASE);
+      return true;
+    }
     bytes[0] = 0xE9;
     std::memcpy(bytes + 1, &rel, 4);
 
@@ -11446,8 +12086,13 @@ namespace dxvk {
 
     uint8_t bytes[8];
     std::memcpy(bytes, reinterpret_cast<const void*>(fn), sizeof(bytes));
-    const int32_t rel = static_cast<int32_t>(
-        reinterpret_cast<intptr_t>(&depthMeshWrapper) - (static_cast<intptr_t>(fn) + 5));
+    int32_t rel = 0;
+    if (!hookEntryRel32(fn, 0u, reinterpret_cast<void*>(&depthMeshWrapper), tramp, rel)) {
+      Logger::warn("[DepthMesh] wrapper unreachable; nothing patched");
+      g_depthMeshTramp = nullptr;
+      VirtualFree(tramp, 0, MEM_RELEASE);
+      return true;
+    }
     bytes[0] = 0xE9;
     std::memcpy(bytes + 1, &rel, 4);
 
@@ -11541,8 +12186,13 @@ namespace dxvk {
 
     uint8_t bytes[8];
     std::memcpy(bytes, reinterpret_cast<const void*>(fn), sizeof(bytes));
-    const int32_t rel = static_cast<int32_t>(
-        reinterpret_cast<intptr_t>(&meshListWrapper) - (static_cast<intptr_t>(fn) + 5));
+    int32_t rel = 0;
+    if (!hookEntryRel32(fn, 0u, reinterpret_cast<void*>(&meshListWrapper), tramp, rel)) {
+      Logger::warn("[MeshList] wrapper unreachable; nothing patched");
+      g_meshListTramp = nullptr;
+      VirtualFree(tramp, 0, MEM_RELEASE);
+      return true;
+    }
     bytes[0] = 0xE9;
     std::memcpy(bytes + 1, &rel, 4);
 
@@ -42449,6 +43099,14 @@ namespace dxvk {
     // upstream-keyed draws and the relRange candidate needs the un-zeroed
     // value to subtract the batch base from. Not in any key.
     m_rsDrawStartRaw = start;
+    // CLEARED PER DRAW, HERE, not only on the branches that set it. The write
+    // below sits inside the upstream-keyed block, so a draw that takes no
+    // upstream branch at all would otherwise carry the PREVIOUS draw's producer
+    // name into cand=recIdx -- a stale-carry that would make the candidate look
+    // better than it is on exactly the draws it does not name.
+    m_rsDrawRecIdx = 0u;
+    m_rsDrawRangeEntry = 0u;
+    m_rsDrawRangeQw0 = 0ull;
     k.drawCount = count;
     k.drawBase  = base;
     k.indexed   = indexed ? 1u : 0u;
@@ -42494,6 +43152,7 @@ namespace dxvk {
     // a world key's value and filing a prop under a piece of the map.
     uint64_t upstreamKey  = 0ull;
     uint32_t upstreamKind = 0u;
+    m_rsDrawSelectionHash = 0ull;
     if (RtxOptions::ResidentScene::worldBatchKey()) {
       upstreamKey = joinprobe::currentWorldKey();
       if (upstreamKey != 0ull)
@@ -42571,6 +43230,17 @@ namespace dxvk {
       }
     }
 
+    // Name a range-pass draw by the complete merged group emitted by
+    // sub_1800B8670. Keep the old whole-table key as geometry dirtiness so any
+    // source change still rebuilds the record. Unmapped draws retain their
+    // original content-derived key.
+    if (upstreamKind == 1u && joinprobe::t_worldProducer == 3u) {
+      m_rsDrawRangeEntry = worldbatch::rangeEntryName(start, &m_rsDrawRangeQw0);
+      if (m_rsDrawRangeEntry != 0u && m_rsDrawRangeQw0 != 0ull) {
+        m_rsDrawSelectionHash = upstreamKey;
+        upstreamKey = m_rsDrawRangeQw0;
+      }
+    }
     uint64_t baseKey = XXH64(&k, sizeof(k), 0ull);
 
     // [KeyParts] anchors on the IA head ALONE -- taken here, before any of the
@@ -42716,10 +43386,27 @@ namespace dxvk {
       // See the head for what the version without that clear was counting.
       t_worldRun     = (upstreamKey == prevWorldKey) ? (t_worldRun + 1u) : 1u;
       t_prevWorldKey = upstreamKey;
-      if (upstreamKind == 1u)
+      if (upstreamKind == 1u) {
         worldbatch::noteKeyed(joinprobe::t_worldKey != 0ull, t_worldRun);
-      else
+        // THE PRODUCER'S NAME FOR THIS SUB-DRAW, and the falsifier for the
+        // mapping that produces it. See worldbatch::subDrawRecIdx.
+        m_rsDrawRecIdx = worldbatch::subDrawRecIdx(t_worldRun);
+        worldbatch::noteRunVsDesc(t_worldRun);
+        // THE MAPPING SEARCH. start/count are this D3D11 draw's own index
+        // range, straight off residentDrawKey's parameters.
+        worldbatch::noteDescMatch(start, count, base);
+        // And the range pass's name, which that search found: the entry whose
+        // +8 is this draw's start. Only producer 3 has a capture live.
+        //
+        // Read off joinprobe, NOT m_rsDrawKeyParts.producer -- that member is
+        // filled 60 lines below this point, so it would still hold the previous
+        // draw's producer here and would attribute range names to whatever came
+        // before. Same stale-carry as t_recCount and m_rsDrawRecIdx.
+        // Range mapping was captured before the upstream identity fold.
+      } else {
+        m_rsDrawRecIdx = 0u;
         studiomodel::noteKeyed(joinprobe::t_studioKey != 0ull);
+      }
     }
 
     // THE OCCURRENCE ORDINAL USED TO BE FOLDED IN HERE. It moved to
@@ -42777,6 +43464,7 @@ namespace dxvk {
       m_rsDrawKeyParts.up    = upstreamKey;
       m_rsDrawKeyParts.kind  = upstreamKind;
       m_rsDrawKeyParts.pass  = joinprobe::t_worldPass;
+      m_rsDrawKeyParts.producer = (upstreamKind == 1u) ? joinprobe::t_worldProducer : 0u;
       m_rsDrawKeyParts.hasPs =
           (m_context->m_state.ps.shader.ptr() != nullptr) ? 1u : 0u;
       m_rsDrawKeyParts.sflags = joinprobe::currentStudioPass();
@@ -42874,6 +43562,11 @@ namespace dxvk {
     if (ia.indexBuffer.buffer != nullptr && !trustProducerIndices) {
       const uint64_t g = ia.indexBuffer.buffer->GetMapGeneration();
       fold = XXH64(&g, sizeof(g), fold);
+    }
+    if (m_rsDrawSelectionHash != 0ull) {
+      // Preserve the former selection proof: changing the range table must
+      // rebuild the record, even though it no longer creates another name.
+      fold = XXH64(&m_rsDrawSelectionHash, sizeof(m_rsDrawSelectionHash), fold);
     }
 
     return fold;
@@ -44260,6 +44953,7 @@ namespace dxvk {
     // draw to the PREVIOUS draw's population, silently and plausibly.
     m_rsDrawKeyClass = 0u;
     m_rsDrawUpstreamKeyed = false;
+    m_rsDrawSelectionHash = 0ull;
 
     if (!RtxOptions::ResidentScene::enable()) {
       return;
@@ -44327,6 +45021,27 @@ namespace dxvk {
           // the gate is predicting hits for draws that have no record to serve.
           " seedLeft=", m_rsSeedFramesLeft,
           " gateSize=", static_cast<uint32_t>(m_residentGate.size()),
+          " rangeKeyed=", m_rsRangeKeyed,
+          " gap2Served=", m_rsGap2Served,
+          // [GapBill]: read these two before hitPct. servedGap says which gap
+          // band the serves came from, staleGap says which band failed a
+          // content test after clearing the gap. Same buckets, so they line up
+          // column for column and a band that gains and fails at once is
+          // visible without arithmetic.
+          [this]() -> std::string {
+            static const char* const kGapB[kRsGapB] = {
+              "1", "2", "3-7", "8-15", "16-31", "32-127", "128-1023", "1024+"
+            };
+            std::string sv(" servedGap{"), st(" staleGap{");
+            for (uint32_t i = 0; i < kRsGapB; ++i) {
+              sv += ' ' + std::string(kGapB[i]) + '='
+                  + std::to_string(m_rsServedGap[i]);
+              st += ' ' + std::string(kGapB[i]) + '='
+                  + std::to_string(m_rsStaleGap[i]);
+            }
+            sv += " max=" + std::to_string(m_rsServedGapMax) + " }";
+            return sv + st + " }";
+          }(),
           " hitPct=", (m_rsDraws > 0 ? (100u * m_rsHit) / m_rsDraws : 0u),
           // THE SAME VERDICT, BILLED TO THE POPULATION THAT EARNED IT. hitPct
           // is one number over four populations that behave nothing alike, and
@@ -44550,7 +45265,143 @@ namespace dxvk {
           // ~0 is the good failure: identity is stable, the content genuinely
           // moves, and those draws simply are not residency candidates.
           " | newKeys ~0 = key stable; newKeys high = DO NOT ARM"));
+        // [RsMiss] on its own line: missKey's CAUSE, which nothing else in this
+        // file measures. absent{} versus present{} is the split that decides
+        // whether a key term can help at all.
+        {
+          static const char* const kMissCls[kRsMissCls] = { "world", "studio", "other" };
+          std::string o;
+          for (uint32_t c = 0; c < kRsMissCls; ++c) {
+            if (m_rsMissTot[c] == 0u) continue;
+            o += str::format(
+              " ", kMissCls[c], "{tot=", m_rsMissTot[c],
+              " noAnchor=", m_rsMissNoAnchor[c],
+              " dupHead=", m_rsMissDupHead[c],
+              " absent{2f=", m_rsMissAbsent[c][0], " 3f=", m_rsMissAbsent[c][1],
+              " 4-7=", m_rsMissAbsent[c][2], " 8-15=", m_rsMissAbsent[c][3],
+              " 16-31=", m_rsMissAbsent[c][4], " 32+=", m_rsMissAbsent[c][5],
+              " max=", m_rsMissAbsMax[c], "}",
+              " present{ord=", m_rsMissOrd[c], " up=", m_rsMissUp[c],
+              " mat=", m_rsMbMat[c], " pass=", m_rsMissPass[c],
+              " tgt=", m_rsMissTgt[c], " gen=", m_rsMissGens[c],
+              " o2w=", m_rsMissO2wP[c], " prod=", m_rsMissProd[c],
+              " start=", m_rsMissStart[c], " same=", m_rsMissSame[c],
+              " multi=", m_rsMissMulti[c], "}}");
+          }
+          if (!o.empty()) {
+            Logger::warn(str::format(
+              "[RsMiss] f=", fid, o,
+              " missOcc{0=", m_rsMissOccIdx[0], " 1=", m_rsMissOccIdx[1],
+              " 2=", m_rsMissOccIdx[2], " 3+=", m_rsMissOccIdx[3], "}",
+              " occ{same=", m_rsOccSame, " up=", m_rsOccUp, " dn=", m_rsOccDn,
+              " maxDelta=", m_rsOccMaxDelta, " fresh=", m_rsOccFresh, "}",
+              " occAll{same=", m_rsOccAllSame, " up=", m_rsOccAllUp,
+              " dn=", m_rsOccAllDn, " maxDelta=", m_rsOccAllMaxDelta, "}",
+              // [OccPeak]: read grew{} against first{}. grew ~0 on a warm scene
+              // means no occurrence index is ever minted above one the head has
+              // already had, and the one-frame anchors are not count growth.
+              " peak{first=", m_rsPeakFirst, " full=", m_rsPeakFull,
+              " part=", m_rsPeakPart, " grew=", m_rsPeakGrew,
+              " growMax=", m_rsPeakGrowMax, "}",
+              // [KeySet]: peak-to-peak only. same dominant sends the residual
+              // to the record store and takes every key term off the table;
+              // diff dominant is the first evidence a key change has ever had.
+              // Read diffGapMax before diff -- a diff across hundreds of frames
+              // is the head having been away, not the head being renamed.
+              " keySet{same=", m_rsFoldSame, " diff=", m_rsFoldDiff,
+              " first=", m_rsFoldFirst, " zdiff=", m_rsFoldZDiff,
+              " gapMax=", m_rsFoldGapMax,
+              " diffGapMax=", m_rsFoldDiffGapMax, "}",
+              " vsPrev{beyond=", m_rsMissBeyond,
+              " within=", m_rsMissWithin, "}",
+              " cadence{1=", m_rsHeadCadence[0], " 2=", m_rsHeadCadence[1],
+              " 3=", m_rsHeadCadence[2], " 4-15=", m_rsHeadCadence[3],
+              " 16+=", m_rsHeadCadence[4], " max=", m_rsHeadCadenceMax, "}",
+              // [HeadFrame] n/g2, oldest frame first, ending at this one. A
+              // slot whose stored frame id is not the one being printed never
+              // ran and prints '-' rather than a stale count. FLAT n refutes
+              // the oscillation and sends this back to per-head phase.
+              [&]() -> std::string {
+                std::string h(" headFrames{");
+                for (uint32_t i = kRsHeadFrames; i-- > 0u; ) {
+                  const uint32_t hf = fid - i;
+                  const uint32_t hs = hf & (kRsHeadFrames - 1u);
+                  if (m_rsHeadFrameFid[hs] == hf) {
+                    h += ' ' + std::to_string(m_rsHeadFrameN[hs])
+                       + '/' + std::to_string(m_rsHeadFrameG2[hs]);
+                  } else {
+                    h += " -";
+                  }
+                }
+                return h + " }";
+              }(),
+              [&]() -> std::string {
+                for (uint32_t i = 0; i < 4u; ++i)
+                  m_rsAnchorOnce[i] = m_rsAnchorMany[i] = 0u;
+                m_rsAnchorMaxOcc = 0u;
+                for (const auto& kv : m_rsMissAnchor) {
+                  const uint32_t b = (kv.second.occ < 3u) ? kv.second.occ : 3u;
+                  if (kv.second.seen <= 1u) m_rsAnchorOnce[b] += 1u;
+                  else                      m_rsAnchorMany[b] += 1u;
+                  if (kv.second.occ > m_rsAnchorMaxOcc)
+                    m_rsAnchorMaxOcc = kv.second.occ;
+                }
+                std::string a = " anchorLife{";
+                static const char* const kN[4] = { "occ0", "occ1", "occ2", "occ3+" };
+                for (uint32_t i = 0; i < 4u; ++i)
+                  a += str::format(" ", kN[i], "{once=", m_rsAnchorOnce[i],
+                                   " many=", m_rsAnchorMany[i], "}");
+                return a + " maxOcc=" + std::to_string(m_rsAnchorMaxOcc) + "}";
+              }(),
+              " headGap{0=", m_rsHeadGap[0], " 1=", m_rsHeadGap[1],
+              " 2-3=", m_rsHeadGap[2], " 4-15=", m_rsHeadGap[3],
+              " 16+=", m_rsHeadGap[4], " max=", m_rsHeadGapMax,
+              " new=", m_rsHeadGapNew, "}",
+              " anchors=",
+              static_cast<uint32_t>(m_rsMissAnchor.size()),
+              " wipe=", m_rsMissWipe,
+              " | absent{} = the head was NOT drawn last frame, so the producer"
+              " did not submit this draw and NO key term can fix it -- that is"
+              " away{2=N 3=0 4+=0}. present{} = the draw was there and its key"
+              " moved; bill the term. present{ord=} alone finally measures the"
+              " ordinal renumbering premise CLAUDE.md §8 records four builds"
+              " dying on. present{same=} must be 0 -- the head was there, every"
+              " term here matched, and the key still missed means the key holds"
+              " something this probe does not track"));
+          }
+          for (uint32_t c = 0; c < kRsMissCls; ++c) {
+            m_rsMissTot[c] = m_rsMissNoAnchor[c] = m_rsMissDupHead[c] = 0u;
+            for (uint32_t b = 0; b < kRsAbsBuckets; ++b) m_rsMissAbsent[c][b] = 0u;
+            m_rsMissAbsMax[c] = 0u;
+            m_rsMissOrd[c] = m_rsMissUp[c] = m_rsMbMat[c] = 0u;
+            m_rsMissPass[c] = m_rsMissTgt[c] = m_rsMissGens[c] = 0u;
+            m_rsMissO2wP[c] = m_rsMissProd[c] = m_rsMissStart[c] = 0u;
+            m_rsMissSame[c] = m_rsMissMulti[c] = 0u;
+          }
+          m_rsMissWipe = 0u;
+          m_rsOccSame = m_rsOccUp = m_rsOccDn = m_rsOccFresh = 0u;
+          m_rsOccAllSame = m_rsOccAllUp = m_rsOccAllDn = 0u;
+          m_rsPeakFirst = m_rsPeakFull = m_rsPeakPart = m_rsPeakGrew = 0u;
+          m_rsPeakGrowMax = 0u;
+          m_rsFoldSame = m_rsFoldDiff = m_rsFoldFirst = 0u;
+          m_rsFoldGapMax = m_rsFoldDiffGapMax = m_rsFoldZDiff = 0u;
+          m_rsMissBeyond = m_rsMissWithin = 0u;
+          for (uint32_t i = 0; i < kRsCadB; ++i) m_rsHeadCadence[i] = 0u;
+          m_rsHeadCadenceMax = 0u;
+          m_rsOccAllMaxDelta = 0u;
+          for (uint32_t i = 0; i < kRsHeadGapB; ++i) m_rsHeadGap[i] = 0u;
+          m_rsHeadGapMax = m_rsHeadGapNew = 0u;
+          m_rsOccMaxDelta = 0u;
+          for (uint32_t i = 0; i < 4u; ++i) m_rsMissOccIdx[i] = 0u;
+        }
         m_rsDraws = m_rsHit = m_rsMissKey = m_rsMissGen = 0u;
+        m_rsRangeKeyed = 0u;
+        m_rsGap2Served = 0u;
+        for (uint32_t i = 0; i < kRsGapB; ++i) {
+          m_rsServedGap[i] = 0u;
+          m_rsStaleGap[i]  = 0u;
+        }
+        m_rsServedGapMax = 0u;
         m_rsNewKeys = m_rsNoKey = 0u;
         for (uint32_t c = 0; c < kRsClasses; ++c) {
           m_rsByClassDraws[c] = m_rsByClassHit[c] = 0u;
@@ -44712,6 +45563,107 @@ namespace dxvk {
     // sits at the end of SubmitDrawTail where it IS final, and this half exists
     // to read the D3D11 state while it is unambiguously this draw's.
     const uint64_t key = residentDrawKey(indexed, count, start, base);
+
+    // [OccSrc]: counted HERE, where nothing has been filtered yet, against
+    // occ{} which is counted in the judge. Same logic, same head, different
+    // population -- that is the whole comparison.
+    if (RtxOptions::ResidentScene::logStats() && m_rsDrawBaseKey != 0ull) {
+      const uint32_t fidA = m_context->m_device->getCurrentFrameId();
+      auto& oa = m_rsOccAll[m_rsDrawBaseKey];
+      if (oa.frame != fidA) {
+        // [HeadFrame]: cadence{} without the ten-frame accumulator under it.
+        // The slot carries its own frame id, so it clears itself the first time
+        // a new frame lands on it and nothing has to reset the ring.
+        const uint32_t hs = fidA & (kRsHeadFrames - 1u);
+        if (m_rsHeadFrameFid[hs] != fidA) {
+          m_rsHeadFrameFid[hs] = fidA;
+          m_rsHeadFrameN[hs]   = 0u;
+          m_rsHeadFrameG2[hs]  = 0u;
+        }
+        m_rsHeadFrameN[hs] += 1u;
+
+        // [HeadCadence]: the gap since this head was last drawn AT ALL. Taken
+        // on the first draw of the head in this frame, over every head.
+        if (oa.frame != 0xFFFFFFFFu) {
+          const uint32_t cg = fidA - oa.frame;
+          uint32_t cb;
+          if (cg == 1u)       cb = 0u;
+          else if (cg == 2u)  cb = 1u;
+          else if (cg == 3u)  cb = 2u;
+          else if (cg <= 15u) cb = 3u;
+          else                cb = 4u;
+          m_rsHeadCadence[cb] += 1u;
+          if (cg > m_rsHeadCadenceMax) m_rsHeadCadenceMax = cg;
+          if (cg == 2u) m_rsHeadFrameG2[hs] += 1u;
+        }
+        if (oa.frame + 1u == fidA && oa.cur != 0u && oa.prev != 0u) {
+          if (oa.cur == oa.prev) {
+            m_rsOccAllSame += 1u;
+          } else {
+            const uint32_t d = (oa.cur > oa.prev) ? (oa.cur - oa.prev)
+                                                  : (oa.prev - oa.cur);
+            if (oa.cur > oa.prev) m_rsOccAllUp += 1u; else m_rsOccAllDn += 1u;
+            if (d > m_rsOccAllMaxDelta) m_rsOccAllMaxDelta = d;
+          }
+        }
+        // [OccPeak]: oa.cur is the COMPLETED count of the head's previous
+        // appearance, which is the only point it is final. Billed against the
+        // head's own peak rather than the previous frame, so a partial frame
+        // cannot masquerade as the count falling.
+        if (oa.cur != 0u) {
+          // [KeySet]: taken BEFORE peak moves, so a growth frame still counts
+          // as whole. oa.frame is still the frame that just completed.
+          if (oa.cur >= oa.peak) {
+            if (oa.peakFoldFrame != 0u) {
+              const uint32_t fg = oa.frame - oa.peakFoldFrame;
+              if (fg > m_rsFoldGapMax) m_rsFoldGapMax = fg;
+              if (oa.fold == oa.peakFold) {
+                m_rsFoldSame += 1u;
+              } else {
+                m_rsFoldDiff += 1u;
+                if (oa.zero != oa.peakZero) m_rsFoldZDiff += 1u;
+                if (fg > m_rsFoldDiffGapMax) m_rsFoldDiffGapMax = fg;
+              }
+            } else {
+              m_rsFoldFirst += 1u;
+            }
+            oa.peakFold      = oa.fold;
+            oa.peakZero      = oa.zero;
+            oa.peakFoldFrame = oa.frame;
+          }
+
+          if (oa.peak == 0u) {
+            m_rsPeakFirst += 1u;
+            oa.peak = oa.cur;
+          } else if (oa.cur > oa.peak) {
+            const uint32_t d = oa.cur - oa.peak;
+            m_rsPeakGrew += 1u;
+            if (d > m_rsPeakGrowMax) m_rsPeakGrowMax = d;
+            oa.peak = oa.cur;
+          } else if (oa.cur == oa.peak) {
+            m_rsPeakFull += 1u;
+          } else {
+            m_rsPeakPart += 1u;
+          }
+          oa.prev = oa.cur;
+        }
+        oa.frame = fidA;
+        oa.cur   = 0u;
+        oa.fold  = 0ull;
+        oa.zero  = 0u;
+      }
+      oa.cur += 1u;
+      // [KeySet]: the gate key itself, mixed so that near-identical keys do not
+      // sum into near-identical folds, and ADDED so duplicates survive.
+      {
+        uint64_t z = key;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        oa.fold += (z ^ (z >> 31));
+        if (key == 0ull) oa.zero += 1u;
+      }
+    }
+
     if (key == 0ull) {
       m_rsNoKey += 1;
       return;
@@ -46450,7 +47402,55 @@ namespace dxvk {
     }
     const uint32_t rsOrdinal = occ.counter++;
 
-    uint64_t key = XXH64(&rsOrdinal, sizeof(rsOrdinal), ordGroup);
+    // THE RANGE PASS NAMES ITS OWN SUB-DRAW, so it does not need the ordinal.
+    //
+    // [RsGap0] byProducer split the world residual and it was never one
+    // problem: batch{tot=1095 same=1095 start=0} against range{tot=4560 same=26
+    // start=4534}, with depth, meshList and object at zero. Four fifths of the
+    // world in-frame collisions are noteRangePass sub-draws differing only in
+    // their index start, and that producer's key covers its whole run at once.
+    //
+    // [DescMap] found what separates them -- dw+8 of the 16-byte table entry
+    // matched the draw's start on 208 of 208 non-zero-start range sub-draws,
+    // while the batch control found nothing over 5% on any of its 156 offsets
+    // -- and rangeMap{hit miss=0 dup=0 over=0} says the attribution is exact.
+    // The entry's absolute index then lost on population (rangeEntry 35600
+    // against keyWithOrd's 34013), so `lo` moves per frame. IDA then showed
+    // that the engine filters and merges these entries before drawing. The
+    // complete emitted group is folded here; its old whole-run key remains in
+    // the dirty test.
+    //
+    // WHY THIS IS WORTH A RUN WHEN THE COLUMN CALLS IT A WASH. Priced side by
+    // side the earlier partial field was: rangeQw0 new=2246 distinct=32680
+    // against keyWithOrd's 2306
+    // and 34013, separating less. But gap0 was never the ordinal's defect. The
+    // ordinal is a POSITION -- when the split changes, a draw that was
+    // occurrence 2 becomes occurrence 1 and misses, which is away{2=N 3=0 4+=0}
+    // and the reason gateSize grows 80-100 a window forever on a scene
+    // [WorldBatch] reports bit-identical. The merged group does not depend on
+    // the range-table position. Same population, different failure mode, and
+    // no candidate column can show the difference because [RsIdent] measures
+    // recurrence, not whether the gate found the record.
+    //
+    // FALSIFIERS, all already in the line and all read in one run:
+    //   by{world} pct must RISE off 52..72
+    //   newKeys must stay ~0 -- a term that can only split keys splitting ones
+    //     that belonged together is how the pixel-shader fold and the storage
+    //     -image sentinel both died
+    //   gateSize growth must fall below ~80-100/window
+    //   ord{} should empty out for the range population
+    // Any of those going the wrong way reverts this to a flag flip.
+    //
+    // Range pass only. The batch's 19% is proven unnameable from D3D11 state
+    // (same=1095 of 1095) and is a record-granularity problem, not this one.
+    uint64_t key;
+    if (m_rsDrawRangeQw0 != 0ull
+        && RtxOptions::ResidentScene::rangeEntryKey()) {
+      key = XXH64(&m_rsDrawRangeQw0, sizeof(m_rsDrawRangeQw0), ordGroup);
+      m_rsRangeKeyed += 1u;
+    } else {
+      key = XXH64(&rsOrdinal, sizeof(rsOrdinal), ordGroup);
+    }
     if (key == 0ull) {
       key = 1ull;   // never the no-record sentinel
     }
@@ -46587,7 +47587,7 @@ namespace dxvk {
       // it would then be worth writing. Near keyWithOrd's 31325 says sub-draw
       // order within a copy is not stable either, and there is nothing left
       // to name a studio sub-draw with.
-      constexpr uint32_t kVariants = 12;
+      constexpr uint32_t kVariants = 15;
       constexpr size_t kMaxTracked = 100000;
       constexpr uint32_t kIdentDumpFrames = 300u;
       struct Recur {
@@ -46647,6 +47647,17 @@ namespace dxvk {
       static uint32_t sG0Same[3]  = { }, sG0Batch[3] = { }, sG0Start[3] = { };
       static uint32_t sG0Pass[3]  = { }, sG0Ps[3]    = { }, sG0Mat[3]   = { };
       static uint32_t sG0Head[3]  = { }, sG0Multi[3] = { };
+      static uint32_t sG0StartNZ[3] = { };
+      // WORLD IS SIX PRODUCERS, NOT ONE. Billed here because this is the
+      // population every identity candidate has been priced against, and if
+      // the collisions belong to a producer that is not the surface batch then
+      // the ordinal, the material fold, relRange and the material slice were
+      // all aimed at draws that were never colliding. tot billed by producer,
+      // and the start= bucket billed separately because that is the 73% and it
+      // is the one [DescMap] says cannot be coming from the batch.
+      static constexpr uint32_t kProd = 7u;
+      static uint32_t sG0Prod[kProd] = { }, sG0ProdStart[kProd] = { };
+      static uint32_t sG0ProdSame[kProd] = { };
       // hdPlusO2w SEPARATES THE LAST TWO READINGS OF THE MATERIAL CHURN.
       //
       // [MatChurnSlot] established that a single identHead, drawn exactly once
@@ -46673,7 +47684,7 @@ namespace dxvk {
       // final until the tail -- the same reason censusRecordO2w is taken there.
       static const char* const kIdentName[kVariants] =
         { "identHead", "drawKey", "hdPlusMat", "hdPlusO2w", "keyPlusPlace", "keyWithOrd", "o2wPlusMat",
-          "assetPlusO2w", "assetO2wMat", "assetO2wOrd", "upPlusMat", "relRange" };
+          "assetPlusO2w", "assetO2wMat", "assetO2wOrd", "upPlusMat", "relRange", "recIdx", "rangeEntry", "rangeGroup" };
 
       // NV-DXVK [O2wDelta]: HOW FAR THE TRANSFORM ACTUALLY MOVES, in units,
       // for one identity between consecutive frames.
@@ -46845,6 +47856,16 @@ namespace dxvk {
           ? XXH64(&nPlace, sizeof(nPlace), narrowed)
           : narrowed;
 
+      // The former rangeQw0 candidate used `narrowed`, which already contains
+      // the entire changing range table. It could not test an independent
+      // entry identity. Keep the IA head, pass, target and material, replacing
+      // only the whole-table term. Lower new/distinct with excessive gap0
+      // falsifies this as a usable name; this remains diagnostic only.
+      const uint64_t rangeGroupParts[4] = {
+        m_rsDrawRangeQw0, m_rsDrawKeyParts.pass, m_rsDrawKeyParts.tgt, m_rsDrawMat
+      };
+      const uint64_t rangeGroup = XXH64(rangeGroupParts, sizeof(rangeGroupParts),
+        XXH64(&m_rsDrawKeyHead, sizeof(m_rsDrawKeyHead), 0ull));
       const uint64_t candId[kVariants] = {
         m_rsDrawBaseKey,
         baseKey,
@@ -46976,7 +47997,122 @@ namespace dxvk {
           const uint32_t rel = (m_rsDrawStartRaw >= lo)
                              ? (m_rsDrawStartRaw - lo) : 0u;
           return XXH64(&rel, sizeof(rel), narrowed);
-        }()
+        }(),
+
+        // recIdx -- THE ORDINAL-FREE KEY PLUS THE PRODUCER'S NAME FOR THE
+        // SURFACE, which is the first candidate on this list that is not a
+        // function of the packing.
+        //
+        // Every previous attempt to separate the sub-draws of a batch was a
+        // position in the per-frame packing and was refuted on population: the
+        // occurrence ordinal 10.8x identHead, the material grouping 8x, the
+        // relative range 12x. [RsGap0] then billed what is left and found
+        // batch=0 head=0 pass=0 ps=0 mat=0 -- no D3D11-side term is missing
+        // from the key, so no D3D11-side term can separate them either.
+        //
+        // This one comes from engine.dll instead: the descriptor's uint16 at
+        // +50 is the surface's index into the level-load record array
+        // qword_193F09850 (sub_1801B8120 and sub_1801B55A0 both use it that
+        // way; sub_1801B36E0 copies record bytes 0..111 into the descriptor).
+        // It names the SOURCE RECORD, so it is invariant under the re-split and
+        // the re-order alike, and it is neither of §8's known-bad shapes.
+        //
+        // PRICE IT ON POPULATION, NOT ON gap0 -- §6.1. The column that matters
+        // is distinct=, against identHead 3292, hdPlusMat 21993 and the live
+        // keyWithOrd 33590. What would make this the answer: gap0 collapsing
+        // toward keyWithOrd's 0 while distinct stays near hdPlusMat. What would
+        // kill it: distinct climbing past keyWithOrd, which would mean the
+        // sub-draw -> descriptor mapping is wrong and recIdx is just another
+        // reading of the packing -- and runVsDesc{} on [WorldBatch] says which
+        // before this column is even read.
+        //
+        // RESULT: REFUTED, AND BOTH COUNTERS FIRED BEFORE THIS COLUMN WAS READ.
+        //
+        //   runVsDesc{eq=10320 lt=12240 gt=9812 dup=9360}   every window, exact
+        //   hdPlusMat  new=1534  gap0=16876  distinct=13574
+        //   recIdx     new=1538  gap0=16871  distinct=13660
+        //
+        // Five draws of 60424. A different hash, the same equivalence classes --
+        // §5.1's shape exactly.
+        //
+        // WHY, AND IT IS TWO SEPARATE ERRORS. dup=9360 says descriptor +50 is
+        // not a per-surface index: in sub_1801B8120 that field is a REFERENCE
+        // from one record type to another (`*(_QWORD*)(a1+48) + 208*v14` and
+        // `qword_193F09850 + 112*v14` are parallel arrays), so many surfaces
+        // sharing it is legal. The index that IS per-surface is
+        // `*(uint32*)(v25 + 4)` in the 16-byte surface entry at a2+65576, and
+        // that is not copied into the descriptor -- the descriptor receives the
+        // record the index POINTS AT, not the index.
+        //
+        // eq=32% says the mapping was wrong independently: the k'th D3D11 draw
+        // of a batch is not the k'th descriptor, because the engine calls the
+        // draw once per material group and the material system splits it again.
+        //
+        // WHAT SURVIVES. A per-surface name does not need the engine-side index
+        // at all: descriptor bytes 0..111 ARE qword_193F09850[idx], so
+        // XXH64(desc + 208*k, 104) already names the surface. Only the mapping
+        // is missing, and [DescMap] searches for it directly. Kept as a probe
+        // so this refutation stays measured rather than remembered.
+        //
+        // Falls back to narrowed when there is no name, so studio and every
+        // non-batch draw contribute their ordinal-free key unchanged and this
+        // column stays comparable with hdPlusMat.
+        (m_rsDrawRecIdx != 0u)
+          ? XXH64(&m_rsDrawRecIdx, sizeof(m_rsDrawRecIdx), narrowed)
+          : narrowed,
+
+        // rangeEntry -- THE 80% OF THE WORLD RESIDUAL, NAMED.
+        //
+        // [RsGap0] byProducer split what had been one number: batch{tot=1095
+        // same=1095 start=0} against range{tot=4560 same=26 start=4534}, with
+        // depth, meshList and object at zero. So four fifths of the world
+        // in-frame collisions are noteRangePass sub-draws that differ ONLY in
+        // their index start, and nothing named them -- that producer's key
+        // covers the whole run of table entries at once.
+        //
+        // [DescMap] then found the field: dw+8 of the 16-byte entry matched the
+        // draw's start on 208 of the 208 sub-draws whose start is non-zero,
+        // while the batch control found nothing over 5% on any of its 156
+        // offsets. This folds the entry's ABSOLUTE INDEX in the persistent
+        // range table, never its bytes -- +8/+12 are index-buffer offsets and
+        // would be §8's first known-bad shape.
+        //
+        // FALSIFIERS, all on [WorldBatch] rangeMap{}: miss= is draws no entry
+        // claimed (expect ~2%, the zero-start ones), dup= is two entries of one
+        // range sharing a start, which makes the attribution a coin flip, and
+        // over= is a range too large to capture. Any of them carrying real mass
+        // means the mapping is not what [DescMap] measured.
+        //
+        // And priced on population per §6.1, against identHead 2437,
+        // hdPlusMat 13574 and the live keyWithOrd 20570: this must cut gap0
+        // without distinct climbing toward keyWithOrd's.
+        (m_rsDrawRangeEntry != 0u)
+          ? XXH64(&m_rsDrawRangeEntry, sizeof(m_rsDrawRangeEntry), narrowed)
+          : narrowed,
+
+        // rangeGroup -- THE EXACT RECORD THE ENGINE EMITS FOR THIS DRAW.
+        //
+        // rangeEntry folded the entry's absolute table index and lost on
+        // population (32144 against keyWithOrd's 30624), which means `lo` moves
+        // per frame and the index is a packing position. The mapping itself is
+        // sound -- rangeMap{hit=3185 miss=0 dup=0} -- so the entry IS the right
+        // record; only the name taken off it was wrong.
+        //
+        // IDA showed that sub_1800B8670 filters entries by mask and merges
+        // adjacent accepted entries with equal qw0 upper bits. Hash the exact
+        // output: first qw0/start plus last end. Using qw0 alone aliases
+        // distinct emitted draws, which the live test exposed as visual errors.
+        //
+        // FALSIFIERS: rangeMap{qw0zero=} on [WorldBatch] -- if the field is
+        // mostly zero it holds nothing and this column is meaningless before it
+        // is read. Then population, §6.1: it must cut gap0 below hdPlusMat's
+        // 8843 while distinct stays near 20064. distinct climbing past
+        // keyWithOrd's 30624 means bytes 0..7 move too, and the range pass has
+        // no stable per-sub-draw name anywhere in its entry -- which would be a
+        // real answer, and would put the 80% back on record granularity.
+        (m_rsDrawRangeQw0 != 0ull)
+          ? rangeGroup
+          : narrowed
       };
 
       for (uint32_t v = 0; v < kVariants; ++v) {
@@ -47013,13 +48149,30 @@ namespace dxvk {
                 if (q.mat   != m_rsDrawMat)             diffs += 1u;
                 if (q.start != m_rsDrawStartRaw)        diffs += 1u;
                 if (diffs > 1u) sG0Multi[b] += 1u;
-                if (diffs == 0u)                             sG0Same[b]  += 1u;
+                // THE CONTRADICTION THIS RESOLVES. [DescMap] reads
+                // zero{start=232} on 232 of 232 sampled world sub-draws --
+                // every one issues with StartIndexLocation 0 -- while this
+                // probe billed 4551 world collisions to start= differing.
+                // Both cannot be true. startNZ counts the draws whose raw
+                // start is actually non-zero, so whichever probe is wrong says
+                // so instead of the two being argued about.
+                if (m_rsDrawStartRaw != 0u) sG0StartNZ[b] += 1u;
+                const uint32_t pr = (m_rsDrawKeyParts.producer < kProd)
+                                  ? m_rsDrawKeyParts.producer : 0u;
+                if (b == 0u) sG0Prod[pr] += 1u;
+                if (diffs == 0u) {
+                  sG0Same[b] += 1u;
+                  if (b == 0u) sG0ProdSame[pr] += 1u;
+                }
                 else if (q.batch != joinprobe::t_worldKey)   sG0Batch[b] += 1u;
                 else if (q.head  != m_rsDrawKeyParts.head)   sG0Head[b]  += 1u;
                 else if (q.pass  != m_rsDrawKeyParts.pass)   sG0Pass[b]  += 1u;
                 else if (q.hasPs != m_rsDrawKeyParts.hasPs)  sG0Ps[b]    += 1u;
                 else if (q.mat   != m_rsDrawMat)             sG0Mat[b]   += 1u;
-                else                                         sG0Start[b] += 1u;
+                else {
+                  sG0Start[b] += 1u;
+                  if (b == 0u) sG0ProdStart[pr] += 1u;
+                }
               }
             }
           } else if (gap == 1u) {
@@ -47081,7 +48234,19 @@ namespace dxvk {
               " ", kG0Kind[b], "{tot=", tot,
               " same=", sG0Same[b], " batch=", sG0Batch[b], " head=", sG0Head[b],
               " pass=", sG0Pass[b], " ps=", sG0Ps[b], " mat=", sG0Mat[b],
-              " start=", sG0Start[b], " multi=", sG0Multi[b], "}");
+              " start=", sG0Start[b], " multi=", sG0Multi[b],
+              " startNZ=", sG0StartNZ[b], "}");
+            if (b == 0u) {
+              static const char* const kProdName[kProd] =
+                { "none", "batch", "depth", "range", "meshList", "object", "array" };
+              o += " byProducer{";
+              for (uint32_t pr = 0; pr < kProd; ++pr)
+                if (sG0Prod[pr] != 0u)
+                  o += str::format(" ", kProdName[pr], "{tot=", sG0Prod[pr],
+                                   " same=", sG0ProdSame[pr],
+                                   " start=", sG0ProdStart[pr], "}");
+              o += " }";
+            }
           }
           if (!o.empty()) {
             Logger::warn(str::format(
@@ -47096,6 +48261,10 @@ namespace dxvk {
           for (uint32_t b = 0; b < 3u; ++b) {
             sG0Same[b] = sG0Batch[b] = sG0Head[b] = sG0Pass[b] = 0u;
             sG0Ps[b] = sG0Mat[b] = sG0Start[b] = sG0Multi[b] = 0u;
+            sG0StartNZ[b] = 0u;
+            if (b == 0u)
+              for (uint32_t pr = 0; pr < kProd; ++pr)
+                sG0Prod[pr] = sG0ProdSame[pr] = sG0ProdStart[pr] = 0u;
           }
         }
       }
@@ -47536,13 +48705,218 @@ namespace dxvk {
     const uint32_t rsOrdB =
         (rsOrdinal < kRsOrdBuckets) ? rsOrdinal : (kRsOrdBuckets - 1u);
 
+    // [RsMiss]: SNAPSHOT THE ANCHOR, THEN UPDATE IT, BOTH BEFORE THE OUTCOME.
+    //
+    // Taken here rather than at the miss sites because the new-key path returns
+    // early -- an update placed after it would silently skip every brand-new
+    // key and make `absent` read as though those heads had never been drawn.
+    // Snapshot-then-update also makes the compare structurally unable to read
+    // the value it just wrote, which is the bug shape §8.3 of the bible lists
+    // four instances of.
+    // Declared before the lambda that captures them, not beside their first
+    // use -- a [&] capture can only reach names that already exist.
+    MissAnchor rsPrev;
+    bool rsHadAnchor = false;
+    bool rsSkipDupHead = false;
+    uint32_t rsOccIdxBilled = 0u;
+    uint32_t rsHeadGapBilled = 0xFFFFFFFFu;
+    uint32_t rsPrevCount = 0xFFFFFFFFu;
+
+    // Bills one miss to the first term that differs from the last time this
+    // head was drawn. Fixed priority, with multi= counting the draws that
+    // differ in more than one so the priority cannot quietly absorb a second
+    // cause -- the same discipline [RsGap0] uses.
+    const auto rsBillMiss =
+        [&](const MissAnchor& prev, bool hadAnchor, uint32_t cls) {
+      m_rsMissTot[cls] += 1u;
+      // Informational only now that the anchor carries the occurrence: this
+      // draw is the 2nd+ of its head this frame, and it IS still attributed.
+      if (rsSkipDupHead)
+        m_rsMissDupHead[cls] += 1u;
+      // WHICH OCCURRENCE MISSED. If these pile onto the high indices while 0
+      // hits, the head's sub-draw count is the defect, not its identity.
+      m_rsMissOccIdx[(rsOccIdxBilled < 3u) ? rsOccIdxBilled : 3u] += 1u;
+      // HOW LONG WAS THE HEAD ITSELF GONE, as opposed to this occurrence of it.
+      if (rsHeadGapBilled == 0xFFFFFFFFu) {
+        m_rsHeadGapNew += 1u;
+      } else {
+        const uint32_t g = rsHeadGapBilled;
+        uint32_t hb;
+        if (g == 0u)       hb = 0u;   // drawn earlier THIS frame
+        else if (g == 1u)  hb = 1u;   // drawn last frame
+        else if (g <= 3u)  hb = 2u;
+        else if (g <= 15u) hb = 3u;
+        else               hb = 4u;
+        m_rsHeadGap[hb] += 1u;
+        if (g > m_rsHeadGapMax) m_rsHeadGapMax = g;
+      }
+      // Only meaningful when the head HAS a previous-frame count to be past.
+      if (rsPrevCount != 0xFFFFFFFFu && rsPrevCount != 0u) {
+        if (rsOccIdxBilled >= rsPrevCount) m_rsMissBeyond += 1u;
+        else                               m_rsMissWithin += 1u;
+      }
+      if (!hadAnchor) {
+        m_rsMissNoAnchor[cls] += 1u;
+        return;
+      }
+      // THE FIRST SPLIT, AND IT IS THE ONE THAT MATTERS. A head not drawn last
+      // frame is a draw the producer did not submit. No key term reaches that.
+      if (prev.frame + 1u != frameId) {
+        const uint32_t d = frameId - prev.frame;
+        uint32_t b;
+        if (d == 2u)       b = 0u;
+        else if (d == 3u)  b = 1u;
+        else if (d <= 7u)  b = 2u;
+        else if (d <= 15u) b = 3u;
+        else if (d <= 31u) b = 4u;
+        else               b = 5u;
+        m_rsMissAbsent[cls][b] += 1u;
+        if (d > m_rsMissAbsMax[cls]) m_rsMissAbsMax[cls] = d;
+        return;
+      }
+      uint32_t diffs = 0u;
+      if (prev.ordinal  != rsOrdinal)                 diffs += 1u;
+      if (prev.mat      != m_rsDrawMat)               diffs += 1u;
+      if (prev.up       != m_rsDrawKeyParts.up)       diffs += 1u;
+      if (prev.pass     != m_rsDrawKeyParts.pass)     diffs += 1u;
+      if (prev.tgt      != m_rsDrawKeyParts.tgt)      diffs += 1u;
+      if (prev.gens     != m_rsDrawGens)              diffs += 1u;
+      if (prev.o2w      != o2w)                       diffs += 1u;
+      if (prev.startRaw != m_rsDrawStartRaw)          diffs += 1u;
+      if (prev.producer != m_rsDrawKeyParts.producer) diffs += 1u;
+      if (diffs > 1u) m_rsMissMulti[cls] += 1u;
+      if (diffs == 0u)                                     m_rsMissSame[cls]  += 1u;
+      else if (prev.ordinal  != rsOrdinal)                 m_rsMissOrd[cls]   += 1u;
+      else if (prev.up       != m_rsDrawKeyParts.up)       m_rsMissUp[cls]    += 1u;
+      else if (prev.mat      != m_rsDrawMat)               m_rsMbMat[cls]   += 1u;
+      else if (prev.pass     != m_rsDrawKeyParts.pass)     m_rsMissPass[cls]  += 1u;
+      else if (prev.tgt      != m_rsDrawKeyParts.tgt)      m_rsMissTgt[cls]   += 1u;
+      else if (prev.gens     != m_rsDrawGens)              m_rsMissGens[cls]  += 1u;
+      else if (prev.o2w      != o2w)                       m_rsMissO2wP[cls]  += 1u;
+      else if (prev.producer != m_rsDrawKeyParts.producer) m_rsMissProd[cls]  += 1u;
+      else                                                 m_rsMissStart[cls] += 1u;
+    };
+
+    const uint32_t rsMissCls =
+        (m_rsDrawKeyParts.kind == 1u) ? 0u
+      : (m_rsDrawKeyParts.kind == 2u) ? 1u : 2u;
+    if (RtxOptions::ResidentScene::logStats()) {
+      if (m_rsMissAnchor.size() > 262144u) {
+        m_rsMissAnchor.clear();
+        m_rsMissOcc.clear();
+        m_rsMissWipe += 1u;
+      }
+      // ANCHOR ON (HEAD, OCCURRENCE), so sub-draw k is compared against sub-draw
+      // k and the whole population is attributable.
+      //
+      // The first cut anchored on the head alone and had to drop every 2nd+
+      // draw of a head in a frame -- dupHead=741 of tot=1084 -- because it
+      // would otherwise have compared this frame's sub-draw 0 against last
+      // frame's sub-draw 2 and reported the ordinal differing when nothing had
+      // moved. That is [O2wDelta]'s confound, twelve blocks up. Adding the
+      // occurrence to the anchor key removes the confound instead of excluding
+      // the population, and dupHead stays as an informational split.
+      auto& rsOcc = m_rsMissOcc[m_rsDrawBaseKey];
+      if (rsOcc.frame != frameId) {
+        // [RsOcc]: the previous frame's count is complete only now, on the
+        // first draw of this head in a new frame. Compared only across
+        // CONSECUTIVE frames -- a head absent for three frames has no count to
+        // compare against and would otherwise read as a change.
+        if (rsOcc.frame + 1u == frameId && rsOcc.cur != 0u) {
+          if (rsOcc.prev == 0u) {
+            m_rsOccFresh += 1u;
+          } else if (rsOcc.cur == rsOcc.prev) {
+            m_rsOccSame += 1u;
+          } else {
+            const uint32_t d = (rsOcc.cur > rsOcc.prev)
+                             ? (rsOcc.cur - rsOcc.prev) : (rsOcc.prev - rsOcc.cur);
+            if (rsOcc.cur > rsOcc.prev) m_rsOccUp += 1u; else m_rsOccDn += 1u;
+            if (d > m_rsOccMaxDelta) m_rsOccMaxDelta = d;
+          }
+          rsOcc.prev = rsOcc.cur;
+        } else if (rsOcc.cur != 0u) {
+          rsOcc.prev = rsOcc.cur;
+        }
+        rsOcc.frame = frameId;
+        rsOcc.cur   = 0u;
+      }
+      const uint32_t rsOccIdx = rsOcc.cur++;
+      rsOccIdxBilled = rsOccIdx;
+      // The count this head reached LAST frame, captured before this frame's
+      // count can overwrite it.
+      rsPrevCount = rsOcc.prev;
+      // [HeadGap]: the same snapshot-then-update discipline, on the head with
+      // no occurrence in the key.
+      {
+        auto hIt = m_rsHeadSeen.find(m_rsDrawBaseKey);
+        if (hIt == m_rsHeadSeen.end()) {
+          rsHeadGapBilled = 0xFFFFFFFFu;   // never seen
+          m_rsHeadSeen.emplace(m_rsDrawBaseKey, frameId);
+        } else {
+          rsHeadGapBilled = frameId - hIt->second;
+          hIt->second = frameId;
+        }
+      }
+      rsSkipDupHead = (rsOccIdx != 0u);
+      const uint64_t rsAnchorKey =
+          XXH64(&rsOccIdx, sizeof(rsOccIdx), m_rsDrawBaseKey);
+      auto aIt = m_rsMissAnchor.find(rsAnchorKey);
+      if (aIt != m_rsMissAnchor.end()) {
+        rsPrev = aIt->second;
+        rsHadAnchor = true;
+      }
+      MissAnchor& cur = m_rsMissAnchor[rsAnchorKey];
+      // seen counts DISTINCT FRAMES, not draws: the same anchor hit twice in
+      // one frame is one life, and counting draws would make every anchor look
+      // long-lived exactly where in-frame multiplicity is the thing under test.
+      if (cur.frame != frameId)
+        cur.seen += 1u;
+      cur.occ      = rsOccIdx;
+      cur.frame    = frameId;
+      cur.key      = key;
+      cur.mat      = m_rsDrawMat;
+      cur.up       = m_rsDrawKeyParts.up;
+      cur.pass     = m_rsDrawKeyParts.pass;
+      cur.tgt      = m_rsDrawKeyParts.tgt;
+      cur.gens     = m_rsDrawGens;
+      cur.o2w      = o2w;
+      cur.ordinal  = rsOrdinal;
+      cur.startRaw = m_rsDrawStartRaw;
+      cur.producer = m_rsDrawKeyParts.producer;
+    }
+
     const auto it = m_residentGate.find(key);
     if (it == m_residentGate.end()) {
       m_rsNewKeys += 1;
+      // Bill actual store growth, separately from returning-key misses.
+      // Continuous sampling keeps load-time draws from exhausting the probe.
+      // Compare base/up/material/ordinal by producer before changing identity.
+      if (RtxOptions::ResidentScene::logStats()) {
+        static uint64_t sNewKeySample = 0;
+        const uint64_t sample = sNewKeySample++;
+        if (sample < 64u || (sample & 127u) == 0u) {
+          Logger::info(str::format(
+            "[RsNewKey] f=", frameId,
+            " class=", rsCls,
+            " producer=", m_rsDrawKeyParts.producer,
+            " key=0x", std::hex, key,
+            " base=0x", baseKey,
+            " up=0x", m_rsDrawKeyParts.up,
+            " mat=0x", m_rsDrawMat,
+            " pass=0x", m_rsDrawKeyParts.pass,
+            " tgt=0x", m_rsDrawKeyParts.tgt,
+            " vs=0x", drawCallState.transformData.vertexShaderHash, std::dec,
+            " ord=", rsOrdinal,
+            " occ=", rsOccIdxBilled,
+            " anchor=", rsHadAnchor));
+        }
+      }
       m_rsMissKey += 1;
       m_rsByClassNewKey[rsCls]  += 1u;
       m_rsByClassMissKey[rsCls] += 1u;
       m_rsMissByOrd[rsOrdB] += 1u;
+      if (RtxOptions::ResidentScene::logStats())
+        rsBillMiss(rsPrev, rsHadAnchor, rsMissCls);
       // Counted here too -- a new key is a judged draw, and leaving it out would
       // bias the denominator by exactly the population with no history.
       if (RtxOptions::ResidentScene::logStats()
@@ -47565,7 +48939,62 @@ namespace dxvk {
     // record that a draw should have updated and did not is the s2s "two views"
     // failure -- alive but stale, with no FAIL to catch it. Requiring
     // contiguity makes that state unreachable through the gate.
-    const bool contiguous = (e.frameLastSeen + 1u == frameId) || (e.frameLastSeen == frameId);
+    //
+    // AND THE MEASUREMENT SAYS THAT IS THE WHOLE DEFECT. [RsMiss], which
+    // attributes each miss against what that draw's head looked like the last
+    // time it was drawn:
+    //
+    //   world{tot=1084 noAnchor=4 dupHead=741 absent{2f=303 3f=0 4+=36}
+    //         present{ord=0 up=0 mat=0 pass=0 tgt=0 gen=0 o2w=0 prod=0
+    //                 start=0 same=0 multi=0}}
+    //
+    // present{} is ENTIRELY ZERO. Not one miss is a draw that was there last
+    // frame carrying a changed key. 339 of 343 attributable misses are
+    // `absent` -- the head was not drawn in the previous frame at all -- and
+    // absent{2f=303 3f=0 4+=36} reproduces away{2=N 3=0 4+=0} from an
+    // independent probe: gone for exactly one frame, zero variance. Fifteen
+    // candidate identities were refuted against a key defect that does not
+    // exist.
+    //
+    // SO THE CONTIGUITY RULE IS THE MISS. It is a PROXY for staleness, and the
+    // four direct staleness sensors it stands in for are all present three
+    // lines below and all read zero every window: missGen=0 missO2w=0
+    // missMat=0 missPlace=0. Allowing a one-frame gap does not weaken the
+    // proof -- gensMatch/matMatch/o2wMatch/placeMatch still gate the serve, and
+    // a record that went stale would fail them. It only stops rejecting a draw
+    // for the separate reason that its producer skipped a frame.
+    //
+    // FALSIFIERS, all already in the line: missGen/missO2w/missMat/missPlace
+    // must STAY at zero -- any of them leaving zero means a genuinely stale
+    // record is now reaching the tests and this comes straight out. by{world}
+    // pct must rise. And this is a visual change, so the screen is the last
+    // word: geometry from the wrong frame would show as ghosting or popping.
+    // HOW WIDE, FROM THE DISTRIBUTION RATHER THAN A GUESS. [RsMiss] split the
+    // absences that the 4+ bucket had been swallowing:
+    //
+    //   absent{2f=0 3f=26 4-7=130 8-15=70 16-31=16 32+=231 max=1405}
+    //
+    // 2f is already zero -- the first widening took those. Half the remainder
+    // is gone 32+ frames, up to 3387 (~56s), which is geometry genuinely not
+    // submitted and unreachable by any tolerance. But 4-15 frames is 200 of
+    // 473, 42%, and those heads do come back. maxGapFrames covers that band and
+    // stops short of the tail it cannot reach.
+    const uint32_t rsGap = frameId - e.frameLastSeen;
+    // 0 means no bound. [KeySet] read same=277852 diff=31 over gaps to 2634
+    // frames, so the key a head offers when it is whole is the same key it
+    // offered last time it was whole, and the gap carries no evidence of
+    // staleness that the four content tests below do not carry better.
+    const uint32_t rsGapOpt = RtxOptions::ResidentScene::maxGapFrames();
+    const uint32_t rsMaxGap =
+        RtxOptions::ResidentScene::allowOneFrameGap()
+          ? (rsGapOpt == 0u ? UINT32_MAX : rsGapOpt)
+          : 1u;
+    const bool contiguous = (rsGap <= rsMaxGap);
+    // Draws admitted ONLY by the relaxation. Without this, "nothing changed"
+    // cannot be told apart from "it applied to nothing" -- which is exactly
+    // how rangeEntryKey was misread as a null result.
+    if (contiguous && rsGap > 1u)
+      m_rsGap2Served += 1u;
     const bool gensMatch  = (e.srcGenHash == m_rsDrawGens);
     const bool matMatch   = (e.matHash == m_rsDrawMat);
     const bool o2wMatch   = (e.o2wHash == o2w);
@@ -47582,7 +49011,10 @@ namespace dxvk {
       m_rsMissKey += 1;
       m_rsByClassMissKey[rsCls] += 1u;
       m_rsMissByOrd[rsOrdB] += 1u;
+      if (RtxOptions::ResidentScene::logStats())
+        rsBillMiss(rsPrev, rsHadAnchor, rsMissCls);
     } else if (!gensMatch) {
+      m_rsStaleGap[rsGapBucket(rsGap)] += 1u;
       m_rsMissGen += 1;
       // [RsVbClass]: the reason a CPU-written buffer can never hit, attributed
       // to the buffer class that caused it.
@@ -47590,6 +49022,7 @@ namespace dxvk {
         rsVbCell->missGen += 1u;
       }
     } else if (!o2wMatch) {
+      m_rsStaleGap[rsGapBucket(rsGap)] += 1u;
       m_rsMissO2w += 1;
     } else if (!matMatch) {
       // EXPECT THIS TO READ 0, AND DO NOT READ THAT AS A FIX. The material is
@@ -47599,6 +49032,7 @@ namespace dxvk {
       // 911,176 draws look like a passing check when it was a counter that could
       // not fire. Read material churn from [MatChurnSlot] matChg and [MatChurn]
       // matNew, neither of which depends on the key.
+      m_rsStaleGap[rsGapBucket(rsGap)] += 1u;
       m_rsMissMat += 1;
     } else if (!placeMatch) {
       // THE ONLY MISS THAT NAMES A CHANGED REQUEST RATHER THAN A CHANGED INPUT.
@@ -47611,11 +49045,14 @@ namespace dxvk {
       // rising is what drives failSize to zero. If it climbs far past failSize's
       // pre-change rate the count is unstable for a reason this did not measure,
       // and the comparison -- not the key -- is what to reconsider.
+      m_rsStaleGap[rsGapBucket(rsGap)] += 1u;
       m_rsMissPlace += 1;
     } else {
       m_rsHit += 1;
       m_rsByClassHit[rsCls] += 1u;
       m_rsHitByOrd[rsOrdB] += 1u;
+      m_rsServedGap[rsGapBucket(rsGap)] += 1u;
+      if (rsGap > m_rsServedGapMax) m_rsServedGapMax = rsGap;
       drawCallState.residentPredictHit = true;
       // [RsVbClass]: the coverage an exclusion would take. This is the only
       // column that can argue against cutting a cell.

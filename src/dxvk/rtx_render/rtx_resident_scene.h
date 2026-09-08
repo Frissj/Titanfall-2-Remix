@@ -232,14 +232,10 @@ namespace dxvk {
   // noteResidentSourceBufferDestroyed, which carries its own lock because it is
   // written from whichever thread happens to release a D3D11 buffer.
   //
-  // THE LIFETIME CONTRACT IS THE BACK-POINTER, NOT A SCAN. A record caches raw
-  // RtInstance* across frames and GC deletes instances, so without a
-  // back-pointer this is a dangling-pointer generator -- the exact failure this
-  // tree has already shipped twice (the file-static s_zigGunInstance deref and
-  // the GC-walk incRef race). RtInstance::m_residentKey carries the key back,
-  // which makes invalidateFor() O(1) and, more importantly, TOTAL: an instance
-  // cannot be destroyed without coming through removeInstance, and
-  // removeInstance invalidates in the same call.
+  // Records cache raw RtInstance* across frames. One instance can occur in
+  // several records, so its single m_residentKey cannot track their lifetime.
+  // m_instanceRecords indexes every reference; removeInstance invalidates all
+  // referring records before deleting the instance, without scanning the store.
   //
   // INVALIDATE THE WHOLE RECORD, NEVER ONE ELEMENT. The list is only meaningful
   // as the complete output of one resolution pass; a list with a hole in it
@@ -401,7 +397,7 @@ namespace dxvk {
     // case it exists for.
     bool holdsInstance(const RtInstance* instance) const;
 
-    // O(1) and TOTAL -- see the class comment.
+    // Visits all records referring to this instance -- see the class comment.
     void invalidateFor(const RtInstance* instance);
 
     // NV-DXVK [ExistenceSource] slice 5b: RETIRE WHAT THE ENGINE NO LONGER
@@ -448,6 +444,7 @@ namespace dxvk {
       // not self-correcting either: it is a permanent property of those draws.
       uint32_t touchMissUnsafe = 0;
       uint32_t invalidated = 0;
+      uint32_t invalidatedOtherKey = 0; // Records the single back-pointer missed.
       uint32_t evicted    = 0;
       // CUMULATIVE across the session and deliberately NOT reset with the rest:
       // a wipe that happens and then reads 0 by the time the line comes out is
@@ -614,8 +611,10 @@ namespace dxvk {
     // scene where it fills fastest.
     static constexpr uint32_t kTombstoneFrames = 4u;
     void recordTombstone(uint64_t key, uint32_t frame);
+    void detachRecord(uint64_t key, Record& record);
 
     std::unordered_map<uint64_t, Record> m_records;
+    std::unordered_map<const RtInstance*, std::unordered_set<uint64_t>> m_instanceRecords;
     std::unordered_map<uint64_t, uint32_t> m_tombstones;
     Stats m_stats;
   };
