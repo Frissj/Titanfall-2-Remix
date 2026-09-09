@@ -273,8 +273,9 @@ namespace dxvk {
       return transformHash;
     }
 
-    void erase(const XXH64_hash_t& transformHash, uint32_t frame = kNoFrame) {
-      eraseInternal(transformHash, frame, /*vacatedTo*/ 0, /*isRefile*/ false);
+    void erase(const XXH64_hash_t& transformHash, const T* data,
+               uint32_t frame = kNoFrame) {
+      eraseInternal(transformHash, data, frame, /*vacatedTo*/ 0, /*isRefile*/ false);
     }
 
   private:
@@ -285,9 +286,40 @@ namespace dxvk {
     // re-filing would be logged as a destruction and the ledger could not answer
     // the question it was built for — "was the key vacated, or was the entry
     // killed" — which are the two branches §5.5 of the residency handoff names.
-    void eraseInternal(const XXH64_hash_t& transformHash, uint32_t frame,
+    void eraseInternal(const XXH64_hash_t& transformHash, const T* expectedData,
+                       uint32_t frame,
                        XXH64_hash_t vacatedTo, bool isRefile) {
-      const size_t slot = m_cache.findSlot(transformHash);
+      XXH64_hash_t actualHash = transformHash;
+      size_t slot = m_cache.findSlot(actualHash);
+
+      // A cached key is only a hint when removing an object. If it is stale,
+      // blindly erasing that slot can delete a different instance, while doing
+      // nothing leaves this raw pointer in m_cells and turns the next nearest
+      // lookup into a use-after-free. Repair the exceptional path by finding the
+      // exact owner. The normal path remains one hash lookup.
+      if (expectedData != nullptr
+          && (slot == Cache::kInvalidSlot || m_cache.valueAt(slot).data != expectedData)) {
+        bool foundOwner = false;
+        m_cache.forEach([&](XXH64_hash_t key, const Entry& entry) {
+          if (!foundOwner && entry.data == expectedData) {
+            actualHash = key;
+            foundOwner = true;
+          }
+        });
+        slot = foundOwner ? m_cache.findSlot(actualHash) : Cache::kInvalidSlot;
+
+        static thread_local uint64_t sEraseRepairProbe = 0;
+        if (sEraseRepairProbe < 32 || (sEraseRepairProbe & 0x3FF) == 0) {
+          Logger::warn(str::format(
+            "[SpatialEraseRepair] #", sEraseRepairProbe,
+            " requested=0x", std::hex, transformHash,
+            " actual=0x", (foundOwner ? actualHash : 0ull), std::dec,
+            " found=", (foundOwner ? 1 : 0),
+            " mapSize=", m_cache.size()));
+        }
+        sEraseRepairProbe += 1;
+      }
+
       if (slot != Cache::kInvalidSlot) {
         // NV-DXVK [SpatialErase]: log every erase. If a propId we expected
         // to stay alive gets erased between insertion and the next lookup,
@@ -297,7 +329,7 @@ namespace dxvk {
         if (sEraseProbe < 32 || (sEraseProbe & 0xFFF) == 0) {
           Logger::info(str::format(
             "[SpatialErase] #", sEraseProbe,
-            " hash=0x", std::hex, transformHash, std::dec,
+            " hash=0x", std::hex, actualHash, std::dec,
             " mapSize=", m_cache.size()));
         }
         sEraseProbe += 1;
@@ -308,10 +340,10 @@ namespace dxvk {
         // ledger while the slot is still valid, and it is only ever compared and
         // printed as an address afterwards.
         const T* const owner = m_cache.valueAt(slot).data;
-        eraseFromCell(centroid, transformHash);
+        eraseFromCell(centroid, actualHash);
         m_cache.eraseAt(slot);
         ++m_dbgErases;
-        ledgerRecord(transformHash,
+        ledgerRecord(actualHash,
                      isRefile ? LedgerOp::Refiled : LedgerOp::Erased,
                      frame, owner, vacatedTo, /*bumped*/ false);
       } else {
@@ -525,8 +557,13 @@ namespace dxvk {
         // entry is about to land on. That pair — "key K was vacated at frame F,
         // by owner P, in favour of key K2" — is the whole answer §5.5 asks for
         // when a stationary prop's lookup on K misses.
-        eraseInternal(oldTransformHash, frame, /*vacatedTo*/ transformHash, /*isRefile*/ true);
-        insert(centroid, newTransform, data, overrideHash, frame);
+        eraseInternal(oldTransformHash, data, frame,
+                      /*vacatedTo*/ transformHash, /*isRefile*/ true);
+        // insert() may collision-bump the requested key. The owner must retain
+        // the key that was actually inserted; returning transformHash here left
+        // a bumped raw pointer unreachable to its later erase, then deletion
+        // turned that orphan into a SpatialMap use-after-free.
+        return insert(centroid, newTransform, data, overrideHash, frame);
       }
       return transformHash;
     }

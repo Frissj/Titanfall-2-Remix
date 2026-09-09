@@ -157,7 +157,7 @@ public:
     // [MapLedger]: the frame is what turns "this key is absent" into "this key
     // was destroyed at frame F", and only the second form is something a verdict
     // against a stationary prop can act on.
-    m_linkedBlas->getSpatialMap().erase(m_spatialCacheHash, m_frameLastUpdated);
+    m_linkedBlas->getSpatialMap().erase(m_spatialCacheHash, this, m_frameLastUpdated);
     m_spatialCacheHash = kEmptyHash;
   }
 

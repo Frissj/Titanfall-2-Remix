@@ -2447,6 +2447,15 @@ namespace dxvk {
     if (p == nullptr)
       return false;
 
+    // Reject a wrapped half-open range before either the cache containment
+    // test or the VirtualQuery result can mistake it for a small valid span.
+    // This matters for guarded engine reads: a corrupt count can otherwise
+    // turn an invalid high address plus a huge size into a low end address.
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(p);
+    if (n > std::numeric_limits<uintptr_t>::max() - addr)
+      return false;
+    const uintptr_t spanEnd = addr + n;
+
     const uint32_t vqEpochNow = vqprobe::g_vqEpoch.load(std::memory_order_relaxed);
     if (vqEpochNow != t_vqEpoch) {
       for (size_t i = 0; i < kVqWays; ++i)
@@ -2459,9 +2468,8 @@ namespace dxvk {
     // so a containment hit IS the readable answer — there is no cached-reject
     // case to distinguish. Empty ways are {0,0} and can never contain a span
     // of non-zero length, so they need no separate validity flag.
-    const uintptr_t addr = reinterpret_cast<uintptr_t>(p);
     for (size_t i = 0; i < kVqWays; ++i) {
-      if (addr >= t_regions[i].start && (addr + n) <= t_regions[i].end)
+      if (addr >= t_regions[i].start && spanEnd <= t_regions[i].end)
         return true;
     }
 
@@ -2485,6 +2493,8 @@ namespace dxvk {
       return false;
     const uintptr_t a     = reinterpret_cast<uintptr_t>(p);
     const uintptr_t start = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+    if (mbi.RegionSize > std::numeric_limits<uintptr_t>::max() - start)
+      return false;
     const uintptr_t end   = start + mbi.RegionSize;
     // Publish the region for the cache above. Only committed+readable regions
     // are cached: every early return before this point is a REJECT, and
@@ -2494,7 +2504,7 @@ namespace dxvk {
     // and anything smarter would cost more than the compare it saves.
     t_regions[t_nextWay] = { start, end };
     t_nextWay = (t_nextWay + 1u) % kVqWays;
-    return a >= start && (a + n) <= end;
+    return a >= start && spanEnd <= end;
   }
 
   // Return true iff p points into committed, EXECUTABLE (code) memory. Used to
@@ -10824,13 +10834,33 @@ namespace dxvk {
       // range cannot leave the previous one live for this pass's draws.
       dmCapture(1u, nullptr, 0u, 0u, false);
       rangeCapture(nullptr, 0u, 0u);
-      if (table == nullptr || !studioMemReadable(table, 8u + 4u * (index + 2u)))
+      const size_t indexOffset = static_cast<size_t>(index) * 4u;
+      if (table == nullptr || !studioMemReadable(table, indexOffset + 8u))
         return 0ull;
-      const int32_t lo = *reinterpret_cast<const int32_t*>(table + 4u * index);
-      const int32_t hi = *reinterpret_cast<const int32_t*>(table + 4u * (index + 1u));
-      if (hi <= lo || (hi - lo) > 65536)
+      const int32_t lo = *reinterpret_cast<const int32_t*>(table + indexOffset);
+      const int32_t hi = *reinterpret_cast<const int32_t*>(table + indexOffset + 4u);
+      const int64_t count = static_cast<int64_t>(hi) - static_cast<int64_t>(lo);
+      // lo is later used as an array index. Validate it and subtract in 64-bit;
+      // the old signed 32-bit `hi - lo` overflowed on a deferred invocation
+      // whose engine path queues these arguments without reading the table,
+      // passed the 65536 limit, and produced the exact wrapped pointer in the
+      // 2026-09-09 VS crash. Returning key 0 matches that path: it draws
+      // nothing now; the replayed invocation is keyed when its table is live.
+      if (lo < 0 || count <= 0 || count > 65536) {
+        if (RtxOptions::ResidentScene::logStats()) {
+          static std::atomic<uint32_t> s_rejected { 0u };
+          const uint32_t sample = s_rejected.fetch_add(1u, std::memory_order_relaxed);
+          if (sample < 8u || (sample & 0x3FFu) == 0u) {
+            Logger::info(str::format(
+              "[RangePassReject] #", sample,
+              " table=0x", std::hex, reinterpret_cast<uintptr_t>(table), std::dec,
+              " mask=", mask, " index=", index,
+              " lo=", lo, " hi=", hi, " count64=", count));
+          }
+        }
         return 0ull;
-      const uint32_t n = static_cast<uint32_t>(hi - lo);
+      }
+      const uint32_t n = static_cast<uint32_t>(count);
       const uint8_t* const first = table + 16u * (static_cast<size_t>(lo) + 1u);
       if (!studioMemReadable(first, static_cast<size_t>(n) * 16u))
         return 0ull;

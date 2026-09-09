@@ -322,6 +322,7 @@ namespace {
 
 DrawCallCache::DrawCallCache(DxvkDevice* device) : CommonDeviceObject(device) {
   m_entries.reserve(1024);
+  m_liveEntries.reserve(1024);
 }
 DrawCallCache::~DrawCallCache() {}
 
@@ -333,20 +334,41 @@ DrawCallCache::~DrawCallCache() {}
 void DrawCallCache::forEachEngineClassSibling(XXH64_hash_t engineClassKey,
                                               const std::function<void(BlasEntry&)>& fn) {
   auto range = m_engineClassIndex.equal_range(engineClassKey);
-  for (auto it = range.first; it != range.second; ++it) {
-    fn(*it->second);
+  for (auto it = range.first; it != range.second; ) {
+    auto current = it++;
+    BlasEntry* entry = current->second;
+    const bool dead = m_liveEntries.find(entry) == m_liveEntries.end();
+    // An erased node may have been recycled at the same address. Membership
+    // alone then succeeds, but its allocation-time class identifies it as a
+    // different object and prevents a cross-class SpatialMap lookup.
+    const bool recycled = !dead && entry->engineClassKey != engineClassKey;
+    if (dead || recycled) {
+      static uint32_t s_pruned = 0;
+      if (s_pruned < 8 || (s_pruned & 0x3FFu) == 0) {
+        Logger::warn(str::format(
+          "[EngineClassIndex] pruned stale entry #", s_pruned,
+          " ptr=0x", std::hex, reinterpret_cast<uintptr_t>(entry),
+          " requestedClass=0x", engineClassKey,
+          " recycled=", recycled ? 1 : 0, std::dec));
+      }
+      ++s_pruned;
+      m_engineClassIndex.erase(current);
+      continue;
+    }
+    fn(*entry);
   }
 }
 
 void DrawCallCache::removeFromEngineClassIndex(BlasEntry& entry) {
+  m_liveEntries.erase(&entry);
   if (entry.engineClassKey == 0) {
     return;
   }
   auto range = m_engineClassIndex.equal_range(entry.engineClassKey);
-  for (auto it = range.first; it != range.second; ++it) {
-    if (it->second == &entry) {
-      m_engineClassIndex.erase(it);
-      return;
+  for (auto it = range.first; it != range.second; ) {
+    auto current = it++;
+    if (current->second == &entry) {
+      m_engineClassIndex.erase(current);
     }
   }
 }
@@ -718,6 +740,7 @@ DrawCallCache::CacheState DrawCallCache::get(const DrawCallState& drawCall, Blas
 BlasEntry* DrawCallCache::allocateEntry(XXH64_hash_t hash, const DrawCallState& drawCall) {
   auto iter = m_entries.emplace(hash, drawCall);
   BlasEntry* result = &iter->second;
+  m_liveEntries.emplace(result);
   result->frameCreated = m_device->getCurrentFrameId();
 
   // NV-DXVK [MatBind identity]: register under engine identity so future

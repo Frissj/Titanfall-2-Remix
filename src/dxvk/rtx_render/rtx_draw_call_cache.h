@@ -24,6 +24,7 @@
 #include <vector>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 #include <functional>
 
 #include "../util/util_vector.h"
@@ -59,8 +60,9 @@ public:
   MultimapType& getEntries() {return m_entries;}
 
   void clear() {
-    m_entries.clear();
     m_engineClassIndex.clear();
+    m_liveEntries.clear();
+    m_entries.clear();
   }
 
   void rebuildSpatialMaps() {
@@ -98,6 +100,11 @@ private:
   // into m_entries (node-based, stable until erase); removal is wired into
   // the scene-manager GC via removeFromEngineClassIndex().
   std::unordered_multimap<XXH64_hash_t, BlasEntry*, XXH64_hash_passthrough> m_engineClassIndex;
+
+  // Membership guard for the raw secondary-index values above. GC can recycle
+  // a BlasEntry address immediately, so forEachEngineClassSibling also checks
+  // the entry's class key before dereferencing it as a sibling.
+  std::unordered_set<BlasEntry*> m_liveEntries;
 
   BlasEntry* allocateEntry(XXH64_hash_t hash, const DrawCallState& drawCall);
 };
