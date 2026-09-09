@@ -153,6 +153,7 @@ namespace dxvk {
     uint32_t m_psdtLevelCount = 0;
     uint32_t m_psdtIndex = 0;
     bool m_psdtHasHistory = false;
+    uint32_t m_psdtFeatureMask = 0;
 
     // Camera state, for the transition classifier in psdt_state. Kept here
     // rather than read from RtCamera's own history because the tonemapper runs
@@ -337,6 +338,14 @@ namespace dxvk {
                "Swapping this changes nothing else in the transform - the space is behind an abstraction on purpose, so it stays an experiment.");
 
     // --- adaptation ------------------------------------------------------
+    // Feature switches preserve the tuned strengths when comparing stages.
+    RTX_OPTION("rtx.tonemap.psdt", bool, globalAdaptationEnabled, true, "Enable histogram-driven global adaptation. Disable to anchor the curve at exposed middle grey (0.18).");
+    RTX_OPTION("rtx.tonemap.psdt", bool, localAdaptationEnabled, true, "Enable local adaptation. Disable to suppress both PSDT local adaptation and Auto Exposure Plus while PSDT is selected.");
+    RTX_OPTION("rtx.tonemap.psdt", bool, sourceExclusionEnabled, true, "Enable source exclusion from the global adaptation anchor, using the saved Source Exclusion strength.");
+    RTX_OPTION("rtx.tonemap.psdt", bool, edgeStoppingEnabled, true, "Enable depth, scale and pyramid coherence when pooling the adaptation field.");
+    RTX_OPTION("rtx.tonemap.psdt", bool, detailRestorationEnabled, true, "Enable local contrast restoration, using the saved Detail Strength.");
+    RTX_OPTION("rtx.tonemap.psdt", bool, colourVolumeEnabled, true, "Enable perceptual colour processing, including luminance concession, hue trajectory, spatial white, colourfulness and chroma compression. Disable for luminance-only RGB scaling followed by the display gamut fit.");
+    RTX_OPTION("rtx.tonemap.psdt", bool, glareEnabled, true, "Enable PSDT glare, using the saved Glare Strength. Independent of bloom.");
     RTX_OPTION("rtx.tonemap.psdt", bool, sceneAdaptive, true,
                "Lets the frame's measured statistics modulate the resolved curve, adaptation and pooling parameters (scene intent: night / indoor / outdoor / bright).\n"
                "Disable to hold every parameter at exactly what the settings below say, which is what you want while sweeping one of them - with this on, a parameter sweep is measuring the parameter and the scene classifier at once.");
@@ -388,7 +397,7 @@ namespace dxvk {
     RTX_OPTION("rtx.tonemap.psdt", float, adaptationSpeedDown, 1.2f,
                "How fast the adaptation anchor falls when the scene gets darker, in units per second. Slower than upward by design; it is also what makes an interior read as dark when you first step into it.");
     RTX_OPTION("rtx.tonemap.psdt", bool, temporalAccumulation, true,
-               "Accumulates the adaptation field across frames with motion-vector reprojection.\n"
+               "Accumulates the adaptation field with motion-vector reprojection and smooths the global adaptation state across frames.\n"
                "The field decides where the curve's anchor sits and the input is a denoised path-traced image whose residual noise is worst in exactly the dark regions that get the most adaptation. Disable only to see what the field is doing on its own.");
     RTX_OPTION("rtx.tonemap.psdt", float, fieldAdaptationSpeed, 8.0f,
                "Adaptation field accumulation speed, in units per second. Higher tracks the scene more closely and shimmers more.");

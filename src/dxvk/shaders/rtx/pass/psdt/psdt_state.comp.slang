@@ -216,7 +216,7 @@ void main(uint i : SV_GroupIndex)
 
   // Coarsest pyramid level, sampled at the frame centre: the whole frame
   // reduced to one texel of each field.
-  const uint levelCount = max((cb.flags >> PSDT_STATE_SHIFT_LEVELS) & 0xFu, 1u);
+  const uint levelCount = max((cb.flags >> PSDT_STATE_SHIFT_LEVELS) & 0x7u, 1u);
   const float coarse = float(levelCount) - 1.0;
   const float4 frame = InField.SampleLevel(float2(0.5, 0.5), coarse);
   const float4 frameSource = InSource.SampleLevel(float2(0.5, 0.5), coarse);
@@ -346,7 +346,8 @@ void main(uint i : SV_GroupIndex)
   const float previousCutFlag = InOutState[PSDT_STATE_CUT_FLAG];
   if (!hasHistory || isCut || previousCutFlag > 0.5) { alpha = 1.0; }
 
-  const float anchor = lerp(previousAnchor, anchorTarget, alpha);
+  const float anchor = (cb.flags & PSDT_STATE_FLAG_FIXED_ANCHOR) != 0
+    ? log2(0.18) : lerp(previousAnchor, anchorTarget, alpha);
   const float sceneWhite = lerp(previousWhite, sceneWhiteLog, alpha);
   const float sceneBlack = lerp(previousBlack, sceneBlackLog, alpha);
   const float velocity = (dt > 1e-4) ? ((anchor - previousAnchor) / dt) : 0.0;
@@ -505,6 +506,7 @@ void main(uint i : SV_GroupIndex)
   InOutState[PSDT_STATE_DETAIL_KNEE]     = max(cb.detailKnee, 0.05);
 
   // --- colour volume ----------------------------------------------------
+  InOutState[PSDT_STATE_BYPASS_COLOUR] = (cb.flags & PSDT_STATE_FLAG_BYPASS_COLOUR) != 0 ? 1.0 : 0.0;
   InOutState[PSDT_STATE_PRESSURE_LUMA]    = saturate(cb.pressureLuma);
   InOutState[PSDT_STATE_PRESSURE_CHROMA]  = psdtChromaReference(space, gamut);
   // Reported for diagnostics: where the soft knee actually sits for an

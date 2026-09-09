@@ -14,6 +14,7 @@ v0.1 shipped two such divergences (the shoulder clamp and the black-level
 epsilon) and nothing noticed, because nothing was looking.
 
     python3 tools/psdt/psdt_check.py
+    python3 tools/psdt/psdt_check.py --static-only  # Never invokes a compiler.
 
 Exits non-zero if anything is wrong.
 """
@@ -126,6 +127,10 @@ def check_state_flag_packing(psdt_h, cpp):
                 if int(mask, 16) != want:
                     bad.append(f'{label} masks {macro} with 0x{mask} not 0x{want:X}')
     check('packed field masks match their declared widths', not bad, '; '.join(bad))
+
+    max_levels = int(re.search(r'#define\s+PSDT_MAX_LEVELS\s+(\d+)', psdt_h).group(1))
+    check('pyramid level count fits beside the feature flags',
+          max_levels < (1 << fields['SHIFT_LEVELS'][1]))
 
     free = [b for b in range(32) if b not in owner]
     notes.append(f'flags word: {32 - len(free)} of 32 bits used, free: '
@@ -574,7 +579,8 @@ if __name__ == '__main__':
     check_push_constants(psdt_h, cpp)
     print(' shader / reference agreement')
     check_shared_constants()
-    check_probe_math()
+    if '--static-only' not in sys.argv:
+        check_probe_math()
     print(' operators and options')
     check_gt7_port()
     check_operators()

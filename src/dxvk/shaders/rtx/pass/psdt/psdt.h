@@ -353,6 +353,7 @@
 #define PSDT_STATE_PREV_TARGET_ANCHOR 71
 #define PSDT_STATE_PREV_TARGET_WHITE  72
 #define PSDT_STATE_PREV_TARGET_BLACK  73
+#define PSDT_STATE_BYPASS_COLOUR     75
 // 74 is PSDT_STATE_SCALE_COHERENCE, declared with the other resolved
 // adaptation parameters above rather than here.
 
@@ -418,10 +419,11 @@ static const uint psdtRoleSky    = 3;
 //   4..5    display gamut          2 bits
 //   6       perceptual space       1 bit
 //   7..10   debug view             4 bits
-//   11..14  pyramid levels         4 bits
+//   11..13  pyramid levels         3 bits (at most PSDT_MAX_LEVELS = 6)
+//   14      fixed middle-grey anchor
 //   15..22  glare near-field lobe  8 bits, fixed point over [0, 1]
 //   23..30  scale coherence        8 bits, fixed point over [0, kMax]
-//   31      spare
+//   31      bypass perceptual colour processing
 //
 // The two fixed-point fields are quantised because they can be: 1/255 of a
 // glare lobe's amplitude and 1/64 of a pooling sensitivity are both finer than
@@ -433,7 +435,9 @@ static const uint psdtRoleSky    = 3;
 #define PSDT_STATE_SHIFT_GAMUT         4   // 2 bits
 #define PSDT_STATE_SHIFT_SPACE         6   // 1 bit
 #define PSDT_STATE_SHIFT_DEBUG         7   // 4 bits
-#define PSDT_STATE_SHIFT_LEVELS        11  // 4 bits
+#define PSDT_STATE_SHIFT_LEVELS        11  // 3 bits
+#define PSDT_STATE_FLAG_FIXED_ANCHOR   (1u << 14)
+#define PSDT_STATE_FLAG_BYPASS_COLOUR  (1u << 31)
 #define PSDT_STATE_SHIFT_NEARFIELD     15  // 8 bits, fixed point over [0, 1]
 #define PSDT_STATE_SHIFT_COHERENCE     23  // 8 bits, fixed point over [0, 4]
 // Upper end of the scale-coherence fixed point range. Four is already well

@@ -590,195 +590,203 @@ float3 psdtApply(
   float displayY = exp2(outLog);
   displayY = clamp(displayY, exp2(curve.blackLog), peak);
 
-  // --- the two colour paths ---------------------------------------------
-  // Path B is the per-channel curve. Every channel goes through the same
-  // monotonic curve, so the result is inside the display volume by
-  // construction, and the dominant channel saturates first - which is what
-  // bends a red towards orange and then towards white and makes this the
-  // source of the hue trajectory.
-  //
-  // Deliberately not renormalised to the tone stage's luminance. For a
-  // saturated colour it lands *below* that target, and that is the whole point:
-  // a saturated red cannot be as bright as a white, so something has to give,
-  // and there are only two candidates. Bleach it to keep the brightness, or let
-  // it be darker to keep the colour. Film lets it be darker, and so does this.
-  const float3 pathFilm = float3(
-    psdtCurveLinear(curve, rgb.r),
-    psdtCurveLinear(curve, rgb.g),
-    psdtCurveLinear(curve, rgb.b));
-  const float filmY = max(psdtLuminance(pathFilm), 1e-8);
-
-  // How much trouble the tone stage's target is actually in: 0 while the colour
-  // still fits at that luminance, approaching 1 the further outside it lands.
-  const float3 strictRgb = rgb * (displayY / sceneY);
-  const float demandStrict = psdtGamutDemand(psdtToDisplayGamut(strictRgb, gamut), peak, gamut);
-  const float trouble = saturate(1.0 - 1.0 / max(demandStrict, 1e-4));
-
-  // Concede luminance towards what this hue can actually support.
-  //
-  // The gap is the whole gate: how far the per-channel path falls short of the
-  // tone target, which is zero for a neutral by construction and grows only
-  // where the curve is concave, so the midtones are untouched and the shoulder
-  // is where it acts. That is the population the concession is for.
-  //
-  // The weight is constant, deliberately. v0.1 scaled it by `trouble` as well,
-  // which made targetY a lerp between two rising functions with a rising
-  // weight - and that is not monotone: the weight can grow faster than the
-  // film path rises, so the conceded target *falls* while both of its
-  // endpoints climb. Measured in psdt_sweep at highlightRolloff 0.90, where
-  // the short sharp shoulder ramps `trouble` fast enough for it to bite: 18
-  // luminance inversions on the sweep grid. With a constant weight the result
-  // is a convex combination of two monotone functions and cannot invert
-  // anywhere, which is the same argument that fixed the local contrast stage.
-  //
-  // `trouble` is still the right driver for the hue trajectory below - a
-  // rotation has no monotonicity requirement to break - and is left there.
-  const float concession = saturate(state[PSDT_STATE_LUMA_CONCESSION]);
-  const float concessionGap = saturate(1.0 - filmY / max(displayY, 1e-8));
-  const float targetY = displayY * (1.0 - concession * concessionGap);
-
-  // Path A preserves chromaticity exactly by scaling RGB to the conceded
-  // target. Colour identity intact; what is left of the excess is the colour
-  // stage's problem.
-  const float3 pathPreserve = rgb * (targetY / sceneY);
-
-  // --- chromatic adaptation to the local illuminant ---------------------
-  // What the spatial white point has to be in order to mean anything.
-  //
-  // v0.1 offset the chroma coordinates by the local mean colour and called
-  // that a white point. It is a translation of a colour space, not an
-  // adaptation of an observer, and it has a specific failure: a surface that
-  // is neutral under the local illuminant does not land on the perceptual
-  // neutral axis, so compressing its chroma towards zero does not take it
-  // towards the local white, and the guarantee that a neutral always fits
-  // inside the display volume stops holding.
-  //
-  // A von Kries transform in CAT02 cone space does mean it. Both perceptual
-  // spaces are defined against D65, so adapting the pixel from the local
-  // illuminant onto D65 before encoding makes "chroma == 0" mean exactly "this
-  // pixel is the local white", and undoing the adaptation afterwards puts the
-  // result back on the display. A tungsten interior then stays warm as it
-  // desaturates rather than drifting towards daylight, which is what the
-  // spatial white point was for, and it does so without giving up the
-  // in-gamut guarantee.
-  //
-  // The illuminant itself is measured, not averaged: psdt_analysis divides
-  // radiance by albedo over surfaces where that division means something, so a
-  // room of coloured walls under a neutral light reports a neutral illuminant.
-  const float illumStrength = state[PSDT_STATE_ILLUM_STRENGTH];
-  const bool adaptWhite = illumStrength > 1e-3;
-  const float3 adaptWhiteRgb = lerp(float3(1.0, 1.0, 1.0), adapt.illuminant, illumStrength);
-  const float3 adaptGain = adaptWhite ? psdtAdaptationGain(adaptWhiteRgb) : float3(1.0, 1.0, 1.0);
-
-  const float3 workPreserve = adaptWhite ? psdtAdaptToD65(pathPreserve, adaptGain) : pathPreserve;
-  const float3 workFilm     = adaptWhite ? psdtAdaptToD65(pathFilm, adaptGain) : pathFilm;
-
-  // --- colour volume ----------------------------------------------------
-  const float3 iabPreserve = psdtToPerceptual(max(workPreserve, 0.0), space, refWhite);
-  const float3 iabFilm = psdtToPerceptual(max(workFilm, 0.0), space, refWhite);
-
-  const float chromaIn = psdtChroma(iabPreserve);
-  const float hueIn = psdtHue(iabPreserve);
-  const float hueFilm = psdtHue(iabFilm);
-
-  // Chroma normalised against the most chroma this display can produce at all.
-  // The perceptual "how saturated is this" term; the geometric "does it fit"
-  // term is the demand below, and the two are deliberately separate.
-  const float chromaNorm = saturate(chromaIn / max(state[PSDT_STATE_PRESSURE_CHROMA], 1e-3));
-
-  // Hue trajectory: a controlled rotation towards the film path's hue, driven
-  // by how far outside the volume the strict target landed.
-  //
-  // Driven by `trouble` rather than by the compression amount on purpose. The
-  // rotation changes the hue, a different amount of chroma fits at a different
-  // hue, and how much fits is exactly what we would otherwise want to drive the
-  // rotation with - a circular dependency. `trouble` is measured before any of
-  // it and answers the same question.
-  //
-  // Taking the shortest arc is what keeps the path smooth across the red /
-  // magenta wrap instead of producing a jump there.
-  const float convergence = pow(trouble, max(state[PSDT_STATE_WHITE_CONVERGE], 1e-3));
-  float dHue = hueFilm - hueIn;
-  dHue -= 6.283185307 * floor(dHue / 6.283185307 + 0.5);
-  const float hueOut = hueIn + dHue * state[PSDT_STATE_HUE_TRAJECTORY] * convergence;
-
-  // The rotated colour, before compression. Measuring the demand here rather
-  // than before the rotation matters: the rotation moves the colour to a hue
-  // where a different amount of chroma fits, so a factor computed beforehand
-  // leaves the result overshooting the boundary and the gamut fit at the end
-  // takes the difference out as a hard clip. Measured cost of getting the order
-  // wrong: about 9% of the available chroma at full hue trajectory.
-  //
-  // The demand is measured on the *display* colour, so the adaptation has to be
-  // undone first: the display volume is a property of the panel, and asking
-  // whether a colour fits it in an adapted space would be asking the wrong
-  // question about the wrong cube.
-  float3 rotated = max(psdtFromPerceptual(
-    psdtFromPolar(iabPreserve.x, chromaIn, hueOut), space, refWhite), 0.0);
-  float3 rotatedDisplay = adaptWhite ? psdtAdaptFromD65(rotated, adaptGain) : rotated;
-  rotatedDisplay = max(rotatedDisplay, 0.0);
-  rotatedDisplay *= targetY / max(psdtLuminance(rotatedDisplay), 1e-8);
-
-  const float demand = psdtGamutDemand(psdtToDisplayGamut(rotatedDisplay, gamut), peak, gamut);
-
-  // Bright AND saturated is what earns an early, gentle approach to the
-  // boundary. Bright alone does not, and saturated alone does not.
-  //
-  // The context term is the fourth factor, and the one v0.1's blend function
-  // was missing. A colour that is a bright outlier against a much darker
-  // neighbourhood - a lamp seen against a wall, a muzzle flash in a corridor -
-  // is a place where the eye is not looking for colour fidelity and where a
-  // hard boundary clip is very visible, so it earns an earlier and gentler
-  // approach. A colour sitting in a large field of its own brightness is the
-  // opposite case: a hue shift there is obvious and there is no clipping
-  // artifact to trade against, so it keeps its colour longer.
-  const float context = saturate((sceneLog - baseLog) / 4.0);
-  const float earlyOnset = state[PSDT_STATE_PRESSURE_LUMA]
-                         * (1.0 + state[PSDT_STATE_PRESSURE_CONTEXT] * context);
-  const float urgency = highlightProgress * chromaNorm;
-  const float knee = psdtCompressionKnee(state[PSDT_STATE_CHROMA_PRESERVE], urgency, earlyOnset);
-
-  const float compress = psdtCompressToBoundary(demand, knee);
-
-  // Colour-volume pressure, defined as how much chroma actually had to be given
-  // up. Deriving it from the compression rather than predicting it separately
-  // keeps every consumer in step with what the chroma stage really did.
-  const float pressure = saturate(1.0 - compress);
-
-  // Colourfulness follows local adaptation: a region the viewer is
-  // dark-adapted to is shown at less absolute display luminance than the
-  // scene had, and needs proportionally more chroma to look equally
-  // colourful. This is the coupling between the tone stage and the colour
-  // stage that treating them as independent throws away.
-  const float adaptOffset = adapt.anchorLog - adapt.adaptedLog;
-  const float colourfulness = 1.0 + clamp(adaptOffset * state[PSDT_STATE_COLOURFULNESS] * 0.1, -0.35, 0.35);
-
-  // Compression is towards the adapted neutral axis, which *is* the local
-  // white - no offset term is needed or wanted, because the adaptation already
-  // moved the origin to the right place.
-  const float compressedChroma = chromaIn * compress * colourfulness;
-
-  float3 outRgb = psdtFromPerceptual(
-    psdtFromPolar(iabPreserve.x, compressedChroma, hueOut), space, refWhite);
-  if (adaptWhite)
+  // The basic path maps luminance and scales RGB without a perceptual round trip.
+  float3 outRgb = rgb * (displayY / sceneY);
+  float3 preClamp = outRgb;
+  float demand = psdtGamutDemand(psdtToDisplayGamut(outRgb, gamut), peak, gamut);
+  float pressure = 0.0;
+  if (state[PSDT_STATE_BYPASS_COLOUR] < 0.5)
   {
-    outRgb = psdtAdaptFromD65(outRgb, adaptGain);
+    // --- the two colour paths ---------------------------------------------
+    // Path B is the per-channel curve. Every channel goes through the same
+    // monotonic curve, so the result is inside the display volume by
+    // construction, and the dominant channel saturates first - which is what
+    // bends a red towards orange and then towards white and makes this the
+    // source of the hue trajectory.
+    //
+    // Deliberately not renormalised to the tone stage's luminance. For a
+    // saturated colour it lands *below* that target, and that is the whole point:
+    // a saturated red cannot be as bright as a white, so something has to give,
+    // and there are only two candidates. Bleach it to keep the brightness, or let
+    // it be darker to keep the colour. Film lets it be darker, and so does this.
+    const float3 pathFilm = float3(
+      psdtCurveLinear(curve, rgb.r),
+      psdtCurveLinear(curve, rgb.g),
+      psdtCurveLinear(curve, rgb.b));
+    const float filmY = max(psdtLuminance(pathFilm), 1e-8);
+
+    // How much trouble the tone stage's target is actually in: 0 while the colour
+    // still fits at that luminance, approaching 1 the further outside it lands.
+    const float3 strictRgb = rgb * (displayY / sceneY);
+    const float demandStrict = psdtGamutDemand(psdtToDisplayGamut(strictRgb, gamut), peak, gamut);
+    const float trouble = saturate(1.0 - 1.0 / max(demandStrict, 1e-4));
+
+    // Concede luminance towards what this hue can actually support.
+    //
+    // The gap is the whole gate: how far the per-channel path falls short of the
+    // tone target, which is zero for a neutral by construction and grows only
+    // where the curve is concave, so the midtones are untouched and the shoulder
+    // is where it acts. That is the population the concession is for.
+    //
+    // The weight is constant, deliberately. v0.1 scaled it by `trouble` as well,
+    // which made targetY a lerp between two rising functions with a rising
+    // weight - and that is not monotone: the weight can grow faster than the
+    // film path rises, so the conceded target *falls* while both of its
+    // endpoints climb. Measured in psdt_sweep at highlightRolloff 0.90, where
+    // the short sharp shoulder ramps `trouble` fast enough for it to bite: 18
+    // luminance inversions on the sweep grid. With a constant weight the result
+    // is a convex combination of two monotone functions and cannot invert
+    // anywhere, which is the same argument that fixed the local contrast stage.
+    //
+    // `trouble` is still the right driver for the hue trajectory below - a
+    // rotation has no monotonicity requirement to break - and is left there.
+    const float concession = saturate(state[PSDT_STATE_LUMA_CONCESSION]);
+    const float concessionGap = saturate(1.0 - filmY / max(displayY, 1e-8));
+    const float targetY = displayY * (1.0 - concession * concessionGap);
+
+    // Path A preserves chromaticity exactly by scaling RGB to the conceded
+    // target. Colour identity intact; what is left of the excess is the colour
+    // stage's problem.
+    const float3 pathPreserve = rgb * (targetY / sceneY);
+
+    // --- chromatic adaptation to the local illuminant ---------------------
+    // What the spatial white point has to be in order to mean anything.
+    //
+    // v0.1 offset the chroma coordinates by the local mean colour and called
+    // that a white point. It is a translation of a colour space, not an
+    // adaptation of an observer, and it has a specific failure: a surface that
+    // is neutral under the local illuminant does not land on the perceptual
+    // neutral axis, so compressing its chroma towards zero does not take it
+    // towards the local white, and the guarantee that a neutral always fits
+    // inside the display volume stops holding.
+    //
+    // A von Kries transform in CAT02 cone space does mean it. Both perceptual
+    // spaces are defined against D65, so adapting the pixel from the local
+    // illuminant onto D65 before encoding makes "chroma == 0" mean exactly "this
+    // pixel is the local white", and undoing the adaptation afterwards puts the
+    // result back on the display. A tungsten interior then stays warm as it
+    // desaturates rather than drifting towards daylight, which is what the
+    // spatial white point was for, and it does so without giving up the
+    // in-gamut guarantee.
+    //
+    // The illuminant itself is measured, not averaged: psdt_analysis divides
+    // radiance by albedo over surfaces where that division means something, so a
+    // room of coloured walls under a neutral light reports a neutral illuminant.
+    const float illumStrength = state[PSDT_STATE_ILLUM_STRENGTH];
+    const bool adaptWhite = illumStrength > 1e-3;
+    const float3 adaptWhiteRgb = lerp(float3(1.0, 1.0, 1.0), adapt.illuminant, illumStrength);
+    const float3 adaptGain = adaptWhite ? psdtAdaptationGain(adaptWhiteRgb) : float3(1.0, 1.0, 1.0);
+
+    const float3 workPreserve = adaptWhite ? psdtAdaptToD65(pathPreserve, adaptGain) : pathPreserve;
+    const float3 workFilm     = adaptWhite ? psdtAdaptToD65(pathFilm, adaptGain) : pathFilm;
+
+    // --- colour volume ----------------------------------------------------
+    const float3 iabPreserve = psdtToPerceptual(max(workPreserve, 0.0), space, refWhite);
+    const float3 iabFilm = psdtToPerceptual(max(workFilm, 0.0), space, refWhite);
+
+    const float chromaIn = psdtChroma(iabPreserve);
+    const float hueIn = psdtHue(iabPreserve);
+    const float hueFilm = psdtHue(iabFilm);
+
+    // Chroma normalised against the most chroma this display can produce at all.
+    // The perceptual "how saturated is this" term; the geometric "does it fit"
+    // term is the demand below, and the two are deliberately separate.
+    const float chromaNorm = saturate(chromaIn / max(state[PSDT_STATE_PRESSURE_CHROMA], 1e-3));
+
+    // Hue trajectory: a controlled rotation towards the film path's hue, driven
+    // by how far outside the volume the strict target landed.
+    //
+    // Driven by `trouble` rather than by the compression amount on purpose. The
+    // rotation changes the hue, a different amount of chroma fits at a different
+    // hue, and how much fits is exactly what we would otherwise want to drive the
+    // rotation with - a circular dependency. `trouble` is measured before any of
+    // it and answers the same question.
+    //
+    // Taking the shortest arc is what keeps the path smooth across the red /
+    // magenta wrap instead of producing a jump there.
+    const float convergence = pow(trouble, max(state[PSDT_STATE_WHITE_CONVERGE], 1e-3));
+    float dHue = hueFilm - hueIn;
+    dHue -= 6.283185307 * floor(dHue / 6.283185307 + 0.5);
+    const float hueOut = hueIn + dHue * state[PSDT_STATE_HUE_TRAJECTORY] * convergence;
+
+    // The rotated colour, before compression. Measuring the demand here rather
+    // than before the rotation matters: the rotation moves the colour to a hue
+    // where a different amount of chroma fits, so a factor computed beforehand
+    // leaves the result overshooting the boundary and the gamut fit at the end
+    // takes the difference out as a hard clip. Measured cost of getting the order
+    // wrong: about 9% of the available chroma at full hue trajectory.
+    //
+    // The demand is measured on the *display* colour, so the adaptation has to be
+    // undone first: the display volume is a property of the panel, and asking
+    // whether a colour fits it in an adapted space would be asking the wrong
+    // question about the wrong cube.
+    float3 rotated = max(psdtFromPerceptual(
+      psdtFromPolar(iabPreserve.x, chromaIn, hueOut), space, refWhite), 0.0);
+    float3 rotatedDisplay = adaptWhite ? psdtAdaptFromD65(rotated, adaptGain) : rotated;
+    rotatedDisplay = max(rotatedDisplay, 0.0);
+    rotatedDisplay *= targetY / max(psdtLuminance(rotatedDisplay), 1e-8);
+
+    demand = psdtGamutDemand(psdtToDisplayGamut(rotatedDisplay, gamut), peak, gamut);
+
+    // Bright AND saturated is what earns an early, gentle approach to the
+    // boundary. Bright alone does not, and saturated alone does not.
+    //
+    // The context term is the fourth factor, and the one v0.1's blend function
+    // was missing. A colour that is a bright outlier against a much darker
+    // neighbourhood - a lamp seen against a wall, a muzzle flash in a corridor -
+    // is a place where the eye is not looking for colour fidelity and where a
+    // hard boundary clip is very visible, so it earns an earlier and gentler
+    // approach. A colour sitting in a large field of its own brightness is the
+    // opposite case: a hue shift there is obvious and there is no clipping
+    // artifact to trade against, so it keeps its colour longer.
+    const float context = saturate((sceneLog - baseLog) / 4.0);
+    const float earlyOnset = state[PSDT_STATE_PRESSURE_LUMA]
+                           * (1.0 + state[PSDT_STATE_PRESSURE_CONTEXT] * context);
+    const float urgency = highlightProgress * chromaNorm;
+    const float knee = psdtCompressionKnee(state[PSDT_STATE_CHROMA_PRESERVE], urgency, earlyOnset);
+
+    const float compress = psdtCompressToBoundary(demand, knee);
+
+    // Colour-volume pressure, defined as how much chroma actually had to be given
+    // up. Deriving it from the compression rather than predicting it separately
+    // keeps every consumer in step with what the chroma stage really did.
+    pressure = saturate(1.0 - compress);
+
+    // Colourfulness follows local adaptation: a region the viewer is
+    // dark-adapted to is shown at less absolute display luminance than the
+    // scene had, and needs proportionally more chroma to look equally
+    // colourful. This is the coupling between the tone stage and the colour
+    // stage that treating them as independent throws away.
+    const float adaptOffset = adapt.anchorLog - adapt.adaptedLog;
+    const float colourfulness = 1.0 + clamp(adaptOffset * state[PSDT_STATE_COLOURFULNESS] * 0.1, -0.35, 0.35);
+
+    // Compression is towards the adapted neutral axis, which *is* the local
+    // white - no offset term is needed or wanted, because the adaptation already
+    // moved the origin to the right place.
+    const float compressedChroma = chromaIn * compress * colourfulness;
+
+    outRgb = psdtFromPerceptual(
+      psdtFromPolar(iabPreserve.x, compressedChroma, hueOut), space, refWhite);
+    if (adaptWhite)
+    {
+      outRgb = psdtAdaptFromD65(outRgb, adaptGain);
+    }
+
+    // Snapshot for the clipping diagnostic, taken here because here is the last
+    // point at which the signal still carries its own overshoot *and* its
+    // undershoot. One line further on the max() destroys the negative half, and
+    // the negative half is the interesting half: it is where a colour coming
+    // back from the perceptual round trip announces that it does not exist on
+    // this display. v0.1's version was sampled after the clamp and could only
+    // ever report overflow, which is the half the gamut fit was already handling.
+    preClamp = outRgb;
+
+    // The perceptual round trip is not luminance-exact once chroma has moved,
+    // so restore the luminance the tone stage decided on. Chroma is what the
+    // colour stage is allowed to change; brightness is not.
+    outRgb = max(outRgb, 0.0);
+    outRgb *= targetY / max(psdtLuminance(outRgb), 1e-8);
   }
-
-  // Snapshot for the clipping diagnostic, taken here because here is the last
-  // point at which the signal still carries its own overshoot *and* its
-  // undershoot. One line further on the max() destroys the negative half, and
-  // the negative half is the interesting half: it is where a colour coming
-  // back from the perceptual round trip announces that it does not exist on
-  // this display. v0.1's version was sampled after the clamp and could only
-  // ever report overflow, which is the half the gamut fit was already handling.
-  const float3 preClamp = outRgb;
-
-  // The perceptual round trip is not luminance-exact once chroma has moved,
-  // so restore the luminance the tone stage decided on. Chroma is what the
-  // colour stage is allowed to change; brightness is not.
-  outRgb = max(outRgb, 0.0);
-  outRgb *= targetY / max(psdtLuminance(outRgb), 1e-8);
 
   // --- display gamut ----------------------------------------------------
   // Everything above works in the perceptual domain and can still land

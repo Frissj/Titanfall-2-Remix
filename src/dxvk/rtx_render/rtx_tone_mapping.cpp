@@ -256,11 +256,41 @@ namespace dxvk {
       ImGui::Unindent();
     }
 
-    // NV-DXVK [PSDT]: drawn here rather than in showImguiSettings for the same
-    // reason the operator dropdown is - showImguiSettings is only reached from
-    // the Global branch, and selecting an operator overrides Tonemapping Mode
-    // without changing it, so the settings for the selected operator have to
-    // stay reachable while the stored mode still says Local.
+    // Keep feature switches visible directly in Tonemapping options, even
+    // when another operator is selected. The baseline button activates PSDT.
+    ImGui::Separator();
+    ImGui::TextUnformatted("Tonemapper Features (PSDT)");
+    if (ImGui::Button("Back to Basics")) {
+      tonemapOperatorObject().setDeferred(TonemapOperator::PerceptualTF2);
+      tonemappingEnabledObject().setDeferred(true);
+      globalAdaptationEnabledObject().setDeferred(false);
+      localAdaptationEnabledObject().setDeferred(false);
+      sourceExclusionEnabledObject().setDeferred(false);
+      edgeStoppingEnabledObject().setDeferred(false);
+      detailRestorationEnabledObject().setDeferred(false);
+      colourVolumeEnabledObject().setDeferred(false);
+      glareEnabledObject().setDeferred(false);
+      rendererSignalsObject().setDeferred(false);
+      sceneAdaptiveObject().setDeferred(false);
+      temporalAccumulationObject().setDeferred(false);
+      debugViewObject().setDeferred(PsdtDebugView::Off);
+    }
+    ImGui::TextWrapped("Back to Basics selects PSDT and keeps its luminance curve and display gamut fit. Enable features one at a time below; tuning values are preserved. Auto exposure, bloom and colour grading have separate controls.");
+    if (tonemapOperator() != TonemapOperator::PerceptualTF2) {
+      ImGui::TextWrapped("These switches apply to PerceptualTF2 (PSDT). Select it above or click Back to Basics to activate it.");
+    }
+    RemixGui::Checkbox("Global Adaptation", &globalAdaptationEnabledObject());
+    RemixGui::Checkbox("Local Adaptation Enabled", &localAdaptationEnabledObject());
+    RemixGui::Checkbox("Source Exclusion Enabled", &sourceExclusionEnabledObject());
+    RemixGui::Checkbox("Edge Stopping", &edgeStoppingEnabledObject());
+    RemixGui::Checkbox("Detail Restoration", &detailRestorationEnabledObject());
+    RemixGui::Checkbox("Colour Volume Enabled", &colourVolumeEnabledObject());
+    RemixGui::Checkbox("Glare Enabled", &glareEnabledObject());
+    RemixGui::Checkbox("Renderer Signals", &rendererSignalsObject());
+    RemixGui::Checkbox("Scene Adaptive", &sceneAdaptiveObject());
+    RemixGui::Checkbox("Temporal Accumulation", &temporalAccumulationObject());
+    ImGui::Separator();
+
     if (tonemapOperator() != TonemapOperator::PerceptualTF2) {
       return;
     }
@@ -292,7 +322,6 @@ namespace dxvk {
           "reads the answer from the gbuffer instead: the per-pixel emissive bit, linear view depth, "
           "and the albedo that lets reflectance be divided out of radiance to leave the colour of "
           "the light. Turn it off to see how much of the image the guess was getting wrong.");
-        RemixGui::Checkbox("Renderer Signals", &rendererSignalsObject());
         RemixGui::DragFloat("Source Threshold (stops)", &sourceThresholdObject(), 0.05f, 0.f, 16.f);
         RemixGui::DragFloat("Glare Class Threshold (stops)", &glareClassThresholdObject(), 0.05f, 0.f, 24.f);
         RemixGui::DragFloat("Sky View Depth", &skyViewZObject(), 1000.f, 1000.f, 400000.f);
@@ -309,7 +338,6 @@ namespace dxvk {
           "Depth Sensitivity stops the pooling averaging a wall together with the sky behind it, and "
           "Scale Coherence stops it averaging a wall together with the shadow across the middle of "
           "one - same surface, same distance, two lighting conditions.");
-        RemixGui::Checkbox("Scene Adaptive", &sceneAdaptiveObject());
         RemixGui::DragFloat("Source Exclusion", &sourceExclusionObject(), 0.01f, 0.f, 1.f);
         RemixGui::DragFloat("Local Adaptation", &localAdaptationObject(), 0.01f, 0.f, 1.f);
         RemixGui::DragFloat("Contrast Budget", &contrastBudgetObject(), 0.01f, 0.f, 4.f);
@@ -319,7 +347,6 @@ namespace dxvk {
         RemixGui::Separator();
         RemixGui::DragFloat("Adaptation Speed Up", &adaptationSpeedUpObject(), 0.05f, 0.05f, 30.f);
         RemixGui::DragFloat("Adaptation Speed Down", &adaptationSpeedDownObject(), 0.05f, 0.05f, 30.f);
-        RemixGui::Checkbox("Temporal Accumulation", &temporalAccumulationObject());
         RemixGui::DragFloat("Field Adaptation Speed", &fieldAdaptationSpeedObject(), 0.1f, 0.1f, 60.f);
         RemixGui::Separator();
         RemixGui::Combo("Local Adaptation Owner", &localAdaptationOwnerObject(),
@@ -466,7 +493,7 @@ namespace dxvk {
   }
 
   bool DxvkToneMapping::psdtOwnsLocalAdaptation() {
-    // Deliberately a pure function of two options and nothing else. It is
+    // Deliberately a pure function of options and nothing else. It is
     // called from DxvkAutoExposurePlus::isEnabled(), which runs at frame begin
     // before any tonemapper state exists for the frame, and an answer that
     // depended on per-frame state would make the two passes' activation order
@@ -477,7 +504,7 @@ namespace dxvk {
     // without one.
     return tonemapOperator() == TonemapOperator::PerceptualTF2
         && tonemappingEnabled()
-        && localAdaptationOwner() == LocalAdaptationOwner::Psdt;
+        && (!localAdaptationEnabled() || localAdaptationOwner() == LocalAdaptationOwner::Psdt);
   }
 
   VkExtent3D DxvkToneMapping::calcPsdtFieldExtent(const VkExtent3D& targetExtent) {
@@ -682,10 +709,23 @@ namespace dxvk {
     const VkExtent3D targetExtent = colorBuffer.view->imageInfo().extent;
     const float deltaSeconds = 0.001f * frameTimeMilliseconds;
 
-    if (m_resetState) {
+    // Feature comparisons must not blend in analysis from the previous setup.
+    const uint32_t featureMask = uint32_t(globalAdaptationEnabled())
+      | (uint32_t(localAdaptationEnabled()) << 1)
+      | (uint32_t(sourceExclusionEnabled()) << 2)
+      | (uint32_t(edgeStoppingEnabled()) << 3)
+      | (uint32_t(detailRestorationEnabled()) << 4)
+      | (uint32_t(colourVolumeEnabled()) << 5)
+      | (uint32_t(glareEnabled()) << 6)
+      | (uint32_t(rendererSignals()) << 7)
+      | (uint32_t(sceneAdaptive()) << 8)
+      | (uint32_t(temporalAccumulation()) << 9)
+      | (static_cast<uint32_t>(localAdaptationOwner()) << 10);
+    if (m_resetState || featureMask != m_psdtFeatureMask) {
       m_psdtHasHistory = false;
       m_psdtHasCameraHistory = false;
     }
+    m_psdtFeatureMask = featureMask;
 
     // Reprojection needs valid motion vectors; without them fall back to the
     // stateless field rather than reprojecting with garbage.
@@ -772,6 +812,10 @@ namespace dxvk {
       }
     }
 
+    if (!localAdaptationEnabled()) {
+      localScale = 0.0f;
+    }
+
     // --- scene analysis: full-res HDR + gbuffer -> field mip 0 ------------
     {
       ScopedGpuProfileZone(ctx, "PSDT: Scene Analysis");
@@ -854,7 +898,7 @@ namespace dxvk {
         PsdtDownsampleArgs pushArgs = {};
         pushArgs.srcExtent = uvec2 { srcExtent.width, srcExtent.height };
         pushArgs.dstExtent = uvec2 { dstExtent.width, dstExtent.height };
-        pushArgs.coherenceSigma = std::max(pyramidCoherence(), 0.0f);
+        pushArgs.coherenceSigma = edgeStoppingEnabled() ? std::max(pyramidCoherence(), 0.0f) : 0.0f;
         ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
 
         ctx->bindResourceView(PSDT_DOWNSAMPLE_FIELD_INPUT, m_psdtField[writeIndex].views[level], nullptr);
@@ -882,21 +926,23 @@ namespace dxvk {
       // Everything that is not a float lives in the flags word: PsdtStateArgs
       // is exactly at the 128-byte push constant limit, so an enum that costs
       // a whole dword costs a parameter somewhere else. The layout is written
-      // out in psdt.h and there is one bit left in it.
+      // out in psdt.h.
       const uint32_t nearFieldFixed = static_cast<uint32_t>(
         std::clamp(glareNearField(), 0.0f, 1.0f) * 255.0f + 0.5f);
       const uint32_t coherenceFixed = static_cast<uint32_t>(
-        std::clamp(scaleCoherence(), 0.0f, PSDT_COHERENCE_MAX)
+        std::clamp(edgeStoppingEnabled() ? scaleCoherence() : 0.0f, 0.0f, PSDT_COHERENCE_MAX)
         * (255.0f / PSDT_COHERENCE_MAX) + 0.5f);
       pushArgs.flags =
-          (m_psdtHasHistory ? PSDT_STATE_FLAG_HAS_HISTORY : 0u)
+          (m_psdtHasHistory && temporalAccumulation() ? PSDT_STATE_FLAG_HAS_HISTORY : 0u)
+        | (!globalAdaptationEnabled() ? PSDT_STATE_FLAG_FIXED_ANCHOR : 0u)
+        | (!colourVolumeEnabled() ? PSDT_STATE_FLAG_BYPASS_COLOUR : 0u)
         | (sceneAdaptive() ? PSDT_STATE_FLAG_SCENE_ADAPTIVE : 0u)
         | (cameraCut ? PSDT_STATE_FLAG_CAMERA_CUT : 0u)
         | (cameraValid ? PSDT_STATE_FLAG_CAMERA_VALID : 0u)
         | (static_cast<uint32_t>(displayGamut()) << PSDT_STATE_SHIFT_GAMUT)
         | (static_cast<uint32_t>(perceptualSpace()) << PSDT_STATE_SHIFT_SPACE)
         | ((static_cast<uint32_t>(debugView()) & 0xFu) << PSDT_STATE_SHIFT_DEBUG)
-        | ((m_psdtLevelCount & 0xFu) << PSDT_STATE_SHIFT_LEVELS)
+        | ((m_psdtLevelCount & 0x7u) << PSDT_STATE_SHIFT_LEVELS)
         | ((nearFieldFixed & 0xFFu) << PSDT_STATE_SHIFT_NEARFIELD)
         | ((coherenceFixed & 0xFFu) << PSDT_STATE_SHIFT_COHERENCE);
 
@@ -905,10 +951,10 @@ namespace dxvk {
       pushArgs.displayRefWhiteNits = displayRefWhiteNits();
       pushArgs.surroundNits = surroundNits();
 
-      pushArgs.sourceExclusion = sourceExclusion();
+      pushArgs.sourceExclusion = sourceExclusionEnabled() ? sourceExclusion() : 0.0f;
       pushArgs.localStrength = localAdaptation() * localScale;
       pushArgs.contrastBudget = contrastBudget() * localScale;
-      pushArgs.depthSensitivity = useRendererSignals ? depthSensitivity() : 0.0f;
+      pushArgs.depthSensitivity = useRendererSignals && edgeStoppingEnabled() ? depthSensitivity() : 0.0f;
 
       pushArgs.adaptationSpeedUp = adaptationSpeedUp();
       pushArgs.adaptationSpeedDown = adaptationSpeedDown();
@@ -917,7 +963,7 @@ namespace dxvk {
       pushArgs.midtoneContrast = midtoneContrast();
       pushArgs.shadowDepth = shadowDepth();
       pushArgs.highlightRolloff = highlightRolloff();
-      pushArgs.detailStrength = detailStrength();
+      pushArgs.detailStrength = detailRestorationEnabled() ? detailStrength() : 0.0f;
       pushArgs.detailProtect = detailProtect();
       pushArgs.detailKnee = detailKnee();
 
@@ -930,7 +976,7 @@ namespace dxvk {
       pushArgs.colourfulness = colourfulness();
       pushArgs.luminanceConcession = luminanceConcession();
 
-      pushArgs.glareStrength = glareStrength();
+      pushArgs.glareStrength = glareEnabled() ? glareStrength() : 0.0f;
       pushArgs.glareThresholdStops = glareThreshold();
       pushArgs.glareFalloff = glareFalloff();
       ctx->pushConstants(0, sizeof(pushArgs), &pushArgs);
