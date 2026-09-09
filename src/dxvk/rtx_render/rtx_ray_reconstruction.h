@@ -32,9 +32,11 @@ namespace dxvk {
       RayReconstructionUpscaling,
     };
 
-    enum class RayReconstructionModel : uint32_t {
-      CNN = 0,
-      Transformer,
+    enum class RayReconstructionPreset : uint32_t {
+      Default = 0,
+      D = 4,
+      E = 5,
+      F = 6,
     };
 
     explicit DxvkRayReconstruction(DxvkDevice* device);
@@ -82,15 +84,15 @@ namespace dxvk {
     RTX_OPTION("rtx.rayreconstruction", bool, enableDLSSRRSurfaceReplacement, true, "Use DLSS-RR surface replacement. Translucent surfaces with significant refraction are excluded from surface replacement and its surface motion vector will be used.\n");
     RTX_OPTION("rtx.rayreconstruction", bool, preprocessSecondarySignal, true, "Denoise secondary signal before passing to DLSS-RR. This option improves reflection on translucent objects.\n");
     RTX_OPTION("rtx.rayreconstruction", bool, compositeVolumetricLight, true, "Composite volumetric light and then input the result to DLSS-RR, otherwise volumetric light is in a separate layer. Disabling it may introduce flickering artifacts.\n");
-    RTX_OPTION_ARGS("rtx.rayreconstruction", RayReconstructionModel, model, RayReconstructionModel::Transformer, "Ray reconstruction model to use. 0: CNN, 1: Transformer (higher quality).",
-                    args.environment = "RTX_RAY_RECONSTRUCTION_MODEL",
-                    args.flags = RtxOptionFlags::UserSetting);
     RTX_OPTION("rtx.rayreconstruction", bool, enableDisocclusionMaskBlur, false, "Enables blurring of disocclusion mask to suppress instabilities due to abrupt mask value changes.");
     RTX_OPTION("rtx.rayreconstruction", uint, disocclusionMaskBlurRadius, 32, "Pixel radius to use for blurring disocclusion mask.");
     RTX_OPTION("rtx.rayreconstruction", float, disocclusionMaskBlurNormalizedGaussianWeightSigma, 0.5f,
                "Normalized Gaussian weight sigma to use for blurring disocclusion mask.\n"
                "The sigma is applied to the normalized blur kernel radius extents (i.e. <0, 1>).")
-    RTX_OPTION("rtx.rayreconstruction", bool, enableTransformerModelD, false, "");
+    RTX_OPTION_ARGS("rtx.rayreconstruction", RayReconstructionPreset, preset, RayReconstructionPreset::Default,
+                    "Render preset for Ray Reconstruction. Default = 0 (DLSS picks the best preset), D = 4, E = 5, F = 6.",
+                    args.environment = "RTX_RAY_RECONSTRUCTION_PRESET",
+                    args.flags = RtxOptionFlags::UserSetting);
 
   private:
     void initializeRayReconstruction(Rc<DxvkContext> pRenderContext);
@@ -98,8 +100,7 @@ namespace dxvk {
     Resources::Resource         m_normals;
     bool                        m_useVirtualNormals = true;
     bool                        m_biasCurrentColorEnabled = true;
-    RayReconstructionModel      m_prevModel;
-    bool                        m_prevEnableTransformerModelD;
+    RayReconstructionPreset     m_prevPreset;
 
     Rc<DxvkBuffer> m_constants;
     std::unique_ptr<NGXRayReconstructionContext> m_rayReconstructionContext;

@@ -201,8 +201,10 @@ namespace dxvk {
     ctx->setFramePassStage(RtxFramePassStage::DLSS);
 
     bool dlssAutoExposure = useDlssAutoExposure();
-    mRecreate |= (mAutoExposure != dlssAutoExposure);
+    mRecreate |= (mAutoExposure != dlssAutoExposure)
+      || m_prevPreset != preset();
     mAutoExposure = dlssAutoExposure;
+    m_prevPreset = preset();
 
     if (mRecreate) {
       initializeDLSS(ctx);
@@ -337,6 +339,19 @@ namespace dxvk {
     // required for initializing DLSS.
     const NVSDK_NGX_PerfQuality_Value perfQuality = profileToQuality(mActualProfile);
 
-    m_dlssContext->initialize(renderContext, mInputSize, mDLSSOutputSize, mIsHDR, mInverseDepth, mAutoExposure, false, perfQuality);
+    NVSDK_NGX_DLSS_Hint_Render_Preset dlssPreset;
+    switch (preset()) {
+    case DLSSPreset::J:
+    case DLSSPreset::K:
+    case DLSSPreset::L:
+    case DLSSPreset::M:
+      dlssPreset = static_cast<NVSDK_NGX_DLSS_Hint_Render_Preset>(preset());
+      break;
+    default:
+      dlssPreset = NVSDK_NGX_DLSS_Hint_Render_Preset_Default;
+      break;
+    }
+
+    m_dlssContext->initialize(renderContext, mInputSize, mDLSSOutputSize, mIsHDR, mInverseDepth, mAutoExposure, false, dlssPreset, perfQuality);
   }
 }

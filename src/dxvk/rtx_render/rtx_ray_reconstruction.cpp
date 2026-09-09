@@ -87,10 +87,11 @@ namespace dxvk {
     PREWARM_SHADER_PIPELINE(PrepareRayReconstructionShader);
   }
 
+  extern RemixGui::ComboWithKey<DxvkRayReconstruction::RayReconstructionPreset> rayReconstructionPresetCombo;
+
   DxvkRayReconstruction::DxvkRayReconstruction(DxvkDevice* device)
     : DxvkDLSS(device)
-    , m_prevModel(model())
-    , m_prevEnableTransformerModelD(enableTransformerModelD()) {
+    , m_prevPreset(preset()) {
 
     DxvkBufferCreateInfo info;
     info.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -138,11 +139,9 @@ namespace dxvk {
 
     bool dlssAutoExposure = true;
     mRecreate |= (mAutoExposure != dlssAutoExposure)
-      || m_prevModel != model()
-      || m_prevEnableTransformerModelD != enableTransformerModelD();
+      || m_prevPreset != preset();
     mAutoExposure = dlssAutoExposure;
-    m_prevModel = model();
-    m_prevEnableTransformerModelD = enableTransformerModelD();
+    m_prevPreset = preset();
 
     if (mRecreate) {
       initializeRayReconstruction(ctx);
@@ -389,7 +388,7 @@ namespace dxvk {
       RemixGui::DragFloat("DLSS-RR Roughness Sensitivity", &upscalerRoughnessDemodulationOffsetObject(), 0.01f, 0.0f, 2.0f, "%.3f");
       RemixGui::DragFloat("DLSS-RR Roughness Multiplier", &upscalerRoughnessDemodulationMultiplierObject(), 0.01f, 0.0f, 20.0f, "%.3f");
       RemixGui::Checkbox("Composite Volumetric Light", &compositeVolumetricLightObject());      
-      RemixGui::Checkbox("Transformer Model D", &enableTransformerModelDObject());
+      rayReconstructionPresetCombo.getKey(&presetObject());
 
       if (RemixGui::CollapsingHeader("Disocclusion Mask")) {
         ImGui::Indent();
@@ -482,12 +481,17 @@ namespace dxvk {
 
     if (m_rayReconstructionContext) {
 
-      // Model to use for DLSS-RR
-      NVSDK_NGX_RayReconstruction_Hint_Render_Preset dlssdModel = (model() == RayReconstructionModel::CNN)
-        ? /* CNN */ NVSDK_NGX_RayReconstruction_Hint_Render_Preset_A
-        : enableTransformerModelD()
-          ? /* Transformer D */ NVSDK_NGX_RayReconstruction_Hint_Render_Preset_D
-          : /* Transformer E - Truthful Shrimp */ NVSDK_NGX_RayReconstruction_Hint_Render_Preset_E;
+      NVSDK_NGX_RayReconstruction_Hint_Render_Preset dlssdModel;
+      switch (preset()) {
+      case RayReconstructionPreset::D:
+      case RayReconstructionPreset::E:
+      case RayReconstructionPreset::F:
+        dlssdModel = static_cast<NVSDK_NGX_RayReconstruction_Hint_Render_Preset>(preset());
+        break;
+      default:
+        dlssdModel = NVSDK_NGX_RayReconstruction_Hint_Render_Preset_Default;
+        break;
+      }
 
       auto optimalSettings = m_rayReconstructionContext->queryOptimalSettings(mInputSize, perfQuality);
 
