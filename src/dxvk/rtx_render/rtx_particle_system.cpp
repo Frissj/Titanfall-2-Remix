@@ -764,6 +764,14 @@ namespace dxvk {
 
       gpuCtx.spawnMeshColorsIdx = pTargetInstance->surface.color0BufferIndex;
       gpuCtx.spawnMeshTexcoordsIdx = pTargetInstance->surface.texcoordBufferIndex;
+      const auto particleSystemIt = m_particleSystems.find(spawnCtx.particleSystemHash);
+      if (pTargetInstance->surface.texcoordBufferIndex == kSurfaceInvalidBufferIndex &&
+          particleSystemIt != m_particleSystems.end() &&
+          particleSystemIt->second->context.desc.useSpawnTexcoords) {
+        ONCE(Logger::warn(str::format(
+          "[UpstreamGuard.ParticleUV] Particle emitter instance ", spawnCtx.instanceId,
+          " requested spawn UVs but has no texcoord buffer; using zero UVs.")));
+      }
       gpuCtx.spawnMeshPositionsOffset = pTargetInstance->surface.positionOffset;
       gpuCtx.spawnMeshPositionsStride = pTargetInstance->surface.positionStride;
 

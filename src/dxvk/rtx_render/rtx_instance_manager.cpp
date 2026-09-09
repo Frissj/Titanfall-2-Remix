@@ -596,6 +596,7 @@ namespace dxvk {
     // Rc copy just addrefs; the stamp site releases it per-instance once the
     // bake lands.
     , m_prevBlasKeepAlive(src.m_prevBlasKeepAlive) {
+    m_opacityMicromapInstanceData.resetCopiedRequestState();
     // NV-DXVK [2026-07-26]: m_isSubsurface is skipped DELIBERATELY, and not
     // because it is harmless. It is a genuine divergence: createInstanceCopy
     // never calls updateInstance, so a clone of a subsurface instance reports

@@ -373,11 +373,25 @@ namespace dxvk {
     }
     // instance should always be valid at this point, but let's check on previous instance being actually valid before unlinking it
     else if (instance) {
-      auto instanceOmmRequestsIter = instanceOmmRequests.find(getOpacityMicromapHash(*instance));
-      omm_validation_assert(instanceOmmRequestsIter->second.numActiveRequests > 0);
-      instanceOmmRequestsIter->second.numActiveRequests -= 1;
-      if (deleteParentInstanceIfEmpty && instanceOmmRequestsIter->second.numActiveRequests == 0) {
-        instanceOmmRequests.erase(instanceOmmRequestsIter);
+      const XXH64_hash_t ommHash = getOpacityMicromapHash(*instance);
+      auto instanceOmmRequestsIter = instanceOmmRequests.find(ommHash);
+      if (instanceOmmRequestsIter != instanceOmmRequests.end()) {
+        omm_validation_assert(instanceOmmRequestsIter->second.numActiveRequests > 0);
+        if (instanceOmmRequestsIter->second.numActiveRequests > 0) {
+          instanceOmmRequestsIter->second.numActiveRequests -= 1;
+        } else {
+          ONCE(Logger::warn(str::format(
+            "[UpstreamGuard.OMMRequest] OMM request count was already zero for hash ", ommHash,
+            "; inspect duplicate unlink/ownership.")));
+        }
+        if (deleteParentInstanceIfEmpty && instanceOmmRequestsIter->second.numActiveRequests == 0) {
+          instanceOmmRequests.erase(instanceOmmRequestsIter);
+        }
+      } else {
+        ONCE(Logger::warn(str::format(
+          "[UpstreamGuard.OMMRequest] OMM parent request was already removed for hash ", ommHash,
+          " while unlinking an instance; inspect instance-copy/OMM ownership.")));
+        omm_validation_assert(0 && "OMM source data parent request container was already removed");
       }
 
       ommManager.onInstanceUnlinked(*instance);

@@ -3540,11 +3540,11 @@ namespace dxvk {
   }
 
   // Helper to populate the texture cache with this resource (and patch sampler if required for texture)
-  void SceneManager::trackTexture(const TextureRef &inputTexture,
+  void SceneManager::trackTexture(const TextureRef& inputTexture,
                                   uint32_t& textureIndex,
                                   bool hasTexcoords,
                                   bool async,
-                                  uint16_t samplerFeedbackStamp) {
+                                  uint16_t* inoutSamplerFeedbackStamp) {
     // If no texcoords, no need to bind the texture
     if (!hasTexcoords) {
       // NV-DXVK: count dropped texture bindings so we can tell whether the
@@ -3560,8 +3560,17 @@ namespace dxvk {
       return;
     }
 
+    if (inoutSamplerFeedbackStamp != nullptr &&
+        *inoutSamplerFeedbackStamp == SAMPLER_FEEDBACK_INVALID &&
+        inputTexture.getManagedTexture() != nullptr) {
+      *inoutSamplerFeedbackStamp = inputTexture.getManagedTexture()->m_samplerFeedbackStamp;
+    }
+
+    const uint16_t stamp = inoutSamplerFeedbackStamp != nullptr
+      ? *inoutSamplerFeedbackStamp
+      : SAMPLER_FEEDBACK_INVALID;
     auto& textureManager = m_device->getCommon()->getTextureManager();
-    textureManager.addTexture(inputTexture, samplerFeedbackStamp, async, textureIndex);
+    textureManager.addTexture(inputTexture, stamp, async, textureIndex);
   }
 
   // NV-DXVK: auto-dump every unique texture ref to rtx-remix/captures/textures/
@@ -5485,7 +5494,7 @@ namespace dxvk {
           samplerFeedbackStamp = opaqueMaterialData.getAlbedoOpacityTexture().getManagedTexture()->m_samplerFeedbackStamp;
         }
 
-        trackTexture(opaqueMaterialData.getAlbedoOpacityTexture(), albedoOpacityTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
+        trackTexture(opaqueMaterialData.getAlbedoOpacityTexture(), albedoOpacityTextureIndex, hasTexcoords, true, &samplerFeedbackStamp);
 
         // NV-DXVK: detect whether the albedo texture is bound with an
         // sRGB-format image view. If so the HW sampler already converts
@@ -5789,9 +5798,9 @@ namespace dxvk {
         // isn't in our sub-view list.
         albedoIsPremultiplied = albedoIsPremultiplied
                               || opaqueMaterialData.getAlbedoIsPremultiplied();
-        trackTexture(opaqueMaterialData.getRoughnessTexture(), roughnessTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
-        trackTexture(opaqueMaterialData.getMetallicTexture(), metallicTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
-        trackTexture(opaqueMaterialData.getSecondaryTexture(), secondaryTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
+        trackTexture(opaqueMaterialData.getRoughnessTexture(), roughnessTextureIndex, hasTexcoords, true, &samplerFeedbackStamp);
+        trackTexture(opaqueMaterialData.getMetallicTexture(), metallicTextureIndex, hasTexcoords, true, &samplerFeedbackStamp);
+        trackTexture(opaqueMaterialData.getSecondaryTexture(), secondaryTextureIndex, hasTexcoords, true, &samplerFeedbackStamp);
         // NV-DXVK: per-draw diagnostic — report the actual texture indices the
         // albedo / normal / rough / metallic / emissive ended up with. If
         // albedo shows INVALID we know the shader is sampling the constant
@@ -5821,16 +5830,16 @@ namespace dxvk {
         roughnessConstant = opaqueMaterialData.getRoughnessConstant();
       }
 
-      trackTexture(opaqueMaterialData.getNormalTexture(), normalTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
-      trackTexture(opaqueMaterialData.getTangentTexture(), tangentTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
-      trackTexture(opaqueMaterialData.getHeightTexture(), heightTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
-      trackTexture(opaqueMaterialData.getEmissiveColorTexture(), emissiveColorTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
-      trackTexture(opaqueMaterialData.getAmbientOcclusionTexture(), ambientOcclusionTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
-      trackTexture(opaqueMaterialData.getLightmapTexture(),         lightmapTextureIndex,        hasTexcoords, true, samplerFeedbackStamp);
-      trackTexture(opaqueMaterialData.getLightmap2Texture(),        lightmap2TextureIndex,       hasTexcoords, true, samplerFeedbackStamp);
-      trackTexture(opaqueMaterialData.getDetailTexture(),           detailTextureIndex,          hasTexcoords, true, samplerFeedbackStamp);
-      trackTexture(opaqueMaterialData.getCloudMaskTexture(),        cloudMaskTextureIndex,       hasTexcoords, true, samplerFeedbackStamp);
-      trackTexture(opaqueMaterialData.getScreenSpaceEmissiveMaskTexture(), screenSpaceEmissiveMaskTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
+      trackTexture(opaqueMaterialData.getNormalTexture(), normalTextureIndex, hasTexcoords, true, &samplerFeedbackStamp);
+      trackTexture(opaqueMaterialData.getTangentTexture(), tangentTextureIndex, hasTexcoords, true, &samplerFeedbackStamp);
+      trackTexture(opaqueMaterialData.getHeightTexture(), heightTextureIndex, hasTexcoords, true, &samplerFeedbackStamp);
+      trackTexture(opaqueMaterialData.getEmissiveColorTexture(), emissiveColorTextureIndex, hasTexcoords, true, &samplerFeedbackStamp);
+      trackTexture(opaqueMaterialData.getAmbientOcclusionTexture(), ambientOcclusionTextureIndex, hasTexcoords, true, &samplerFeedbackStamp);
+      trackTexture(opaqueMaterialData.getLightmapTexture(),         lightmapTextureIndex,        hasTexcoords, true, &samplerFeedbackStamp);
+      trackTexture(opaqueMaterialData.getLightmap2Texture(),        lightmap2TextureIndex,       hasTexcoords, true, &samplerFeedbackStamp);
+      trackTexture(opaqueMaterialData.getDetailTexture(),           detailTextureIndex,          hasTexcoords, true, &samplerFeedbackStamp);
+      trackTexture(opaqueMaterialData.getCloudMaskTexture(),        cloudMaskTextureIndex,       hasTexcoords, true, &samplerFeedbackStamp);
+      trackTexture(opaqueMaterialData.getScreenSpaceEmissiveMaskTexture(), screenSpaceEmissiveMaskTextureIndex, hasTexcoords, true, &samplerFeedbackStamp);
 
       emissiveIntensity = opaqueMaterialData.getEmissiveIntensity() * RtxOptions::emissiveIntensity();
       emissiveColorConstant = opaqueMaterialData.getEmissiveColorConstant();
@@ -5877,14 +5886,14 @@ namespace dxvk {
         }
 
         if (RtxOptions::SubsurfaceScattering::enableTextureMaps()) {
-          trackTexture(opaqueMaterialData.getSubsurfaceTransmittanceTexture(), subsurfaceTransmittanceTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
+          trackTexture(opaqueMaterialData.getSubsurfaceTransmittanceTexture(), subsurfaceTransmittanceTextureIndex, hasTexcoords, true, &samplerFeedbackStamp);
 
           if (isSubsurfaceScatteringDiffusionProfile) {
             // NOTE: reuse of 'subsurfaceSingleScatteringAlbedoTextureIndex' variable!
-            trackTexture(opaqueMaterialData.getSubsurfaceRadiusTexture(), subsurfaceSingleScatteringAlbedoTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
+            trackTexture(opaqueMaterialData.getSubsurfaceRadiusTexture(), subsurfaceSingleScatteringAlbedoTextureIndex, hasTexcoords, true, &samplerFeedbackStamp);
           } else {
-            trackTexture(opaqueMaterialData.getSubsurfaceSingleScatteringAlbedoTexture(), subsurfaceSingleScatteringAlbedoTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
-            trackTexture(opaqueMaterialData.getSubsurfaceThicknessTexture(), subsurfaceThicknessTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
+            trackTexture(opaqueMaterialData.getSubsurfaceSingleScatteringAlbedoTexture(), subsurfaceSingleScatteringAlbedoTextureIndex, hasTexcoords, true, &samplerFeedbackStamp);
+            trackTexture(opaqueMaterialData.getSubsurfaceThicknessTexture(), subsurfaceThicknessTextureIndex, hasTexcoords, true, &samplerFeedbackStamp);
           }
         }
 
@@ -5975,10 +5984,11 @@ namespace dxvk {
       uint32_t normalTextureIndex = kSurfaceMaterialInvalidTextureIndex;
       uint32_t transmittanceTextureIndex = kSurfaceMaterialInvalidTextureIndex;
       uint32_t emissiveColorTextureIndex = kSurfaceMaterialInvalidTextureIndex;
+      uint16_t samplerFeedbackStamp = SAMPLER_FEEDBACK_INVALID;
 
-      trackTexture(translucentMaterialData.getNormalTexture(), normalTextureIndex, hasTexcoords);
-      trackTexture(translucentMaterialData.getTransmittanceTexture(), transmittanceTextureIndex, hasTexcoords);
-      trackTexture(translucentMaterialData.getEmissiveColorTexture(), emissiveColorTextureIndex, hasTexcoords);
+      trackTexture(translucentMaterialData.getNormalTexture(), normalTextureIndex, hasTexcoords, true, &samplerFeedbackStamp);
+      trackTexture(translucentMaterialData.getTransmittanceTexture(), transmittanceTextureIndex, hasTexcoords, true, &samplerFeedbackStamp);
+      trackTexture(translucentMaterialData.getEmissiveColorTexture(), emissiveColorTextureIndex, hasTexcoords, true, &samplerFeedbackStamp);
 
       float refractiveIndex = translucentMaterialData.getRefractiveIndex() * std::clamp(TranslucentMaterialOptions::refractiveIndexScale(), 0.0f, 3.0f);
       Vector3 transmittanceColor = translucentMaterialData.getTransmittanceColor();
@@ -5995,7 +6005,7 @@ namespace dxvk {
         refractiveIndex,
         transmittanceMeasureDistance, transmittanceColor,
         enableEmissive, emissiveIntensity, emissiveColorConstant,
-        isThinWalled, thinWallThickness, useDiffuseLayer, samplerIndex
+        isThinWalled, thinWallThickness, useDiffuseLayer, samplerIndex, samplerFeedbackStamp
       };
 
       surfaceMaterial.emplace(translucentSurfaceMaterial);

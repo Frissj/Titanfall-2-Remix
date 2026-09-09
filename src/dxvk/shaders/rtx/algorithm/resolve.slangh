@@ -833,7 +833,7 @@ float oitDepthWeight(float hitT, float tMax)
 
 // Handles unordered Resolve operations within the resolve loop which do not depend on the typical ordered execution
 // for the resolve logic.
-void resolveVertexUnordered<let RAY_FLAGS : uint8_t>(
+void resolveVertexUnordered<let RAY_FLAGS : uint>(
   uint8_t resolveMode, Ray ray, uint rayMask,
   PortalSpace2BitsType portalSpace,
   bool useIntersectionBillboards,

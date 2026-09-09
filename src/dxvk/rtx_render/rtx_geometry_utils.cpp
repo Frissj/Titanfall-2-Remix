@@ -322,7 +322,14 @@ namespace dxvk {
 
     // Note: VK_FORMAT_R32_UINT assumed to be 32 bit spherical octahedral normals.
     assert(normalVertexFormat == VK_FORMAT_R32G32B32_SFLOAT || normalVertexFormat == VK_FORMAT_R32G32B32A32_SFLOAT || normalVertexFormat == VK_FORMAT_R32_UINT);
-    assert(drawCallState.getGeometryData().blendWeightBuffer.defined());
+    if (!drawCallState.getGeometryData().blendWeightBuffer.defined()) {
+      ONCE(Logger::err(str::format(
+        "[UpstreamGuard.Skinning] Skipping skinning draw with no blend-weight buffer: vertices=",
+        drawCallState.getGeometryData().vertexCount, " bones=", drawCallState.getSkinningState().numBones,
+        " bonesPerVertex=", drawCallState.getGeometryData().numBonesPerVertex,
+        ". Inspect the source mesh/vertex declaration.")));
+      return;
+    }
 
     // NV-DXVK [SkinPalProbe]: this memcpy trusts numBones, but the CPU palette
     // is only materialised for the consumers that need it now. If this path

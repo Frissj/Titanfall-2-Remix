@@ -1071,6 +1071,8 @@ namespace dxvk {
 
     // NOTE: Would like to use the BLAS Linked instances here, but that misses viewmodel and virtual instances
     std::unordered_map<BlasEntry*, std::vector<RtInstance*>> uniqueBlas;
+    std::vector<BlasEntry*> uniqueBlasOrder;
+    uniqueBlasOrder.reserve(instances.size());
 
     // NV-DXVK debug: routing stats per frame for PI vs non-PI instances.
     struct RoutingStats {
@@ -2138,7 +2140,11 @@ namespace dxvk {
         // as before.
         fillGeometryInfoFromBlasEntry(*blasEntry, *instance, opacityMicromapManager);
         // Since this loop is iterating over instances, and instances can share BLAS, we will build these later after identifying unique ones.
-        uniqueBlas[blasEntry].push_back(instance);
+        auto [uniqueBlasIt, inserted] = uniqueBlas.try_emplace(blasEntry);
+        if (inserted) {
+          uniqueBlasOrder.push_back(blasEntry);
+        }
+        uniqueBlasIt->second.push_back(instance);
       } else {
         ++s.routedMerged;
 
@@ -2497,9 +2503,9 @@ namespace dxvk {
     markMrg(mrg_tcFlush);
 
     // Build/Update the dynamic BLAS
-    for (const std::pair<BlasEntry*, std::vector<RtInstance*>> pair : uniqueBlas) {
-      BlasEntry* blasEntry = pair.first;
-      if (pair.second.size() == 0) {
+    for (BlasEntry* blasEntry : uniqueBlasOrder) {
+      const std::vector<RtInstance*>& blasInstances = uniqueBlas.at(blasEntry);
+      if (blasInstances.empty()) {
         continue;
       }
       assert(blasEntry->buildGeometries.size() == 1); // dynamic BLAS should always have this
@@ -2511,10 +2517,10 @@ namespace dxvk {
         // Check validity of a built BLAS, only if:
         // We can only support OMM on dynamic BLAS whos surface is unique to that BLAS.  This is so we can benefit from instancing BLAS memory.  
         // In cases where there are multiple linked instances each with different surfaces OMM would break.
-        bool ommsCompatible = pair.second.size() == 1;
-        const XXH64_hash_t firstOmmHash = OpacityMicromapManager::getOpacityMicromapHash(*pair.second[0]);
-        for (uint32_t i = 1; i < pair.second.size(); i++) {
-          const XXH64_hash_t thisOmmHash = OpacityMicromapManager::getOpacityMicromapHash(*pair.second[i]);
+        bool ommsCompatible = blasInstances.size() == 1;
+        const XXH64_hash_t firstOmmHash = OpacityMicromapManager::getOpacityMicromapHash(*blasInstances[0]);
+        for (uint32_t i = 1; i < blasInstances.size(); i++) {
+          const XXH64_hash_t thisOmmHash = OpacityMicromapManager::getOpacityMicromapHash(*blasInstances[i]);
           if (thisOmmHash != firstOmmHash) {
             ommsCompatible = false;
             break;
@@ -2522,7 +2528,7 @@ namespace dxvk {
         }
 
         if (ommsCompatible) {
-          RtInstance* exemplarInstance = pair.second[0];
+          RtInstance* exemplarInstance = blasInstances[0];
 
           // Bind opacity micromap
           // Opacity micromaps must be bound before acceleration sizes are calculated
@@ -2657,7 +2663,7 @@ namespace dxvk {
         copyAccelerationStructureBuildGeometryInfo(buildInfo, selectedBlas->buildInfo);
       }
 
-      for (RtInstance* rtInstance : pair.second) {
+      for (RtInstance* rtInstance : blasInstances) {
         // Append an instance of this merged BLAS to the merged instance list
         if (rtInstance->surface.instancesToObject == nullptr) {
           addBlas(rtInstance, blasEntry, nullptr);
@@ -3051,9 +3057,38 @@ namespace dxvk {
         }
       }
 
+      struct TopologyHashData {
+        XXH64_hash_t previousHash;
+        XXH64_hash_t indexHash;
+        uint32_t primitiveOffset;
+        uint32_t firstVertex;
+      };
+      XXH64_hash_t newTopologyHash = kEmptyHash;
+      for (uint32_t geometryIndex = 0; geometryIndex < bucket->geometries.size(); ++geometryIndex) {
+        const BlasEntry* blasEntry = bucket->originalInstances[geometryIndex]->getBlas();
+        const TopologyHashData topologyHashData {
+          newTopologyHash,
+          blasEntry->modifiedGeometryData.hashes[HashComponents::Indices],
+          bucket->ranges[geometryIndex].primitiveOffset,
+          bucket->ranges[geometryIndex].firstVertex,
+        };
+        newTopologyHash = hashStructByMemory<TopologyHashData, false>(topologyHashData);
+      }
+
       // Must ensure that if we are updating an existing blas, rather than rebuilding, the blas is compatible with our new build info
       // Cannot update a blas that contains OMM instances, this leads to sporadic device lost errors
-      if (!bucket->hasOmmInstances && selectedBlas && validateUpdateMode(selectedBlas->buildInfo, buildInfo) && selectedBlas->primitiveCounts == bucket->primitiveCounts) {
+      const bool updateLayoutCompatible = selectedBlas &&
+        validateUpdateMode(selectedBlas->buildInfo, buildInfo) &&
+        selectedBlas->primitiveCounts == bucket->primitiveCounts;
+      if (selectedBlas && updateLayoutCompatible && selectedBlas->topologyHash != kEmptyHash && selectedBlas->topologyHash != newTopologyHash) {
+        static uint32_t s_topologyGuardLogCount = 0;
+        if (s_topologyGuardLogCount++ < 16) {
+          Logger::warn(str::format(
+            "[UpstreamGuard.BLASTopology] Merged BLAS topology changed (old=", selectedBlas->topologyHash,
+            ", new=", newTopologyHash, ", geometries=", bucket->geometries.size(), "); forcing BUILD."));
+        }
+      }
+      if (!bucket->hasOmmInstances && updateLayoutCompatible && selectedBlas->topologyHash == newTopologyHash) {
         buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;
       }
 
@@ -3078,6 +3113,7 @@ namespace dxvk {
 
       copyAccelerationStructureBuildGeometryInfo(buildInfo, selectedBlas->buildInfo);
       selectedBlas->primitiveCounts = bucket->primitiveCounts;
+      selectedBlas->topologyHash = newTopologyHash;
 
       // Allocate a scratch buffer slice
       const size_t requiredScratchAllocSize = align(sizeInfo.buildScratchSize + m_scratchAlignment, m_scratchAlignment);

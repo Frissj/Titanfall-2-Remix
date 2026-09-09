@@ -344,6 +344,9 @@ namespace dxvk {
     friend class OpacityMicromapManager;
   public:
     OpacityMicromapInstanceData();
+    void resetCopiedRequestState() {
+      needsToCalculateNumTexelsPerMicroTriangle = false;
+    }
 
     // NV-DXVK [perf] 2026-08-08 (handoff d §3): read-only view of the pending
     // -work flag for InstanceManager's fast path — the
