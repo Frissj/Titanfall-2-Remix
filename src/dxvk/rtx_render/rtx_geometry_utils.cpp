@@ -918,10 +918,12 @@ namespace dxvk {
     const uint32_t numDispatches = dxvk::util::ceilDivide(numThreads, numThreadsPerDispatch);
     const uint32_t baseThreadIndexOffset = bakeState.numMicroTrianglesBaked / args.numMicroTrianglesPerThread;
 
-    args.numActiveThreads = numThreadsPerDispatch;
-
     for (uint32_t i = 0; i < numDispatches; i++) {
-      args.threadIndexOffset = i * numThreadsPerDispatch + baseThreadIndexOffset;
+      const uint32_t dispatchThreadOffset = i * numThreadsPerDispatch;
+      const uint32_t numActiveThreadsThisDispatch = std::min(numThreads - dispatchThreadOffset, numThreadsPerDispatch);
+
+      args.threadIndexOffset = dispatchThreadOffset + baseThreadIndexOffset;
+      args.numActiveThreads = numActiveThreadsThisDispatch;
 
       // Upload the arguments into a buffer slice
       const auto& devInfo = ctx->getDevice()->properties().core.properties;
@@ -933,7 +935,9 @@ namespace dxvk {
       ctx->bindResourceBuffer(BINDING_BAKE_OPACITY_MICROMAP_CONSTANTS, cb);
 
       // Run the shader
-      const VkExtent3D workgroups = util::computeBlockCount(VkExtent3D { numThreadsPerDispatch, 1, 1 }, VkExtent3D { BAKE_OPACITY_MICROMAP_NUM_THREAD_PER_COMPUTE_BLOCK, 1, 1 });
+      const VkExtent3D workgroups = util::computeBlockCount(
+        VkExtent3D { numActiveThreadsThisDispatch, 1, 1 },
+        VkExtent3D { BAKE_OPACITY_MICROMAP_NUM_THREAD_PER_COMPUTE_BLOCK, 1, 1 });
       ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
     }
 
@@ -1195,6 +1199,16 @@ namespace dxvk {
     }
 
     return true;
+  }
+
+  // CPU path only writes uint16 indices; meshes needing uint32 output (vertexCount >= 64K) use the compute shader.
+  template<typename SrcType>
+  static void dispatchGenTriListCpu(const Rc<DxvkContext>& ctx, const GenTriListArgs& cb, const DxvkBufferSlice& dstSlice, uint16_t* dst, const RasterBuffer* srcBuffer) {
+    const SrcType* src = (cb.useIndexBuffer != 0) ? reinterpret_cast<SrcType*>(srcBuffer->mapPtr()) : nullptr;
+    for (uint32_t idx = 0; idx < cb.primCount; idx++) {
+      generateIndices(idx, dst, src, cb);
+    }
+    ctx->writeToBuffer(dstSlice.buffer(), 0, cb.primCount * 3 * sizeof(uint16_t), dst);
   }
 
   void RtxGeometryUtils::dispatchGenTriList(const Rc<DxvkContext>& ctx, const GenTriListArgs& cb, const DxvkBufferSlice& dstSlice, const RasterBuffer* srcBuffer) const {

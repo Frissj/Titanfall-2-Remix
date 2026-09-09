@@ -299,7 +299,7 @@ namespace dxvk {
      * and general troubleshooting.
      */
     void logAdapterInfo() const;
-    
+
     /**
      * \brief Checks whether this is a UMA system
      *
@@ -308,7 +308,37 @@ namespace dxvk {
      * \returns \c true if the system has unified memory.
      */
     bool isUnifiedMemoryArchitecture() const;
-    
+
+    // NV-DXVK start: Device filtering
+
+    /**
+     * \brief Checks whether a device extension is supported
+     *
+     * \param [in] pName Extension name
+     * \returns \c true if the extension is supported
+     */
+    bool supportsExtension(const char* pName) const {
+      return m_deviceExtensions.supports(pName) != 0;
+    }
+
+    /**
+     * \brief Checks if adapter is emulated
+     *
+     */
+    inline static bool isEmulated(
+      const VkPhysicalDeviceVulkan12Properties& p) {
+      // Mesa Dozen is a Vulkan atop D3D12 driver which
+      // could be found on mobile devices. Such adapters report
+      // physical type and are difficult to tell apart
+      // from real adapters since they also do not have a
+      // vk maintance level to query for the underlying
+      // implemetation.
+      // Another way of doing it is to query for MSFT layered
+      // driver extension and then find the underlying driver type.
+      return p.driverID == VK_DRIVER_ID_MESA_DOZEN;
+    }
+    // NV-DXVK end
+
   private:
     
     Rc<vk::InstanceFn>  m_vki;

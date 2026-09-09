@@ -40,12 +40,16 @@
 #include <pxr/base/gf/vec4d.h>
 #include <pxr/base/gf/vec4f.h>
 #include <pxr/base/gf/vec4i.h>
-#include "../usd-plugins/RemixParticleSystem/particleSystemAPI.h"
+#include <pxr/base/tf/token.h>
+#include <pxr/base/vt/value.h>
+#include <pxr/usd/usd/schemaRegistry.h>
 #include "usd_include_end.h"
 #include "../../public/include/remix/remix_c.h"
 #include "../dxvk/shaders/rtx/pass/particles/particle_system_enums.h"
 
 namespace lss {
+  inline constexpr std::size_t kParticleSystemSchemaPropertyCount = 129;
+
   template<typename TDest, typename TSrc>
   inline TDest AssignFromPrimvar(const TSrc& src) {
     return static_cast<TDest>(src);
@@ -68,14 +72,16 @@ namespace lss {
 
   template<>
   inline ParticleBillboardType AssignFromPrimvar<ParticleBillboardType, pxr::TfToken>(const pxr::TfToken& token) {
-    static pxr::RemixTokensType tokens;
-    if (token == tokens.faceCamera_UpAxisLocked) {
+    static const pxr::TfToken kFaceCamera_UpAxisLocked("FaceCamera_UpAxisLocked");
+    static const pxr::TfToken kFaceCamera_Position("FaceCamera_Position");
+    static const pxr::TfToken kFaceWorldUp("FaceWorldUp");
+    if (token == kFaceCamera_UpAxisLocked) {
       return FaceCamera_UpAxisLocked;
     }
-    if (token == tokens.faceCamera_Position) {
+    if (token == kFaceCamera_Position) {
       return FaceCamera_Position;
     }
-    if (token == tokens.faceWorldUp) {
+    if (token == kFaceWorldUp) {
       return FaceWorldUp;
     }
     return FaceCamera_Spherical;
@@ -83,11 +89,12 @@ namespace lss {
 
   template<>
   inline ParticleSpriteSheetMode AssignFromPrimvar<ParticleSpriteSheetMode, pxr::TfToken>(const pxr::TfToken& token) {
-    static pxr::RemixTokensType tokens;
-    if (token == tokens.overrideMaterial_Lifetime) {
+    static const pxr::TfToken kOverrideMaterial_Lifetime("OverrideMaterial_Lifetime");
+    static const pxr::TfToken kOverrideMaterial_Random("OverrideMaterial_Random");
+    if (token == kOverrideMaterial_Lifetime) {
       return OverrideMaterial_Lifetime;
     }
-    if (token == tokens.overrideMaterial_Random) {
+    if (token == kOverrideMaterial_Random) {
       return OverrideMaterial_Random;
     }
     return UseMaterialSpriteSheet;
@@ -95,11 +102,12 @@ namespace lss {
 
   template<>
   inline ParticleCollisionMode AssignFromPrimvar<ParticleCollisionMode, pxr::TfToken>(const pxr::TfToken& token) {
-    static pxr::RemixTokensType tokens;
-    if (token == tokens.stop) {
+    static const pxr::TfToken kStop("Stop");
+    static const pxr::TfToken kKill("Kill");
+    if (token == kStop) {
       return ParticleCollisionMode::Stop;
     }
-    if (token == tokens.kill) {
+    if (token == kKill) {
       return ParticleCollisionMode::Kill;
     }
     return ParticleCollisionMode::Bounce;
@@ -107,14 +115,16 @@ namespace lss {
 
   template<>
   inline ParticleRandomFlipAxis AssignFromPrimvar<ParticleRandomFlipAxis, pxr::TfToken>(const pxr::TfToken& token) {
-    static pxr::RemixTokensType tokens;
-    if (token == tokens.vertical) {
+    static const pxr::TfToken kVertical("Vertical");
+    static const pxr::TfToken kHorizontal("Horizontal");
+    static const pxr::TfToken kBoth("Both");
+    if (token == kVertical) {
       return ParticleRandomFlipAxis::Vertical;
     }
-    if (token == tokens.horizontal) {
+    if (token == kHorizontal) {
       return ParticleRandomFlipAxis::Horizontal;
     }
-    if (token == tokens.both) {
+    if (token == kBoth) {
       return ParticleRandomFlipAxis::Both;
     }
     return ParticleRandomFlipAxis::None;

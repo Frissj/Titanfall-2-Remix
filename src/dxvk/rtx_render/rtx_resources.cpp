@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -41,7 +41,8 @@
 #include "rtx_texture_manager.h"
 #include "rtx_debug_view.h"
 #include "rtx_xess.h"
-#include "../util/util_globaltime.h"
+#include "rtx_ray_reconstruction.h"
+#include "../util/util_global_time.h"
 
 namespace dxvk {
 
@@ -369,6 +370,30 @@ namespace dxvk {
     return m_raytracingOutput.isReady() && m_targetExtent == targetExtent && m_downscaledExtent == downscaledExtent;
   }
 
+  bool Resources::needsNrdDenoisingGuideResources() const {
+    return !device()->getCommon()->metaRayReconstruction().useRayReconstruction() &&
+           RtxOptions::useDenoiser() &&
+           !RtxOptions::useDenoiserReferenceMode();
+  }
+
+  // Tracks the denoiser at frame granularity rather than through a resolution reset, so toggling the denoiser
+  // does not cost a waitForIdle and a full downscaled resource rebuild.
+  void Resources::createNrdDenoisingGuideResources(Rc<DxvkContext>& ctx) {
+    const bool resourcesAreNeeded = needsNrdDenoisingGuideResources();
+
+    if (resourcesAreNeeded == m_nrdDenoisingGuideResourcesAllocated) {
+      return;
+    }
+
+    if (resourcesAreNeeded) {
+      m_raytracingOutput.m_secondaryVirtualWorldShadingNormalPerceptualRoughnessDenoising = createImageResource(ctx, "secondary virtual world shading normal perceptual roughness denoising", m_downscaledExtent, VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+    } else {
+      m_raytracingOutput.m_secondaryVirtualWorldShadingNormalPerceptualRoughnessDenoising.reset();
+    }
+
+    m_nrdDenoisingGuideResourcesAllocated = resourcesAreNeeded;
+  }
+
   void Resources::onFrameBegin(
     Rc<DxvkContext> ctx,
     RtxTextureManager& textureManager,
@@ -404,6 +429,8 @@ namespace dxvk {
         }
       }
     }
+
+    createNrdDenoisingGuideResources(ctx);
 
     // Alias resources that alias to different resources frame to frame
     m_raytracingOutput.m_secondaryConeRadius = AliasedResource(m_raytracingOutput.getCurrentRtxdiConfidence(), ctx, m_downscaledExtent, VK_FORMAT_R16_SFLOAT, "Secondary Cone Radius");
@@ -465,6 +492,28 @@ namespace dxvk {
       } else {
         m_raytracingOutput.m_sharedSubsurfaceData.reset();
         m_raytracingOutput.m_sharedSubsurfaceDiffusionProfileData.reset();
+      }
+    }
+
+    // Alloc / free images based on RtxOption
+    if (RtxOptions::ShadowTerminator::enableOffset()) {
+      for (auto& terminatorResource : m_raytracingOutput.m_sharedTerminatorFix) {
+        if (!terminatorResource.isValid() || terminatorResource.image->info().extent != m_downscaledExtent) {
+          terminatorResource = createImageResource(ctx, "shadow terminator fix", m_downscaledExtent, VK_FORMAT_R16_SFLOAT);
+        }
+        assert(terminatorResource.isValid());
+        if (resetHistory && terminatorResource.isValid()) {
+          VkClearColorValue clearValue = { 0.f, 0.f, 0.f, 0.f };
+          VkImageSubresourceRange subRange = {};
+          subRange.layerCount = 1;
+          subRange.levelCount = 1;
+          subRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+          ctx->clearColorImage(terminatorResource.image, clearValue, subRange);
+        }
+      }
+    } else {
+      for (auto& terminatorResource : m_raytracingOutput.m_sharedTerminatorFix) {
+        terminatorResource.reset();
       }
     }
   }
@@ -1063,7 +1112,6 @@ namespace dxvk {
 
     m_raytracingOutput.m_primaryAttenuation = createImageResource(ctx, "primary attenuation", m_downscaledExtent, VK_FORMAT_R32_UINT);
     m_raytracingOutput.m_primaryWorldShadingNormal = createImageResource(ctx, "primary world shading normal", m_downscaledExtent, VK_FORMAT_R32_UINT);
-    m_raytracingOutput.m_primaryWorldInterpolatedNormal = createImageResource(ctx, "primary world interpolated normal", m_downscaledExtent, VK_FORMAT_R32_UINT);
     m_raytracingOutput.m_primaryPerceptualRoughness = createImageResource(ctx, "primary perceptual roughness", m_downscaledExtent, VK_FORMAT_R8_UNORM);
     m_raytracingOutput.m_primaryLinearViewZ = createImageResource(ctx, "primary linear view Z", m_downscaledExtent, VK_FORMAT_R32_SFLOAT);
     uint32_t primaryDepthIndex = 0;
@@ -1084,6 +1132,7 @@ namespace dxvk {
       }
     }
     m_raytracingOutput.m_primaryVirtualWorldShadingNormalPerceptualRoughness = createImageResource(ctx, "primary virtual world shading normal perceptual roughness", m_downscaledExtent, VK_FORMAT_R16G16B16A16_UNORM);
+    // Note: this is unused when RR is ON, but the resource is aliased by m_primaryRtxdiTemporalPosition which is used almost everytime, so keep this allocated for simplicity.
     m_raytracingOutput.m_primaryVirtualWorldShadingNormalPerceptualRoughnessDenoising = AliasedResource(ctx, m_downscaledExtent, VK_FORMAT_A2B10G10R10_UNORM_PACK32, "primary virtual world shading normal perceptual roughness denoising", true);;
     m_raytracingOutput.m_primaryHitDistance = createImageResource(ctx, "primary hit distance", m_downscaledExtent, VK_FORMAT_R32_SFLOAT);
     m_raytracingOutput.m_primaryViewDirection = createImageResource(ctx, "primary view direction", m_downscaledExtent, VK_FORMAT_R16G16_SNORM);
@@ -1119,14 +1168,18 @@ namespace dxvk {
     m_raytracingOutput.m_secondaryBaseReflectivity, ctx, m_downscaledExtent, VK_FORMAT_A2B10G10R10_UNORM_PACK32, "Secondary Specular Albedo");
     m_raytracingOutput.m_secondaryVirtualMotionVector = AliasedResource(ctx, m_downscaledExtent, VK_FORMAT_R16G16B16A16_SFLOAT, "Secondary Virtual Motion Vector");
     m_raytracingOutput.m_secondaryVirtualWorldShadingNormalPerceptualRoughness = createImageResource(ctx, "secondary virtual world shading normal perceptual roughness", m_downscaledExtent, VK_FORMAT_R16G16B16A16_UNORM);
-    m_raytracingOutput.m_secondaryVirtualWorldShadingNormalPerceptualRoughnessDenoising = createImageResource(ctx, "secondary virtual world shading normal perceptual roughness denoising", m_downscaledExtent, VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+    m_nrdDenoisingGuideResourcesAllocated = needsNrdDenoisingGuideResources();
+    if (m_nrdDenoisingGuideResourcesAllocated) {
+      m_raytracingOutput.m_secondaryVirtualWorldShadingNormalPerceptualRoughnessDenoising = createImageResource(ctx, "secondary virtual world shading normal perceptual roughness denoising", m_downscaledExtent, VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+    } else {
+      m_raytracingOutput.m_secondaryVirtualWorldShadingNormalPerceptualRoughnessDenoising.reset();
+    }
     m_raytracingOutput.m_secondaryHitDistance = createImageResource(ctx, "secondary hit distance", m_downscaledExtent, VK_FORMAT_R32_SFLOAT);
     m_raytracingOutput.m_secondaryViewDirection = AliasedResource(ctx, m_downscaledExtent, VK_FORMAT_R16G16_SNORM, "Secondary View Direction", allowCompatibleFormatAliasing);
     m_raytracingOutput.m_secondaryWorldPositionWorldTriangleNormal = AliasedResource(ctx, m_downscaledExtent, VK_FORMAT_R32G32B32A32_SFLOAT, "Secondary World Position World Triangle Normal", allowCompatibleFormatAliasing);
     m_raytracingOutput.m_secondaryPositionError = AliasedResource(ctx, m_downscaledExtent, VK_FORMAT_R32_SFLOAT, "Secondary Position Error", allowCompatibleFormatAliasing);
     m_raytracingOutput.m_alphaBlendGBuffer = createImageResource(ctx, "alpha blend gbuffer", m_downscaledExtent, VK_FORMAT_R32G32B32A32_UINT);
     m_raytracingOutput.m_alphaBlendRadiance = AliasedResource(m_raytracingOutput.m_secondaryVirtualMotionVector, ctx, m_downscaledExtent, VK_FORMAT_R16G16B16A16_SFLOAT, "Alpha Blend Radiance");
-    m_raytracingOutput.m_rayReconstructionParticleBuffer = createImageResource(ctx, "DLSS-RR particle buffer", m_downscaledExtent, VK_FORMAT_R16G16B16A16_SFLOAT);
 
     // Denoiser input and output (Primary/Secondary Surfaces with Direct/Indirect or Combined Radiance)
     // Note: A single texture is aliased for both the noisy output from the integration pass and the denoised result from NRD.

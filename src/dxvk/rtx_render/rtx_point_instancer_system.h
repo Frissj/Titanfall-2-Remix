@@ -70,7 +70,7 @@ namespace dxvk {
   constexpr uint32_t kSurfaceGPUDwords = 64;
 
   struct PointInstancerBatch {
-    const std::vector<Matrix4>* transforms;       // Source instanceToObject transforms (CPU data, uploaded per batch)
+    std::shared_ptr<const std::vector<Matrix4>> transforms; // Source instanceToObject transforms (CPU data, uploaded per batch)
     Matrix4 objectToWorld;                         // Object-to-world for this instancer
     Matrix4 prevObjectToWorld;                     // Previous-frame object-to-world (for motion vectors in surface data)
     uint32_t instanceCount;                        // Number of input transforms

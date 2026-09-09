@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -32,7 +32,9 @@
 #include "../../util/util_spatial_map.h"
 
 #include <inttypes.h>
+#include <memory>
 #include <vector>
+#include <unordered_set>
 #include <future>
 #include <chrono>
 #include <cmath>
@@ -120,29 +122,149 @@ std::ostream& operator << (std::ostream& os, PrimInstance::Type type);
 
 struct ReplacementInstance {
   // Lifecycle note:
-  // Currently, ReplacementInstances are created the first time a given replaced draw call
-  // is rendered.  A single entity (a light or instance) is designated as the 'root'.
-  // When that entity is destroyed, the ReplacementInstance is destroyed.
-  // Unfortunately, lights and instances aren't always destroyed at the same time, or
-  // in the same order they were created.  To accomodate that, when non-root entities
-  // are deleted, they remove themselves from the `entities` vector.  Similarly, when
-  // the root is deleted, all entities remaining in the vector will have their pointer
-  // to the ReplacementInstance set to nullptr.
-  // TODO(REMIX-4226): In the future, draw calls should be tracked and destroyed based
-  // on the pre-replacement draw call, so that everything in a ReplacementInstance gets
-  // destroyed at the same time.  When that change is made, the original tracked draw
-  // call should own this ReplacementInstance.
+  // All ReplacementInstances are owned by DrawCallTracker and tracked via two-level hash
+  // lookup (identity hash + tracking hash + proximity). PrimInstanceOwner stores a non-owning
+  // pointer; DrawCallTracker::destroyReplacementInstance() handles destruction.
 
   static constexpr uint32_t kInvalidReplacementIndex = UINT32_MAX;
 
+  // Bundled hash/position/transform parameters used to look up or create a
+  // ReplacementInstance. Constructed by callers from whatever source they have
+  // (DrawCallState, D3DLIGHT9, ExternalDrawState).
+  struct LookupKey {
+    XXH64_hash_t identityHash;
+    // The hash to identify which spatial map to search for the replacementInstance.
+    XXH64_hash_t spatialMapHash;
+    XXH64_hash_t materialHash;
+    XXH64_hash_t vertexPositionHash;
+    Vector3 worldPos;
+    Matrix4 transform;
+    // Texture-coordinate projection from DrawCallTransforms. Surface state on the
+    // preserve path is reused as-is, so any frame-to-frame drift in textureTransform
+    // or texgenMode (e.g. terrain baker rewriting view→cascade space, or free-camera
+    // view-space texgen) must be detected as a dirty-flag change to push the draw
+    // back onto the dynamic path. Light/external lookups default to identity / None
+    // so they don't churn dirty flags.
+    Matrix4 textureTransform = Matrix4();
+    TexGenMode texgenMode = TexGenMode::None;
+  };
+
+  ReplacementInstance() = delete;
+
+  ReplacementInstance(const LookupKey& key, uint32_t newId, uint32_t frameId);
+
+  // Per-submission update routing. Lookup-drift bits (Transform, VertexPosHash,
+  // MaterialHash, Other) reflect LookupKey changes; cleared on the first exact-match
+  // lookup each frame. Dynamic-feature bits (ParticleSystem, EffectLight) are set
+  // during processDrawCallState and cleared only when entering the dynamic path.
+  //
+  // Note: distinct from boundingBoxDirty. That flag is a "pending work" signal
+  // set externally and cleared by the consumer (recalculateBoundingBox).
+  enum class DirtyFlag : uint32_t {
+    // These bits indicate that something about the draw call has changed:
+    Transform,
+    VertexPosHash,
+    MaterialHash,
+    Other,           // Catch-all: texgen/texture-transform drift and other lookup changes
+    
+    // These bits indicate that something in the previous frame's update required the next frame to be dynamic.
+    ParticleSystem,
+  };
+  using DirtyFlags = Flags<DirtyFlag>;
+  inline static const DirtyFlags kLookupDriftMask{
+    DirtyFlag::Transform,
+    DirtyFlag::VertexPosHash,
+    DirtyFlag::MaterialHash,
+    DirtyFlag::Other,
+  };
+  inline static const DirtyFlags kDynamicFeatureMask{
+    DirtyFlag::ParticleSystem,
+  };
+  inline static const DirtyFlags kAllDirtyFlags = kLookupDriftMask | kDynamicFeatureMask;
+
   ~ReplacementInstance();
 
+  // Mark all prim entities for GC, drop the prim/root slots, reset cached
+  // aggregate bounding boxes, and clear activeReplacements. Returns the RI to
+  // the same shape it had immediately after construction.
   void clear();
 
   std::vector<PrimInstance> prims;
   PrimInstance root;
 
-  void setup(PrimInstance newRoot, size_t numPrims);
+  // Reset the RI and re-initialize it with the given root, prim count, and
+  // tracking pointer to the replacement vector that owns those prims (pass
+  // nullptr for non-replacement contexts -- e.g. standalone draws or external
+  // mesh submissions). The stored pointer is used by drawReplacements to
+  // detect when the underlying replacement data has changed across frames.
+  void setup(PrimInstance newRoot, size_t numPrims,
+             const std::vector<AssetReplacement>* replacements);
+
+  // Frame-to-frame tracking fields (used by SceneManager two-level lookup)
+  uint32_t id = 0;
+  XXH64_hash_t identityHash = kEmptyHash;
+  XXH64_hash_t spatialMapHash = kEmptyHash;
+  XXH64_hash_t materialHash = kEmptyHash;
+  XXH64_hash_t legacyMaterialIdentityHash = kEmptyHash;
+  XXH64_hash_t vertexPositionHash = kEmptyHash;
+  Vector3 centroid = Vector3(0.f);
+  uint32_t frameCreated = 0;
+  uint32_t frameLastSeen = 0;
+  XXH64_hash_t spatialCacheTransformHash = kEmptyHash;
+
+  // Pointer to the replacement data this RI was set up with. Used to detect when
+  // replacements change (async load, hot reload, variant toggle) and the RI needs reinitialization.
+  // Comparing this against getReplacementsForMesh's return value is sufficient for all transitions:
+  // first-time publishes go nullptr → live ptr, and variant toggles produce a different lookup key
+  // (assetHash + variantId), which returns a different vector pointer. drawReplacements clears and
+  // rebuilds prims when this mismatches.
+  const std::vector<AssetReplacement>* activeReplacements = nullptr;
+
+  // Draw call properties that affect anti-culling GC decisions.
+  // Set from the original DrawCallState each time the RI is matched.
+  // Stored as raw bits because CategoryFlags is defined later in this file.
+  uint32_t categoryFlags = 0;
+  bool isSkinned = false;
+
+  // When true, the aggregate object-space bounding boxes (geometryBoundingBox,
+  // lightBoundingBox) will be recomputed from the replacement mesh/light data
+  // on the next drawReplacements call. Defaults to true so the initial frame
+  // computes the AABB. Set back to true by clear() or dirtyBoundingBox().
+  bool boundingBoxDirty = true;
+
+  void dirtyBoundingBox() { boundingBoxDirty = true; }
+
+  // Recompute the aggregate object-space bounding boxes from the replacement data,
+  // if boundingBoxDirty is set. Always updates objectToWorld (the game object may
+  // move each frame). Clears boundingBoxDirty after computation.
+  // originalGeometryBBox is the original draw call's geometry bbox, used for
+  // includeOriginal replacements (pass nullptr when there is no original geometry,
+  // e.g. light-only replacements in addLight).
+  void recalculateBoundingBox(const Matrix4& newObjectToWorld,
+                              const AxisAlignedBoundingBox* originalGeometryBBox = nullptr);
+
+  // Anti-culling bounding boxes, both in the space defined by objectToWorld.
+  // For mesh draw calls, this is the original draw call's object space.
+  // For light replacements, this is the D3D9 light's local space.
+  // objectToWorld transforms these to world space for the frustum check.
+  // geometryBoundingBox covers mesh geometry (checked against main camera frustum).
+  // lightBoundingBox covers light positions expanded by radius (checked against
+  // the wider light anti-culling frustum). If either check passes, the RI is kept alive.
+  AxisAlignedBoundingBox geometryBoundingBox;
+  AxisAlignedBoundingBox lightBoundingBox;
+  Matrix4 objectToWorld;
+
+  // Cached copies of the texture-coordinate projection fields from the last
+  // submission's LookupKey. Compared against the current key in computeDirtyFlags
+  // so that view-dependent texgen (terrain baker, free-camera) and any other
+  // textureTransform/texgenMode churn force the dynamic path, which refreshes
+  // RtSurface state. See LookupKey for the dirty-flag rationale.
+  Matrix4 textureTransform;
+  TexGenMode texgenMode = TexGenMode::None;
+
+  // Gates preserve vs dynamic dispatch and (future) split updaters. See DirtyFlag
+  // and kLookupDriftMask / kDynamicFeatureMask for clear semantics.
+  DirtyFlags dirtyFlags;
 };
 
 // Wrapper utility to share the code for handling replacementInstance ownership.
@@ -164,7 +286,6 @@ public:
 
   bool isRoot(const void* owner) const;
   void setReplacementInstance(ReplacementInstance* replacementInstance, size_t replacementIndex, void* owner, PrimInstance::Type type);
-  ReplacementInstance* getOrCreateReplacementInstance(void* owner, PrimInstance::Type type, size_t index, size_t numPrims);
   ReplacementInstance* getReplacementInstance() const { return m_replacementInstance; }
   size_t getReplacementIndex() const { return m_replacementIndex; }
   bool isSubPrim() const {
@@ -1121,9 +1242,9 @@ enum class InstanceCategories : uint32_t {
   ThirdPersonPlayerModel,
   ThirdPersonPlayerBody,
   IgnoreBakedLighting,
-  IgnoreTransparencyLayer,
   ParticleEmitter,
   SmoothNormals,
+  HairCards,
 
   Count,
 };
@@ -1242,15 +1363,20 @@ struct DrawCallState {
 
   // Note: This uses the original material for the hash, not the replaced material
   const XXH64_hash_t getHash(const HashRule& rule) const {
-    return geometryData.getHashForRule(rule) ^ materialData.getHash();
+    return getGeometryData().getHashForRule(rule) ^ materialData.getHash();
   }
 
   [[deprecated("(REMIX-656): Remove this once we can transition content to new hash")]]
   const XXH64_hash_t getHashLegacy(const HashRule& rule) const {
-    return geometryData.getHashForRuleLegacy(rule) ^ materialData.getHash();
+    return getGeometryData().getHashForRuleLegacy(rule) ^ materialData.getHash();
   }
 
   const RasterGeometry& getGeometryData() const {
+    return nullptr == overrides.geometryData ? geometryData : *overrides.geometryData;
+  }
+
+  RasterGeometry& modifyGeometryData() {
+    assert(nullptr == overrides.geometryData && "Refusing to modify overridden geometry data!");
     return geometryData;
   }
 
@@ -1258,7 +1384,15 @@ struct DrawCallState {
     return materialData;
   }
 
+  LegacyMaterialData& modifyMaterialData() {
+    return materialData;
+  }
+
   const DrawCallTransforms& getTransformData() const {
+    return transformData;
+  }
+
+  DrawCallTransforms& modifyTransformData() {
     return transformData;
   }
 
@@ -1279,6 +1413,14 @@ struct DrawCallState {
 
   const CategoryFlags getCategoryFlags() const {
     return categories;
+  }
+
+  CategoryFlags& modifyCategoryFlags() {
+    return categories;
+  }
+
+  VkCullModeFlags getCullMode() const {
+    return VK_CULL_MODE_FLAG_BITS_MAX_ENUM == overrides.cullMode ? getGeometryData().cullMode : overrides.cullMode;
   }
 
   bool finalizePendingFutures(const RtCamera* pLastCamera);
@@ -1505,13 +1647,20 @@ struct DrawCallState {
 #endif
   }
 
+  void overrideGeometryData(const RasterGeometry* overriddenGeometryData) {
+    overrides.geometryData = overriddenGeometryData;
+  }
+
+  void overrideCullMode(VkCullModeFlags overriddenCullMode) {
+    overrides.cullMode = overriddenCullMode;
+  }
+
 private:
   friend class RtxContext;
   friend class SceneManager;
   friend class D3D11Rtx;
   friend class TerrainBaker;
   friend struct RemixAPIPrivateAccessor;
-  friend class RtxParticleSystemManager;
 
   bool finalizeGeometryHashes();
   void finalizeGeometryBoundingBox();
@@ -1599,7 +1748,15 @@ struct PooledBlas : public RcObject {
   // Keep a copy of the build info so we can validate BLAS update compatibility
   VkAccelerationStructureBuildGeometryInfoKHR buildInfo = {};
   std::vector<uint32_t> primitiveCounts {};
+
+  // Hash of the index topology that was last built into this BLAS.
+  // Vulkan updates may change vertex positions, but not index values.
   XXH64_hash_t topologyHash = kEmptyHash;
+
+  // Content hash of the geometry data that was last built into this BLAS.
+  // When the merged BLAS content (geometry addresses + primitive counts) is
+  // unchanged, the GPU build can be skipped entirely.
+  XXH64_hash_t contentHash = kEmptyHash;
 
   explicit PooledBlas();
   ~PooledBlas();
@@ -1745,16 +1902,12 @@ struct BlasEntry {
   }
 
   void linkInstance(RtInstance* instance) {
-    m_linkedInstances.push_back(instance);
+    m_linkedInstances.insert(instance);
   }
 
   void unlinkInstance(RtInstance* instance);
 
-  const std::vector<RtInstance*>& getLinkedInstances() const { return m_linkedInstances; }
-  InstanceMap& getSpatialMap() { return m_spatialMap; }
-  const InstanceMap& getSpatialMap() const { return m_spatialMap; }
-
-  void rebuildSpatialMap();
+  const std::unordered_set<RtInstance*>& getLinkedInstances() const { return m_linkedInstances; }
 
   void printDebugInfo(const char* name = "") const {
 #ifdef REMIX_DEVELOPMENT
@@ -1788,8 +1941,13 @@ struct BlasEntry {
   }
 
 private:
-  std::vector<RtInstance*> m_linkedInstances;
-  InstanceMap m_spatialMap;
+  // Hash set instead of vector: unlink path used to be O(N) (std::find then
+  // swap-and-pop), which became a hot spot when many same-geometry transient
+  // instances share one BlasEntry — end-of-frame GC of N instances ran in
+  // O(N²). Switching to a hash set makes unlink O(1) average. Insertion
+  // ordering doesn't matter for any current consumer (size / empty are the
+  // only read operations on this container).
+  std::unordered_set<RtInstance*> m_linkedInstances;
   std::unordered_map<XXH64_hash_t, LegacyMaterialData> m_materials;
 };
 
@@ -1835,6 +1993,7 @@ struct DxvkRaytracingInstanceState {
 enum class RtxFramePassStage {
   FrameBegin,
   Volumetrics,
+  SparseRendering,
   VolumeIntegrateRestirInitial,
   VolumeIntegrateRestirVisible,
   VolumeIntegrateRestirTemporal,

@@ -22,9 +22,11 @@
 
 #include "rtx_neural_radiance_cache.h"
 #include "dxvk_device.h"
+#include "dxvk_objects.h"
 #include "rtx.h"
 #include "rtx/pass/common_binding_indices.h"
 #include "rtx_render/rtx_shader_manager.h"
+#include "rtx_render/rtx_sparse_rendering.h"
 #include "dxvk_scoped_annotation.h"
 #include "rtx_context.h"
 #include "rtx_imgui.h"
@@ -116,6 +118,7 @@ namespace dxvk {
         STRUCTURED_BUFFER(NRC_RESOLVE_BINDING_NRC_TRAINING_PATH_INFO_INPUT)
         
         TEXTURE2D(NRC_RESOLVE_BINDING_SHARED_FLAGS_INPUT)
+        TEXTURE2D(NRC_RESOLVE_BINDING_ACTIVE_LOCAL_PIXEL_COORDS_INPUT)
         CONSTANT_BUFFER(NRC_RESOLVE_BINDING_RAYTRACE_ARGS_INPUT)
 
         RW_STRUCTURED_BUFFER(NRC_RESOLVE_BINDING_NRC_DEBUG_TRAINING_PATH_INFO_INPUT_OUTPUT)
@@ -126,10 +129,17 @@ namespace dxvk {
 
         RW_TEXTURE2D(NRC_RESOLVE_BINDING_DEBUG_VIEW_TEXTURE_OUTPUT)
         RW_STRUCTURED_BUFFER(NRC_RESOLVE_BINDING_GPU_PRINT_BUFFER_OUTPUT)
-        END_PARAMETER()
-      };
+     END_PARAMETER()
+    };
 
-    PREWARM_SHADER_PIPELINE(NrcResolveShader);
+  }
+
+  void NeuralRadianceCache::prewarmShaders(DxvkPipelineManager& pipelineManager) const {
+    if (RtxOptions::integrateIndirectMode() != IntegrateIndirectMode::NeuralRadianceCache) {
+      return;
+    }
+
+    NrcResolveShader::getShader();
   }
 
   void NeuralRadianceCache::NrcOptions::onMaxNumTrainingIterationsChanged(DxvkDevice* device) {
@@ -246,14 +256,15 @@ namespace dxvk {
       const ImVec4 kWhite = ImVec4(1.f, 1.f, 1.f, 1.f);
       const ImVec4 kRed = ImVec4(1.f, 0.f, 0.f, 1.f);
       const ImVec4 kYellow = ImVec4(1.f, 1.f, 0.f, 1.f);
+      const uint32_t numberOfTrainingRecords = getNumberOfTrainingRecords();
 
-      if (m_numberOfTrainingRecords > 0) {
+      if (numberOfTrainingRecords > 0) {
 
         ImVec4 textColor;
 
-        if (m_numberOfTrainingRecords >= calculateTargetNumTrainingRecords()) {
+        if (numberOfTrainingRecords >= calculateTargetNumTrainingRecords()) {
           const float kTargetMaxTolerance = 1.1f;
-          if (m_numberOfTrainingRecords <= kTargetMaxTolerance * calculateTargetNumTrainingRecords()) {
+          if (numberOfTrainingRecords <= kTargetMaxTolerance * calculateTargetNumTrainingRecords()) {
             textColor = kWhite;
           } else {
             textColor = kYellow;
@@ -262,7 +273,7 @@ namespace dxvk {
           textColor = kRed;
         }
            
-        ImGui::TextColored(textColor, "Number of Training Records: %u", m_numberOfTrainingRecords);
+        ImGui::TextColored(textColor, "Number of Training Records: %u", numberOfTrainingRecords);
       } else {
         ImGui::TextColored(kRed, "Number of Training Records: Not Available");
       }
@@ -896,6 +907,8 @@ namespace dxvk {
   }
 
   bool NeuralRadianceCache::onActivation(Rc<DxvkContext>& ctx) {
+    m_isActiveForStats.store(false, std::memory_order_relaxed);
+    m_numberOfTrainingRecords.store(0, std::memory_order_relaxed);
 
     // Fallback to Importance Sampled mode if NRC setup failed.
     // Note: it would be preferable to fallback to ReSTIRGI, but that would require delaying that change to the beginning of the next frame
@@ -914,11 +927,14 @@ namespace dxvk {
     }
 
     m_initSceneBounds = true;
+    m_isActiveForStats.store(true, std::memory_order_relaxed);
 
     return true;
   }
 
   void NeuralRadianceCache::onDeactivation() {
+    m_isActiveForStats.store(false, std::memory_order_relaxed);
+    m_numberOfTrainingRecords.store(0, std::memory_order_relaxed);
     m_nrcCtx = nullptr;
     m_numberOfTrainingRecordsStaging = nullptr;
   }
@@ -996,7 +1012,7 @@ namespace dxvk {
     VkDeviceSize offset = (frameIdx % kMaxFramesInFlight) * sizeof(uint32_t);
     uint32_t* gpuMappedUint = reinterpret_cast<uint32_t*>(m_numberOfTrainingRecordsStaging->mapPtr(offset));
 
-    m_numberOfTrainingRecords = *gpuMappedUint;
+    m_numberOfTrainingRecords.store(*gpuMappedUint, std::memory_order_relaxed);
 
     // NV-DXVK [NrcRecordsProbe]: decisive split for the "weapon black /
     // NRC stuck at numTrainRecords=0" failure. Peek EVERY ring slot of the
@@ -1038,6 +1054,7 @@ namespace dxvk {
     bool forceReset) {
 
     readAndResetNumberOfTrainingRecords();
+    const uint32_t numberOfTrainingRecords = getNumberOfTrainingRecords();
 
     const uint32_t frameIdx = m_nrcCtx->device()->getCurrentFrameId();
 
@@ -1093,7 +1110,7 @@ namespace dxvk {
 
       // Calculate smoothed number of training record statistic
       m_smoothedNumberOfTrainingRecords =
-        lerp<float>(m_smoothedNumberOfTrainingRecords, m_numberOfTrainingRecords, 1.f / numSmoothedFrames);
+        lerp<float>(m_smoothedNumberOfTrainingRecords, numberOfTrainingRecords, 1.f / numSmoothedFrames);
 
       assert(numSmoothedFrames <= NrcOptions::numFramesToSmoothOutTrainingDimensions());
 
@@ -1217,6 +1234,7 @@ namespace dxvk {
       ctx.bindResourceBuffer(NRC_RESOLVE_BINDING_NRC_DEBUG_TRAINING_PATH_INFO_INPUT_OUTPUT, m_nrcCtx->getBufferSlice(ctx, nrc::BufferIdx::DebugTrainingPathInfo));
 
       ctx.bindResourceView(NRC_RESOLVE_BINDING_SHARED_FLAGS_INPUT, rtOutput.m_sharedFlags.view, nullptr);
+      ctx.bindResourceView(NRC_RESOLVE_BINDING_ACTIVE_LOCAL_PIXEL_COORDS_INPUT, rtOutput.m_sparseRenderingActiveLocalPixelCoords.view, nullptr);
       ctx.bindResourceBuffer(NRC_RESOLVE_BINDING_RAYTRACE_ARGS_INPUT, DxvkBufferSlice(raytraceArgsBuffer, 0, raytraceArgsBuffer->info().size));
 
       ctx.bindResourceView(NRC_RESOLVE_BINDING_PRIMARY_DIFFUSE_RADIANCE_HIT_DISTANCE_INPUT_OUTPUT, rtOutput.m_primaryIndirectDiffuseRadiance.view(Resources::AccessType::ReadWrite), nullptr);
@@ -1231,9 +1249,6 @@ namespace dxvk {
 
     // Push constants
     NrcResolvePushConstants pushArgs = {};
-    pushArgs.resolution = uvec2 {
-      m_nrcCtxSettings->frameDimensions.x,
-      m_nrcCtxSettings->frameDimensions.y };
     pushArgs.addPathtracedRadiance = NrcOptions::resolveAddPathTracedRadiance();
     pushArgs.addNrcRadiance = NrcOptions::resolveAddNrcQueriedRadiance();
     pushArgs.resolveMode = NrcOptions::enableDebugResolveMode() ? NrcOptions::debugResolveMode() : NrcResolveMode::AddQueryResultToOutput;
@@ -1276,7 +1291,8 @@ namespace dxvk {
       m_nrcCtxSettings->frameDimensions.x,
       m_nrcCtxSettings->frameDimensions.y,
       1 };
-    VkExtent3D workgroups = util::computeBlockCount(numRaysExtent, VkExtent3D { 16, 8, 1 });
+    VkExtent3D workgroups = util::computeBlockCount(numRaysExtent, VkExtent3D { NRC_RESOLVE_THREADS_DISPATCH_WIDTH, NRC_RESOLVE_THREADS_DISPATCH_HEIGHT, 1 });
+
 
     ctx.bindShader(VK_SHADER_STAGE_COMPUTE_BIT, NrcResolveShader::getShader());
     ctx.dispatch(workgroups.width, workgroups.height, workgroups.depth);
@@ -1350,3 +1366,19 @@ namespace dxvk {
     m_nrcCtx->endFrame();
   }
 } // namespace dxvk
+
+// See declaration in rtx_neural_radiance_cache.h.
+int remixinternal_GetNrcStatus(uint32_t* outTrainingRecords) {
+  dxvk::DxvkDevice* pDevice = dxvk::g_dxvkDeviceNative;
+  if (pDevice == nullptr) {
+    return -1;
+  }
+  dxvk::NeuralRadianceCache& nrc = pDevice->getCommon()->metaNeuralRadianceCache();
+  if (!nrc.isActiveForStats()) {
+    return 0;
+  }
+  if (outTrainingRecords != nullptr) {
+    *outTrainingRecords = nrc.getNumberOfTrainingRecords();
+  }
+  return 1;
+}

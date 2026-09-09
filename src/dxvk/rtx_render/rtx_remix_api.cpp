@@ -42,14 +42,11 @@
 #include "../../util/util_math.h"
 #include "../../util/util_vector.h"
 #include "../../util/util_string.h"
+#include "../../util/util_sentry.h"
 
 #include "../../d3d11/d3d11_device.h"
 #include "../../d3d11/d3d11_context_imm.h"
 #include "../../d3d11/d3d11_texture.h"
-
-#include "../../lssusd/usd_include_begin.h"
-#include <src/usd-plugins/RemixParticleSystem/ParticleSystemAPI.h>
-#include "../../lssusd/usd_include_end.h"
 
 #include <windows.h>
 #include <dxgi1_2.h>
@@ -667,6 +664,9 @@ namespace {
     // --
 
     CameraType::Enum categoryToCameraType(remixapi_InstanceCategoryFlags flags) {
+      if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL) {
+        return CameraType::ViewModel;
+      }
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_SKY) {
         return CameraType::Sky;
       }
@@ -697,9 +697,9 @@ namespace {
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_MODEL){ result.set(InstanceCategories::ThirdPersonPlayerModel); }
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_BODY ){ result.set(InstanceCategories::ThirdPersonPlayerBody ); }
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_BAKED_LIGHTING    ){ result.set(InstanceCategories::IgnoreBakedLighting   ); }
-      if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_TRANSPARENCY_LAYER){ result.set(InstanceCategories::IgnoreTransparencyLayer); }
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE_EMITTER)         { result.set(InstanceCategories::ParticleEmitter); }
       if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_SMOOTH_NORMALS)            { result.set(InstanceCategories::SmoothNormals); }
+      if (flags & REMIXAPI_INSTANCE_CATEGORY_BIT_HAIR_CARDS)                { result.set(InstanceCategories::HairCards); }
       
       static_assert((int)InstanceCategories::Count == 25, "Instance categories changed, please update Remix SDK");
       return result;
@@ -809,28 +809,25 @@ namespace {
       desc.restrictVelocityY = static_cast<uint8_t>(info.restrictVelocityY);
       desc.restrictVelocityZ = static_cast<uint8_t>(info.restrictVelocityZ);
 
-      // If this assert fails a new particle system parameter added, please update here.
-      assert(pxr::RemixParticleSystemAPI::GetSchemaAttributeNames(false).size() == 46);
-
       return desc;
     }
 
-    ExternalDrawState toRtDrawState(const remixapi_InstanceInfo& info) {
+    std::unique_ptr<dxvk::ExternalDrawState> toRtDrawState(const remixapi_InstanceInfo& info) {
       return RemixAPIPrivateAccessor::toRtDrawState(info);
     }
   }
 }
 
-dxvk::ExternalDrawState dxvk::RemixAPIPrivateAccessor::toRtDrawState(const remixapi_InstanceInfo& info)
+std::unique_ptr<dxvk::ExternalDrawState> dxvk::RemixAPIPrivateAccessor::toRtDrawState(const remixapi_InstanceInfo& info)
 {
-  auto prototype = DrawCallState {};
+  auto state = std::make_unique<dxvk::ExternalDrawState>();
+  const CameraType::Enum cameraType = convert::categoryToCameraType(info.categoryFlags);
+
+  auto& prototype = state->drawCall;
   {
-    prototype.cameraType = CameraType::Main;
+    prototype.cameraType = cameraType;
     prototype.transformData.objectToWorld = convert::tomat4(info.transform);
-    prototype.transformData.textureTransform = Matrix4 {};
     prototype.transformData.texgenMode = TexGenMode::None;
-    prototype.materialData.colorTextures[0] = TextureRef {};
-    prototype.materialData.colorTextures[1] = TextureRef {};
     prototype.categories = convert::toRtCategories(info.categoryFlags);
   }
 
@@ -852,6 +849,7 @@ dxvk::ExternalDrawState dxvk::RemixAPIPrivateAccessor::toRtDrawState(const remix
     for (uint32_t boneIdx = 0; boneIdx < boneCount; boneIdx++) {
       apiBones[boneIdx] = convert::tomat4(extBones->boneTransforms_values[boneIdx]);
     }
+    prototype.skinningData.computeHash();
   }
 
   if (auto extBlend = pnext::find<remixapi_InstanceInfoBlendEXT>(&info)) {
@@ -877,17 +875,16 @@ dxvk::ExternalDrawState dxvk::RemixAPIPrivateAccessor::toRtDrawState(const remix
     prototype.materialData.blendMode.writeMask = (VkColorComponentFlags) extBlend->writeMask;
   }
 
-  std::optional<RtxParticleSystemDesc> optParticles;
   if (auto extParticles = pnext::find<remixapi_InstanceInfoParticleSystemEXT>(&info)) {
-    optParticles.emplace(convert::toRtParticleDesc(*extParticles));
+    state->optionalParticleDesc.emplace(convert::toRtParticleDesc(*extParticles));
   }
   if (auto extParticles = pnext::find<remixapi_InstanceInfoParticleSystemLegacyEXT>(&info)) {
-    optParticles.emplace(convert::toRtParticleDesc(*extParticles));
+    state->optionalParticleDesc.emplace(convert::toRtParticleDesc(*extParticles));
   }
 
-  std::vector<Matrix4> gpuInstancingTransforms;
   if (auto extInstancing = pnext::find<remixapi_InstanceInfoGpuInstancingEXT>(&info)) {
     if (extInstancing->instanceTransforms_count > 0 && extInstancing->instanceTransforms_values) {
+      auto& gpuInstancingTransforms = state->gpuInstancingTransforms;
       gpuInstancingTransforms.reserve(extInstancing->instanceTransforms_count);
       for (uint32_t i = 0; i < extInstancing->instanceTransforms_count; ++i) {
         gpuInstancingTransforms.push_back(convert::tomat4(extInstancing->instanceTransforms_values[i]));
@@ -895,15 +892,12 @@ dxvk::ExternalDrawState dxvk::RemixAPIPrivateAccessor::toRtDrawState(const remix
     }
   }
 
-  return ExternalDrawState {
-    prototype,
-    info.mesh,
-    convert::categoryToCameraType(info.categoryFlags),
-    convert::toRtCategories(info.categoryFlags),
-    convert::tobool(info.doubleSided),
-    optParticles,
-    std::move(gpuInstancingTransforms)
-  };
+  state->mesh = info.mesh;
+  state->cameraType = cameraType;
+  state->categories = convert::toRtCategories(info.categoryFlags);
+  state->doubleSided = convert::tobool(info.doubleSided);
+
+  return state;
 }
 
 namespace {
@@ -1123,12 +1117,52 @@ namespace {
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
+  remixapi_ErrorCode REMIXAPI_CALL remixapi_SetCameraMediumMaterial(
+    const remixapi_CameraMediumInfo* info) {
+    dxvk::D3D9DeviceEx* remixDevice = tryAsDxvk();
+    if (!remixDevice) {
+      return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
+    }
+    if (!info || info->sType != REMIXAPI_STRUCT_TYPE_CAMERA_MEDIUM_INFO) {
+      return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
+    }
+
+    const remixapi_MaterialHandle handle = info->medium;
+
+    std::lock_guard lock { s_mutex };
+    remixDevice->EmitCs([handle](dxvk::DxvkContext* ctx) {
+      auto& sceneManager = ctx->getCommonObjects()->getSceneManager();
+      if (handle == nullptr) {
+        sceneManager.clearExternalStartInMediumMaterial();
+        return;
+      }
+
+      const dxvk::MaterialData* material = sceneManager.getAssetReplacer()->accessExternalMaterial(handle);
+      if (material == nullptr) {
+        dxvk::Logger::warn("SetCameraMediumMaterial: material handle not found");
+        return;
+      }
+      if (material->getType() != dxvk::MaterialDataType::Translucent) {
+        dxvk::Logger::warn("SetCameraMediumMaterial: material must be translucent");
+        return;
+      }
+
+      sceneManager.setExternalStartInMediumMaterial(*material);
+    });
+    return REMIXAPI_ERROR_CODE_SUCCESS;
+  }
+
   remixapi_ErrorCode REMIXAPI_CALL remixapi_DrawInstance(
     const remixapi_InstanceInfo* info) {
     auto* remixCtx = tryGetContext();
     if (!remixCtx) {
       return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
     }
+    ScopedCpuProfileZone();
+
+    // Hoist conversion outside of mutex
+    auto drawState = convert::toRtDrawState(*info);
+
     std::lock_guard lock { s_mutex };
     dxvk::RemixAPIPrivateAccessor::EmitCs(remixCtx, [cRtDrawState = convert::toRtDrawState(*info)](dxvk::DxvkContext* dxvkCtx) mutable {
       auto* ctx = static_cast<dxvk::RtxContext*>(dxvkCtx);
@@ -1334,6 +1368,7 @@ namespace {
     if (info.editorModeEnabled) {
       const_cast<dxvk::LightManager::FallbackLightMode&>(dxvk::LightManager::fallbackLightMode()) = dxvk::LightManager::FallbackLightMode::Never;
       const_cast<bool&>(dxvk::DxvkPostFx::desaturateOthersOnHighlight()) = false;
+      const_cast<bool&>(dxvk::RtxOptions::showUICursor()) = false;
     }
   }
 
@@ -1380,6 +1415,7 @@ namespace {
       i.disableSrgbConversionForOutput = editorModeEnabled;
       i.forceNoVkSwapchain = editorModeEnabled;
       i.editorModeEnabled = editorModeEnabled;
+      i.combineGuiInFinalColor = !editorModeEnabled;
       static_assert(sizeof(remixapi_StartupInfo) == 40, "If changing, also set defaults here");
     }
     return remixapi_dxvk_CreateD3D11Device(i, out_pDevice);
@@ -1468,6 +1504,11 @@ namespace {
     case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_NORMALS:
     case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_OBJECT_PICKING:
       break;
+    case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_GUI:
+      if (!dxvk::ImGUI::enableExternalPresenter()) {
+        return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+      }
+      break;
     default:
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
     }
@@ -1482,7 +1523,7 @@ namespace {
       dxvk::Rc<dxvk::DxvkImage> srcImage = nullptr;
       switch (type) {
       case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_FINAL_COLOR:
-        srcImage = rtOutput.m_finalOutput.resource(dxvk::Resources::AccessType::Read).image;
+        srcImage = cBackbuffer;
         break;
       case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_DEPTH:
         srcImage = rtOutput.m_primaryDepth.image;
@@ -1493,6 +1534,15 @@ namespace {
       case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_OBJECT_PICKING:
         srcImage = rtOutput.m_primaryObjectPicking.image;
         break;
+      case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_GUI: {
+        dxvk::DxvkRenderTargets renderTargets;
+        renderTargets.color[0].view = cDestView;
+        renderTargets.color[0].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        ctx->bindRenderTargets(renderTargets);
+        ctx->getCommonObjects()->getImgui().render(ctx, { cDestView->imageInfo().extent.width, cDestView->imageInfo().extent.height });
+
+        break;
+      }
       default:
         assert(!"unexpected remixapi_dxvk_CopyRenderingOutputType value");
         return;
@@ -1738,6 +1788,7 @@ extern "C"
       interf.CreateMesh = remixapi_CreateMesh;
       interf.DestroyMesh = remixapi_DestroyMesh;
       interf.SetupCamera = remixapi_SetupCamera;
+      interf.SetCameraMediumMaterial = remixapi_SetCameraMediumMaterial;
       interf.DrawInstance = remixapi_DrawInstance;
       interf.CreateLight = remixapi_CreateLight;
       interf.DestroyLight = remixapi_DestroyLight;
@@ -1752,9 +1803,10 @@ extern "C"
       interf.pick_RequestObjectPicking = remixapi_pick_RequestObjectPicking;
       interf.pick_HighlightObjects = remixapi_pick_HighlightObjects;
     }
-    static_assert(sizeof(interf) == 168, "Add/remove function registration");
+    static_assert(sizeof(interf) == 176, "Add/remove function registration");
 
     *out_result = interf;
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
+
 }

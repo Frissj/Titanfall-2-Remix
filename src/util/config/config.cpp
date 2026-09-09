@@ -603,11 +603,6 @@ namespace dxvk {
         "ace20008ae3a0a5b,"  // barrel detail texture
         "504697625CCD3B45,"  // building detail texture
       },
-      { "rtx.ignoreTransparencyLayerTextures",
-        // Light beams
-        "0x67801EDD7AA4E77A,"
-        "0xF116B8E9DA308EE8,"
-      },
       { "rtx.ignoreLights",
         // Chell atlases - associated with a light (player light?)
         "460306E97FB2D4B5,"  // 5044883607524660405ULL
@@ -864,7 +859,7 @@ namespace dxvk {
       { "rtx.postfx.enableMotionBlurNoiseSample",               "True"  },
       { "rtx.postfx.chromaticAberrationAmount",                 "0.0"   },
       { "rtx.postfx.chromaticCenterAttenuationAmount",          "0.975" },
-      { "rtx.postfx.vignetteIntensity",                         "1.0"   },
+      { "rtx.postfx.vignetteIntensity",                         "0.8"   },
       { "rtx.postfx.vignetteRadius",                            "0.8"   },
       { "rtx.postfx.vignetteSoftness",                          "0.1"   },
       { "rtx.enableNearPlaneOverride",                          "True"  },

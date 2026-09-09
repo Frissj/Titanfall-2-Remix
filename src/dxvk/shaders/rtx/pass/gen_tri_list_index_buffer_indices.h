@@ -21,7 +21,7 @@
 */
 #pragma once
 
-struct GenTriListArgs 
+struct GenTriListArgs
 {
   uint32_t useIndexBuffer;
   uint32_t topology;

@@ -1,9 +1,9 @@
 <project toolsVersion="7.2.2">
-  <dependency name="nv_usd_py310_release" linkPath="./_external/nv_usd/release">
-    <package name="nv-usd" version="22.11.nv.0.2.8268.07efe1d5-win64_py310_release-dev_omniverse" />
+  <dependency name="usd_release" linkPath="./_external/usd_stock_x64/release">
+    <package name="open_usd" version="25.11+07744417-windows-x86_64-release-nopython" />
   </dependency>
-  <dependency name="nv_usd_py310_debug" linkPath="./_external/nv_usd/debug" tags="non-redist">
-    <package name="nv-usd" version="22.11.nv.0.2.8268.07efe1d5-win64_py310_debug-dev_omniverse" />
+  <dependency name="usd_debug" linkPath="./_external/usd_stock_x64/debug" tags="non-redist">
+    <package name="open_usd" version="25.11+07744417-windows-x86_64-debug-nopython" />
   </dependency>
   <dependency name="glfw" linkPath="./_external/glfw">
     <package name="glfw" version="3.3.0+pipeline10400731-windows-x86_64" />

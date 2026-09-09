@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -19,6 +19,9 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
+#include <assert.h>
+#include <atomic>
+#include <cstring>
 #include <mutex>
 #include <atomic>
 #include <vector>
@@ -42,6 +45,7 @@
 // DEBUG_VIEW_VERTEX_SHADER_ID, used by vsDebugIdIsConsumed() below.
 #include "rtx_debug_view.h"
 #include "rtx_materials.h"
+#include "rtx_ray_portal_manager.h"
 #include "rtx_terrain_baker.h"
 
 #include "rtx_cb_types.h"
@@ -539,13 +543,13 @@ namespace dxvk {
   RtInstance::RtInstance(const uint64_t id, uint32_t instanceVectorId)
     : m_id(id)
     , m_instanceVectorId(instanceVectorId)
+    , m_cacheIdentity(nextRtInstanceCacheIdentity())
     , m_surfaceIndex(SURFACE_INDEX_INVALID)
     , m_previousSurfaceIndex(SURFACE_INDEX_INVALID) { }
 
   // Makes a copy of an instance
   RtInstance::RtInstance(const RtInstance& src, uint64_t id, uint32_t instanceVectorId)
-    : surface(src.surface)
-    , m_id(id)
+    : m_id(id)
     , m_instanceVectorId(instanceVectorId)
     , m_seenCameraTypes(src.m_seenCameraTypes)
     , m_materialType(src.m_materialType)
@@ -644,7 +648,22 @@ namespace dxvk {
        indexOffsets
      */
   }
-  // Ensure the copy ctor copies all needed members when size changes, and update the object size check.
+
+#ifndef NDEBUG
+  void RtInstance::operator delete(void* ptr) noexcept {
+    if (ptr != nullptr) {
+      std::memset(ptr, kDestroyedRtInstanceMemoryPattern, sizeof(RtInstance));
+    }
+
+    ::operator delete(ptr);
+  }
+
+  void RtInstance::operator delete(void* ptr, std::size_t) noexcept {
+    RtInstance::operator delete(ptr);
+  }
+#endif
+
+  // Ensure copyInstanceDataFrom copies all needed members when size changes, and update the object size check.
   // Note: The object has a different size on Debug builds. 
   //       Checking the non-Debug flavors is good enough for the sake of convenience of tracking just a single size.
  #if defined(DEBUG_OPTIMIZED) || defined(NDEBUG)
@@ -806,6 +825,102 @@ namespace dxvk {
 
   void RtInstance::setBlas(BlasEntry& blas) {
     m_linkedBlas = &blas;
+    syncBufferIndicesFromBlas();
+  }
+
+  void RtInstance::syncBufferIndicesFromBlas() {
+    if (m_linkedBlas == nullptr) {
+      return;
+    }
+    const RaytraceGeometry& geo = m_linkedBlas->modifiedGeometryData;
+    surface.positionBufferIndex = geo.positionBufferIndex;
+    surface.positionOffset      = geo.positionBuffer.offsetFromSlice();
+    surface.positionStride      = geo.positionBuffer.stride();
+    surface.normalBufferIndex   = geo.normalBufferIndex;
+    surface.normalOffset        = geo.normalBuffer.offsetFromSlice();
+    surface.normalStride        = geo.normalBuffer.stride();
+    surface.normalFormat        = geo.normalBuffer.vertexFormat();
+    surface.color0BufferIndex   = geo.color0BufferIndex;
+    surface.color0Offset        = geo.color0Buffer.offsetFromSlice();
+    surface.color0Stride        = geo.color0Buffer.stride();
+    surface.texcoordBufferIndex = geo.texcoordBufferIndex;
+    surface.texcoordOffset      = geo.texcoordBuffer.offsetFromSlice();
+    surface.texcoordStride      = geo.texcoordBuffer.stride();
+    surface.previousPositionBufferIndex = geo.previousPositionBufferIndex;
+    surface.indexBufferIndex    = geo.indexBufferIndex;
+    surface.indexStride         = geo.indexBuffer.stride();
+  }
+
+  void RtInstance::copyInstanceDataFrom(const RtInstance& src) {
+    surface = src.surface;
+
+    m_seenCameraTypes = src.m_seenCameraTypes;
+    m_materialType = src.m_materialType;
+    m_albedoOpacityTextureIndex = src.m_albedoOpacityTextureIndex;
+    m_samplerIndex = src.m_samplerIndex;
+    m_secondaryOpacityTextureIndex = src.m_secondaryOpacityTextureIndex;
+    m_secondarySamplerIndex = src.m_secondarySamplerIndex;
+    m_isAnimated = src.m_isAnimated;
+    m_opacityMicromapInstanceData = src.m_opacityMicromapInstanceData;
+    m_opacityMicromapInstanceData.resetCopiedRequestState();
+    m_surfaceIndex = src.m_surfaceIndex;
+    m_previousSurfaceIndex = src.m_previousSurfaceIndex;
+    m_isHidden = src.m_isHidden;
+    m_isPlayerModel = src.m_isPlayerModel;
+    m_isWorldSpaceUI = src.m_isWorldSpaceUI;
+    m_isUnordered = src.m_isUnordered;
+    m_isObjectToWorldMirrored = src.m_isObjectToWorldMirrored;
+    m_isSubsurface = src.m_isSubsurface;
+    m_linkedBlas = src.m_linkedBlas;
+    m_materialHash = src.m_materialHash;
+    m_materialDataHash = src.m_materialDataHash;
+    m_texcoordHash = src.m_texcoordHash;
+    m_indexHash = src.m_indexHash;
+    m_vkInstance = src.m_vkInstance;
+    m_geometryFlags = src.m_geometryFlags;
+    m_firstBillboard = src.m_firstBillboard;
+    m_billboardCount = src.m_billboardCount;
+    m_categoryFlags = src.m_categoryFlags;
+
+    // Intentionally NOT synced (identity / lifecycle / per-build state):
+    //   m_id, m_instanceVectorId, m_cacheIdentity, m_isMarkedForGC, m_isUnlinkedForGC,
+    //   m_isInsideFrustum, m_frameLastUpdated, m_frameCreated,
+    //   m_isCreatedByRenderer, m_spatialCacheHash,
+    //   OMM request registration state,
+    //   m_primInstanceOwner, buildGeometries, buildRanges,
+    //   billboardIndices, indexOffsets, m_blasDirty,
+    //   m_billboardGeometryDirty, m_emitterMotionState
+  }
+
+  void RtInstance::updateFromReference(const RtInstance& src, const bool preserveTransforms) {
+    // Optionally preserve the persistent instance's corrected transforms so that
+    // callers that apply an absolute corrected transform afterward can detect
+    // whether the transform actually changed between frames.
+    const Matrix4 savedObjectToWorld = surface.objectToWorld;
+    const Matrix4 savedPrevObjectToWorld = surface.prevObjectToWorld;
+    const Matrix3 savedNormalObjectToWorld = surface.normalObjectToWorld;
+    const VkTransformMatrixKHR savedVkTransform = m_vkInstance.transform;
+
+    copyInstanceDataFrom(src);
+
+    if (preserveTransforms) {
+      // Restore transforms; the caller applies the corrected transform afterward.
+      surface.objectToWorld = savedObjectToWorld;
+      surface.prevObjectToWorld = savedPrevObjectToWorld;
+      surface.normalObjectToWorld = savedNormalObjectToWorld;
+
+      // Restore VK instance transform (was overwritten by the m_vkInstance copy above).
+      m_vkInstance.transform = savedVkTransform;
+    }
+
+    // Clones are not linked into BlasEntry::m_linkedInstances (see createInstanceCopy), so
+    // updateBufferCache's push never reaches them. Re-derive from the BLAS rather than relying on
+    // the reference instance having been refreshed first.
+    syncBufferIndicesFromBlas();
+
+    // Mark dirty so the incremental BLAS cache treats this instance as changed.
+    m_blasDirty = true;
+    m_billboardGeometryDirty = true;
   }
 
   // NV-DXVK [MapGate]: why is the SpatialMap never written?
@@ -1544,6 +1659,7 @@ namespace dxvk {
     surface.normalObjectToWorld = transpose(inverse(Matrix3(surface.objectToWorld)));
     surface.prevObjectToWorld = prevObjectToWorld;
     onTransformChanged();
+    m_blasDirty = true;
 
     return memcmp(surface.prevObjectToWorld.data, surface.objectToWorld.data, sizeof(Matrix4)) != 0;
   }
@@ -1553,6 +1669,7 @@ namespace dxvk {
     surface.normalObjectToWorld = transpose(inverse(Matrix3(surface.objectToWorld)));
     surface.prevObjectToWorld = oldToNew * surface.prevObjectToWorld;
     onTransformChanged();
+    m_blasDirty = true;
 
     if (m_primInstanceOwner.isRoot(this)) {
       // this is the root of a replacement - need to update the transform history for all the instances in the replacement.
@@ -1664,17 +1781,6 @@ namespace dxvk {
     m_isMarkedForGC = true;
   }
 
-  void RtInstance::markAsUnlinkedFromBlasEntryForGarbageCollection() const {
-    m_isUnlinkedForGC = true;
-  }
-
-  void RtInstance::markAsInsideFrustum() const {
-    m_isInsideFrustum = true;
-  }
-
-  void RtInstance::markAsOutsideFrustum() const {
-    m_isInsideFrustum = false;
-  }
 
   bool RtInstance::registerCamera(CameraType::Enum cameraType, uint32_t frameIndex) {
     const bool settingNewCameraType = !m_seenCameraTypes.test(cameraType);
@@ -1761,7 +1867,6 @@ namespace dxvk {
       "Material Data Hash: 0x", std::hex, m_materialDataHash, std::dec, "\n",
       "Texcoord Hash: 0x", std::hex, m_texcoordHash, std::dec, "\n",
       "Index Hash: 0x", std::hex, m_indexHash, std::dec, "\n",
-      "Spatial Cache Hash: 0x", std::hex, m_spatialCacheHash, std::dec, "\n",
       "\n",
       "=== Vulkan Instance Info ===\n",
       "VK Instance Mask: ", m_vkInstance.mask, "\n",
@@ -1799,8 +1904,6 @@ namespace dxvk {
       "\n",
       "=== Garbage Collection Flags ===\n",
       "Is Marked For GC: ", m_isMarkedForGC ? "true" : "false", "\n",
-      "Is Unlinked For GC: ", m_isUnlinkedForGC ? "true" : "false", "\n",
-      "Is Inside Frustum: ", m_isInsideFrustum ? "true" : "false", "\n",
       "\n",
       "=== View Model Flags ===\n",
       "Is View Model: ", isViewModel() ? "true" : "false", "\n",
@@ -1849,10 +1952,12 @@ namespace dxvk {
   InstanceManager::InstanceManager(DxvkDevice* device, ResourceCache* pResourceCache)
     : CommonDeviceObject(device)
     , m_pResourceCache(pResourceCache) {
-    m_previousViewModelState = RtxOptions::ViewModel::enable();
   }
 
   InstanceManager::~InstanceManager() {
+#ifndef NDEBUG
+    releaseDestroyedInstanceQuarantine();
+#endif
   }
 
   void InstanceManager::removeEventHandler(void* eventHandlerOwnerAddress) {
@@ -1881,7 +1986,7 @@ namespace dxvk {
 
     for (RtInstance* instance : m_instances) {
       removeInstance(instance);
-      delete instance;
+      destroyInstanceAllocation(instance);
     }
 
     m_instances.clear();
@@ -2764,6 +2869,7 @@ namespace dxvk {
       clear();
       m_previousViewModelState = isViewModelEnabled;
     }
+  }
 
     // NV-DXVK [SubViewVsCensus]: per-VS bucket counts across ALL
     // sub-view RtInstances (every instance with IgnoreAntiCulling set
@@ -3347,7 +3453,6 @@ namespace dxvk {
 
     const bool forceGarbageCollection = (m_instances.size() >= RtxOptions::AntiCulling::Object::numObjectsToKeep());
     for (uint32_t i = 0; i < m_instances.size();) {
-      // Must take a ref here since we'll be swapping
       RtInstance*& pInstance = m_instances[i];
       assert(pInstance != nullptr);
 
@@ -4069,14 +4174,14 @@ namespace dxvk {
         // Note: Pop and swap for performance, index not incremented to process swapped instance on next iteration
         removeInstance(pInstance);
 
+        // If this instance is tracked in a persistent map (as key or value),
+        // remove the entry so we don't leave a dangling pointer.
+        erasePersistentMapEntries(pInstance);
+
         // NOTE: pInstance is now the (previously) last element
         std::swap(pInstance, m_instances.back());
-
         m_instances[i]->m_instanceVectorId = i;
-
-        delete m_instances.back();
-
-        // Remove the last element
+        destroyInstanceAllocation(m_instances.back());
         m_instances.pop_back();
         continue;
       }
@@ -6474,18 +6579,32 @@ namespace dxvk {
     // Handle Alpha Test State
 
     // Note: Even if the Alpha Test enable flag is set, we consider it disabled if the actual test type is set to always.
-    const bool forceAlphaTest = drawCall.getCategoryFlags().test(InstanceCategories::AlphaBlendToCutout);
-    const bool alphaTestEnabled = forceAlphaTest || (AlphaTestType)drawCall.getMaterialData().alphaTestCompareOp != AlphaTestType::kAlways;
+    const bool forceCutoutAlphaTest = drawCall.testCategoryFlags(InstanceCategories::AlphaBlendToCutout);
+    const bool forceHairCardAlphaTest = drawCall.testCategoryFlags(InstanceCategories::HairCards);
+    const bool forceAlphaTest = forceCutoutAlphaTest || forceHairCardAlphaTest;
+    const bool legacyAlphaTestEnabled = (AlphaTestType)drawCall.getMaterialData().alphaTestCompareOp != AlphaTestType::kAlways;
+    const bool materialAlphaTestEnabled = opaqueMaterialData.getAlphaTestType() != AlphaTestType::kAlways;
 
     // Note: Use the Opaque Material Data's alpha test state information directly if requested,
     // otherwise derive the alpha test state from the drawcall (via its legacy material data).
-    if (forceAlphaTest) {
+    if (forceCutoutAlphaTest) {
       out.alphaTestType = AlphaTestType::kGreater;
       out.alphaTestReferenceValue = static_cast<uint8_t>(RtxOptions::forceCutoutAlpha() * 255.0);
+    } else if (forceHairCardAlphaTest) {
+      if (!useLegacyAlphaState && materialAlphaTestEnabled) {
+        out.alphaTestType = opaqueMaterialData.getAlphaTestType();
+        out.alphaTestReferenceValue = opaqueMaterialData.getAlphaTestReferenceValue();
+      } else if (legacyAlphaTestEnabled) {
+        out.alphaTestType = (AlphaTestType)drawCall.getMaterialData().alphaTestCompareOp;
+        out.alphaTestReferenceValue = drawCall.getMaterialData().alphaTestReferenceValue;
+      } else {
+        out.alphaTestType = AlphaTestType::kGreater;
+        out.alphaTestReferenceValue = static_cast<uint8_t>(RtxOptions::forceCutoutAlpha() * 255.0);
+      }
     } else if (!useLegacyAlphaState) {
       out.alphaTestType = opaqueMaterialData.getAlphaTestType();
       out.alphaTestReferenceValue = opaqueMaterialData.getAlphaTestReferenceValue();
-    } else if (alphaTestEnabled) {
+    } else if (legacyAlphaTestEnabled) {
       out.alphaTestType = (AlphaTestType)drawCall.getMaterialData().alphaTestCompareOp;
       out.alphaTestReferenceValue = drawCall.getMaterialData().alphaTestReferenceValue;
     }
@@ -8652,6 +8771,8 @@ namespace dxvk {
   RtInstance* InstanceManager::addInstance(BlasEntry& blas) {
     const uint32_t currentFrameIdx = m_device->getCurrentFrameId();
 
+    notifySceneChanged();
+
     const uint32_t instanceIdx = m_instances.size();
     RtInstance* newInst = new RtInstance(m_nextInstanceId++, instanceIdx);
     m_instances.push_back(newInst);
@@ -8675,9 +8796,6 @@ namespace dxvk {
     for (auto& event : m_eventHandlers)
       event.onInstanceAddedCallback(*currentInstance);
 
-    // onInstanceAddedCallback will link current instance to the BLAS
-    currentInstance->m_isUnlinkedForGC = false;
-
     return currentInstance;
   }
 
@@ -8692,6 +8810,13 @@ namespace dxvk {
     RtInstance* newInstance = new RtInstance(reference, id, instanceIdx);
     newInstance->m_isCreatedByRenderer = true;
     m_instances.push_back(newInstance);
+    notifySceneChanged();
+
+    // Renderer-created clones (view model, player model, ray-portal virtual instances) deliberately
+    // skip onInstanceAdded, so BlasEntry::linkInstance is never called for them and
+    // updateBufferCache's propagation will not reach them. Derive the indices straight from the BLAS
+    // instead of trusting the indices copied from the reference instance.
+    newInstance->syncBufferIndicesFromBlas();
 
     return newInstance;
   }
@@ -9025,6 +9150,7 @@ namespace dxvk {
       // Apply world offset
       Vector3 worldOffset = RtxOptions::instanceOverrideWorldOffset();
       currentInstance.teleportWithHistory(translationMatrix(worldOffset));
+      notifySceneChanged();
 
       return true;
     }
@@ -9559,6 +9685,9 @@ namespace dxvk {
     // setFrameLastUpdated() must be called first as it resets instance's state on a first call in a frame
     const bool isFirstUpdateThisFrame = currentInstance.setFrameLastUpdated(m_device->getCurrentFrameId());
 
+    // Full instance processing always goes through the dynamic draw path this frame.
+    currentInstance.surface.isPreservePath = false;
+
     // These can change in the Runtime UI so need to check during update
     currentInstance.m_isHidden = currentInstance.testCategoryFlags(InstanceCategories::Hidden);
     currentInstance.m_isPlayerModel = currentInstance.testCategoryFlags(InstanceCategories::ThirdPersonPlayerModel);
@@ -9570,8 +9699,10 @@ namespace dxvk {
       currentInstance.m_isHidden = true;
     }
 
-    // Register camera
-    bool isNewCameraSet = currentInstance.registerCamera(drawCall.cameraType, m_device->getCurrentFrameId());
+    // Snapshot whether this is a brand-new camera before the call to preserveInstance() at the
+    // bottom (which always re-registers via RtInstance::registerCamera) so the override logic
+    // below sees the "is this the first time we've seen this camera type?" state.
+    const bool isNewCameraSet = !currentInstance.isCameraRegistered(drawCall.cameraType);
 
     const bool overridePreviousCameraUpdate = isNewCameraSet &&
       (drawCall.cameraType == CameraType::Main ||
@@ -10022,7 +10153,6 @@ namespace dxvk {
         currentInstance.surface.isTextureFactorBlend = drawCall.getMaterialData().isTextureFactorBlend;
         currentInstance.surface.isVertexColorBakedLighting = drawCall.getMaterialData().isVertexColorBakedLighting;
         currentInstance.surface.isMotionBlurMaskOut = currentInstance.testCategoryFlags(InstanceCategories::IgnoreMotionBlur);
-        currentInstance.surface.ignoreTransparencyLayer = currentInstance.testCategoryFlags(InstanceCategories::IgnoreTransparencyLayer);
 
         // Note: Skip the spritesheet adjustment logic in the surface interaction when using Ray Portal materials as this logic
         // is done later in the Surface Material Interaction (and doing it in both places will just double up the animation).
@@ -10564,6 +10694,11 @@ namespace dxvk {
           }
         }
 
+        if (hasTransformChanged) {
+          notifySceneChanged();
+          currentInstance.m_blasDirty = true;
+        }
+
         currentInstance.surface.textureTransform = drawCall.getTransformData().textureTransform;
         // NV-DXVK: log ONE entry per (hash-of-matrix, vsHash) combo so we see
         // every distinct transform any draw uses, paired with the VS hash so
@@ -10939,11 +11074,20 @@ namespace dxvk {
 
     uiSplit.mark(4);   // NV-DXVK [Perf.UpdInst]: end of `viewmodel`
 
-    if (RtxOptions::enableSeparateUnorderedApproximations() &&
-        (drawCall.cameraType == CameraType::Main || drawCall.cameraType == CameraType::ViewModel) &&
-        currentInstance.m_isUnordered &&
-        !currentInstance.m_isHidden &&
-        currentInstance.getVkInstance().mask != 0) {
+    const auto currentInstancesToObject = currentInstance.surface.instancesToObject;
+    const size_t currentInstancesToObjectSize = currentInstancesToObject ? currentInstancesToObject->size() : 0;
+    const uint32_t currentCustomIndexFlags = currentInstance.m_vkInstance.instanceCustomIndex & ~uint32_t(CUSTOM_INDEX_SURFACE_MASK);
+    const bool accelerationStructureKeyChanged =
+      previousCategoryFlags.raw() != currentInstance.m_categoryFlags.raw() ||
+      previousInstanceMask != currentInstance.m_vkInstance.mask ||
+      previousCustomIndexFlags != currentCustomIndexFlags ||
+      previousInstanceShaderBindingTableRecordOffset != currentInstance.m_vkInstance.instanceShaderBindingTableRecordOffset ||
+      previousInstanceFlags != currentInstance.m_vkInstance.flags ||
+      previousUsesUnorderedApproximations != currentInstance.m_isUnordered ||
+      previousIsSubsurface != currentInstance.m_isSubsurface ||
+      previousGeometryFlags != currentInstance.m_geometryFlags ||
+      previousInstancesToObject.get() != currentInstancesToObject.get() ||
+      previousInstancesToObjectSize != currentInstancesToObjectSize;
 
       // NV-DXVK [Phase2b]: createBillboards reads MAPPED BUFFER CONTENTS (a
       // positional read — the physical slice a logical buffer resolves to is a
@@ -11396,7 +11540,6 @@ namespace dxvk {
     // Always clean up replacement instance references, even for renderer-created instances
     // to avoid use-after-free bugs in ReplacementInstance.prims
     instance->getPrimInstanceOwner().setReplacementInstance(nullptr, ReplacementInstance::kInvalidReplacementIndex, instance, PrimInstance::Type::Instance);
-    instance->removeFromSpatialCache();
     
     // In these cases we skip calling onInstanceDestroyed:
     //   Some view model and player instances are created in the renderer and don't have onInstanceAdded called,
@@ -11416,15 +11559,27 @@ namespace dxvk {
                                                        const Matrix4d& perspectiveCorrection,
                                                        const Matrix4d& prevPerspectiveCorrection) {
 
-    // Create a view model instance corresponding to the reference instance, for one frame 
-
-    // Don't pollute global instance id with View Models since they're not tracked in game capturer
-    const bool needValidGlobalInstanceId = false;
-
-    RtInstance* viewModelInstance = createInstanceCopy(reference, needValidGlobalInstanceId);
-
     const uint32_t frameId = m_device->getCurrentFrameId();
-    viewModelInstance->setFrameCreated(frameId);
+
+    // Try to reuse a persistent view model instance for this reference.
+    RtInstance* viewModelInstance = nullptr;
+    auto it = m_persistentViewModelInstances.find(const_cast<RtInstance*>(&reference));
+    if (it != m_persistentViewModelInstances.end()) {
+      // Existing persistent instance — sync surface/material data from the
+      // reference while preserving the corrected transform for change detection.
+      viewModelInstance = it->second;
+      viewModelInstance->updateFromReference(reference);
+      notifySceneChanged();
+    } else {
+      // First time seeing this reference — create a new persistent instance.
+      const bool needValidGlobalInstanceId = false;
+      viewModelInstance = createInstanceCopy(reference, needValidGlobalInstanceId);
+      viewModelInstance->setFrameCreated(frameId);
+      m_persistentViewModelInstances[const_cast<RtInstance*>(&reference)] = viewModelInstance;
+    }
+
+    // Keep the instance alive (prevent GC) and mark it as current.
+    viewModelInstance->m_isMarkedForGC = false;
     viewModelInstance->setFrameLastUpdated(frameId);
     viewModelInstance->m_vkInstance.mask = OBJECT_MASK_VIEWMODEL;
     viewModelInstance->setCustomIndexBit(CUSTOM_INDEX_IS_VIEW_MODEL, true);
@@ -11605,10 +11760,7 @@ namespace dxvk {
 
     // ViewModel should never be considered static
     viewModelInstance->surface.isStatic = false;
-
-    // Note this is an instance copy of a input reference. It is unknown to the source engine, so we don't call onInstanceAdded callbacks for it
-    // It also results in this instance not being linked to reference instance BLAS and thus not considered in findSimilarInstances' lookups
-    // This is desired as ViewModel instances are not to be linked frame to frame
+    viewModelInstance->surface.isPreservePath = false;
 
     // NV-DXVK [VM.final]: log the final viewmodel instance's transform +
     // mask so we can see where it'd render and whether the BVH/TLAS upload
@@ -11783,12 +11935,19 @@ namespace dxvk {
 
     if (!vmCamValid)
       return;
+    }
+
+    if (!cameraManager.isCameraValid(CameraType::ViewModel)) {
+      cleanupAllPersistentViewModelInstances();
+      return;
+    }
 
     // If the first person player model is enabled, hide the view model.
     if (RtxOptions::PlayerModel::enableInPrimarySpace()) {
       for (auto* candidateInstance : m_viewModelCandidates) {
         candidateInstance->m_vkInstance.mask = 0;
       }
+      cleanupAllPersistentViewModelInstances();
       return;
     }
 
@@ -11890,6 +12049,7 @@ namespace dxvk {
       // Tag the instance as ViewModel so it can be checked for it being a reference view model instance
       candidateInstance->setCustomIndexBit(CUSTOM_INDEX_IS_VIEW_MODEL, true);
 
+      activeViewModelReferences.insert(candidateInstance);
       viewModelInstances.push_back(createViewModelInstance(ctx, *candidateInstance, perspectiveCorrection, prevPerspectiveCorrection));
       ++vmCreated;
     }
@@ -11899,6 +12059,9 @@ namespace dxvk {
       " created=", vmCreated,
       " skipNoCam=", vmSkippedNoCam,
       " skipMultiCam=", vmSkippedMulticam));
+
+    // Mark persistent view model instances whose references have disappeared for GC.
+    cleanupPersistentMap(m_persistentViewModelInstances, activeViewModelReferences);
 
     // Create virtual instances for the view model instances
     createRayPortalVirtualViewModelInstances(viewModelInstances, cameraManager, rayPortalManager);
@@ -12074,8 +12237,17 @@ namespace dxvk {
   }
 
   void InstanceManager::createPlayerModelVirtualInstances(Rc<DxvkContext> ctx, const CameraManager& cameraManager, const RayPortalManager& rayPortalManager) {
-    if (m_playerModelInstances.empty())
+    auto cleanupAllPersistentPlayerModelClones = [this]() {
+      for (auto& [ref, inst] : m_persistentPlayerModelClones) {
+        inst->markForGarbageCollection();
+      }
+      m_persistentPlayerModelClones.clear();
+    };
+
+    if (m_playerModelInstances.empty()) {
+      cleanupAllPersistentPlayerModelClones();
       return;
+    }
 
     // Sometimes, the game renders the player model on the other side of the portal
     // that is closest to the camera. To detect that, we look at the model position.
@@ -12090,8 +12262,10 @@ namespace dxvk {
         bodyInstance = instance;
     }
 
-    if (!bodyInstance)
+    if (!bodyInstance) {
+      cleanupAllPersistentPlayerModelClones();
       return;
+    }
 
     // Get the position from the transform matrix - works for Portal
     Vector3 playerModelPosition = bodyInstance->getTransform()[3].xyz();
@@ -12116,8 +12290,10 @@ namespace dxvk {
     const bool createVirtualInstances = RtxOptions::PlayerModel::enableVirtualInstances() && (nearPortalInfo != nullptr);
 
     // The loop below creates virtual instances and applies the offset. Exit if neither is necessary.
-    if (!createVirtualInstances && backwardOffset == 0.f)
+    if (!createVirtualInstances && backwardOffset == 0.f) {
+      cleanupAllPersistentPlayerModelClones();
       return;
+    }
 
     // Calculate the offset vector
     Vector3 backwardOffsetVector = cameraManager.getMainCamera().getHorizontalForwardDirection();
@@ -12135,13 +12311,15 @@ namespace dxvk {
       Vector4(backwardOffsetVector, 1.f)
     };
     
-    // Create virtual instances for player model instances that are close to portals.
+    // Create or update virtual instances for player model instances that are close to portals.
     // Offset both real and virtual instances by backwardOffset units if enabled.
+    std::unordered_set<RtInstance*> activePlayerModelReferences;
     for (RtInstance* originalInstance : m_playerModelInstances) {
 
       if (backwardOffset != 0.f) {
         // Offset the original instance
         originalInstance->teleportWithHistory(backwardOffsetMatrix);
+        notifySceneChanged();
 
         // Offset the original instance particles
         for (uint32_t i = 0; i < originalInstance->m_billboardCount; ++i) {
@@ -12151,17 +12329,26 @@ namespace dxvk {
 
       if (!createVirtualInstances)
         continue;
-      
-      // Don't pollute global instance id with Player Models since they're not tracked in game capturer
-      const bool needValidGlobalInstanceId = false;
 
-      RtInstance* clonedInstance = createInstanceCopy(*originalInstance, needValidGlobalInstanceId);
-      
-      clonedInstance->setFrameCreated(frameId);
+      activePlayerModelReferences.insert(originalInstance);
+
+      RtInstance* clonedInstance = nullptr;
+      auto it = m_persistentPlayerModelClones.find(originalInstance);
+      if (it != m_persistentPlayerModelClones.end()) {
+        // Reuse existing persistent clone.
+        clonedInstance = it->second;
+        clonedInstance->updateFromReference(*originalInstance, /* preserveTransforms = */ false);
+        notifySceneChanged();
+      } else {
+        // Create new persistent clone.
+        const bool needValidGlobalInstanceId = false;
+        clonedInstance = createInstanceCopy(*originalInstance, needValidGlobalInstanceId);
+        clonedInstance->setFrameCreated(frameId);
+        m_persistentPlayerModelClones[originalInstance] = clonedInstance;
+      }
+
+      clonedInstance->m_isMarkedForGC = false;
       clonedInstance->setFrameLastUpdated(frameId);
-
-      // Cloned player model instances are recreated every frame
-      clonedInstance->markForGarbageCollection();
 
       // Compute the instance masks for both original and cloned instances.
       // When the original instance is real (which is the case normally), the cloned one is virtual and located on the other side of a portal.
@@ -12223,6 +12410,9 @@ namespace dxvk {
         -dot(nearPortalInfo->entryPortalInfo.planeNormal, nearPortalInfo->entryPortalInfo.centroid));
       originalInstance->m_vkInstance.flags |= VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR;
     }
+
+    // Mark persistent player model clones whose references have disappeared for GC.
+    cleanupPersistentMap(m_persistentPlayerModelClones, activePlayerModelReferences);
   }
 
   void InstanceManager::findPortalForVirtualInstances(const CameraManager& cameraManager, const RayPortalManager& rayPortalManager) {
@@ -12264,51 +12454,69 @@ namespace dxvk {
                                                                  const CameraManager& cameraManager,
                                                                  const RayPortalManager& rayPortalManager) {
     // Early out if there is no eligible portal
-    if (m_virtualInstancePortalIndex < 0)
+    if (m_virtualInstancePortalIndex < 0) {
+      // No portal in range — clean up any leftover persistent virtual view model instances.
+      for (auto& [ref, inst] : m_persistentVirtualViewModelInstances) {
+        inst->markForGarbageCollection();
+      }
+      m_persistentVirtualViewModelInstances.clear();
       return;
+    }
 
     if (rayPortalManager.getRayPortalPairInfos().empty()) {
       assert(!"There must be a portal pair in createRayPortalVirtualViewModelInstances if m_virtualInstancePortalIndex is defined");
       return;
     }
 
-    if (!RtxOptions::ViewModel::enableVirtualInstances())
+    if (!RtxOptions::ViewModel::enableVirtualInstances()) {
+      // Feature disabled — clean up persistent instances.
+      for (auto& [ref, inst] : m_persistentVirtualViewModelInstances) {
+        inst->markForGarbageCollection();
+      }
+      m_persistentVirtualViewModelInstances.clear();
       return;
+    }
 
     const SingleRayPortalDirectionInfo& closestPortalInfo = rayPortalManager.getRayPortalPairInfos()[0]->pairInfos[m_virtualInstancePortalIndex];
     
     const uint32_t frameId = m_device->getCurrentFrameId();
 
-    // Create virtual instances for view model instances that are close to portals
+    // Create or update virtual instances for view model instances that are close to portals
+    std::unordered_set<RtInstance*> activeVirtualViewModelReferences;
     for (RtInstance* referenceInstance : viewModelReferenceInstances) {
 
-      // Create a view model virtual instance corresponding to the view model instance, for one frame
+      activeVirtualViewModelReferences.insert(referenceInstance);
 
-      // Don't pollute global instance id with View Models since they're not tracked in game capturer
-      const bool needValidGlobalInstanceId = false;
+      RtInstance* virtualInstance = nullptr;
+      auto it = m_persistentVirtualViewModelInstances.find(referenceInstance);
+      if (it != m_persistentVirtualViewModelInstances.end()) {
+        // Reuse existing persistent instance.
+        virtualInstance = it->second;
+        virtualInstance->updateFromReference(*referenceInstance, /* preserveTransforms = */ false);
+        notifySceneChanged();
+      } else {
+        // Create new persistent virtual instance.
+        const bool needValidGlobalInstanceId = false;
+        virtualInstance = createInstanceCopy(*referenceInstance, needValidGlobalInstanceId);
+        virtualInstance->setFrameCreated(frameId);
+        m_persistentVirtualViewModelInstances[referenceInstance] = virtualInstance;
+      }
 
-      RtInstance* virtualInstance = createInstanceCopy(*referenceInstance, needValidGlobalInstanceId);
-
-      virtualInstance->setFrameCreated(frameId);
+      virtualInstance->m_isMarkedForGC = false;
       virtualInstance->setFrameLastUpdated(frameId);
-
-      // Virtual view model instances are recreated every frame
-      virtualInstance->markForGarbageCollection();
 
       // Virtual instances are to be visible only in their corresponding portal spaces
       static_assert(maxRayPortalCount == 2);
-      // View model virtual instance
       virtualInstance->m_vkInstance.mask = OBJECT_MASK_VIEWMODEL_VIRTUAL;
     
       // Update virtual instance transforms given the reference and the portal transform
       {
         virtualInstance->teleportWithHistory(closestPortalInfo.portalToOpposingPortalDirection);
       }
-
-      // Note this is an instance copy of an input reference. It is unknown to the source engine, so we don't call onInstanceAdded callbacks for it
-      // It also results in this instance not being linked to reference instance BLAS and thus not considered in findSimilarInstances' lookups
-      // This is desired as ViewModel instances are not to be linked frame to frame
     }
+
+    // Mark persistent virtual view model instances whose references have disappeared for GC.
+    cleanupPersistentMap(m_persistentVirtualViewModelInstances, activeVirtualViewModelReferences);
   }
 
   void InstanceManager::resetSurfaceIndices() {
@@ -12319,6 +12527,56 @@ namespace dxvk {
   inline bool isFpSpecial(float x) {
     const uint32_t u = *(uint32_t*) &x;
     return (u & 0x7f800000) == 0x7f800000;
+  }
+
+  uint32_t InstanceManager::computeBillboardIntersectionPrimitiveMask(const RtInstance& instance) {
+    // Player-model intersection primitives live in OBJECT_MASK_PLAYER_MODEL (and
+    // OBJECT_MASK_PLAYER_MODEL_VIRTUAL on portal clones — overwritten later in
+    // createPlayerModelVirtualInstances). See instance_definitions.h for the mask layout.
+    if (instance.m_isPlayerModel) {
+      return OBJECT_MASK_PLAYER_MODEL;
+    }
+    // Pick the _INTERSECTION_PRIMITIVE half of the BLENDED / EMISSIVE pair that matches
+    // the instance's blend mode.
+    if (instance.surface.alphaState.isDecal) {
+      return OBJECT_MASK_UNORDERED_BLENDED_INTERSECTION_PRIMITIVE;
+    }
+    if (instance.surface.alphaState.emissiveBlend) {
+      return OBJECT_MASK_UNORDERED_EMISSIVE_INTERSECTION_PRIMITIVE;
+    }
+    return OBJECT_MASK_UNORDERED_BLENDED_INTERSECTION_PRIMITIVE;
+  }
+
+  void InstanceManager::refreshBillboardsForCurrentFrame(RtInstance& currentInstance,
+                                                         CameraType::Enum cameraType,
+                                                         const Vector3& cameraViewDirection) {
+    // m_billboards is cleared every frame in onFrameEnd, so reset the per-instance
+    // count and let createBeams / createBillboards re-populate m_billboards and
+    // re-stamp m_firstBillboard / m_billboardCount for this frame.
+    const uint32_t previousBillboardCount = currentInstance.m_billboardCount;
+    currentInstance.m_billboardCount = 0;
+
+    // Note: instance.mask is not part of this guard. createBillboards() and createBeams()
+    // intentionally clear bits from the mask (for player-model particles the mask ends up
+    // at 0), so re-checking mask on the next frame would skip the very instances that
+    // still need their billboards re-populated on the preserve path.
+    if (!(RtxOptions::enableSeparateUnorderedApproximations() &&
+          (cameraType == CameraType::Main || cameraType == CameraType::ViewModel) &&
+          currentInstance.m_isUnordered &&
+          !currentInstance.m_isHidden)) {
+      return;
+    }
+
+    if (currentInstance.testCategoryFlags(InstanceCategories::Beam)) {
+      createBeams(currentInstance);
+    } else if (!currentInstance.surface.alphaState.isDecal) {
+      createBillboards(currentInstance, cameraViewDirection);
+    }
+
+    if (currentInstance.m_billboardCount != previousBillboardCount) {
+      currentInstance.m_blasDirty = true;
+      currentInstance.m_billboardGeometryDirty = true;
+    }
   }
 
   void InstanceManager::createBillboards(RtInstance& instance, const Vector3& cameraViewDirection)
@@ -12448,7 +12706,7 @@ namespace dxvk {
       billboard.centerUV = centerUV;
       billboard.instance = &instance;
       billboard.vertexColor = vertexColor;
-      billboard.instanceMask = instance.getVkInstance().mask & OBJECT_MASK_UNORDERED_ALL_INTERSECTION_PRIMITIVE;
+      billboard.instanceMask = computeBillboardIntersectionPrimitiveMask(instance);
       billboard.texCoordHash = XXH64(texcoords, sizeof(texcoords), kEmptyHash);
       billboard.vertexOpacityHash = XXH64(vertexOpacities8bit, sizeof(vertexOpacities8bit), kEmptyHash);
       billboard.allowAsIntersectionPrimitive = true;
@@ -12471,6 +12729,10 @@ namespace dxvk {
           IntersectionBillboard& billboard = m_billboards[i];
           billboard.allowAsIntersectionPrimitive = false;
         }
+        // Triangle catches intersection-primitive rays as the fallback (since the billboards
+        // can't this frame). OR in the matching _INTERSECTION_PRIMITIVE bits so the triangle
+        // mask ends in the canonical "_GEOMETRY | _INTERSECTION_PRIMITIVE" state.
+        instance.getVkInstance().mask |= computeBillboardIntersectionPrimitiveMask(instance);
       }
     } else {
       // Revert the billboards that were created successfully before the first failure,
@@ -12553,7 +12815,7 @@ namespace dxvk {
       billboard.yAxisUV = (texcoords[2] - texcoords[0]) * 0.5f;
       billboard.centerUV = (texcoords[0] + texcoords[3]) * 0.5f;
       billboard.vertexColor = vertexColor;
-      billboard.instanceMask = instance.getVkInstance().mask & OBJECT_MASK_UNORDERED_ALL_INTERSECTION_PRIMITIVE;
+      billboard.instanceMask = computeBillboardIntersectionPrimitiveMask(instance);
       billboard.instance = &instance;
       billboard.texCoordHash = 0;
       billboard.vertexOpacityHash = 0;

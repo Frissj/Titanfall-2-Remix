@@ -26,6 +26,7 @@ This document outlines our project's C++ code formatting standards, commenting s
 - **Constants**: `k` prefix and camelCase, i.e. `kConstantName`
 -  **Macros and defines**: UPPER_CASE
 - **Class and struct names**: PascalCase
+- **Functions**: Prefer a short **verb + object** name that matches vocabulary in the same subsystem (e.g. `registerCamera`, `mergeInstanceHeuristics`). Do not spell out mechanics (which container, per-frame reset); put that in a comment on the definition or call site.
 
   ```cpp
   class Example {
@@ -62,6 +63,24 @@ This document outlines our project's C++ code formatting standards, commenting s
     // namespace content
   }
   ```
+
+### Conditions
+
+- **Truthiness Checks**: Test an integer flag by referencing the variable on its own rather than comparing it against zero. This applies to C++ and to Slang, including `uint` flags in shader constant buffers.
+
+  ```cpp
+  // Good
+  if (flag) {
+    // ...
+  }
+
+  // Bad
+  if (flag != 0) {
+    // ...
+  }
+  ```
+
+  Comparisons against a value other than zero, and bit tests such as `(flags & kSomeBit) != 0`, are unaffected.
 
 ### Headers and Includes
 

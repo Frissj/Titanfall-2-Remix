@@ -28,10 +28,12 @@
 #include "../util/rc/util_rc_ptr.h"
 #include "rtx_types.h"
 #include "rtx_common_object.h"
+#include "rtx_gpu_crash_recorder.h"
 #include "rtx_staging.h"
 #include "rtx_point_instancer_system.h"
 #include "../util/util_vector.h"
 #include "../util/util_matrix.h"
+#include "../util/util_struct_hash.h"
 
 namespace dxvk 
 {
@@ -59,11 +61,54 @@ class AccelManager : public CommonDeviceObject {
     uint32_t reorderedSurfacesOffset = UINT32_MAX;
     bool hasOmmInstances = false;
     bool hasSssInstances = false;
+
+    // The PooledBlas assigned to this bucket by createBlasBuffersAndInstances.
+    // Stored here so the per-bucket cache can capture it after buildBlases.
+    PooledBlas* assignedBlas = nullptr;
     
     // Tries to add a geometry instance to the bucket. The addition is successful if either:
     //   a) the bucket is empty,
     //   b) the instance has the same mask etc. as all other instances in the bucket.
     bool tryAddInstance(RtInstance* instance);
+  };
+
+  // Key for O(1) bucket lookup in the merged-BLAS path.
+  // Two instances can share a merged BLAS bucket iff they have identical keys.
+  struct BlasBucketKey {
+    uint32_t instanceShaderBindingTableRecordOffset = 0;
+    uint32_t customIndexFlags = 0;
+    VkGeometryInstanceFlagsKHR instanceFlags = 0;
+    uint8_t instanceMask = 0;
+    bool usesUnorderedApproximations = false;
+    bool isSubsurface = false;
+    uint8_t pad = 0;
+
+    bool operator==(const BlasBucketKey& other) const {
+      return instanceMask == other.instanceMask &&
+             instanceShaderBindingTableRecordOffset == other.instanceShaderBindingTableRecordOffset &&
+             customIndexFlags == other.customIndexFlags &&
+             instanceFlags == other.instanceFlags &&
+             usesUnorderedApproximations == other.usesUnorderedApproximations &&
+             isSubsurface == other.isSubsurface;
+    }
+  };
+
+  struct BlasBucketKeyHash {
+    size_t operator()(const BlasBucketKey& k) const {
+      return static_cast<size_t>(hashStructByMemory<BlasBucketKey,
+          &BlasBucketKey::instanceShaderBindingTableRecordOffset,
+          &BlasBucketKey::customIndexFlags,
+          &BlasBucketKey::instanceFlags,
+          &BlasBucketKey::instanceMask,
+          &BlasBucketKey::usesUnorderedApproximations,
+          &BlasBucketKey::isSubsurface,
+          &BlasBucketKey::pad>(k));
+    }
+  };
+
+  struct UniqueBlasInstances {
+    BlasEntry* blasEntry = nullptr;
+    std::vector<RtInstance*> instances;
   };
 
 public:
@@ -112,6 +157,8 @@ public:
                                      const Rc<DxvkBuffer>& surfaceMaterialBuffer);
 
   void buildTlas(Rc<DxvkContext> ctx);
+
+  void dumpCrashState(const char* reason) const { m_gpuCrashRecorder.dump(reason); }
 
   // Returns the number of live BLAS objects
   static uint32_t getBlasCount();
@@ -198,6 +245,7 @@ private:
                    const std::vector<std::unique_ptr<BlasBucket>>& blasBuckets, 
                    std::vector<VkAccelerationStructureBuildGeometryInfoKHR>& blasToBuild,
                    std::vector<VkAccelerationStructureBuildRangeInfoKHR*>& blasRangesToBuild,
+                   const std::vector<VkTransformMatrixKHR>& instanceTransforms,
                    size_t& currentScratchOffset);
   
   void addBlas(RtInstance* instance, BlasEntry* blasEntry, const Matrix4* instanceToObject);
@@ -303,6 +351,9 @@ private:
   Rc<DxvkBuffer> getScratchMemory(const size_t requiredScratchAllocSize);
   Rc<PooledBlas> createPooledBlas(size_t bufferSize, const char* name) const;
 
+  // The recorder currently lives here because it only captures acceleration
+  // structure state. Move it higher if crash recording expands beyond AS data.
+  RtxGpuCrashRecorder m_gpuCrashRecorder;
   VkDeviceSize m_scratchAlignment;
   Rc<DxvkBuffer> m_scratchBuffer;
 };

@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -21,6 +21,9 @@
 */
 #pragma once
 
+#include <cstddef>
+#include <deque>
+#include <memory>
 #include <mutex>
 #include <atomic>
 #include <vector>
@@ -132,9 +135,14 @@ public:
   RtInstance() = delete;
   RtInstance(const uint64_t id, uint32_t instanceVectorId);
   RtInstance(const RtInstance& src, uint64_t id, uint32_t instanceVectorId);
+#ifndef NDEBUG
+  static void operator delete(void* ptr) noexcept;
+  static void operator delete(void* ptr, std::size_t size) noexcept;
+#endif
 
   uint64_t getId() const { return m_id; }
   uint32_t getVectorIdx() const { return m_instanceVectorId; }
+  uint64_t getCacheIdentity() const { return m_cacheIdentity; }
   const VkAccelerationStructureInstanceKHR& getVkInstance() const { return m_vkInstance; }
   VkAccelerationStructureInstanceKHR& getVkInstance() { return m_vkInstance; }
   bool isObjectToWorldMirrored() const { return m_isObjectToWorldMirrored; }
@@ -163,8 +171,36 @@ public:
 
   bool isCreatedThisFrame(uint32_t frameIndex) const { return frameIndex == m_frameCreated; }
 
-  // Bind a BLAS object to this instance
+  // Particle-emitter spawn-discontinuity guard state (rtx.particles.enableDiscontinuityGuard).
+  // velocityMovingAverage tracks the emitter's per-frame world translation. A one-frame motion that
+  // deviates from it is flagged a discontinuity. Lives on the instance so it persists across frames
+  // and is freed with the instance, no separate map or pruning needed.
+  struct EmitterMotionState {
+    Vector3 velocityMovingAverage = Vector3(0.f);
+    uint32_t lastFrame = kInvalidFrameIndex;
+    bool discontinuity = false;
+  };
+  // Lazily allocated on first use so only actual emitters fill the pointer, non-emitters keep it null.
+  EmitterMotionState& getEmitterMotionState() const {
+    if (!m_emitterMotionState) {
+      m_emitterMotionState = std::make_unique<EmitterMotionState>();
+    }
+    return *m_emitterMotionState;
+  }
+
+  // Syncs surface and material data from a reference instance.
+  // Preserves the persistent instance's identity (id, vector index) and lifecycle state.
+  // Set preserveTransforms when the caller applies an absolute corrected transform afterward.
+  // Leave it false before relative transforms, such as portal teleports.
+  void updateFromReference(const RtInstance& src, bool preserveTransforms = true);
+
+  // Bind a BLAS object to this instance and sync buffer indices/strides from its geometry data.
   void setBlas(BlasEntry& blas);
+
+  // Syncs surface buffer indices and strides from the currently bound BLAS.
+  // Called by setBlas() on initial bind or re-link, and by updateBufferCache()
+  // when geometry buffer slots change mid-scene.
+  void syncBufferIndicesFromBlas();
 
   // Sets current and previous transforms explicitly
   bool teleport(const Matrix4& objectToWorld);
@@ -185,9 +221,6 @@ public:
   uint32_t getFrameAge() const { return m_frameLastUpdated - m_frameCreated; }
   // Signal this object should be collected on the next GC pass
   void markForGarbageCollection() const;
-  void markAsUnlinkedFromBlasEntryForGarbageCollection() const;
-  void markAsInsideFrustum() const;
-  void markAsOutsideFrustum() const;
   // Returns true if a new camera type was registered
   bool registerCamera(CameraType::Enum cameraType, uint32_t frameIndex);
   bool isCameraRegistered(CameraType::Enum cameraType) const;
@@ -310,8 +343,16 @@ uint32_t getFirstBillboardIndex() const { return m_firstBillboard; }
   bool isViewModelReference() const;
   bool isViewModelVirtual() const;
   bool isSubsurface() const { return m_isSubsurface; }
+  bool isCreatedByRenderer() const { return m_isCreatedByRenderer; }
 
-  bool isUnlinkedForGC() const { return m_isUnlinkedForGC; }
+  // Returns true if this instance has been modified since the last BLAS build
+  // (transform, material, or geometry change).  New instances default to dirty.
+  bool isBlasDirty() const { return m_blasDirty; }
+  void clearBlasDirty() { m_blasDirty = false; }
+  bool isBillboardGeometryDirty() const { return m_billboardGeometryDirty; }
+  void clearBillboardGeometryDirty() { m_billboardGeometryDirty = false; }
+
+  bool isMarkedForGC() const { return m_isMarkedForGC; }
 
   PrimInstanceOwner& getPrimInstanceOwner() { return m_primInstanceOwner; }
   // Const overload: the match-eligibility predicate shared by findSimilarInstance's
@@ -350,10 +391,8 @@ private:
   // most notably the GameCapturer
   const uint64_t m_id;
   mutable uint32_t m_instanceVectorId; // Index within instance vector in instance manager
+  const uint64_t m_cacheIdentity; // Unique per allocation; used to detect raw-pointer ABA in acceleration-structure caches
 
-  mutable bool m_isMarkedForGC = false;
-  mutable bool m_isUnlinkedForGC = false;
-  mutable bool m_isInsideFrustum = true;
   mutable uint32_t m_frameLastUpdated = kInvalidFrameIndex;
   mutable uint32_t m_frameCreated = kInvalidFrameIndex;
 
@@ -431,10 +470,9 @@ private:
   uint32_t m_secondaryOpacityTextureIndex = kSurfaceMaterialInvalidTextureIndex;
   uint32_t m_secondarySamplerIndex = kSurfaceMaterialInvalidTextureIndex;
 
-  // Extra instance meta data needed for Opacity Micromap Manager, generally describes if animated spritesheets are in use
-  // on a given instance (though the applicability to OMMs are only relevant for Opaque and Ray Portal materials currently
-  // where cutout opacity can be animated, translucent materials do not have any relation right now to OMMs).
-  bool m_isAnimated = false;
+  uint32_t m_surfaceIndex;        // Material surface index for reordered surfaces by AccelManager
+  uint32_t m_previousSurfaceIndex;
+
   // Object with Opacity Micromap per-instance data maintained by Opacity Micromap Manager.
   // Stored in instance object to avoid indirection of looking it up for an instance
   OpacityMicromapInstanceData m_opacityMicromapInstanceData;
@@ -452,6 +490,8 @@ private:
   bool m_isObjectToWorldMirrored = false;
   bool m_isCreatedByRenderer = false;
   bool m_isSubsurface = false;
+  bool m_blasDirty = true;  // Needs reprocessing in mergeInstancesIntoBlas; starts dirty for new instances
+  bool m_billboardGeometryDirty = true;  // Needs initial geometry info generation for billboard-derived layout
   BlasEntry* m_linkedBlas = nullptr;
   XXH64_hash_t m_materialHash = kEmptyHash;
   XXH64_hash_t m_materialDataHash = kEmptyHash;
@@ -490,7 +530,6 @@ private:
 
   CategoryFlags m_categoryFlags;
 
-  XXH64_hash_t m_spatialCacheHash = kEmptyHash;
 
   // NV-DXVK [Phase2b]: frame id of the last DEFERRED spatial-map op recorded for
   // this instance (sharded instance phase only). Lets onTransformChanged detect
@@ -562,8 +601,11 @@ struct InstanceEventHandler {
   // Callback triggered whenever a new instance has been added to the database
   std::function<void(RtInstance&)> onInstanceAddedCallback;
   // Callback triggered whenever instance metadata is updated - the boolean flags 
-  //   signal if the transform and/or vertex positions have changed (respectively)
-  std::function<void(RtInstance&, const DrawCallState& drawCall, const MaterialData&, bool, bool, bool)> onInstanceUpdatedCallback;
+  //   signal if the transform and/or vertex positions have changed (respectively).
+  // The MaterialData pointer is non-null on the dynamic update path and null on the
+  // preserve path (RtInstance::surface.isPreservePath is set iff the pointer is null).
+  // Handlers must null-check or short-circuit on isPreservePath before reading material.
+  std::function<void(RtInstance&, const DrawCallState& drawCall, const MaterialData*, bool, bool, bool)> onInstanceUpdatedCallback;
   // Callback triggered whenever an instance has been removed from the database
   std::function<void(RtInstance&)> onInstanceDestroyedCallback;
 
@@ -637,7 +679,19 @@ public:
 
   // Returns the active number of instances in scene
   const uint32_t getActiveCount() const { return m_instances.size(); }
-  
+
+  // Returns a monotonically increasing token used only for equality checks by
+  // acceleration-structure caches.  It is bumped for changes that affect BLAS
+  // or TLAS membership/build inputs: instance add/remove, transform changes
+  // baked into merged BLASes, material or bucket-key changes, geometry/build
+  // range changes, and external systems invalidating AS bindings.
+  uint64_t getSceneGeneration() const { return m_sceneGeneration; }
+
+  // Notify that acceleration structures must be reconsidered.  Per-frame GPU
+  // surface-data refreshes (previous-frame indices/transforms, surface mapping,
+  // prefix sums) do not need this notification when BLAS/TLAS inputs are stable.
+  void notifySceneChanged() { ++m_sceneGeneration; }
+
   void onFrameEnd();
 
   // Optional notification callbacks that can be implemented to "opt-in" to InstanceManager events
@@ -684,6 +738,34 @@ public:
   // returns it through out_indexInCache. UINT32_MAX keeps the old behaviour for
   // any caller that cannot supply one.
   void bindMaterial(RtInstance& instance, const RtSurfaceMaterial& material, uint32_t indexInCache = UINT32_MAX);
+
+  // Per-frame finalization shared by the dynamic and preserve paths:
+  // re-registers the player-model / view-model candidate lists (cleared every onFrameEnd) and
+  // dispatches onInstanceUpdated to listeners.
+  // updateInstance() calls this at the end of its dynamic-state work; the preserve path calls
+  // it directly with hasTransformChanged / hasPreviousPositions == false because the instance's
+  // RtSurface (transform, vertex buffers) is reused as-is from the last dynamic update.
+  // materialData is non-null on the dynamic path and null on the preserve path — see
+  // onInstanceUpdatedCallback's contract above for the null-handling requirement.
+  void preserveInstance(
+      RtInstance& instance,
+      const DrawCallState& drawCall,
+      const MaterialData* materialData,
+      bool hasTransformChanged = false,
+      bool hasPreviousPositions = false,
+      bool isFirstUpdateThisFrame = true,
+      bool fireEvents = true);
+
+  // Rebuild this instance's contribution to m_billboards (which is cleared every
+  // frame in onFrameEnd) and update m_billboardCount / m_firstBillboard / blas
+  // dirty bits accordingly. Mirrors the billboard block inside updateInstance so
+  // both the dynamic and preserve draw paths leave billboard-backed unordered draws
+  // (particles, beams) in the same state. Without this call, preserved
+  // particles/beams keep stale m_firstBillboard offsets and produce no
+  // intersection primitives for portal-space sampling.
+  void refreshBillboardsForCurrentFrame(RtInstance& currentInstance,
+                                        CameraType::Enum cameraType,
+                                        const Vector3& cameraViewDirection);
 
   // Creates a copy of a reference instance and adds it to the instance pool
   // Temporary single frame instances generated every frame should disable valid id generation to avoid overflowing it
@@ -1081,7 +1163,6 @@ private:
   uint32_t m_playerModelInstancesFrameId = kInvalidFrameIndex;
   std::vector<IntersectionBillboard> m_billboards;
 
-  bool m_previousViewModelState = false;
   RtInstance* targetInstance = nullptr;
 
   uint32_t m_decalSortOrderCounter = 0;  // monotonically incrementing value indicating the draw call order of this decal on the frame
@@ -1089,6 +1170,30 @@ private:
   // Controls active portal space for which virtual view model or player model instances have been generated for.
   // Negative values mean there is no portal that's close enough to the camera.
   int m_virtualInstancePortalIndex = 0;    
+
+  // Persistent renderer-created instances that survive across frames.
+  // Maps reference instance → derived instance.  Avoids create/destroy
+  // churn that would needlessly bump m_sceneGeneration every frame.
+  std::unordered_map<RtInstance*, RtInstance*> m_persistentViewModelInstances;
+  std::unordered_map<RtInstance*, RtInstance*> m_persistentVirtualViewModelInstances;
+  std::unordered_map<RtInstance*, RtInstance*> m_persistentPlayerModelClones;
+
+  // Removes persistent entries whose references are no longer active and
+  // marks the associated derived instances for GC.
+  void cleanupPersistentMap(std::unordered_map<RtInstance*, RtInstance*>& map,
+                            const std::unordered_set<RtInstance*>& activeReferences);
+
+  // Removes any persistent map entry (key or value) that references a
+  // dying instance.  Called from garbageCollection() before the instance
+  // is deleted to prevent dangling pointers.
+  void erasePersistentMapEntries(RtInstance* dying);
+
+#ifndef NDEBUG
+  std::deque<void*> m_destroyedInstanceQuarantine;
+
+  void releaseDestroyedInstanceQuarantine();
+#endif
+  void destroyInstanceAllocation(RtInstance* instance);
 
   std::vector<InstanceEventHandler> m_eventHandlers;
 
@@ -1247,6 +1352,10 @@ private:
 
   void createBeams(RtInstance& instance);
 
+  // Returns the TLAS mask to use for an intersection primitive (billboard / beam) generated
+  // from `instance`. Pure function of the instance's alphaState + m_isPlayerModel.
+  static uint32_t computeBillboardIntersectionPrimitiveMask(const RtInstance& instance);
+
   void filterPlayerModelInstances(const Vector3& playerModelPosition, const RtInstance* bodyInstance);
 
   void detectIfPlayerModelIsVirtual(
@@ -1259,4 +1368,3 @@ private:
 };
 
 }  // namespace dxvk
-

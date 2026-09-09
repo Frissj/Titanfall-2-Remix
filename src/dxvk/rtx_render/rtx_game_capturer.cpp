@@ -50,7 +50,7 @@
 #include "rtx_matrix_helpers.h"
 #include "rtx_lights.h"
 
-#include "../util/util_globaltime.h"
+#include "../util/util_global_time.h"
 
 #include <filesystem>
 
@@ -309,8 +309,7 @@ namespace dxvk {
   }
 
   void GameCapturer::captureLights() {
-    for (auto&& pair : m_sceneManager.getLightManager().getLightTable()) {
-      const RtLight& rtLight = pair.second;
+    auto captureLight = [&](const RtLight& rtLight) {
       assert(rtLight.getInitialHash() != 0);
       switch (rtLight.getType()) {
       default:
@@ -336,6 +335,13 @@ namespace dxvk {
         captureDistantLight(rtLight.getDistantLight());
         break;
       }
+    };
+
+    for (auto&& pair : m_sceneManager.getLightManager().getLightTable()) {
+      captureLight(pair.second);
+    }
+    for (auto&& pair : m_sceneManager.getLightManager().getExternallyTrackedLightTable()) {
+      captureLight(pair.second);
     }
   }
 
@@ -594,7 +600,15 @@ namespace dxvk {
       }
       for (uint32_t i = 0; i < (uint32_t) InstanceCategories::Count; i++) {
         const InstanceCategories flag = (InstanceCategories) i;
-        pMesh->lssData.categoryFlags[getInstanceCategorySubKey(flag)] = flags.test(flag);
+        const bool isSet = flags.test(flag);
+
+        // Keep Hair Cards absent from captured categoryFlags when false instead of authoring an explicit false value.
+        // This preserves existing captures while true hair-card instances still store the category explicitly.
+        if (flag == InstanceCategories::HairCards && !isSet) {
+          continue;
+        }
+
+        pMesh->lssData.categoryFlags[getInstanceCategorySubKey(flag)] = isSet;
       }
       pMesh->lssData.numVertices = numVertices;
       pMesh->lssData.numIndices = numIndices;

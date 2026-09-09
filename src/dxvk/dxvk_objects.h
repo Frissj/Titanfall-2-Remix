@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023-2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -54,6 +54,7 @@
 #include "rtx_render/rtx_geometry_utils.h"
 #include "rtx_render/rtx_image_utils.h"
 #include "rtx_render/rtx_postFx.h"
+#include "rtx_render/rtx_srgb_dither.h"
 #include "rtx_render/rtx_initializer.h"
 #include "rtx_render/rtx_scene_manager.h"
 #include "rtx_render/rtx_reflex.h"
@@ -61,6 +62,7 @@
 #include "rtx_render/rtx_dust_particles.h"
 #include "rtx_render/rtx_particle_system.h"
 #include "rtx_render/rtx_point_instancer_system.h"
+#include "rtx_render/rtx_gpu_crash.h"
 
 #include "rtx_render/rtx_denoise_type.h"
 #include "../util/util_lazy.h"
@@ -80,11 +82,13 @@ namespace dxvk {
   class CompositePass;
   class DebugView;
   class DxvkPostFx;
+  class DxvkSRGBDither;
   class OpacityMicromapManager;
   class ImGUI;
   class RtxTextureManager;
   class NeuralRadianceCache;
   class DxvkXeSS;
+  class SparseRendering;
 
   class NGXContext;
 
@@ -140,6 +144,10 @@ namespace dxvk {
 
     RtxGlobalVolumetrics& metaGlobalVolumetrics() {
       return m_globalVolumetrics.get();
+    }
+
+    SparseRendering& metaSparseRendering() {
+      return m_sparseRendering.get();
     }
 
     DxvkPathtracerGbuffer& metaPathtracerGbuffer() {
@@ -234,6 +242,10 @@ namespace dxvk {
       return m_composite.get();
     }
 
+    GpuCrashPass& metaGpuCrash() {
+      return m_gpuCrash.get();
+    }
+
     DebugView& metaDebugView() {
       return m_debug_view.get();
     }
@@ -273,7 +285,11 @@ namespace dxvk {
     DxvkPostFx& metaPostFx() {
       return m_postFx.get();
     }
-    
+
+    DxvkSRGBDither& metaSRGBDither() {
+      return m_srgbDither.get();
+    }
+
     RtxReflex& metaReflex() {
       return m_reflex.get(m_device);
     }
@@ -364,9 +380,9 @@ namespace dxvk {
     ImGUI              m_imgui;
     Rc<GameCapturer>   m_capturer;
 
-
     // RTX Shaders
     Active<RtxGlobalVolumetrics>            m_globalVolumetrics;
+    Active<SparseRendering>                 m_sparseRendering;
     Active<DxvkPathtracerGbuffer>           m_pathtracerGbuffer;
     Active<DxvkRtxdiRayQuery>               m_rtxdiRayQuery;
     Active<DxvkReSTIRGIRayQuery>            m_restirgiRayQuery;
@@ -391,6 +407,7 @@ namespace dxvk {
     Active<DxvkTemporalAA>                  m_taa;
     Active<DxvkXeSS>                        m_xess;
     Active<CompositePass>                   m_composite;
+    Active<GpuCrashPass>                    m_gpuCrash;
     Active<DebugView>                       m_debug_view;
     Active<DxvkAutoExposure>                m_autoExposure;
     Active<DxvkToneMapping>                 m_toneMapping;
@@ -401,6 +418,7 @@ namespace dxvk {
     Active<RtxGeometryUtils>                m_geometryUtils;
     Active<RtxImageUtils>                   m_imageUtils;
     Active<DxvkPostFx>                      m_postFx;
+    Active<DxvkSRGBDither>                  m_srgbDither;
     Lazy<RtxReflex>                         m_reflex;
     Lazy<RtxDustParticles>                  m_dustParticles;
     Lazy<RtxParticleSystemManager>          m_particleSystem;

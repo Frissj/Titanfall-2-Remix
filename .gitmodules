@@ -25,7 +25,7 @@
 	url = https://github.com/KhronosGroup/Vulkan-Headers
 [submodule "submodules/rtxdi"]
 	path = submodules/rtxdi
-	url = https://github.com/NVIDIA-RTX/RTXDI
+	url = https://github.com/NVIDIA-RTX/RTXDI.git
 	branch = remix
 [submodule "submodules/rtxcr"]
 	path = submodules/rtxcr
@@ -42,3 +42,7 @@
 [submodule "submodules/xess"]
 	path = submodules/xess
 	url = https://github.com/intel/xess.git
+	shallow = false
+[submodule "include/MathLib/External/sse2neon"]
+	path = include/MathLib/External/sse2neon
+	url = https://github.com/DLTcollab/sse2neon.git

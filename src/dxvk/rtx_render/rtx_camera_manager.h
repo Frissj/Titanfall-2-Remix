@@ -133,4 +133,3 @@ namespace dxvk {
     RTX_OPTION("rtx", bool, rayPortalEnabled, false, "Enables ray portal support. Note this requires portal texture hashes to be set for the ray portal geometries in rtx.rayPortalModelTextureHashes.");
   };
 }  // namespace dxvk
-

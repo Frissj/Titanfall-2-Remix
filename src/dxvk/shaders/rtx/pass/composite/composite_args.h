@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022-2023, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -35,13 +35,11 @@ struct CompositeArgs {
   Camera camera;
   DomeLightArgs domeLightArgs;
   RayPortalHitInfo rayPortalHitInfos[maxRayPortalCount * 2];
+  VolumeArgs volumeArgs;
+  AccumulationArgs accumulationArgs;
+  SparseRenderingArgs sparseRenderingArgs;
 
-  mat4 projectionToViewJittered;
-  mat4 viewToWorld;
-
-  vec2 resolution;
-  float nearPlane;
-  float postFilterThreshold;
+  // -- Struct objects should go above this line to preserve alignment --
 
   // Fog
   vec3 fogColor;
@@ -57,10 +55,6 @@ struct CompositeArgs {
   uint usePostFilter;
   uint demodulateRoughness;
   float roughnessDemodulationOffset;
-  uint combineLightingChannels;
-
-  VolumeArgs volumeArgs;
-  AccumulationArgs accumulationArgs;
 
   // One of DENOISER_MODE constants, affects signal conversion
   uint primaryDirectDenoiser;
@@ -81,15 +75,13 @@ struct CompositeArgs {
   uint8_t compositeSecondaryCombinedSpecular;
   // The number of active Ray Portals (Used for Ray Portal sampling). Always <= RAY_PORTAL_MAX_COUNT
   uint8_t numActiveRayPortals;
-  uint8_t pad;
+  uint8_t pad0;
 
   uint enableSeparatedDenoisers;
   uint frameIdx;
 
-  uint outputSecondarySignalToParticleLayer;
-  uint compositeVolumetricLight;
-  uint outputParticleLayer;
-  uint enableDemodulateAttenuation;
+  vec3 clearColorFinalColor;
+  uint useRayReconstruction;
 
   uint enableStochasticAlphaBlend;
   uint stochasticAlphaBlendEnableFilter;
@@ -110,9 +102,6 @@ struct CompositeArgs {
   uint stochasticAlphaBlendDiscardBlackPixel;
   uint enhanceAlbedo;
   float skyBrightness;
-
-  vec3 clearColorFinalColor;
-  uint timeSinceStartMS;
 
   float alphaBlendSurfacePackMult; // for packing/unpacking hitT into Float16 in AlphaBlendSurface
   float pad1;

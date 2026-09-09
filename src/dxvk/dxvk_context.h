@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2023, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -842,6 +842,18 @@ namespace dxvk {
             uint32_t                  height,
             uint32_t                  depth);
 
+    // NV-DXVK start: Indirect ray dispatch support
+    /**
+     * \brief Starts raytracing jobs with the ray counts sourced from a buffer
+     *
+     * \param [in] argBuffer Buffer holding a VkTraceRaysIndirectCommandKHR
+     * \param [in] argOffset Byte offset of the command within the buffer
+     */
+    void traceRaysIndirect(
+      const Rc<DxvkBuffer>&           argBuffer,
+            VkDeviceSize              argOffset);
+    // NV-DXVK end
+
     /**
      * \brief Transforms image subresource layouts
      * 
@@ -1249,7 +1261,7 @@ namespace dxvk {
 
     DxvkFramebufferInfo getFramebufferInfo() const { return m_state.om.framebufferInfo; }
     VkCommandBuffer getCmdBuffer(DxvkCmdBuffer cmdBuffer) const { return m_cmd->getCmdBuffer(cmdBuffer); }
-    Rc<DxvkCommandList> getCommandList() const { return m_cmd; }
+    const Rc<DxvkCommandList>& getCommandList() const { return m_cmd; }
 
     DxvkObjects* getCommonObjects() const { return m_common; }
     const Rc<DxvkDevice>& getDevice() const { return m_device; }

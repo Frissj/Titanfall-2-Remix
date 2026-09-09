@@ -30,11 +30,11 @@ endif
 # download USD, 'run_command()' is invoked only during a configuration step, not each build
 message('HDREMIX: Downloading USD and other dependencies...')
 packman_result = run_command(
-  join_paths(meson.current_source_dir(), '../../../../scripts-common/packman/packman.cmd'), 
-  'pull', 
-  join_paths(meson.current_source_dir(), 'packman-external.xml'), 
-  '-p', 
-  'windows-x86_64', 
+  join_paths(meson.current_source_dir(), '../../../../scripts-common/packman/packman.cmd'),
+  'pull',
+  join_paths(meson.current_source_dir(), 'packman-external.xml'),
+  '-p',
+  'windows-x86_64',
   check: true,
 )
 if packman_result.returncode() != 0
@@ -44,7 +44,7 @@ endif
 fs.read(join_paths(meson.current_source_dir(), 'packman-external.xml'))
 
 
-hdremix_nvusd_dir = hdremix_isdebug ? '_external/nv_usd/debug/' : '_external/nv_usd/release/'
+hdremix_nvusd_dir = hdremix_isdebug ? '_external/usd_stock_x64/debug/' : '_external/usd_stock_x64/release/'
 hdremix_nvusd_libdir = join_paths(meson.current_source_dir(), hdremix_nvusd_dir, 'lib')
 hdremix_nvusd_bindir = join_paths(meson.current_source_dir(), hdremix_nvusd_dir, 'bin')
 
@@ -71,71 +71,31 @@ hdremix_defines = [
 
 hdremix_compilerflags = [
   '/Zc:inline-', # plugins dont register without this
+  '/wd4251',  # USD headers: needs dll-interface (TfSingleton, TsSplineSamples)
+  '/wd4275',  # USD headers: non dll-interface base class (TfType::FactoryBase)
 ]
-
 
 hdremix_nvusd_deplibs = [
-  'arch',
-  'garch',
-  'cameraUtil',
-  'geomUtil',
-  'gf',
-  'glf',
-  'hd',
-  'hdGp',
-  'hdx',
-  'hdmtlx',
-  'hdsi',
-  'hdst',
-  'hf',
-  'hgi',
-  'hgiGL',
-  'hgiinterop',
-  'hio',
-  'ndr',
-  'plug',
-  'pxosd',
-  'sdf',
-  'sdr',
-  'tf',
-  'usd',
-  'usdImaging',
-  'usdImagingGL',
-  'usdGeom',
-  'usdShade',
-  'usdLux',
-  'usdMtlx',
-  'usdVol',
-  'usdVolImaging',
-  'usdUi',
-  'usdUtils',
-  'vt',
-  'python310',
-  hdremix_isdebug ? 'boost_python310-vc142-mt-gd-x64-1_76' :
-                    'boost_python310-vc142-mt-x64-1_76',
-  hdremix_isdebug ? 'tbb_debug' :
-                    'tbb',    # NOTE: remixsdk also depends on tbb.dll, assuming both USD / remixsdk use the same tbb version
+  'usd_cameraUtil',
+  'usd_gf',
+  'usd_glf',
+  'usd_hd',
+  'usd_hdx',
+  'usd_hgi',
+  'usd_hgiGL',
+  'usd_sdf',
+  'usd_tf',
+  'usd_plug',
+  'usd_usd',
+  'usd_usdImaging',
+  'usd_usdShade',
+  'usd_usdGeom',
+  'usd_vt',
 ]
 
-
-hdremix_nvusd_depbins = [
-  'MaterialXCore',
-  'MaterialXFormat',
-  'MaterialXGenGlsl',
-  'MaterialXGenMdl',
-  'MaterialXGenMsl',
-  'MaterialXGenOsl',
-  'MaterialXGenShader',
-  'MaterialXRender',
-  'MaterialXRenderGlsl',
-  'MaterialXRenderHw',
-  'MaterialXRenderOsl',
-]
-
+# MaterialX DLLs not available in local nopy USD build.
+# Will restore when nopy packman package includes them.
 hdremix_depbins = []
-foreach ulib : hdremix_nvusd_depbins
-  hdremix_depbins += join_paths(hdremix_nvusd_bindir, ulib)
-endforeach
 
 hdremix_linklibs = [
   hdremix_cpp_compiler.find_library('opengl32'),
@@ -143,6 +103,8 @@ hdremix_linklibs = [
 foreach ulib : hdremix_nvusd_deplibs
   hdremix_linklibs += hdremix_cpp_compiler.find_library(ulib, dirs: hdremix_nvusd_libdir)
 endforeach
+
+hdremix_linklibs += hdremix_cpp_compiler.find_library(hdremix_isdebug ? 'tbb12_debug' : 'tbb12', dirs: hdremix_nvusd_libdir)
 
 hdremix_test_exe_src = files([
   'test_render.cpp',
@@ -167,13 +129,26 @@ HydraTestRender_exepath = join_paths(meson.current_build_dir(), hdremix_test_exe
 dxvkrt_test_root = meson.global_source_root().replace('\\', '/') + '/tests/rtx/dxvk_rt_testing/'
 hydra_test_render_path = join_paths(dxvkrt_test_root, 'apics', 'HydraTestRender')
 
-foreach ulib : hdremix_nvusd_deplibs
-  install_data(
-    join_paths(hdremix_nvusd_libdir, ulib) + '.dll',
-    install_dir: hydra_test_render_path,
-    install_tag: 'apics_HydraTestRender'
-  )
-endforeach
+# install USD dlls
+meson.add_install_script(
+  join_paths(global_src_root_norm, 'scripts-common/copy.bat'),
+  hdremix_nvusd_libdir,
+  hydra_test_render_path,
+  'usd_*.dll',
+  install_tag: 'apics_HydraTestRender' 
+)
+
+install_data(
+  join_paths(hdremix_nvusd_dir, 'bin', hdremix_isdebug ? 'tbb12_debug.dll' : 'tbb12.dll'),
+  install_dir: hydra_test_render_path,
+  install_tag: 'apics_HydraTestRender'
+)
+
+install_data(
+  join_paths(hdremix_nvusd_dir, 'bin', hdremix_isdebug ? 'tbbmalloc_debug.dll' : 'tbbmalloc.dll'),
+  install_dir: hydra_test_render_path,
+  install_tag: 'apics_HydraTestRender'
+)
 
 foreach ulib : hdremix_depbins
   install_data(

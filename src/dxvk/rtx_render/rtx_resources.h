@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -230,6 +230,7 @@ namespace dxvk
     };
 
     struct RaytracingOutput {
+      // Note: resources are called 'shared' if they are written by both Primary and Secondary (PSR) passes
       Resource m_sharedFlags;
       Resource m_sharedRadianceRG;
       Resource m_sharedRadianceB;
@@ -241,10 +242,12 @@ namespace dxvk
       AliasedResource m_sharedSurfaceIndex;
       Resource m_sharedSubsurfaceData;
       Resource m_sharedSubsurfaceDiffusionProfileData;
+      // Terminator offset image is written by Primary and overwritten by a single chosen Secondary pass -- so it's shared,
+      // as a terminator fix not that visible if we have both reflections/refractions, so we can omit it in one of them.
+      Resource m_sharedTerminatorFix[2];
 
       Resource m_primaryAttenuation;
       Resource m_primaryWorldShadingNormal;
-      Resource m_primaryWorldInterpolatedNormal;
       Resource m_primaryPerceptualRoughness;
       Resource m_primaryLinearViewZ;
       ResourceQueue m_primaryDepthQueue;
@@ -290,7 +293,9 @@ namespace dxvk
       // Resource containing 1spp radiance from indirect pass - with each pixel containing {diffuse | specular} for a {primary | secondary} surface
       AliasedResource m_indirectRadianceHitDistance;
       AliasedResource m_rayReconstructionHitDistance;
-      Resource m_rayReconstructionParticleBuffer;
+      Resource m_sparseRenderingActivePixelMask;
+      Resource m_sparseRenderingPixelSamplingRate;
+      Resource m_sparseRenderingActiveLocalPixelCoords;
 
       AliasedResource m_primaryDirectDiffuseRadiance;
       AliasedResource m_primaryDirectSpecularRadiance;
@@ -391,6 +396,8 @@ namespace dxvk
       const AliasedResource& getPreviousRtxdiConfidence() const { return m_rtxdiConfidence[!m_swapTextures]; }
       const AliasedResource& getCurrentPrimaryWorldPositionWorldTriangleNormal() const { return m_primaryWorldPositionWorldTriangleNormal[m_swapTextures]; }
       const AliasedResource& getPreviousPrimaryWorldPositionWorldTriangleNormal() const { return m_primaryWorldPositionWorldTriangleNormal[!m_swapTextures]; }
+      const Resource& getCurrentSharedTerminatorFix() const { return m_sharedTerminatorFix[m_swapTextures]; }
+      const Resource& getPreviousSharedTerminatorFix() const { return m_sharedTerminatorFix[!m_swapTextures]; }
 
     private:
       bool m_swapTextures = false;
@@ -467,6 +474,9 @@ namespace dxvk
 
     const VkExtent3D& getTargetDimensions() const { return m_targetExtent; }
     const VkExtent3D& getDownscaleDimensions() const { return m_downscaledExtent; }
+    bool areNrdDenoisingGuideResourcesAllocated() const { return m_nrdDenoisingGuideResourcesAllocated; }
+    bool needsNrdDenoisingGuideResources() const;
+    void createNrdDenoisingGuideResources(Rc<DxvkContext>& ctx);
 
     static RtxTextureFormatCompatibilityCategory getFormatCompatibilityCategory(const VkFormat format);
     static bool areFormatsCompatible(const VkFormat format1, const VkFormat format2);
@@ -515,6 +525,7 @@ namespace dxvk
     Tlas m_tlas[Tlas::Type::Count];
 
     VkExtent3D m_downscaledExtent = { 0, 0, 0 };
+    bool m_nrdDenoisingGuideResourcesAllocated = false;
     VkExtent3D m_targetExtent = { 0, 0, 0 };
 
     using ResizeEventList = std::vector<std::weak_ptr<EventHandler::ResizeEvent>>;

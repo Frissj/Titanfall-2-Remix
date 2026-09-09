@@ -27,7 +27,7 @@
 #include <iomanip>
 #include <optional>
 #include <nvapi.h>
-#include <NVIDIASansRg.ttf.h>
+#include <NVIDIASansMd.ttf.h>
 #include <NVIDIASansBd.ttf.h>
 #include <RobotoMonoRg.ttf.h>
 
@@ -54,13 +54,15 @@
 #include "rtx_render/rtx_restir_gi_rayquery.h"
 #include "rtx_render/rtx_debug_view.h"
 #include "rtx_render/rtx_composite.h"
+#include "rtx_render/rtx_sparse_rendering.h"
 #include "dxvk_image.h"
 #include "../util/rc/util_rc_ptr.h"
 #include "../util/util_math.h"
-#include "../util/util_globaltime.h"
+#include "../util/util_global_time.h"
 #include "rtx_render/rtx_opacity_micromap_manager.h"
 #include "rtx_render/rtx_bridge_message_channel.h"
 #include "dxvk_imgui_about.h"
+#include "dxvk_imgui_first_use_guide.h"
 #include "dxvk_imgui_splash.h"
 #include "dxvk_imgui_capture.h"
 // NV-DXVK: needed for the DXBC->SPIR-V translation HUD counters.
@@ -183,8 +185,8 @@ namespace dxvk {
     {"lightmaptextures","Lightmap Textures (optional)", &RtxOptions::lightmapTexturesObject()},
     {"ignorelights", "Ignore Lights (optional)", &RtxOptions::ignoreLightsObject()},
     {"particletextures", "Particle Texture (optional)", &RtxOptions::particleTexturesObject()},
+    {"haircardtextures", "Hair Cards Texture (optional)", &RtxOptions::hairCardTexturesObject()},
     {"beamtextures", "Beam Texture (optional)", &RtxOptions::beamTexturesObject()},
-    {"ignoretransparencytextures", "Ignore Transparency Layer Texture (optional)", &RtxOptions::ignoreTransparencyLayerTexturesObject()},
     {"lightconvertertextures", "Add Light to Textures (optional)", &RtxOptions::lightConverterObject()},
     {"decaltextures", "Decal Texture (optional)", &RtxOptions::decalTexturesObject()},
     {"terraintextures", "Terrain Texture", &RtxOptions::terrainTexturesObject()},
@@ -386,6 +388,8 @@ namespace dxvk {
         {1, "2x"},
         {2, "3x"},
         {3, "4x"},
+        {4, "5x"},
+        {5, "6x"},
     } }
   };
 
@@ -402,6 +406,7 @@ namespace dxvk {
   RemixGui::ComboWithKey<dxvk::RtxFramePassStage>::ComboEntries aliasingPassComboEntries = { {
       { RtxFramePassStage::FrameBegin, "FrameBegin" },
       { RtxFramePassStage::Volumetrics, "Volumetrics" },
+      { RtxFramePassStage::SparseRendering, "SparseRendering" },
       { RtxFramePassStage::VolumeIntegrateRestirInitial, "VolumeIntegrateRestirInitial" },
       { RtxFramePassStage::VolumeIntegrateRestirVisible, "VolumeIntegrateRestirVisible" },
       { RtxFramePassStage::VolumeIntegrateRestirTemporal, "VolumeIntegrateRestirTemporal" },
@@ -555,6 +560,7 @@ namespace dxvk {
   : m_device (device)
   , m_gameHwnd   (nullptr)
   , m_about  (new ImGuiAbout)
+  , m_firstUseGuide (new ImGuiFirstUseGuide)
   , m_splash  (new ImGuiSplash)
   , m_graphGUI  (new RtxGraphGUI) {
     // Set up constant state
@@ -838,6 +844,8 @@ namespace dxvk {
           RemixGui::SliderFloat("Metallic Bias", &OpaqueMaterialOptions::metallicBiasObject(), -1.0f, 1.f, "%.3f", sliderFlags);
           RemixGui::SliderFloat("Roughness Scale", &OpaqueMaterialOptions::roughnessScaleObject(), 0.0f, 1.f, "%.3f", sliderFlags);
           RemixGui::SliderFloat("Roughness Bias", &OpaqueMaterialOptions::roughnessBiasObject(), -1.0f, 1.f, "%.3f", sliderFlags);
+          RemixGui::DragFloat("Hair Cards Mip Bias", &RtxOptions::hairCardMipBiasObject(), 0.25f, -32.0f, 16.0f, "%.2f", sliderFlags);
+          RemixGui::DragFloat("Hair Cards Roughness Scale", &RtxOptions::hairCardRoughnessScaleObject(), 0.01f, 0.0f, 4.0f, "%.3f", sliderFlags);
           RemixGui::SliderFloat("Normal Strength##1", &OpaqueMaterialOptions::normalIntensityObject(), -10.0f, 10.f, "%.3f", sliderFlags);
 
           RemixGui::Checkbox("Enable dual-layer animated water normal for Opaque", &OpaqueMaterialOptions::layeredWaterNormalEnableObject());
@@ -952,11 +960,6 @@ namespace dxvk {
   }
 
   void ImGUI::update(const Rc<DxvkContext>& ctx) {
-    ImGui_ImplDxvk::NewFrame();
-    ImGui_ImplWin32_NewFrame();
-
-    ImGui::NewFrame();
-
     processHotkeys();
     updateQuickActions(ctx);
 
@@ -968,6 +971,17 @@ namespace dxvk {
 
     showDebugVisualizations(ctx);
 
+    // On first frame, check if the first-use guide should be shown (overrides loaded showUI).
+    {
+      static bool s_firstUseChecked = false;
+      if (!s_firstUseChecked) {
+        s_firstUseChecked = true;
+        if (ImGuiFirstUseGuide::shouldShow()) {
+          switchMenu(UIType::FirstUseGuide);
+        }
+      }
+    }
+
     const auto showUI = RtxOptions::showUI();
     if (showUI == UIType::Advanced) {
       showMainMenu(ctx);
@@ -976,6 +990,10 @@ namespace dxvk {
       //ImGui::ShowDemoWindow();
     } else if (showUI == UIType::Basic) {
       showUserMenu(ctx);
+    } else if (showUI == UIType::FirstUseGuide) {
+      if (m_firstUseGuide->show(m_boldFont)) {
+        switchMenu(UIType::None);
+      }
     }
     
     // Render any blocked edit popup warnings
@@ -1004,10 +1022,11 @@ namespace dxvk {
     showHudMessages(ctx);
 
 #ifdef REMIX_DEVELOPMENT
-    // Show visual indicator when crash hotkey is armed
+    // Show visual indicator when crash hotkeys are armed (one option arms both CPU and GPU crash hotkeys)
     if (RtxOptions::enableCrashHotkey()) {
-      const auto crashHotkeyStr = buildKeyBindDescriptorString(RtxOptions::crashHotkey());
-      const auto warningText = str::format("!! CRASH HOTKEY ARMED (", crashHotkeyStr, ") !!");
+      const auto crashHotkeyStr = buildKeyBindDescriptorStringForDisplay(RtxOptions::crashHotkey());
+      const auto gpuCrashHotkeyStr = buildKeyBindDescriptorStringForDisplay(RtxOptions::gpuCrashHotkey());
+      const auto warningText = str::format("!! CRASH HOTKEYS ARMED (", crashHotkeyStr, " = CPU crash, ", gpuCrashHotkeyStr, " = GPU crash) !!");
       const ImVec2 textSize = ImGui::CalcTextSize(warningText.c_str());
       const ImGuiViewport* viewport = ImGui::GetMainViewport();
       const ImVec2 textPos(viewport->Size.x - textSize.x - 10.0f, 10.0f);
@@ -1664,7 +1683,7 @@ namespace dxvk {
 
     ImGui::Separator();
 
-    { // Crash Hotkey Feature - allows triggering a deliberate crash for testing crash handling
+    { // Crash Hotkey Feature - arms both CPU crash (deliberate crash) and GPU crash (dialog + Sentry) hotkeys
       const bool isArmed = RtxOptions::enableCrashHotkey();
       
       // Use warning color when armed to make it visually distinct
@@ -1672,32 +1691,32 @@ namespace dxvk {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
       }
       
-      // ImGui::Checkbox returns true when the checkbox state changes
       const bool changed = RemixGui::Checkbox("Arm Crash Hotkey", &RtxOptions::enableCrashHotkeyObject());
       
       if (isArmed) {
         ImGui::PopStyleColor();
       }
       
-      const auto crashHotkeyStr = buildKeyBindDescriptorString(RtxOptions::crashHotkey());
+      const auto crashHotkeyStr = buildKeyBindDescriptorStringForDisplay(RtxOptions::crashHotkey());
+      const auto gpuCrashHotkeyStr = buildKeyBindDescriptorStringForDisplay(RtxOptions::gpuCrashHotkey());
       RemixGui::SetTooltipToLastWidgetOnHover(
-        str::format("When armed, pressing ", crashHotkeyStr, " will trigger a deliberate crash.\n"
-        "Useful for testing crash handling, crash dumps, and crash reporting.\n"
+        str::format("When armed: ", crashHotkeyStr, " = deliberate CPU crash; ", gpuCrashHotkeyStr, " = deliberate GPU crash.\n"
         "A red warning indicator will appear on screen while armed.").c_str());
       
       // Log state changes for crash dump analysis
       if (changed) {
         const bool nowArmed = RtxOptions::enableCrashHotkey();
         if (nowArmed) {
-          Logger::warn(str::format("Crash hotkey ARMED - press ", crashHotkeyStr, " to trigger crash"));
+          Logger::warn(str::format("Crash hotkeys ARMED - ", crashHotkeyStr, " = CPU crash, ", gpuCrashHotkeyStr, " = GPU crash"));
         } else {
-          Logger::warn("Crash hotkey disarmed");
+          Logger::warn("Crash hotkeys disarmed");
         }
       }
     }
+    
+    RemixGui::Separator();
 #endif
 
-    RemixGui::Separator();
 
     showVsyncOptions(false);
 
@@ -1799,11 +1818,13 @@ namespace dxvk {
 
     if (RemixGui::CollapsingHeader("Developer Options", collapsingHeaderFlags)) {
       ImGui::Indent();
+      RemixGui::Checkbox("Enable Preserve Path", &RtxOptions::enablePreservePathObject());
       RemixGui::Checkbox("Enable Instance Debugging", &RtxOptions::enableInstanceDebuggingToolsObject());
       RemixGui::Checkbox("Disable Draw Calls Post RTX Injection", &RtxOptions::skipDrawCallsPostRTXInjectionObject());
       RemixGui::Checkbox("Break into Debugger On Press of Key 'B'", &RtxOptions::enableBreakIntoDebuggerOnPressingBObject());
       RemixGui::Checkbox("Block Input to Game in UI", &RtxOptions::blockInputToGameInUIObject());
       RemixGui::Checkbox("Force Camera Jitter", &RtxOptions::forceCameraJitterObject());
+      RemixGui::Checkbox("Force Static Scene Motion Vectors", &RtxOptions::forceStaticSceneMotionVectorsObject());
       RemixGui::DragInt("Camera Jitter Sequence Length", &RtxOptions::cameraJitterSequenceLengthObject());
       
       RemixGui::DragIntRange2("Draw Call Range Filter", &RtxOptions::drawCallRangeObject(), 1.f, 0, INT32_MAX, nullptr, nullptr, ImGuiSliderFlags_AlwaysClamp);
@@ -2155,6 +2176,45 @@ namespace dxvk {
       return str.str();
     }
 
+    std::string buildTextureCategoryTooltip(const RtxTextureOption& category,
+                                            std::optional<XXH64_hash_t> texHash = std::nullopt) {
+      if (!category.textureSetOption) {
+        assert(false && "Texture category is missing an RTX option.");
+        return category.displayName;
+      }
+
+      std::string tooltipText;
+      const char* description = category.textureSetOption->getDescription();
+      if (description && description[0] != '\0') {
+        tooltipText = description;
+        tooltipText += "\n\n";
+      }
+
+      tooltipText += category.textureSetOption->getFullName();
+
+      if (texHash.has_value()) {
+        std::string layerValues = RemixGui::FormatOptionLayerValues(category.textureSetOption, texHash, false);
+        if (!layerValues.empty()) {
+          tooltipText += "\n\nPer-layer status for this hash:\n";
+          tooltipText += layerValues;
+        }
+      }
+
+      return tooltipText;
+    }
+
+    float computeTexturePopupLabelColumnWidth(uint32_t textureFeatureFlags) {
+      float maxWidth = 0.0f;
+      for (const auto& rtxOption : rtxTextureOptions) {
+        if ((rtxOption.featureFlagMask & textureFeatureFlags) != rtxOption.featureFlagMask) {
+          continue;
+        }
+        const std::string labelForWidth = std::string(rtxOption.displayName) + " [!]";
+        maxWidth = ImMax(maxWidth, ImGui::CalcTextSize(labelForWidth.c_str()).x);
+      }
+      return maxWidth + ImGui::GetStyle().FramePadding.x * 2.0f;
+    }
+
     void toggleTextureSelection(XXH64_hash_t textureHash, const char* uniqueId, RtxOption<fast_unordered_set>* textureSet) {
       if (textureHash == kEmptyHash) {
         return;
@@ -2297,7 +2357,24 @@ namespace dxvk {
             g_openWhenAvailable = false;
           }
         }
-        
+
+        const XXH64_hash_t texHashForSizing = g_holdingTexture.load();
+        float texturePopupLabelColumnW = 0.0f;
+        if (texHashForSizing != kEmptyHash) {
+          uint32_t textureFeatureFlagsForSizing = 0;
+          const auto pairForSizing = g_imguiTextureMap.find(texHashForSizing);
+          if (pairForSizing != g_imguiTextureMap.end()) {
+            textureFeatureFlagsForSizing = pairForSizing->second.textureFeatureFlags;
+          }
+          texturePopupLabelColumnW = computeTexturePopupLabelColumnWidth(textureFeatureFlagsForSizing);
+          if (ImGui::IsPopupOpen(POPUP_NAME, ImGuiPopupFlags_None)) {
+            const ImGuiStyle& sizingStyle = ImGui::GetStyle();
+            const float minPopupW =
+              texturePopupLabelColumnW + sizingStyle.ItemInnerSpacing.x + ImGui::GetFrameHeight() + sizingStyle.WindowPadding.x * 2.0f;
+            ImGui::SetNextWindowSizeConstraints(ImVec2(minPopupW, 0.0f), ImVec2(FLT_MAX, FLT_MAX));
+          }
+        }
+
         if (ImGui::BeginPopup(POPUP_NAME)) {
           const XXH64_hash_t texHash = g_holdingTexture.load();
           if (texHash != kEmptyHash) {
@@ -2310,6 +2387,7 @@ namespace dxvk {
             if (pair != g_imguiTextureMap.end()) {
               textureFeatureFlags = pair->second.textureFeatureFlags;
             }
+            RemixGui::PushLabelColumnFixedWidth(texturePopupLabelColumnW);
             for (auto& rtxOption : rtxTextureOptions) {
               rtxOption.bufferToggle = rtxOption.textureSetOption->containsHash(texHash);
               if ((rtxOption.featureFlagMask & textureFeatureFlags) != rtxOption.featureFlagMask) {
@@ -2330,23 +2408,20 @@ namespace dxvk {
                 displayName = std::string(rtxOption.displayName) + " [!]";
               }
 
-              if (RemixGui::Checkbox(displayName.c_str(), &rtxOption.bufferToggle)) {
+              const bool toggleChanged = RemixGui::Checkbox(displayName.c_str(), &rtxOption.bufferToggle);
+              const bool showTooltip = ImGui::IsItemHovered();
+
+              if (toggleChanged) {
                 toggleTextureSelection(texHash, rtxOption.uniqueId, rtxOption.textureSetOption);
               }
               
-              // Only build the expensive tooltip when this item is actually hovered
-              if (ImGui::IsItemHovered()) {
-                std::ostringstream tooltipStream;
-                tooltipStream << rtxOption.textureSetOption->getDescription() << "\n";
-                
-                std::string layerValues = RemixGui::FormatOptionLayerValues(rtxOption.textureSetOption, texHash, false);
-                if (!layerValues.empty()) {
-                  tooltipStream << "\nPer-layer status for this hash:\n" << layerValues;
-                }
-                
-                ImGui::SetTooltip("%s", tooltipStream.str().c_str());
+              // Only build the expensive tooltip when this item is actually hovered.
+              if (showTooltip) {
+                std::string tooltipText = buildTextureCategoryTooltip(rtxOption, texHash);
+                RemixGui::SetTooltipUnformatted(tooltipText.c_str());
               }
             }
+            RemixGui::PopLabelColumnFixedWidth();
 
             ImGui::EndPopup();
             return texHash;
@@ -2674,8 +2749,6 @@ namespace dxvk {
     ImGui::EndDisabled();
     RemixGui::Separator();
     RemixGui::Checkbox("Highlight Legacy Materials (flash red)", &RtxOptions::useHighlightLegacyModeObject());
-    RemixGui::Checkbox("Highlight Legacy Meshes with Shared Vertex Buffers (dull purple)", &RtxOptions::useHighlightUnsafeAnchorModeObject());
-    RemixGui::Checkbox("Highlight Replacements with Unstable Anchors (flash red)", &RtxOptions::useHighlightUnsafeReplacementModeObject());
 
   }
 
@@ -2877,7 +2950,8 @@ namespace dxvk {
           spacing();
         }
         for (const RtxTextureOption& category : rtxTextureOptions) {
-          showLegacyGui(category.uniqueId, category.displayName, RemixGui::BuildRtxOptionTooltip(category.textureSetOption).c_str());
+          std::string categoryTooltip = buildTextureCategoryTooltip(category);
+          showLegacyGui(category.uniqueId, category.displayName, categoryTooltip.c_str());
         }
 
         // Check if last saved category was closed this frame
@@ -2893,6 +2967,9 @@ namespace dxvk {
     if (ImGui::BeginTabItem("Step 2: Parameter Tuning", nullptr, tab_item_flags)) {
       spacing();
       RemixGui::DragFloat("Scene Unit Scale", &RtxOptions::sceneScaleObject(), 0.00001f, 0.00001f, FLT_MAX, "%.5f", sliderFlags);
+      ImGui::Indent();
+      ImGui::TextWrapped("1 cm  =  %.2f game units", RtxOptions::sceneScale());
+      ImGui::Unindent();
       RemixGui::Checkbox("Scene Z-Up", &RtxOptions::zUpObject());
       RemixGui::Checkbox("Scene Left-Handed Coordinate System", &RtxOptions::leftHandedCoordinateSystemObject());
       fusedWorldViewModeCombo.getKey(&RtxOptions::fusedWorldViewModeObject());
@@ -3252,10 +3329,10 @@ namespace dxvk {
     style->ScrollbarSize = 15.0f;
     style->GrabMinSize = 10.0f;
 
-    style->WindowBorderSize = 1.0f;
-    style->ChildBorderSize = 1.0f;
-    style->PopupBorderSize = 1.0f;
-    style->FrameBorderSize = 1.0f;
+    style->WindowBorderSize = 1.5f;
+    style->ChildBorderSize = 1.5f;
+    style->PopupBorderSize = 1.5f;
+    style->FrameBorderSize = 1.5f;
     style->TabBorderSize = 0.0f;
 
     style->WindowRounding = 0.0f;
@@ -3280,7 +3357,7 @@ namespace dxvk {
     style->Colors[ImGuiCol_Text] = ImVec4(0.8f, 0.8f, 0.8f, 1.00f);
     style->Colors[ImGuiCol_TextDisabled] = ImVec4(0.44f, 0.44f, 0.44f, 1.00f);
     style->Colors[ImGuiCol_ChildBg] = ImVec4(0.16f, 0.16f, 0.16f, 0.86f);
-    style->Colors[ImGuiCol_Border] = ImVec4(0.34f, 0.34f, 0.34f, 0.86f);
+    style->Colors[ImGuiCol_Border] = ImVec4(0.34f, 0.34f, 0.34f, 1.0f);
     style->Colors[ImGuiCol_BorderShadow] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
     style->Colors[ImGuiCol_FrameBg] = ImVec4(0.188f, 0.188f, 0.188f, 1.00f);
     style->Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.15f, 0.30f, 0.35f, 1.00f);
@@ -3810,6 +3887,7 @@ namespace dxvk {
       ImGui::Indent();
 
       RemixGui::Checkbox("RNG: seed with frame index", &RtxOptions::rngSeedWithFrameIndexObject());
+      RemixGui::Checkbox("Advance time", &RtxOptions::advanceTimeObject());
 
       if (RemixGui::CollapsingHeader("Resolver", collapsingHeaderClosedFlags)) {
         ImGui::Indent();
@@ -3915,9 +3993,9 @@ namespace dxvk {
 
         RemixGui::Checkbox("Enable Opacity Micromap", &RtxOptions::OpacityMicromap::enableObject());
         
-        if (common->getOpacityMicromapManager())
+        if (common->getOpacityMicromapManager()) {
           common->getOpacityMicromapManager()->showImguiSettings();
-
+        }
         ImGui::Unindent();
       }
 
@@ -3935,6 +4013,7 @@ namespace dxvk {
           ImGui::Unindent();
         }
       }
+
       ImGui::Unindent();
     }
 
@@ -4016,6 +4095,12 @@ namespace dxvk {
       ImGui::Unindent();
     }
 
+    if (RemixGui::CollapsingHeader("Sparse Rendering", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      common->metaSparseRendering().showImguiSettings();
+      ImGui::Unindent();
+    }
+
     RtxParticleSystemManager::showImguiSettings();
 
     RtxPointInstancerSystem::showImguiSettings();
@@ -4083,7 +4168,7 @@ namespace dxvk {
 
     if (RemixGui::CollapsingHeader("Denoising", collapsingHeaderClosedFlags)) {
       bool isRayReconstructionEnabled = RtxOptions::isRayReconstructionEnabled();
-      bool useNRD = !isRayReconstructionEnabled || common->metaRayReconstruction().enableNRDForTraining();
+      const bool useNRD = !isRayReconstructionEnabled;
       ImGui::Indent();
       ImGui::BeginDisabled(!useNRD);
       RemixGui::Checkbox("Denoising Enabled", &RtxOptions::useDenoiserObject());
@@ -4228,7 +4313,10 @@ namespace dxvk {
 
       if (RemixGui::CollapsingHeader("Post FX", collapsingHeaderClosedFlags))
         common->metaPostFx().showImguiSettings();
-      
+
+      if (RemixGui::CollapsingHeader("sRGB + Dither", collapsingHeaderClosedFlags))
+        common->metaSRGBDither().showImguiSettings();
+
       ImGui::Unindent();
     }
 
@@ -4251,6 +4339,23 @@ namespace dxvk {
       RemixGui::Separator();
       RemixGui::Checkbox("Portals: Virtual Instance Matching", &RtxOptions::useRayPortalVirtualInstanceMatchingObject());
       RemixGui::Checkbox("Portals: Fade In Effect", &RtxOptions::enablePortalFadeInEffectObject());
+      ImGui::Unindent();
+    }
+
+    if (RemixGui::CollapsingHeader("Shadow Terminator Fix", collapsingHeaderClosedFlags)) {
+      ImGui::Indent();
+      RemixGui::Checkbox("Enable Terminator Offset", &RtxOptions::ShadowTerminator::enableOffsetObject());
+      ImGui::Indent();
+      ImGui::BeginDisabled(!RtxOptions::ShadowTerminator::enableOffset());
+      ImGui::TextWrapped("NOTE: The options below are metric (ensure a correct scene scale).");
+      RemixGui::DragFloat("Area Threshold (in meters^2)", &RtxOptions::ShadowTerminator::maxAreaObject(), 0.01f, 0.f, 100.f);
+      RemixGui::DragFloat("Max Offset Length (in meters)", &RtxOptions::ShadowTerminator::maxLengthObject(), 0.01f, 0.f, 1.f);
+      ImGui::EndDisabled();
+      ImGui::Unindent();
+
+      RemixGui::Separator();
+      RemixGui::Checkbox("Terminator Transition Softening", &RtxOptions::ShadowTerminator::softenObject());
+
       ImGui::Unindent();
     }
 
@@ -4493,11 +4598,7 @@ namespace dxvk {
     ImGui::PopItemWidth();
   }
 
-  void ImGUI::render(
-    const HWND gameHwnd,
-    const Rc<DxvkContext>& ctx,
-    VkExtent2D         surfaceSize,
-    bool               vsync) {
+  void ImGUI::render(const Rc<DxvkContext>& ctx, VkExtent2D surfaceSize) {
     ScopedGpuProfileZone(ctx, "ImGUI Render");
 
     ONCE(Logger::info(str::format("[ImGUI] render() first call: HWND=", (uintptr_t)gameHwnd,
@@ -4507,8 +4608,6 @@ namespace dxvk {
     if (m_overlayWin.ptr() != nullptr) {
       m_overlayWin->update(gameHwnd);
     }
-
-    m_lastRenderVsyncStatus = vsync;
 
     ImGui::SetCurrentContext(m_context);
     ImPlot::SetCurrentContext(m_plotContext);
@@ -4535,11 +4634,17 @@ namespace dxvk {
         " size=", surfaceSize.width, "x", surfaceSize.height));
     }
 
+    ImGui_ImplDxvk::NewFrame();
+    ImGui_ImplWin32_NewFrame(); 
+
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2((float) surfaceSize.width, (float) surfaceSize.height);
+
+    ImGui::NewFrame();
+
     update(ctx);
 
     ImGui_ImplDxvk::RenderDrawData(ImGui::GetDrawData(), ctx.ptr(), surfaceSize.width, surfaceSize.height);
-
-    ctx->setSpecConstant(VK_PIPELINE_BIND_POINT_GRAPHICS, 0, 0);
   }
 
   void ImGUI::createFontsTexture(const Rc<DxvkContext>& ctx) {
@@ -4576,14 +4681,13 @@ namespace dxvk {
     normalFontCfg.SizePixels = 16.f;
     normalFontCfg.FontDataOwnedByAtlas = false;
 
-    const size_t nvidiaSansLength = sizeof(___NVIDIASansRg) / sizeof(___NVIDIASansRg[0]);
+    const size_t nvidiaSansLength = sizeof(___NVIDIASansMd) / sizeof(___NVIDIASansMd[0]);
     const size_t nvidiaSansBdLength = sizeof(___NVIDIASansBd) / sizeof(___NVIDIASansBd[0]);
     const size_t robotoMonoLength = sizeof(___RobotoMonoRg) / sizeof(___RobotoMonoRg[0]);
 
     {
       // Add letters/symbols (NVIDIA-Sans)
-      m_regularFont = io.Fonts->AddFontFromMemoryTTF(&___NVIDIASansRg[0], nvidiaSansLength, 0, &normalFontCfg, characterRange.Data);
-      io.FontDefault = m_regularFont;
+      m_regularFont = io.Fonts->AddFontFromMemoryTTF(&___NVIDIASansMd[0], nvidiaSansLength, 0, &normalFontCfg, characterRange.Data);
 
       // Enable merging
       normalFontCfg.MergeMode = true;
@@ -4615,6 +4719,9 @@ namespace dxvk {
     // Build the fonts
 
     io.Fonts->Build();
+
+    // Apply the correct default font based on largeUiMode setting
+    io.FontDefault = largeUiMode() ? m_largeFont : m_regularFont;
 
 
     // Allocate/upload glyph cache...

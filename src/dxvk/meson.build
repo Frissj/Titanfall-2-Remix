@@ -181,6 +181,8 @@ dxvk_src = files([
   'rtx_render/rtx_accel_manager.h',
   'rtx_render/rtx_accumulation.cpp',
   'rtx_render/rtx_accumulation.h',
+  'rtx_render/rtx_sparse_rendering.cpp',
+  'rtx_render/rtx_sparse_rendering.h',
   'rtx_render/rtx_asset_data.h',
   'rtx_render/rtx_asset_data_manager.cpp',
   'rtx_render/rtx_asset_data_manager.h',
@@ -208,6 +210,8 @@ dxvk_src = files([
   'rtx_render/rtx_composite.h',
   'rtx_render/rtx_context.cpp',
   'rtx_render/rtx_context.h',
+  'rtx_render/rtx_gpu_crash.cpp',
+  'rtx_render/rtx_gpu_crash.h',
   'rtx_render/rtx_debug_view.cpp',
   'rtx_render/rtx_debug_view.h',
   'rtx_render/rtx_demodulate.cpp',
@@ -221,6 +225,8 @@ dxvk_src = files([
   'rtx_render/rtx_dlss.h',
   'rtx_render/rtx_draw_call_cache.cpp',
   'rtx_render/rtx_draw_call_cache.h',
+  'rtx_render/rtx_draw_call_tracker.cpp',
+  'rtx_render/rtx_draw_call_tracker.h',
   'rtx_render/rtx_dust_particles.cpp',
   'rtx_render/rtx_dust_particles.h',
   'rtx_render/rtx_engine_renderables.cpp',
@@ -238,6 +244,8 @@ dxvk_src = files([
   'rtx_render/rtx_geometry_utils.h',
   'rtx_render/rtx_global_volumetrics.cpp',
   'rtx_render/rtx_global_volumetrics.h',
+  'rtx_render/rtx_gpu_crash_recorder.cpp',
+  'rtx_render/rtx_gpu_crash_recorder.h',
   'rtx_render/rtx_hashing.cpp',
   'rtx_render/rtx_hashing.h',
   'rtx_render/rtx_hash_collision_detection.cpp',
@@ -318,6 +326,9 @@ dxvk_src = files([
   'rtx_render/rtx_pathtracer_integrate_indirect.h',
   'rtx_render/rtx_postFx.cpp',
   'rtx_render/rtx_postFx.h',
+  'rtx_render/rtx_preserved_object_picking.h',
+  'rtx_render/rtx_srgb_dither.cpp',
+  'rtx_render/rtx_srgb_dither.h',
   'rtx_render/rtx_ray_portal_manager.cpp',
   'rtx_render/rtx_ray_portal_manager.h',
   'rtx_render/rtx_ray_reconstruction.cpp',
@@ -396,6 +407,8 @@ dxvk_src = files([
 
   'rtx_render/rtx_gui_widgets.cpp',
   'rtx_render/rtx_gui_widgets.h',
+  'rtx_render/rtx_option_blocking_popup.cpp',
+  'rtx_render/rtx_option_blocking_popup.h',
 
   'platform/dxvk_win32_exts.cpp',
   
@@ -414,6 +427,8 @@ dxvk_src = files([
   'imgui/dxvk_imgui_about.h',
   'imgui/dxvk_imgui_capture.cpp',
   'imgui/dxvk_imgui_capture.h',
+  'imgui/dxvk_imgui_first_use_guide.cpp',
+  'imgui/dxvk_imgui_first_use_guide.h',
   'imgui/dxvk_imgui_splash.cpp',
   'imgui/dxvk_imgui_splash.h',
   'imgui/rtx_user_menu.cpp',
@@ -446,6 +461,11 @@ nrd_dep = declare_dependency(
   include_directories : nrd_include_dir
 )
 
+target_dlss_lib_path = 'lib/Windows_x86_64/x64'
+if dxvk_is_woa
+  target_dlss_lib_path = 'lib/Windows_arm64/arm64'
+endif
+
 # Note: Include directory paths must be relative paths due to a limitation in Meson (currently at least)
 dlss_include_dir = include_directories(join_paths('../../', dlss_root_path, 'include'))
 dlss_lib_path = join_paths(global_src_root_norm, dlss_root_path, 'lib/Windows_x86_64/x64')
@@ -461,17 +481,27 @@ dlss_dep = declare_dependency(
   include_directories : [ dlss_include_dir, dlfg_include_dir ]
 )
 
-# XeSS dependency
-xess_lib_path = join_paths(global_src_root_norm, 'submodules/xess/lib')
-xess_include_dir = include_directories('../../submodules/xess/inc')
-xess_lib = dxvk_compiler.find_library('libxess', dirs : xess_lib_path, required : false)
-xess_dep = declare_dependency(
-  dependencies : [ xess_lib ],
-  include_directories : xess_include_dir
-)
+if dxvk_is_woa
+  nrc_dll_path = join_paths(meson.global_source_root(), 'external/nrc_arm64/bin/')
+  nrc_lib_path = join_paths(meson.global_source_root(), 'external/nrc_arm64/lib/')
+  nrc_include_path = include_directories(join_paths('../../', 'external/nrc_arm64/include'))
+else
+  nrc_dll_path = join_paths(meson.global_source_root(), 'submodules/nrc/bin/')
+  nrc_lib_path = join_paths(meson.global_source_root(), 'submodules/nrc/lib/')
+  nrc_include_path = include_directories(join_paths('../../', 'submodules/nrc/include'))
+endif
 
-nrc_dll_path = join_paths(meson.global_source_root(), 'submodules/nrc/bin/')
-nrc_lib_path = join_paths(meson.global_source_root(), 'submodules/nrc/lib/')
+# XeSS dependency
+if not dxvk_is_woa
+  xess_lib_path = join_paths(global_src_root_norm, 'submodules/xess/lib')
+  xess_include_dir = include_directories('../../submodules/xess/inc')
+  xess_lib = dxvk_compiler.find_library('libxess', dirs : xess_lib_path, required : false)
+  xess_dep = declare_dependency(
+    dependencies : [ xess_lib ],
+    include_directories : xess_include_dir
+  )
+endif
+
 nrc_lib = dxvk_compiler.find_library('NRC_Vulkan', dirs : nrc_lib_path, required : true)
 
 nrc_dep = declare_dependency(
@@ -491,14 +521,18 @@ rtx_shaders = custom_target(
 )
 
 dxvk_embedded_data_files = files([
-  '../../external/fonts/NVIDIASans/NVIDIASansRg.ttf',
+  '../../external/fonts/NVIDIASans/NVIDIASansMd.ttf',
   '../../external/fonts/NVIDIASans/NVIDIASansBd.ttf',
   '../../external/fonts/RobotoMono/RobotoMonoRg.ttf'
 ])
 
 dxvk_generated_embedded_files = embedding_compiler.process(dxvk_embedded_data_files)
 
-dxvk_deps = [ thread_dep, vkcommon_dep, dxvk_extradep, usd_dep, lssUsd_dep, nrc_dep, nrd_dep, dlss_dep, submodules_dep, xess_dep, tracy_dep, tracy_dep_dynamic, aftermath_dep, nvapi_dep, reflex_dep, usd_plugin_deps ]
+dxvk_deps = [ thread_dep, vkcommon_dep, dxvk_extradep, usd_dep, lssUsd_dep, nrc_dep, nrd_dep, dlss_dep, submodules_dep, tracy_dep, tracy_dep_dynamic, aftermath_dep, nvapi_dep, reflex_dep, usd_plugin_deps ]
+
+if not dxvk_is_woa
+  dxvk_deps += xess_dep
+endif
 
 if enable_rtxio
   dxvk_deps += rtxio_dep
@@ -517,7 +551,7 @@ dxvk_deps += delayimp_dep
 dxvk_lib = static_library('dxvk', dxvk_src, dxvk_version, [generated_dxvk_shaders, rtx_shaders, dxvk_generated_embedded_files],
   link_with           : [ util_lib, spirv_lib, usd_plugins ], 
   dependencies        : [ dxvk_deps ],
-  include_directories : [ dxvk_include_path, dxvk_shader_include_path, rtxdi_include_path, remix_api_include_path, rtxcr_include_path, submodules_include_path  ],
+  include_directories : [ dxvk_include_path, dxvk_shader_include_path, rtxdi_include_path, remix_api_include_path, rtxcr_include_path, submodules_include_path ],
   override_options    : ['cpp_std='+dxvk_cpp_std],
   # Force switch statements over enums to either cover all cases or have a default case.
   cpp_args            : dxvk_is_msvc ? ['/we4062'] : ['-Wswitch'],

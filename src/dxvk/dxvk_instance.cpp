@@ -53,6 +53,7 @@
 
 #include "../util/xxHash/xxhash.h"
 #include "../util/util_env.h"
+#include "../util/util_sentry.h"
 #include "../util/util_string.h"
 // NV-DXVK end
 
@@ -64,7 +65,16 @@
 // NV-DXVK start: Provide error code on exception
 #include <remix/remix_c.h>
 // NV-DXVK end
+
+// NV-DXVK start: Sentry includes
+#include "dxvk_extensions.h"
+// NV-DXVK end
+
 namespace dxvk {
+  // NV-DXVK start: initialize new static variables
+  std::atomic<bool> DxvkInstance::s_aftermathEnabled{ false };
+  bool DxvkInstance::s_aftermathInitFailed = false;
+  // NV-DXVK end
 
   // NV-DXVK start: debug callback context (stack trace + duplicate filtering)
   struct DxvkDebugUtilsContext {
@@ -529,6 +539,7 @@ namespace dxvk {
     if (dumpFile.is_open()) {
       dumpFile.write((char*) pGpuCrashDump, gpuCrashDumpSize);
       dumpFile.close();
+      dxvk::sentry::queueGpuCrashReport(dumpFilename.c_str());
     } else {
       Logger::warn(str::format("Aftermath was trying to write a GPU dump, but it failed, proposed filename: ", dumpFilename));
     }
@@ -572,6 +583,18 @@ namespace dxvk {
   DxvkInstance::DxvkInstance() {
     Logger::info(str::format("Game: ", env::getExeName()));
     Logger::info(str::format("DXVK_Remix: ", DXVK_VERSION));
+
+    // NV-DXVK start: Sentry tags (set early so they are attached to any crash report).
+    {
+      sentry::setTag("game", env::getExeName());
+      // Game arch: x64 = game directly loaded our x64 DLL; x86 = x86 game (or x86 game using bridge to x64 runtime).
+      if (env::isRemixBridgeActive()) {
+        sentry::setTag("game_arch", "x86");  // We are the x64 NvRemixBridge process serving an x86 game
+      } else {
+        sentry::setTag("game_arch", "x64");  // x64 game, direct load
+      }
+    }
+    // NV-DXVK end
 
     // NV-DXVK start: Log System Info Report
     RtxSystemInfo::logReport();
@@ -661,7 +684,7 @@ namespace dxvk {
       }
 
       // NV-DXVK start: Integrate Aftermath
-      if (m_options.enableAftermath && !m_aftermathEnabled) {
+      if (m_options.enableAftermath && !s_aftermathEnabled) {
         GFSDK_Aftermath_Result aftermathResult = GFSDK_Aftermath_EnableGpuCrashDumps(GFSDK_Aftermath_Version_API,
                                                                                      GFSDK_Aftermath_GpuCrashDumpWatchedApiFlags_Vulkan,
                                                                                      GFSDK_Aftermath_GpuCrashDumpFeatureFlags_DeferDebugInfoCallbacks,
@@ -690,6 +713,10 @@ namespace dxvk {
       }
       // NV-DXVK end
     }
+
+    // NV-DXVK start: add information to crash reporting.
+    setSentryGpuAndAftermathTags();
+    // NV-DXVK end
 
     if (RtxOptions::areValidationLayersEnabled()) {
       // NV-DXVK start: use EXT_debug_utils
@@ -729,8 +756,81 @@ namespace dxvk {
     }
     // NV-DXVK end
   }
-  
-  
+
+  // NV-DXVK start: add information to crash reporting.
+  void DxvkInstance::setSentryGpuAndAftermathTags() {
+    // Fetch the list of layers and extensions and convert them to strings.
+    DxvkNameSet layerSet = DxvkNameSet::enumInstanceLayers(m_vkl);
+    DxvkNameSet extSet = DxvkNameSet::enumInstanceExtensions(m_vkl);
+    DxvkNameList layerList = layerSet.toNameList();
+    DxvkNameList extList = extSet.toNameList();
+    std::vector<std::string> layerNames;
+    std::vector<std::string> extNames;
+    for (uint32_t i = 0; i < layerList.count(); i++) {
+      layerNames.push_back(layerList.name(i));
+    }
+    for (uint32_t i = 0; i < extList.count(); i++) {
+      extNames.push_back(extList.name(i));
+    }
+
+    Logger::info("Vulkan instance layers:");
+    for (const auto& name : layerNames) {
+      Logger::info(str::format("  ", name));
+    }
+    if (layerNames.empty()) {
+      Logger::info("  (none)");
+    }
+
+    Logger::info("Vulkan instance extensions:");
+    for (const auto& name : extNames) {
+      Logger::info(str::format("  ", name));
+    }
+    if (extNames.empty()) {
+      Logger::info("  (none)");
+    }
+
+    // Set Sentry context for Vulkan instance layers and extensions.
+    sentry::setVulkanLayersAndExtensionsContext(layerNames, extNames);
+
+    // Set Sentry tags for hardware information. gpu_driver and vulkan_version are set in DxvkAdapter::logAdapterInfo().
+    if (!m_adapters.empty()) {
+      const Rc<DxvkAdapter>& adapter = m_adapters[0];
+      const auto& props = adapter->deviceProperties();
+      {
+        const char* vendor = "Unknown";
+        switch (props.vendorID) {
+          case 0x10de: vendor = "NVIDIA"; break;
+          case 0x1002: vendor = "AMD"; break;
+          case 0x8086: vendor = "Intel"; break;
+        }
+        sentry::setTag("gpu_vendor", vendor);
+      }
+      {
+        VkPhysicalDeviceMemoryProperties memProps = adapter->memoryProperties();
+        VkDeviceSize vramBytes = 0;
+        for (uint32_t i = 0; i < memProps.memoryHeapCount; i++) {
+          if (memProps.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            vramBytes += memProps.memoryHeaps[i].size;
+          }
+        }
+        sentry::setTag("vram", str::formatBytes(static_cast<size_t>(vramBytes)));
+      }
+      if (m_adapters.size() == 1) {
+        sentry::setTag("gpu_selection", "only_gpu");
+      } else {
+        sentry::setTag("gpu_selection", props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? "discrete" : "integrated");
+      }
+    }
+
+    // Set Sentry tag for Aftermath status (process-wide, not per-instance).
+    if (s_aftermathEnabled) {
+      sentry::setTag("aftermath", "enabled");
+    } else {
+      sentry::setTag("aftermath", s_aftermathInitFailed ? "failed" : "disabled");
+    }
+  }
+  // NV-DXVK end
+
   Rc<DxvkAdapter> DxvkInstance::enumAdapters(uint32_t index) const {
     return index < m_adapters.size()
       ? m_adapters[index]
@@ -946,27 +1046,44 @@ namespace dxvk {
 
     // Filter Physical Devices
 
-    std::vector<VkPhysicalDeviceProperties> deviceProperties(numAdapters);
+    std::vector<VkPhysicalDeviceProperties2> deviceProperties(numAdapters);
+    std::vector<VkPhysicalDeviceVulkan12Properties> deviceVulkanProperties(numAdapters);
     DxvkDeviceFilterFlags filterFlags = 0;
+    
+    bool haveRealDGPU = false;
+    bool haveRealIGPU = false;
 
     for (uint32_t i = 0; i < numAdapters; i++) {
-      m_vki->vkGetPhysicalDeviceProperties(adapters[i], &deviceProperties[i]);
+      deviceProperties[i].sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+      deviceProperties[i].pNext = &deviceVulkanProperties[i];
 
-      // Skip CPU or Integrated GPU devices if any other device type is present
-      // Note: Originally DXVK only did this for CPU devices, but Remix extends this logic to include
-      // Integrated GPUs too. This is because applications have little information about which device
-      // is best when exposed as adapters through DirectX and cannot be expected to make a good selection
-      // on their own. In the case of Remix, if a dedicated GPU is installed on a system it should almost
-      // always be prioritized over integrated GPUs, as some applications will attempt to select a
-      // non-default adapter and often times end up severely degrading performance by unknowingly selecting
-      // one corresponding to an integrated GPU.
+      deviceVulkanProperties[i].sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES;
+      deviceVulkanProperties[i].pNext = nullptr;
 
-      if (deviceProperties[i].deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU) {
-        filterFlags.set(DxvkDeviceFilterFlag::SkipCpuDevices);
+      m_vki->vkGetPhysicalDeviceProperties2(adapters[i], &deviceProperties[i]);
+
+      if (deviceProperties[i].properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+        haveRealDGPU |= !DxvkAdapter::isEmulated(deviceVulkanProperties[i]);
       }
 
-      if (deviceProperties[i].deviceType != VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+      if (deviceProperties[i].properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+        haveRealIGPU |= !DxvkAdapter::isEmulated(deviceVulkanProperties[i]);
+      }
+    }
+
+    if (numAdapters > 1) {
+      // Skip CPU, Integrated or Emulated GPU devices if any other device type is present
+
+      // If we have more than one device always skip CPU devices.
+      filterFlags.set(DxvkDeviceFilterFlag::SkipCpuDevices);
+
+      if (haveRealDGPU) {
+        // Skip integrated and emulated device(s) if we have a real dGPU
         filterFlags.set(DxvkDeviceFilterFlag::SkipIntegratedGPUDevices);
+        filterFlags.set(DxvkDeviceFilterFlag::SkipEmulatedGPUDevices);
+      } else if (haveRealIGPU) {
+        // Skip emulated device(s) if we have a real iGPU
+        filterFlags.set(DxvkDeviceFilterFlag::SkipEmulatedGPUDevices);
       }
     }
 
@@ -1000,7 +1117,20 @@ namespace dxvk {
           if (b->deviceProperties().deviceType == deviceTypes[i]) bRank = i;
         }
 
-        return aRank < bRank;
+        if (aRank != bRank)
+          return aRank < bRank;
+
+        // Among adapters of the same device type, prefer ones that support
+        // ray tracing extensions required by RTX Remix.
+        const bool aSupportsRT = a->supportsExtension(VK_KHR_RAY_QUERY_EXTENSION_NAME)
+                               && a->supportsExtension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+        const bool bSupportsRT = b->supportsExtension(VK_KHR_RAY_QUERY_EXTENSION_NAME)
+                               && b->supportsExtension(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+
+        if (aSupportsRT != bSupportsRT)
+          return aSupportsRT;
+
+        return false;
       });
     
     if (result.size() == 0) {

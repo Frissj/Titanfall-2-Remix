@@ -31,6 +31,10 @@
 
 namespace dxvk {
 
+  // Indicates that an option with the InvalidatesDrawcallTranslation flag has been changed since the last frame.
+  // This should only ever be modified or read on the dxvk-cs thread.
+  bool RtxOptionManager::s_drawcallTranslationInvalid = false;
+
   // ============================================================================
   // RtxOptionManager static method implementations
   // ============================================================================
@@ -236,7 +240,7 @@ namespace dxvk {
       {
         const auto tResolveStart = Clock::now();
         for (auto& rtxOption : dirtyOptions) {
-          const bool valueChanged = rtxOption.second->resolveValue(rtxOption.second->m_resolvedValue, false);
+          const bool valueChanged = rtxOption.second->resolveValue(rtxOption.second->m_resolvedValue);
           if (forceOnChange || valueChanged) {
             dirtyOptionsVector.push_back(rtxOption.second);
           }
@@ -338,6 +342,14 @@ namespace dxvk {
       b.resolveUsSince = 0;
       b.callbackUsSince = 0;
     }
+  }
+
+  void RtxOptionManager::clearDrawcallTranslationInvalid() {
+    s_drawcallTranslationInvalid = false;
+  }
+
+  bool RtxOptionManager::isDrawcallTranslationInvalid() {
+    return s_drawcallTranslationInvalid;
   }
 
   void RtxOptionManager::logEffectiveValues() {

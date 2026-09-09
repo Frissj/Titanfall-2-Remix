@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -113,7 +113,7 @@ namespace dxvk
     RTX_OPTION_ENV("rtx.camera", Vector3, freeCameraPosition, Vector3(0.f, 0.f, 0.f), "RTX_FREE_CAMERA_POSITION", "Free camera's position.");
     RTX_OPTION_ENV("rtx.camera", float, freeCameraYaw, 0.f, "RTX_FREE_CAMERA_YAW", "Free camera's position.");
     RTX_OPTION_ENV("rtx.camera", float, freeCameraPitch, 0.f, "RTX_FREE_CAMERA_PITCH", "Free camera's pitch.");
-    RTX_OPTION("rtx.camera", bool, lockFreeCamera, false, "Locks free camera.");
+    RTX_OPTION_ENV("rtx.camera", bool, lockFreeCamera, false, "RTX_LOCK_FREE_CAMERA", "Locks free camera.");
     RTX_OPTION("rtx.camera", bool, freeCameraViewRelative, true, "Free camera transform is relative to the view.");
     RTX_OPTION("rtx.camera", bool, useFreeCameraForComponents, true, "Use free camera for graph components when free camera is enabled.");
     RTX_OPTION("rtx", float, freeCameraSpeed, 200, "Free camera speed [GameUnits/s].");
@@ -218,6 +218,9 @@ namespace dxvk
     // the matrices retreived from the various getter functions can be casted to float matrices for a minor upfront performance cost.
     Matrix4d m_matCache[MatrixType::Count] = {};
 
+    // Single precision matrix cache to save on conversion
+    Matrix4 m_matCachef[MatrixType::Count];
+
     RtFrustum m_frustum;
     cFrustum m_lightAntiCullingFrustum;
 
@@ -226,9 +229,13 @@ namespace dxvk
     Vector3 m_artificalWorldOffset = Vector3(0.f);
     Vector3 m_previousArtificalWorldOffset = Vector3(0.f);
 
+    uint32_t m_lastViewHistoryInvalidationFrameId = kInvalidFrameIndex;
+
     // Note: Start the camera off as invalid until it is set properly.
     uint32_t m_frameLastTouched = kInvalidFrameIndex;
     std::chrono::time_point<std::chrono::system_clock> m_prevRunningTime = {};
+
+    static bool m_isFreeCameraEnabled;
 
   public:
     RtCamera() = default;
@@ -261,6 +268,9 @@ namespace dxvk
     const Matrix4d& getPreviousProjectionToView() const { return m_matCache[MatrixType::PreviousProjectionToView]; }
 
     const Matrix4d& getViewToWorldToFreeCamViewToWorld() const;
+
+    const Matrix4& getWorldToViewf(bool freecam = true) const;
+    const Matrix4& getViewToProjectionf() const { return m_matCachef[MatrixType::ViewToProjection]; }
 
     const RtFrustum& getFrustum() const { return m_frustum; }
     RtFrustum& getFrustum() { return m_frustum; }
@@ -322,6 +332,8 @@ namespace dxvk
     }
     CameraType::Enum getCameraType() const { return m_type; }
 
+    void invalidateViewHistory(uint32_t frameIdx);
+    bool isViewHistoryInvalidated(uint32_t frameIdx) const;
     bool isCameraCut() const;
     static bool isFreeCameraEnabled();
     Vector3 getHorizontalForwardDirection() const;

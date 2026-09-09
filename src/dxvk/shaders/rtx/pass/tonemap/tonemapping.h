@@ -137,8 +137,8 @@ struct ToneMappingCurveArgs {
 struct ToneMappingApplyToneMappingArgs {
   uint toneMappingEnabled;
   uint debugMode; // If true shows from left to right: Reinhard (0-0.25), Heji Burgess-Dawson (0.25-0.5), and dynamic tone mappers (0.5-1) along with a tone curve on the same screen.
-  uint performSRGBConversion;
   uint enableAutoExposure;
+  uint colorGradingEnabled;
 
   float shadowContrast;       // See ToneMappingCurveArgs
   float shadowContrastEnd;    // See ToneMappingCurveArgs
@@ -147,15 +147,11 @@ struct ToneMappingApplyToneMappingArgs {
 
   // Color grading
   vec3 colorBalance;
-  uint colorGradingEnabled;
-
   float saturation;
+
   float toneCurveMinStops;
   float toneCurveMaxStops;
   uint finalizeWithACES;
-
-  uint ditherMode;
-  uint frameIndex;
   uint useLegacyACES;
   uint tonemapOperator; // NV-DXVK: one of tonemapOperator* (0 = native dynamic curve)
 };

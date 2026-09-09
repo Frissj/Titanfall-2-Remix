@@ -25,6 +25,7 @@
 
 namespace dxvk {
   class NGXRayReconstructionContext;
+  class DxvkPipelineManager;
   class DxvkRayReconstruction : public DxvkDLSS {
   public:
     enum class RayReconstructionParticleBufferMode : uint32_t {
@@ -43,13 +44,9 @@ namespace dxvk {
 
     bool supportsRayReconstruction() const;
 
+    void prewarmShaders(DxvkPipelineManager& pipelineManager) const;
+
     void showRayReconstructionImguiSettings(bool showAdvancedSettings);
-
-    RayReconstructionParticleBufferMode getParticleBufferMode();
-
-    bool useParticleBuffer() {
-      return getParticleBufferMode() != RayReconstructionParticleBufferMode::None;
-    }
 
     void dispatch(
       Rc<RtxContext> ctx,
@@ -60,16 +57,12 @@ namespace dxvk {
 
     void release();
 
-    bool useRayReconstruction();
+    bool useRayReconstruction() const;
 
     void setSettings(const uint32_t displaySize[2], const DLSSProfile profile, uint32_t outRenderSize[2]);
 
     virtual void onDestroy();
 
-    RTX_OPTION("rtx.rayreconstruction", RayReconstructionParticleBufferMode, particleBufferMode,
-               RayReconstructionParticleBufferMode::RayReconstructionUpscaling,
-               "Use a separate particle buffer to handle particles.\n");
-    RTX_OPTION("rtx.rayreconstruction", bool, enableNRDForTraining, false, "Enable NRD. This option is only for training or debug purpose.\n");
     RTX_OPTION("rtx.rayreconstruction", PathTracerPreset, pathTracerPreset, PathTracerPreset::RayReconstruction, 
                "Path tracer preset to use when Ray Reconstruction is enabled.");
     RTX_OPTION("rtx.rayreconstruction", bool, useSpecularHitDistance, true, "Use specular hit distance to reduce ghosting.\n");
@@ -97,8 +90,6 @@ namespace dxvk {
   private:
     void initializeRayReconstruction(Rc<DxvkContext> pRenderContext);
 
-    Resources::Resource         m_normals;
-    bool                        m_useVirtualNormals = true;
     bool                        m_biasCurrentColorEnabled = true;
     RayReconstructionPreset     m_prevPreset;
 

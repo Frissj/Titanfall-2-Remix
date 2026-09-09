@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -34,8 +34,9 @@
 #include "rtx_ray_reconstruction.h"
 #include "rtx_restir_gi_rayquery.h"
 #include "rtx_debug_view.h"
+#include "rtx_sparse_rendering.h"
 
-#include "../util/util_globaltime.h"
+#include "../util/util_global_time.h"
 
 #include <rtx_shaders/composite.h>
 #include <rtx_shaders/composite_alpha_blend.h>
@@ -73,6 +74,8 @@ namespace dxvk {
         SAMPLER3D(COMPOSITE_VOLUME_FILTERED_RADIANCE_Y_INPUT)
         SAMPLER3D(COMPOSITE_VOLUME_FILTERED_RADIANCE_CO_CG_INPUT)
         TEXTURE2D(COMPOSITE_ALPHA_GBUFFER_INPUT)
+        TEXTURE2D(COMPOSITE_ACTIVE_PIXEL_MASK_INPUT)
+        TEXTURE2D(COMPOSITE_ACTIVE_LOCAL_PIXEL_COORDS_INPUT)
         TEXTURE2DARRAY(COMPOSITE_BLUE_NOISE_TEXTURE)
         SAMPLER3D(COMPOSITE_VALUE_NOISE_SAMPLER)
         SAMPLER3D(COMPOSITE_AERIAL_PERSPECTIVE_LUT_INPUT)
@@ -83,7 +86,6 @@ namespace dxvk {
         RW_TEXTURE2D(COMPOSITE_FINAL_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_LAST_FINAL_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_ALPHA_BLEND_RADIANCE_OUTPUT)
-        RW_TEXTURE2D(COMPOSITE_RAY_RECONSTRUCTION_PARTICLE_BUFFER_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_DEBUG_VIEW_OUTPUT)
       END_PARAMETER()
     };
@@ -113,10 +115,13 @@ namespace dxvk {
         CONSTANT_BUFFER(COMPOSITE_CONSTANTS_INPUT)
         TEXTURE2D(COMPOSITE_BSDF_FACTOR_INPUT)
         TEXTURE2D(COMPOSITE_BSDF_FACTOR2_INPUT)
+        TEXTURE2D(COMPOSITE_PIXEL_SAMPLING_RATE_INPUT)
         SAMPLER3D(COMPOSITE_VOLUME_FILTERED_RADIANCE_AGE_INPUT)
         SAMPLER3D(COMPOSITE_VOLUME_FILTERED_RADIANCE_Y_INPUT)
         SAMPLER3D(COMPOSITE_VOLUME_FILTERED_RADIANCE_CO_CG_INPUT)
         TEXTURE2D(COMPOSITE_ALPHA_GBUFFER_INPUT)
+        TEXTURE2D(COMPOSITE_ACTIVE_PIXEL_MASK_INPUT)
+        TEXTURE2D(COMPOSITE_ACTIVE_LOCAL_PIXEL_COORDS_INPUT)
         TEXTURE2DARRAY(COMPOSITE_BLUE_NOISE_TEXTURE)
         SAMPLER3D(COMPOSITE_VALUE_NOISE_SAMPLER)
         SAMPLER3D(COMPOSITE_AERIAL_PERSPECTIVE_LUT_INPUT)
@@ -128,8 +133,8 @@ namespace dxvk {
         RW_TEXTURE2D(COMPOSITE_FINAL_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_LAST_FINAL_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_ALPHA_BLEND_RADIANCE_OUTPUT)
-        RW_TEXTURE2D(COMPOSITE_RAY_RECONSTRUCTION_PARTICLE_BUFFER_OUTPUT)
         RW_TEXTURE2D(COMPOSITE_DEBUG_VIEW_OUTPUT)
+        RW_TEXTURE2D(COMPOSITE_RAY_RECONSTRUCTION_HIT_DISTANCE_OUTPUT)
       END_PARAMETER()
     };
 
@@ -341,7 +346,10 @@ namespace dxvk {
     const DxvkReSTIRGIRayQuery& restirGI = ctx->getCommonObjects()->metaReSTIRGIRayQuery();
     ctx->bindResourceView(COMPOSITE_BSDF_FACTOR_INPUT, rtOutput.m_bsdfFactor.view, nullptr);
     ctx->bindResourceView(COMPOSITE_BSDF_FACTOR2_INPUT, restirGI.getBsdfFactor2().view, nullptr);
+    ctx->bindResourceView(COMPOSITE_PIXEL_SAMPLING_RATE_INPUT, rtOutput.m_sparseRenderingPixelSamplingRate.view, nullptr);
     ctx->bindResourceView(COMPOSITE_ALPHA_GBUFFER_INPUT, rtOutput.m_alphaBlendGBuffer.view, nullptr);
+    ctx->bindResourceView(COMPOSITE_ACTIVE_PIXEL_MASK_INPUT, rtOutput.m_sparseRenderingActivePixelMask.view, nullptr);
+    ctx->bindResourceView(COMPOSITE_ACTIVE_LOCAL_PIXEL_COORDS_INPUT, rtOutput.m_sparseRenderingActiveLocalPixelCoords.view, nullptr);
 
     // Note: Clamp to edge used to avoid interpolation to black on the edges of the view.
     Rc<DxvkSampler> linearSampler = ctx->getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
@@ -371,10 +379,8 @@ namespace dxvk {
 
     DebugView& debugView = ctx->getDevice()->getCommon()->metaDebugView();
     ctx->bindResourceView(COMPOSITE_DEBUG_VIEW_OUTPUT, debugView.getDebugOutput(), nullptr);
-    ctx->bindResourceView(COMPOSITE_RAY_RECONSTRUCTION_PARTICLE_BUFFER_OUTPUT, rtOutput.m_rayReconstructionParticleBuffer.view, nullptr);
-
-    ctx->bindResourceView(COMPOSITE_RAY_RECONSTRUCTION_PARTICLE_BUFFER_OUTPUT, rtOutput.m_rayReconstructionParticleBuffer.view, nullptr);
-
+    ctx->bindResourceView(COMPOSITE_RAY_RECONSTRUCTION_HIT_DISTANCE_OUTPUT,
+      ctx->useRayReconstruction() ? rtOutput.m_rayReconstructionHitDistance.view(Resources::AccessType::Write) : nullptr, nullptr);
     const DomeLightArgs& domeLightArgs = sceneManager.getLightManager().getDomeLightArgs();
     ctx->bindResourceSampler(COMPOSITE_SKY_LIGHT_TEXTURE, linearSampler);
     Rc<DxvkImageView> skyLightBoundView;
@@ -454,15 +460,8 @@ namespace dxvk {
       }
     }
 
-    // Some camera parameters for primary ray reconstruction
-    Camera cameraConstants = sceneManager.getCamera().getShaderConstants();
-    compositeArgs.camera = cameraConstants;
-    compositeArgs.projectionToViewJittered = cameraConstants.projectionToViewJittered;
-    compositeArgs.viewToWorld = cameraConstants.viewToWorld;
-    compositeArgs.resolution.x = float(cameraConstants.resolution.x);
-    compositeArgs.resolution.y = float(cameraConstants.resolution.y);
-    compositeArgs.nearPlane = cameraConstants.nearPlane;
-    compositeArgs.frameIdx = m_device->getCurrentFrameId();
+    compositeArgs.camera = sceneManager.getCamera().getShaderConstants();
+    compositeArgs.frameIdx = frameIdx;
 
     // NV-DXVK [AerialPerspective]: pull the atmosphere args from the
     // (always-initialised) RtxAtmosphere so the composite shader has
@@ -497,7 +496,6 @@ namespace dxvk {
 
     // Combine the direct and indirect channels if the seperated denoiser is enabled, otherwise the channels will be combined
     // elsewhere before compositing.
-    compositeArgs.combineLightingChannels = RtxOptions::denoiseDirectAndIndirectLightingSeparately();
     compositeArgs.debugKnob = ctx->getCommonObjects()->metaDebugView().debugKnob();
     // NV-DXVK [SkyMissMagentaProbe]: forward the rtx.debug.visualizeMissedPixels
     // option into the composite shader, which paints primary-miss pixels
@@ -517,12 +515,11 @@ namespace dxvk {
     compositeArgs.pixelHighlightReuseStrength = 1.0 / pixelHighlightReuseStrength();
     compositeArgs.enableRtxdi = RtxOptions::useRTXDI();
     compositeArgs.enableReSTIRGI = RtxOptions::useReSTIRGI();
+    compositeArgs.sparseRenderingArgs = rtOutput.m_raytraceArgs.sparseRenderingArgs;
     compositeArgs.volumeArgs = rtOutput.m_raytraceArgs.volumeArgs;
-    compositeArgs.outputParticleLayer = ctx->useRayReconstruction() && rayReconstruction.useParticleBuffer();
-    compositeArgs.outputSecondarySignalToParticleLayer = ctx->useRayReconstruction() && rayReconstruction.preprocessSecondarySignal();
-    compositeArgs.enableDemodulateAttenuation = ctx->useRayReconstruction() && rayReconstruction.demodulateAttenuation();
+    compositeArgs.useRayReconstruction = ctx->useRayReconstruction();
     compositeArgs.enhanceAlbedo = ctx->useRayReconstruction() && rayReconstruction.enableDetailEnhancement();
-    compositeArgs.compositeVolumetricLight = ctx->useRayReconstruction() && rayReconstruction.compositeVolumetricLight();
+    compositeArgs.writeRayReconstructionHitDistance = ctx->useRayReconstruction() ? 1u : 0u;
 
     NrdArgs primaryDirectNrdArgs;
     NrdArgs primaryIndirectNrdArgs;
@@ -610,12 +607,14 @@ namespace dxvk {
       compositeArgs.skyBrightness = RtxOptions::skyBrightness() * envScale;
     }
 
+    const bool sparseRenderingEnabled = rtOutput.m_raytraceArgs.sparseRenderingArgs.mode != SparseRenderingMode::Off;
+
     Rc<DxvkBuffer> cb = getCompositeConstantsBuffer();
     ctx->writeToBuffer(cb, 0, sizeof(CompositeArgs), &compositeArgs);
     ctx->getCommandList()->trackResource<DxvkAccess::Read>(cb);
 
     ctx->bindResourceBuffer(COMPOSITE_CONSTANTS_INPUT, DxvkBufferSlice(cb, 0, cb->info().size));
-    VkExtent3D workgroups = util::computeBlockCount(rtOutput.m_compositeOutputExtent, VkExtent3D { 16, 8, 1 });
+    VkExtent3D workgroups = util::computeBlockCount(rtOutput.m_compositeOutputExtent, VkExtent3D { COMPOSITE_THREAD_GROUP_WIDTH, COMPOSITE_THREAD_GROUP_HEIGHT, 1 });
 
     if (enableStochasticAlphaBlend()) {
       ScopedGpuProfileZone(ctx, "Composite Alpha Blend");

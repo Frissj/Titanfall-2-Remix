@@ -19,9 +19,10 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
-#pragma once
+#include <algorithm>
 
 #include "rtx_types.h"
+#include "rtx_asset_replacer.h"
 #include "rtx_options.h"
 #include "rtx_terrain_baker.h"
 #include "rtx_instance_manager.h"
@@ -156,12 +157,14 @@ namespace dxvk {
   }
 
   ReplacementInstance::~ReplacementInstance() {
-    root = PrimInstance();
     clear();
   }
 
   void ReplacementInstance::clear() {
-    // clear up all references to this ReplacementInstance.
+    // Mark all prim entities for GC and detach their back-pointers, then drop
+    // the prim/root slots, the active-replacements tracking pointer, and the
+    // cached aggregate bounding boxes so the RI is in a clean "no replacement
+    // attached" state. setup() is the matching re-init.
     for (size_t i = 0; i < prims.size(); i++) {
       RtInstance* subInstance = prims[i].getInstance();
       if (subInstance) {
@@ -177,13 +180,101 @@ namespace dxvk {
       }
       prims[i].setReplacementInstance(nullptr, kInvalidReplacementIndex);
     }
+    prims.clear();
+    root = PrimInstance();
+    activeReplacements = nullptr;
+    legacyMaterialIdentityHash = kEmptyHash;
+    geometryBoundingBox.invalidate();
+    lightBoundingBox.invalidate();
+    boundingBoxDirty = true;
+    dirtyFlags = kAllDirtyFlags;
   }
 
-  void ReplacementInstance::setup(PrimInstance newRoot, size_t numPrims) {
+  ReplacementInstance::ReplacementInstance(const LookupKey& key, uint32_t newId, uint32_t frameId)
+      : id(newId)
+      , identityHash(key.identityHash)
+      , spatialMapHash(key.spatialMapHash)
+      , materialHash(key.materialHash)
+      , vertexPositionHash(key.vertexPositionHash)
+      , centroid(key.worldPos)
+      , frameCreated(frameId)
+      , textureTransform(key.textureTransform)
+      , texgenMode(key.texgenMode) {
+    // No prior data to diff against; every field is effectively new. Set all
+    // dirty bits so downstream update logic that gates individual steps on
+    // specific bits runs the full update on the RI's first submission.
+    dirtyFlags = kAllDirtyFlags;
+  }
+
+  void ReplacementInstance::setup(PrimInstance newRoot, size_t numPrims,
+                                  const std::vector<AssetReplacement>* replacements) {
+    clear();
     prims.resize(numPrims);
     root = newRoot;
+    activeReplacements = replacements;
   }
-  
+
+  void ReplacementInstance::recalculateBoundingBox(
+      const Matrix4& newObjectToWorld,
+      const AxisAlignedBoundingBox* originalGeometryBBox) {
+    objectToWorld = newObjectToWorld;
+
+    if (!boundingBoxDirty) {
+      return;
+    }
+
+    AxisAlignedBoundingBox geoBBox;
+    AxisAlignedBoundingBox litBBox;
+
+    if (activeReplacements == nullptr) {
+      geoBBox = *originalGeometryBBox;
+    } else {
+      for (const auto& replacement : *activeReplacements) {
+        if (replacement.includeOriginal && originalGeometryBBox != nullptr) {
+          geoBBox.unionWith(*originalGeometryBBox);
+        } else if (replacement.type == AssetReplacement::eMesh && replacement.geometry != nullptr) {
+          const AxisAlignedBoundingBox& srcBBox = replacement.geometry->data.boundingBox;
+          if (srcBBox.isValid()) {
+            const Vector3& mn = srcBBox.minPos;
+            const Vector3& mx = srcBBox.maxPos;
+            const Vector3 corners[8] = {
+              Vector3(mn.x, mn.y, mn.z), Vector3(mx.x, mn.y, mn.z),
+              Vector3(mn.x, mx.y, mn.z), Vector3(mn.x, mn.y, mx.z),
+              Vector3(mx.x, mx.y, mn.z), Vector3(mn.x, mx.y, mx.z),
+              Vector3(mx.x, mn.y, mx.z), Vector3(mx.x, mx.y, mx.z)
+            };
+            for (const Vector3& corner : corners) {
+              const Vector3 transformed = (replacement.replacementToObject * Vector4(corner, 1.0f)).xyz();
+              for (uint32_t j = 0; j < 3; j++) {
+                geoBBox.minPos[j] = std::min(geoBBox.minPos[j], transformed[j]);
+                geoBBox.maxPos[j] = std::max(geoBBox.maxPos[j], transformed[j]);
+              }
+            }
+          }
+        } else if (replacement.type == AssetReplacement::eLight && replacement.lightData.has_value()) {
+          RtLight objectSpaceLight = replacement.lightData->toRtLight();
+          const Vector3 pos = objectSpaceLight.getPosition();
+          float lightRadius = 0.f;
+          if (objectSpaceLight.getType() == RtLightType::Sphere) {
+            lightRadius = objectSpaceLight.getSphereLight().getRadius();
+          }
+          for (uint32_t j = 0; j < 3; j++) {
+            litBBox.minPos[j] = std::min(litBBox.minPos[j], pos[j] - lightRadius);
+            litBBox.maxPos[j] = std::max(litBBox.maxPos[j], pos[j] + lightRadius);
+          }
+        }
+      }
+    }
+
+    if (geoBBox.isValid()) {
+      geometryBoundingBox = geoBBox;
+    }
+    if (litBBox.isValid()) {
+      lightBoundingBox = litBBox;
+    }
+    boundingBoxDirty = false;
+  }
+
   bool PrimInstanceOwner::isRoot(const void* owner) const {
     return m_replacementInstance != nullptr
       && m_replacementIndex != ReplacementInstance::kInvalidReplacementIndex
@@ -191,63 +282,34 @@ namespace dxvk {
   }
 
   void PrimInstanceOwner::setReplacementInstance(ReplacementInstance* replacementInstance, size_t replacementIndex, void* owner, PrimInstance::Type type) {
-    // Early out if this is just re-applying the same values.
-    if (m_replacementInstance != nullptr && m_replacementInstance == replacementInstance) {
-      ONCE(assert(false && "single prim is being set to multiple replacement indices."));
+    // No-op if already linked to the same slot
+    if (m_replacementInstance == replacementInstance && m_replacementIndex == replacementIndex) {
       return;
     }
 
-    // Then check if the owner is already in a replacement:
-    if (m_replacementInstance && m_replacementIndex != ReplacementInstance::kInvalidReplacementIndex) {
-      
-      // Inside a replacement, check if it's the root:
-      if (isRoot(owner)) {
-        // This is the root of a replacement being deleted.
-        // Clear the root, and delete the replacementInstance.
-        // the ReplacementInstance destructor will call this function again, which will
-        // actually clear m_replacementInstance and m_replacementIndex.
-        delete m_replacementInstance;
-        m_replacementInstance = nullptr;
-        m_replacementIndex = ReplacementInstance::kInvalidReplacementIndex;
-        return;
+    // Unlink from current ReplacementInstance
+    if (m_replacementInstance != nullptr &&
+        m_replacementIndex < m_replacementInstance->prims.size()) {
+      PrimInstance& currentSlot = m_replacementInstance->prims[m_replacementIndex];
+      if (currentSlot.getUntyped() == owner) {
+        currentSlot = PrimInstance();
       }
-
-      // Next, remove the prim from the replacementInstance.
-      PrimInstance& prim = m_replacementInstance->prims[m_replacementIndex];
-      if (prim.getType() == type && prim.getUntyped() == owner) {
-        // clear up the old reference to this owner
-        prim = PrimInstance();
-      } else {
-        // The prim believed it was in a slot, but something else was actually there.
-        // This is a sign that something went wrong earlier, but shouldn't cause problems itself.
-        ONCE(assert(false && "PrimInstance was not properly removed from its replacementInstance before something else took its place."));
+      if (m_replacementInstance->root.getUntyped() == owner) {
+        m_replacementInstance->root = PrimInstance();
       }
     }
 
-    // Set this owner to the new replacementInstance.
+    // Link to new ReplacementInstance
     m_replacementInstance = replacementInstance;
     m_replacementIndex = replacementIndex;
 
-    // Inform the replacementInstance that this owner is now in it.
-    if (m_replacementInstance && replacementIndex != ReplacementInstance::kInvalidReplacementIndex) {
-      PrimInstance& prim = m_replacementInstance->prims[replacementIndex];
-      if (prim.getType() != type && prim.getType() != PrimInstance::Type::None) {
-        // While specific pointers may change, the type of a slot should never change.
-        ONCE(assert(false && "Trying to assign a primInstance to a replacementInstance slot that was not the same type."));
-        m_replacementInstance = nullptr;
-        m_replacementIndex = ReplacementInstance::kInvalidReplacementIndex;
-        return;
-      } else if (prim.getUntyped() != nullptr && prim.getUntyped() != owner) {
-        // Another owner is already in this spot.  Clean that up properly before overriding it.
-        if (m_replacementInstance->root.getUntyped() == prim.getUntyped()) {
-          // Replacing the old root.  Shouldn't happen, but if it does we would want to
-          // update the root before clearing the old root, to avoid triggering garbage collection.
-          m_replacementInstance->root = PrimInstance(owner, type);
-        }
-        prim.setReplacementInstance(nullptr, ReplacementInstance::kInvalidReplacementIndex);
-        ONCE(assert(false && "PrimInstance was not properly cleaned up before being replaced."));
+    if (m_replacementInstance != nullptr &&
+        m_replacementIndex < m_replacementInstance->prims.size()) {
+      PrimInstance& targetSlot = m_replacementInstance->prims[m_replacementIndex];
+      if (targetSlot.getUntyped() != nullptr && targetSlot.getUntyped() != owner) {
+        targetSlot.setReplacementInstance(nullptr, ReplacementInstance::kInvalidReplacementIndex);
       }
-      prim = PrimInstance(owner, type);
+      targetSlot = PrimInstance(owner, type);
     }
   }
 
@@ -737,7 +799,6 @@ namespace dxvk {
 
     setCategory(InstanceCategories::Particle, lookupHash(RtxOptions::particleTextures(), textureHash));
     setCategory(InstanceCategories::Beam, lookupHash(RtxOptions::beamTextures(), textureHash));
-    setCategory(InstanceCategories::IgnoreTransparencyLayer, lookupHash(RtxOptions::ignoreTransparencyLayerTextures(), textureHash));
 
     setCategory(InstanceCategories::DecalStatic, lookupHash(RtxOptions::decalTextures(), textureHash));
     setCategory(InstanceCategories::DecalDynamic, lookupHash(RtxOptions::dynamicDecalTextures(), textureHash));
@@ -1067,26 +1128,13 @@ namespace dxvk {
   }
 
   BlasEntry::BlasEntry(const DrawCallState& input_)
-    : input(input_), m_spatialMap(RtxOptions::uniqueObjectDistance() * 2.f) {
-      if (RtxOptions::uniqueObjectDistance() <= 0.f) {
-        ONCE(Logger::err("rtx.uniqueObjectDistance must be greater than 0."));
-      }
+    : input(input_) {
     }
 
   void BlasEntry::unlinkInstance(RtInstance* instance) {
-    instance->removeFromSpatialCache();
-    auto it = std::find(m_linkedInstances.begin(), m_linkedInstances.end(), instance);
-    if (it != m_linkedInstances.end()) {
-      // Swap & pop - faster than "erase", but doesn't preserve order, which is fine here.
-      std::swap(*it, m_linkedInstances.back());
-      m_linkedInstances.pop_back();
-    } else {
+    if (m_linkedInstances.erase(instance) == 0) {
       ONCE(Logger::err("Tried to unlink an instance, which was never linked!"));
     }
-  }
-
-  void BlasEntry::rebuildSpatialMap() {
-    m_spatialMap.rebuild(RtxOptions::uniqueObjectDistance() * 2.f);
   }
 
 } // namespace dxvk

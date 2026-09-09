@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -19,6 +19,7 @@
 * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 * DEALINGS IN THE SOFTWARE.
 */
+#include <limits>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -45,6 +46,7 @@
 #include "rtx_mesh_trace.h"
 #include "rtx_terrain_baker.h"
 #include "rtx_texture_manager.h"
+#include "rtx_texture.h"
 #include "rtx_xess.h"
 #include "rtx_asset_exporter.h"
 #include "../../util/util_filesys.h"
@@ -58,13 +60,22 @@
 
 #include "rtx_game_capturer.h"
 #include "rtx_matrix_helpers.h"
-#include "rtx_intersection_test.h"
-
 #include "dxvk_scoped_annotation.h"
 #include "rtx_lights_data.h"
 #include "rtx_light_utils.h"
 
-#include "../util/util_globaltime.h"
+#include "../util/util_global_time.h"
+#include "../util/util_struct_hash.h"
+
+#include "rtx/pass/particles/particle_system_common.h"
+
+namespace {
+  // helper function to ensure generating spatialMapHash for external draws is done the same way in multiple places.
+  XXH64_hash_t spatialMapHashForExternalDrawMesh(remixapi_MeshHandle mesh) {
+    const uintptr_t meshId = reinterpret_cast<uintptr_t>(mesh);
+    return XXH3_64bits(&meshId, sizeof(meshId));
+  }
+} // namespace
 
 namespace dxvk {
 
@@ -156,6 +167,7 @@ namespace dxvk {
     , m_graphManager()
     , m_rayPortalManager(device, this)
     , m_drawCallCache(device)
+    , m_drawCallTracker(device)
     , m_bindlessResourceManager(device)
     , m_pReplacer(new AssetReplacer())
     , m_terrainBaker(new TerrainBaker())
@@ -164,7 +176,7 @@ namespace dxvk {
     m_indexStashPool = std::make_shared<IndexStashPool>(device);
     InstanceEventHandler instanceEvents(this);
     instanceEvents.onInstanceAddedCallback = [this](RtInstance& instance) { onInstanceAdded(instance); };
-    instanceEvents.onInstanceUpdatedCallback = [this](RtInstance& instance, const DrawCallState& drawCall, const MaterialData& material, bool hasTransformChanged, bool hasVerticesChanged, bool isFirstUpdateThisFrame) { onInstanceUpdated(instance, drawCall, material, hasTransformChanged, hasVerticesChanged, isFirstUpdateThisFrame); };
+    instanceEvents.onInstanceUpdatedCallback = [this](RtInstance& instance, const DrawCallState& drawCall, const MaterialData* material, bool hasTransformChanged, bool hasVerticesChanged, bool isFirstUpdateThisFrame) { onInstanceUpdated(instance, drawCall, material, hasTransformChanged, hasVerticesChanged, isFirstUpdateThisFrame); };
     instanceEvents.onInstanceDestroyedCallback = [this](RtInstance& instance) { onInstanceDestroyed(instance); };
     // NV-DXVK [perf] sec 4c: this handler's onInstanceUpdated resolves a surface
     // material and binds its index. m_surfaceMaterialCache is never cleared per
@@ -309,9 +321,12 @@ namespace dxvk {
       m_device->waitForIdle();
     }
 
+    // unregister all geometry buffers and verify that nothing has leaked.
+    // (this function could be debug only, but this isn't a hot path.) 
+    verifyAndReleaseBufferCache();
+
     // We still need to clear caches even if the scene wasn't rendered
     m_bufferCache.clear();
-    m_surfaceMaterialCache.clear();
     m_preCreationSurfaceMaterialMap.clear();
     // NV-DXVK [perf]: the memo holds an index INTO m_surfaceMaterialCache, so it
     // must die with it -- a scene reset renumbers every material. ALL slots, not
@@ -320,19 +335,66 @@ namespace dxvk {
     m_legacyOpaqueConversionCache.clear();
     m_surfaceMaterialExtensionCache.clear();
     m_volumeMaterialCache.clear();
-    
+
+    // Clear ReplacementInstances first: their destructors call clear() which
+    // accesses prims[] to mark entities for GC and clear back-pointers.
+    // Entities must still be alive at this point.
+    m_drawCallTracker.clear();
+
     // Called before instance manager's clear, so that it resets all tracked instances in Opacity Micromap manager at once
     if (m_opacityMicromapManager.get())
       m_opacityMicromapManager->clear();
-    
+
+    // Invalidate AccelManager's bucket cache before InstanceManager::clear() deletes
+    // every RtInstance. The cache holds raw RtInstance* in m_cachedBuckets[].instances /
+    // .surfaces and m_instanceBucketIndex, and the next frame's mergeInstancesIntoBlas
+    // dirty check would dereference those (now-freed) pointers. The per-instance
+    // onInstanceDestroyed -> removeInstanceFromBucketCache hook only patches the index
+    // map, not the vectors, so a bulk reset must drop the cache wholesale.
+    m_accelManager.clear();
+
+    // Instance destruction fires onInstanceDestroyed -> releaseSurfaceMaterial for every
+    // game-submitted instance, decrementing texture ref counts and feature counts.
+    // The surface material cache must still be valid here so those releases are not
+    // silently skipped by the bounds check in releaseSurfaceMaterial.
     m_instanceManager.clear();
+
+    // After all instances are destroyed their retain/release pairs must be balanced.
+    // If any count is non-zero here there is a retain/release mismatch.
+    if (m_activePOMCount != 0) {
+      Logger::err(str::format("[RTX] SceneManager::clear: POM count is ", m_activePOMCount, " after instance destruction (retain/release mismatch)"));
+      assert(false && "SceneManager::clear: POM count non-zero after instance destruction");
+      m_activePOMCount = 0;
+    }
+    if (m_sssCount != 0) {
+      Logger::err(str::format("[RTX] SceneManager::clear: SSS count is ", m_sssCount, " after instance destruction (retain/release mismatch)"));
+      assert(false && "SceneManager::clear: SSS count non-zero after instance destruction");
+      m_sssCount = 0;
+    }
+    if (m_thinOpaqueCount != 0) {
+      Logger::err(str::format("[RTX] SceneManager::clear: thin-opaque count is ", m_thinOpaqueCount, " after instance destruction (retain/release mismatch)"));
+      assert(false && "SceneManager::clear: thin-opaque count non-zero after instance destruction");
+      m_thinOpaqueCount = 0;
+    }
+    textureManager.assertAllRefCountsZero();
+
+    // Now safe to clear material caches; all ref counts have been released.
+    m_surfaceMaterialCache.clear();
+    m_surfaceMaterialExtensionCache.clear();
     m_lightManager.clear();
     m_graphManager.clear();
     m_rayPortalManager.clear();
     m_drawCallCache.clear();
     textureManager.clear();
+    m_textureCacheGenerationValidForPreserve = textureManager.getTextureCacheGeneration();
 
     m_previousFrameSceneAvailable = false;
+    m_startInMediumMaterialIndex = SURFACE_INDEX_INVALID;
+    m_fogStartInMediumMaterialIndex_inCache = kInvalidMaterialCacheIndex;
+    m_externalStartInMediumMaterialIndex_inCache = kInvalidMaterialCacheIndex;
+    m_startInMediumMaterialIndex_inCache = kInvalidMaterialCacheIndex;
+    m_lastResolvedStartInMediumMaterialIndexInCache = kInvalidMaterialCacheIndex;
+    m_lastUploadedStartInMediumMaterialIndexInCache = kInvalidMaterialCacheIndex;
   }
 
   void SceneManager::garbageCollection() {
@@ -1208,7 +1270,7 @@ namespace dxvk {
     output.lastBoneHash = drawCallState.getSkinningState().boneHash;
 
     // Update draw parameters
-    output.cullMode = input.cullMode;
+    output.cullMode = drawCallState.getCullMode();
     output.frontFace = input.frontFace;
 
     // Copy the hashes over
@@ -1701,13 +1763,13 @@ namespace dxvk {
     // Update color buffer in BVH with DrawCallState
     // The user can disable/enable color buffer for specific materials, so we manually sync the DrawCallState and BVH here to keep the color buffer in BVH updated.
     // Note, we don't setup kUpdateBVH because it's too waste to update all buffers if only the color buffer needs to be updated.
-    if (output.color0Buffer.defined() && !drawCallState.geometryData.color0Buffer.defined()) {
+    if (output.color0Buffer.defined() && !drawCallState.getGeometryData().color0Buffer.defined()) {
       // Remove the color buffer in BVH if the color buffer from drawcall is removed by ignoreBakedLighting
       output.color0Buffer = RaytraceBuffer();
-    } else if (!output.color0Buffer.defined() && drawCallState.geometryData.color0Buffer.defined()) {
+    } else if (!output.color0Buffer.defined() && drawCallState.getGeometryData().color0Buffer.defined()) {
       // Write the color buffer back to BVH if the color buffer is enabled again
       const DxvkBufferSlice slice = DxvkBufferSlice(output.historyBuffer[0]);
-      const auto& colorBuffer = drawCallState.geometryData.color0Buffer;
+      const auto& colorBuffer = drawCallState.getGeometryData().color0Buffer;
       output.color0Buffer = RaytraceBuffer(slice, colorBuffer.offsetFromSlice(), colorBuffer.stride(), colorBuffer.vertexFormat());
     }
 
@@ -1803,6 +1865,12 @@ namespace dxvk {
   void SceneManager::onFrameEnd(Rc<DxvkContext> ctx, bool raytracedThisFrame) {
     ScopedCpuProfileZone();
 
+    // Commit this frame's texture registrations for preserve next frame. Must run before
+    // manageTextureVram(), which may clear the cache and bump the generation so the
+    // following frame takes the dynamic path for every draw call.
+    m_textureCacheGenerationValidForPreserve =
+        m_device->getCommon()->getTextureManager().getTextureCacheGeneration();
+
     manageTextureVram();
 
     if (m_enqueueDelayedClear || m_pReplacer->checkForChanges(ctx)) {
@@ -1847,13 +1915,13 @@ namespace dxvk {
       m_opacityMicromapManager->onFrameEnd();
     }
     
-    m_activePOMCount = 0;
     m_startInMediumMaterialIndex = SURFACE_INDEX_INVALID;
+    m_fogStartInMediumMaterialIndex_inCache = UINT32_MAX;
     m_startInMediumMaterialIndex_inCache = UINT32_MAX;
 
     if (m_uniqueObjectSearchDistance != RtxOptions::uniqueObjectDistance()) {
       m_uniqueObjectSearchDistance = RtxOptions::uniqueObjectDistance();
-      m_drawCallCache.rebuildSpatialMaps();
+      m_drawCallTracker.rebuildSpatialMaps(m_uniqueObjectSearchDistance * 2.f);
     }
 
     // NV-DXVK [perf] sec 4c: refresh the binding epoch BEFORE the per-frame caches
@@ -1913,8 +1981,6 @@ namespace dxvk {
       }
     }
 
-    m_thinOpaqueMaterialExist = false;
-    m_sssMaterialExist = false;
 
     // execute graph updates after all garbage collection is complete (to avoid updating graphs that will just be deleted)
     // RtxOptions will still be pending, so any changes to them will apply next frame.
@@ -2658,7 +2724,7 @@ namespace dxvk {
             uint32_t id = UINT32_MAX;
             createSurfaceMaterial(*pFogReplacement, input, &id);
             assert(id != UINT32_MAX);
-            m_startInMediumMaterialIndex_inCache = id;
+            m_fogStartInMediumMaterialIndex_inCache = id;
           }
         } else if (m_fog.mode == FogMode::None) {
           // render the first unreplaced fog.
@@ -2674,7 +2740,7 @@ namespace dxvk {
 
     // Track this mesh hash for mesh hash checking
     trackMeshHash(activeReplacementHash);
-    
+
     std::vector<AssetReplacement>* pReplacements = m_pReplacer->getReplacementsForMesh(activeReplacementHash);
 
     // TODO (REMIX-656): Remove this once we can transition content to new hash
@@ -2711,7 +2777,54 @@ namespace dxvk {
     if (pReplacements != nullptr) {
       drawReplacements(ctx, &input, pReplacements, renderMaterialData);
     } else {
-      processDrawCallState(ctx, input, renderMaterialData, nullptr, nullptr);
+      MaterialData renderMaterialData = determineMaterialData(overrideMaterialData, input);
+      if (!activeReplacementsMatch) {
+        replacementInstance->clear();
+      }
+
+      // Recompute dynamic-feature bits on each dynamic update.
+      replacementInstance->dirtyFlags.clr(ReplacementInstance::kDynamicFeatureMask);
+
+      // Create / process: full geometry cache and instance update.
+      if (pReplacements != nullptr) {
+        drawReplacements(ctx, &input, pReplacements, renderMaterialData, replacementInstance);
+      } else {
+        RtInstance* existingInstance = (replacementInstance->prims.size() > 0)
+            ? replacementInstance->prims[0].getInstance() : nullptr;
+
+        RtInstance* instance = processDrawCallState(ctx, input, renderMaterialData,
+            *replacementInstance, existingInstance, nullptr);
+        if (instance != nullptr) {
+          if (replacementInstance->root.getUntyped() == nullptr) {
+            replacementInstance->setup(PrimInstance(instance, PrimInstance::Type::Instance), 1, nullptr);
+          }
+          if (replacementInstance->prims[0].getUntyped() != instance) {
+            instance->getPrimInstanceOwner().setReplacementInstance(replacementInstance, 0, instance,
+                PrimInstance::Type::Instance);
+          }
+        }
+      }
+      replacementInstance->legacyMaterialIdentityHash = legacyMaterialIdentityHash;
+    }
+
+    replacementInstance->frameLastSeen = currentFrameId;
+    replacementInstance->categoryFlags = input.getCategoryFlags().raw();
+    replacementInstance->isSkinned = input.getSkinningState().numBones > 0;
+
+    // Cache this submission's texture-coordinate projection so that next frame's
+    // computeDirtyFlags can detect drift. Writing here (after either path has run)
+    // mirrors how objectToWorld is updated downstream of the dirty-flag check.
+    replacementInstance->textureTransform = input.getTransformData().textureTransform;
+    replacementInstance->texgenMode = input.getTransformData().texgenMode;
+
+    // For standalone draw calls, store the object-space bounding box for anti-culling.
+    // For replacement draw calls, the aggregate AABB is computed inside drawReplacements.
+    if (pReplacements == nullptr) {
+      const auto& geoBBox = input.getGeometryData().boundingBox;
+      if (geoBBox.isValid()) {
+        replacementInstance->geometryBoundingBox = geoBBox;
+        replacementInstance->objectToWorld = input.getTransformData().objectToWorld;
+      }
     }
   }
 
@@ -2830,7 +2943,7 @@ namespace dxvk {
     mdSplit.markPortal();
     if (RtxOptions::getRayPortalTextureIndex(input.getMaterialData().getHash(), rayPortalTextureIndex)) {
       assert(rayPortalTextureIndex < maxRayPortalCount);
-      assert(rayPortalTextureIndex < std::numeric_limits<uint8_t>::max());
+      assert(rayPortalTextureIndex < (std::numeric_limits<uint8_t>::max)());
 
       MaterialData renderMaterialData = input.getMaterialData().as<RayPortalMaterialData>();
       renderMaterialData.getRayPortalMaterialData().setRayPortalIndex(rayPortalTextureIndex);
@@ -2930,18 +3043,53 @@ namespace dxvk {
     m_lightManager.addLight(rtLight, input, RtLightAntiCullingType::MeshReplacement);
   }
 
-  void SceneManager::drawReplacements(Rc<DxvkContext> ctx, const DrawCallState* input, const std::vector<AssetReplacement>* pReplacements, MaterialData& renderMaterialData) {
-    ScopedCpuProfileZone();
-    // TODO: Ideally we should create and track `replacementInstance` based on the draw call.  It currently relies on the
-    // `findSimilarInstance` function of the first RtInstance created for the draw call, which is pretty clumsy.
-    // We also should be tracking and garbage collecting the entire draw call together,
-    // rather than doing each instance separately.
-    ReplacementInstance* replacementInstance = nullptr;
+  std::optional<DrawCallState> SceneManager::buildReplacementMeshDrawCallState(
+      const DrawCallState& input,
+      const AssetReplacement& replacement) {
+    if (replacement.includeOriginal) {
+      auto newDrawCallState = std::make_optional<DrawCallState>(input);
+      newDrawCallState->modifyCategoryFlags() = replacement.categories.applyCategoryFlags(newDrawCallState->getCategoryFlags());
+      return newDrawCallState;
+    }
 
-    // Detect replacements of meshes that would have unstable hashes due to the vertex hash using vertex data from a shared vertex buffer.
-    // TODO: Once the vertex hash only uses vertices referenced by the index buffer, this should be removed.
-    const bool highlightUnsafeReplacement = RtxOptions::useHighlightUnsafeReplacementMode() &&
-        input->getGeometryData().indexBuffer.defined() && input->getGeometryData().vertexCount > input->getGeometryData().indexCount;
+    if (replacement.type == AssetReplacement::eMesh) {
+      auto newDrawCallState = std::make_optional<DrawCallState>(input);
+
+      DrawCallTransforms& transforms = newDrawCallState->modifyTransformData();
+      transforms.objectToWorld = transforms.objectToWorld * replacement.replacementToObject;
+      transforms.objectToView = transforms.objectToView * replacement.replacementToObject;
+      if (replacement.instancesToObject && !replacement.instancesToObject->empty()) {
+        transforms.instancesToObject = replacement.instancesToObject;
+      } else {
+        transforms.instancesToObject = nullptr;
+      }
+      // Mesh replacements don't support these.
+      transforms.textureTransform = Matrix4();
+      transforms.texgenMode = TexGenMode::None;
+
+      newDrawCallState->overrideGeometryData(&replacement.geometry->data);
+      newDrawCallState->modifyCategoryFlags() = replacement.categories.applyCategoryFlags(newDrawCallState->getCategoryFlags());
+      return newDrawCallState;
+    }
+
+    return std::nullopt;
+  }
+
+  void SceneManager::drawReplacements(Rc<DxvkContext> ctx, const DrawCallState* input, const std::vector<AssetReplacement>* pReplacements, MaterialData& renderMaterialData, ReplacementInstance* replacementInstance) {
+    ScopedCpuProfileZone();
+    if (pReplacements == nullptr) {
+      assert(false && "pReplacements should never be nullptr here");
+      ONCE(Logger::err("pReplacements should never be nullptr in SceneManager::drawReplacements"));
+      return;
+    }
+    // If the index contains an RtInstance, get a pointer to it.
+    auto getExistingInstance = [replacementInstance](size_t idx) -> RtInstance* {
+      if (replacementInstance->prims.size() <= idx) {
+        return nullptr;
+      }
+      return replacementInstance->prims[idx].getInstance();
+    };
+
     for (size_t i = 0; i < pReplacements->size(); i++) {
       auto& replacement = (*pReplacements)[i];
       RtInstance* instance = nullptr;
@@ -3001,33 +3149,37 @@ namespace dxvk {
         }
 
         const RtxParticleSystemDesc* pParticleSystemDesc = replacement.particleSystem.has_value() ? &replacement.particleSystem.value() : nullptr;
-
-        RtInstance* existingInstance = replacementInstance ? replacementInstance->prims[i].getInstance() : nullptr;
-        // Only use findSimilarInstance if we're processing the root of a replacement - all others should just rely on the existingInstance.
-        instance = processDrawCallState(ctx, newDrawCallState, renderMaterialData, existingInstance, pParticleSystemDesc);
+        instance = processDrawCallState(ctx, *newDrawCallState, renderMaterialData, *replacementInstance, getExistingInstance(i), pParticleSystemDesc);
       }
-      
+
       if (instance != nullptr) {
-        if (replacementInstance == nullptr) {
-          // first mesh in this replacement, so it becomes the root.
-          replacementInstance = instance->getPrimInstanceOwner().getOrCreateReplacementInstance(instance, PrimInstance::Type::Instance, i, pReplacements->size());
-        }
-        if (replacementInstance->prims[i].getUntyped() == nullptr) {
-          // First frame, need to set the replacement instance.
+        if (replacementInstance->root.getUntyped() == nullptr) {
+          // This is the first time this replacementInstance is used, and the first mesh drawn
+          //  as part of this replacementInstance, so invoke setup and set the root.
+          replacementInstance->setup(PrimInstance(instance, PrimInstance::Type::Instance), pReplacements->size(), pReplacements);
           instance->getPrimInstanceOwner().setReplacementInstance(replacementInstance, i, instance, PrimInstance::Type::Instance);
-        } else if (replacementInstance->prims[i].getInstance() != instance) {
-          Logger::err(str::format("ReplacementInstance: instance returned by processDrawCallState is not the same as the one stored. index: ", i,"  mesh hash: ", std::hex, input->getHash(RtxOptions::geometryAssetHashRule())));
-          assert(false && "instance returned by processDrawCallState is not the same as the one stored.");
+        } else if (replacementInstance->prims[i].getUntyped() != instance) {
+          instance->getPrimInstanceOwner().setReplacementInstance(replacementInstance, i, instance, PrimInstance::Type::Instance);
         }
       }
     }
 
+    processReplacementLights(input, pReplacements, replacementInstance);
+    processReplacementGraphs(ctx, input, pReplacements, replacementInstance);
+
+    replacementInstance->recalculateBoundingBox(
+        input->getTransformData().objectToWorld,
+        &input->getGeometryData().boundingBox);
+  }
+  
+  void SceneManager::processReplacementLights(
+      const DrawCallState* input, const std::vector<AssetReplacement>* pReplacements,
+      ReplacementInstance* replacementInstance) {
+    ScopedCpuProfileZone();
     for (size_t i = 0; i < pReplacements->size(); i++) {
       auto&& replacement = (*pReplacements)[i];
       if (replacement.type == AssetReplacement::eLight) {
-        if (replacementInstance == nullptr) {
-          // TODO(TREX-1141) if we refactor instancing to depend on the pre-replacement drawcall instead
-          // of the fully processed draw call, we can remove this requirement.
+        if (replacementInstance->root.getUntyped() == nullptr) {
           Logger::err(str::format(
               "Light prims anchored to a mesh replacement must also include actual meshes.  mesh hash: ",
               std::hex, input->getHash(RtxOptions::geometryAssetHashRule())
@@ -3035,12 +3187,14 @@ namespace dxvk {
           break;
         }
         if (replacement.lightData.has_value()) {
-          RtLight localLight = replacement.lightData->toRtLight();
+          RtLight objectSpaceLight = replacement.lightData->toRtLight();
+
+          // Transform to world space for the actual light creation
+          RtLight localLight = objectSpaceLight;
           localLight.applyTransform(input->getTransformData().objectToWorld);
-          
-          // Handle all non-root lights as externally tracked lights - they'll be cleaned up when the root is garbage collected.
-          // For mesh replacements, the root is always a mesh, so no need to handle root lights here.
-          RtLight* existingLight = replacementInstance->prims[i].getLight();
+
+          RtLight* existingLight = (replacementInstance->prims.size() > i)
+              ? replacementInstance->prims[i].getLight() : nullptr;
           if (existingLight != nullptr) {
             if (existingLight->getPrimInstanceOwner().getReplacementInstance() != replacementInstance) {
               ONCE(assert(false && "light in a replacementInstance believes it is owned by a different replacementInstance."));
@@ -3053,23 +3207,29 @@ namespace dxvk {
         }
       }
     }
+  }
 
-    // Create graphs associated with this replacement, if they haven't already been created.
-    // Graphs are cleaned up when the replacementInstance is destroyed, which happens when the 
-    // root instance is destroyed.
+  void SceneManager::processReplacementGraphs(
+      Rc<DxvkContext> ctx, const DrawCallState* input, const std::vector<AssetReplacement>* pReplacements,
+      ReplacementInstance* replacementInstance) {
+    ScopedCpuProfileZone();
     for (size_t i = 0; i < pReplacements->size(); i++) {
       auto&& replacement = (*pReplacements)[i];
-      if (replacement.type == AssetReplacement::eGraph && replacementInstance->prims[i].getGraph() == nullptr) {
-        if (!replacement.graphState.has_value()) {
-          Logger::err(str::format(
-              "Graph prims missing graph state in mesh replacement.  mesh hash: ",
-              std::hex, input->getHash(RtxOptions::geometryAssetHashRule())
-          ));
-          break;
-        }
-        GraphInstance* graphInstance = m_graphManager.addInstance(ctx, replacement.graphState.value());
-        if (graphInstance) {
-          graphInstance->getPrimInstanceOwner().setReplacementInstance(replacementInstance, i, graphInstance, PrimInstance::Type::Graph);
+      if (replacement.type == AssetReplacement::eGraph) {
+        bool hasGraph = (replacementInstance->prims.size() > i) &&
+                        (replacementInstance->prims[i].getGraph() != nullptr);
+        if (!hasGraph) {
+          if (!replacement.graphState.has_value()) {
+            Logger::err(str::format(
+                "Graph prims missing graph state in mesh replacement.  mesh hash: ",
+                std::hex, input->getHash(RtxOptions::geometryAssetHashRule())
+            ));
+            break;
+          }
+          GraphInstance* graphInstance = m_graphManager.addInstance(ctx, replacement.graphState.value());
+          if (graphInstance) {
+            graphInstance->getPrimInstanceOwner().setReplacementInstance(replacementInstance, i, graphInstance, PrimInstance::Type::Graph);
+          }
         }
       }
     }
@@ -3199,11 +3359,12 @@ namespace dxvk {
 
   SceneManager::ObjectCacheState SceneManager::onSceneObjectAdded(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, BlasEntry* pBlas) {
     // This is a new object.
-    ObjectCacheState result = processGeometryInfo<true>(ctx, drawCallState, pBlas->modifiedGeometryData);
+    ObjectCacheState result = processGeometryInfo<true>(ctx, drawCallState, pBlas);
     
     assert(result == ObjectCacheState::KBuildBVH);
 
     pBlas->frameLastUpdated = m_device->getCurrentFrameId();
+    m_instanceManager.notifySceneChanged();
 
     return result;
   }
@@ -3215,13 +3376,15 @@ namespace dxvk {
     }
 
     // TODO: If mesh is static, no need to do any of the below, just use the existing modifiedGeometryData and set result to kInstanceUpdate.
-    ObjectCacheState result = processGeometryInfo<false>(ctx, drawCallState, pBlas->modifiedGeometryData);
+    ObjectCacheState result = processGeometryInfo<false>(ctx, drawCallState, pBlas);
 
     // We dont expect to hit the rebuild path here - since this would indicate an index buffer or other topological change, and that *should* trigger a new scene object (since the hash would change)
     assert(result != ObjectCacheState::KBuildBVH);
 
-    if (result == ObjectCacheState::kUpdateBVH)
+    if (result == ObjectCacheState::kUpdateBVH) {
       pBlas->frameLastUpdated = m_device->getCurrentFrameId();
+      m_instanceManager.notifySceneChanged();
+    }
     
     pBlas->clearMaterialCache();
     pBlas->input = drawCallState; // cache the draw state for the next time.
@@ -3528,13 +3691,101 @@ namespace dxvk {
     }
   }
 
+  void SceneManager::retainSurfaceMaterial(uint32_t matIdx) {
+    // Retain is always called with newMatIdx from createSurfaceMaterial, which must return
+    // a valid in-bounds index. An out-of-bounds index here indicates a logic error upstream.
+    if (matIdx >= m_surfaceMaterialCache.getTotalCount()) {
+      Logger::err(str::format("[RTX] retainSurfaceMaterial: matIdx ", matIdx,
+        " out of bounds (cache size ", m_surfaceMaterialCache.getTotalCount(),
+        "; createSurfaceMaterial returned invalid index"));
+      assert(false && "retainSurfaceMaterial: matIdx out of bounds");
+      return;
+    }
+    auto& textureManager = m_device->getCommon()->getTextureManager();
+    const RtSurfaceMaterial& mat = m_surfaceMaterialCache.getObjectTable()[matIdx];
+    mat.forEachTextureIndex([&](uint32_t texIdx) {
+      textureManager.retainTexture(texIdx);
+    });
+    if (mat.getType() == RtSurfaceMaterialType::Opaque) {
+      const RtOpaqueSurfaceMaterial& opaque = mat.getOpaqueSurfaceMaterial();
+      if (opaque.hasValidDisplacement()) {
+        ++m_activePOMCount;
+      }
+      const uint32_t subsurfaceIdx = opaque.getSubsurfaceMaterialIndex();
+      if (subsurfaceIdx != SURFACE_INDEX_INVALID &&
+          subsurfaceIdx < m_surfaceMaterialExtensionCache.getTotalCount()) {
+        const RtSurfaceMaterial& extMat = m_surfaceMaterialExtensionCache.getObjectTable()[subsurfaceIdx];
+        extMat.forEachTextureIndex([&](uint32_t texIdx) {
+          textureManager.retainTexture(texIdx);
+        });
+        if (extMat.getType() == RtSurfaceMaterialType::Subsurface) {
+          const float radiusScale = extMat.getSubsurfaceMaterial().getSubsurfaceRadiusScale();
+          if (radiusScale > 0.0f)      ++m_sssCount;
+          else if (radiusScale < 0.0f) ++m_thinOpaqueCount;
+        }
+      }
+    }
+  }
+
+  void SceneManager::releaseSurfaceMaterial(uint32_t matIdx) {
+    // Out-of-bounds covers instances that were never bound (surfaceMaterialIndex ==
+    // kSurfaceInvalidSurfaceMaterialIndex). Renderer-created instances skip
+    // onInstanceDestroyedCallback entirely so they never reach here.
+    if (matIdx >= m_surfaceMaterialCache.getTotalCount()) {
+      return;
+    }
+    auto& textureManager = m_device->getCommon()->getTextureManager();
+    const RtSurfaceMaterial& mat = m_surfaceMaterialCache.getObjectTable()[matIdx];
+    mat.forEachTextureIndex([&](uint32_t texIdx) {
+      textureManager.releaseTexture(texIdx);
+    });
+    if (mat.getType() == RtSurfaceMaterialType::Opaque) {
+      const RtOpaqueSurfaceMaterial& opaque = mat.getOpaqueSurfaceMaterial();
+      if (opaque.hasValidDisplacement()) {
+        if (m_activePOMCount == 0) {
+          Logger::err("[RTX] releaseSurfaceMaterial: POM count underflow (mismatched retain/release)");
+          assert(false && "releaseSurfaceMaterial: POM count underflow");
+        } else {
+          --m_activePOMCount;
+        }
+      }
+      const uint32_t subsurfaceIdx = opaque.getSubsurfaceMaterialIndex();
+      if (subsurfaceIdx != SURFACE_INDEX_INVALID &&
+          subsurfaceIdx < m_surfaceMaterialExtensionCache.getTotalCount()) {
+        const RtSurfaceMaterial& extMat = m_surfaceMaterialExtensionCache.getObjectTable()[subsurfaceIdx];
+        extMat.forEachTextureIndex([&](uint32_t texIdx) {
+          textureManager.releaseTexture(texIdx);
+        });
+        if (extMat.getType() == RtSurfaceMaterialType::Subsurface) {
+          const float radiusScale = extMat.getSubsurfaceMaterial().getSubsurfaceRadiusScale();
+          if (radiusScale > 0.0f) {
+            if (m_sssCount == 0) {
+              Logger::err("[RTX] releaseSurfaceMaterial: SSS count underflow (mismatched retain/release)");
+              assert(false && "releaseSurfaceMaterial: SSS count underflow");
+            } else {
+              --m_sssCount;
+            }
+          } else if (radiusScale < 0.0f) {
+            if (m_thinOpaqueCount == 0) {
+              Logger::err("[RTX] releaseSurfaceMaterial: thin-opaque count underflow (mismatched retain/release)");
+              assert(false && "releaseSurfaceMaterial: thin-opaque count underflow");
+            } else {
+              --m_thinOpaqueCount;
+            }
+          }
+        }
+      }
+    }
+  }
+
   void SceneManager::onInstanceDestroyed(RtInstance& instance) {
+    releaseSurfaceMaterial(instance.surface.surfaceMaterialIndex);
+
+    // Evict from the AccelManager bucket cache to prevent stale pointer ABA issues.
+    m_accelManager.removeInstanceFromBucketCache(&instance);
+
     BlasEntry* pBlas = instance.getBlas();
-    // Some BLAS were cleared in the SceneManager::garbageCollection().
-    // When a BLAS is destroyed, all instances that linked to it will be automatically unlinked. In such case we don't need to
-    // call onInstanceDestroyed to double unlink the instances.
-    // Note: This case often happens when BLAS are destroyed faster than instances. (e.g. numFramesToKeepGeometryData >= numFramesToKeepInstances)
-    if (pBlas != nullptr && !instance.isUnlinkedForGC()) {
+    if (pBlas != nullptr) {
       pBlas->unlinkInstance(&instance);
     }
   }
@@ -3804,7 +4055,7 @@ namespace dxvk {
     }
   }
 
-  RtInstance* SceneManager::processDrawCallState(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, MaterialData& renderMaterialData, RtInstance* existingInstance, const RtxParticleSystemDesc* pParticleSystemDesc) {
+  RtInstance* SceneManager::processDrawCallState(const Rc<DxvkContext>& ctx, const DrawCallState& drawCallState, const MaterialData& renderMaterialData, ReplacementInstance& replacementInstance, RtInstance* existingInstance, const RtxParticleSystemDesc* pParticleSystemDesc) {
     ScopedCpuProfileZone();
 
     // NV-DXVK [MeshTrace] funnel stage 2: survived submitDrawState's filters.
@@ -4034,13 +4285,16 @@ namespace dxvk {
     // This is useful for older games where geometry may lack smooth normals, especially
     // when using the VertexShader Capture mechanism. The smooth normals are computed on the GPU
     // from the triangle mesh (area-weighted) and written into the normal buffer.
-    // Only dispatch on BVH build/update — for static geometry, positions don't change so
+    // Only dispatch on BVH build/update - for static geometry, positions don't change so
     // the normals computed on the first pass remain valid for subsequent frames.
     if (drawCallState.shouldGenerateSmoothNormals() &&
         (result == ObjectCacheState::KBuildBVH || result == ObjectCacheState::kUpdateBVH)) {
       m_device->getCommon()->metaGeometryUtils().dispatchSmoothNormals(ctx, drawCallState.getGeometryData(), pBlas->modifiedGeometryData);
       pBlas->modifiedGeometryData.smoothNormalsApplied = true;
+      // dispatchSmoothNormals() changes the vertex buffers, which need to be re-synced.
+      syncLinkedInstances(pBlas);
       pBlas->frameLastUpdated = pBlas->frameLastTouched;
+      m_instanceManager.notifySceneChanged();
     }
 
     if (drawCallState.getSkinningState().numBones > 0 &&
@@ -4590,7 +4844,7 @@ namespace dxvk {
     if (!pParticleSystemDesc) {
       pParticleSystemDesc = renderMaterialData.getParticleSystemDesc();
     }
-    if (!pParticleSystemDesc && drawCallState.categories.test(InstanceCategories::ParticleEmitter)) {
+    if (!pParticleSystemDesc && drawCallState.getCategoryFlags().test(InstanceCategories::ParticleEmitter)) {
       globalParticleDesc = RtxParticleSystemManager::createGlobalParticleSystemDesc();
       pParticleSystemDesc = &globalParticleDesc;
     }
@@ -4609,6 +4863,8 @@ namespace dxvk {
           emitterInstance->setHidden(true);
         }
       }
+
+      replacementInstance.dirtyFlags.set(ReplacementInstance::DirtyFlag::ParticleSystem);
     }
 
     if (instance) {
@@ -5150,6 +5406,32 @@ namespace dxvk {
       m_lastSurfaceMaterial[i].valid = false;
   }
 
+  void SceneManager::trackObjectPickingMeta(
+      const DrawCallState& drawCallState,
+      ObjectPickingValue objectPickingValue) {
+    const bool objectPickingActive = m_device->getCommon()->getResources().getRaytracingOutput()
+      .m_primaryObjectPicking.isValid();
+    if (!objectPickingActive || !g_allowMappingLegacyHashToObjectPickingValue) {
+      return;
+    }
+
+    auto meta = DrawCallMetaInfo {};
+    XXH64_hash_t h = drawCallState.getMaterialData().getColorTexture().getImageHash();
+    if (h != kEmptyHash) {
+      meta.legacyTextureHash = h;
+    }
+    h = drawCallState.getMaterialData().getColorTexture2().getImageHash();
+    if (h != kEmptyHash) {
+      meta.legacyTextureHash2 = h;
+    }
+
+    std::lock_guard lock { m_drawCallMeta.mutex };
+    auto [iter, isNew] = m_drawCallMeta.infos[m_drawCallMeta.ticker].emplace(objectPickingValue, meta);
+    ONCE_IF_FALSE(isNew, Logger::warn(
+      "Found multiple draw calls with the same \'objectPickingValue\'. "
+      "Ignoring further MetaInfo-s, some objects might be not be available through object picking"));
+  }
+
   const RtSurfaceMaterial& SceneManager::createSurfaceMaterial(const MaterialData& renderMaterialData,
                                                                const DrawCallState& drawCallState,
                                                                uint32_t* out_indexInCache) {
@@ -5396,6 +5678,32 @@ namespace dxvk {
     preCreationHash = XXH64(&samplerIndex2, sizeof(samplerIndex2), preCreationHash);
     preCreationHash = XXH64(&hasTexcoords, sizeof(hasTexcoords), preCreationHash);
     preCreationHash = XXH64(&drawCallState.isUsingRaytracedRenderTarget, sizeof(drawCallState.isUsingRaytracedRenderTarget), preCreationHash);
+    const bool isHairCard = drawCallState.testCategoryFlags(InstanceCategories::HairCards);
+    preCreationHash = XXH64(&isHairCard, sizeof(isHairCard), preCreationHash);
+
+    // For Opaque materials, fold in a bitmask of which texture slots are populated. MaterialData::getHash()
+    // sums TextureRef::getImageHash() across slots, but render-target-backed TextureRefs (notably
+    // TerrainBaker cascades) have a zero image hash, so two materials that differ only in cascade
+    // composition (e.g. "albedo only" vs "albedo + normal + roughness") collide on getHash() and the
+    // per-frame cache would serve the earlier "albedo only" entry to later draws that have valid
+    // secondary cascades.
+    if (renderMaterialDataType == MaterialDataType::Opaque) {
+      const auto& opaqueMaterialData = renderMaterialData.getOpaqueMaterialData();
+      uint32_t texturePresenceMask = 0;
+      texturePresenceMask |= opaqueMaterialData.getAlbedoOpacityTexture().isImageEmpty()             ? 0u : (1u << 0);
+      texturePresenceMask |= opaqueMaterialData.getSecondaryTexture().isImageEmpty()                 ? 0u : (1u << 1);
+      texturePresenceMask |= opaqueMaterialData.getNormalTexture().isImageEmpty()                    ? 0u : (1u << 2);
+      texturePresenceMask |= opaqueMaterialData.getTangentTexture().isImageEmpty()                   ? 0u : (1u << 3);
+      texturePresenceMask |= opaqueMaterialData.getHeightTexture().isImageEmpty()                    ? 0u : (1u << 4);
+      texturePresenceMask |= opaqueMaterialData.getRoughnessTexture().isImageEmpty()                 ? 0u : (1u << 5);
+      texturePresenceMask |= opaqueMaterialData.getMetallicTexture().isImageEmpty()                  ? 0u : (1u << 6);
+      texturePresenceMask |= opaqueMaterialData.getEmissiveColorTexture().isImageEmpty()             ? 0u : (1u << 7);
+      texturePresenceMask |= opaqueMaterialData.getSubsurfaceTransmittanceTexture().isImageEmpty()   ? 0u : (1u << 8);
+      texturePresenceMask |= opaqueMaterialData.getSubsurfaceThicknessTexture().isImageEmpty()       ? 0u : (1u << 9);
+      texturePresenceMask |= opaqueMaterialData.getSubsurfaceSingleScatteringAlbedoTexture().isImageEmpty() ? 0u : (1u << 10);
+      texturePresenceMask |= opaqueMaterialData.getSubsurfaceRadiusTexture().isImageEmpty()          ? 0u : (1u << 11);
+      preCreationHash = XXH64(&texturePresenceMask, sizeof(texturePresenceMask), preCreationHash);
+    }
 
     // NV-DXVK [MatChurn]: count every material resolution and, separately, the
     // ones that fall through to a full material build. m_preCreationSurfaceMaterialMap
@@ -5870,8 +6178,6 @@ namespace dxvk {
           subsurfaceMaxSampleRadius = std::max(0.F, opaqueMaterialData.getSubsurfaceMaxSampleRadius());
           subsurfaceRadiusScale = std::max(opaqueMaterialData.getSubsurfaceRadiusScale(), 1e-5f);
           assert(subsurfaceRadiusScale > 0);
-
-          m_sssMaterialExist = true;
         } else /* if thin opaque */ {
           assert(subsurfaceMeasurementDistance > 0);
 
@@ -5881,8 +6187,6 @@ namespace dxvk {
           assert(subsurfaceRadiusScale < 0);  // if < 0, then shaders assume that
                                               // this material is not SubsurfaceScatter, but just SingleScatter
                                               // same here, but <0.F
-
-          m_thinOpaqueMaterialExist = true;
         }
 
         if (RtxOptions::SubsurfaceScattering::enableTextureMaps()) {
@@ -5973,10 +6277,6 @@ namespace dxvk {
         bakedAlbedoAsEmissive
       };
 
-      if (opaqueSurfaceMaterial.hasValidDisplacement()) {
-        ++m_activePOMCount;
-      }
-
       surfaceMaterial.emplace(opaqueSurfaceMaterial);
     } else if (renderMaterialDataType == MaterialDataType::Translucent) {
       const auto& translucentMaterialData = renderMaterialData.getTranslucentMaterialData();
@@ -6043,6 +6343,90 @@ namespace dxvk {
     // NV-DXVK [Phase2b]: memo copy, not a cache reference — see the memo-hit
     // return above.
     return *memo.material;
+  }
+
+
+  RtTranslucentSurfaceMaterial SceneManager::createTranslucentSurfaceMaterial(const TranslucentMaterialData& translucentMaterialData,
+                                                                              uint32_t samplerIndex,
+                                                                              bool hasTexcoords) {
+    uint32_t normalTextureIndex = kSurfaceMaterialInvalidTextureIndex;
+    uint32_t transmittanceTextureIndex = kSurfaceMaterialInvalidTextureIndex;
+    uint32_t emissiveColorTextureIndex = kSurfaceMaterialInvalidTextureIndex;
+    uint16_t samplerFeedbackStamp = SAMPLER_FEEDBACK_INVALID;
+
+    trackTexture(translucentMaterialData.getNormalTexture(), normalTextureIndex, hasTexcoords, true, &samplerFeedbackStamp);
+    trackTexture(translucentMaterialData.getTransmittanceTexture(), transmittanceTextureIndex, hasTexcoords, true, &samplerFeedbackStamp);
+    trackTexture(translucentMaterialData.getEmissiveColorTexture(), emissiveColorTextureIndex, hasTexcoords, true, &samplerFeedbackStamp);
+
+    return RtTranslucentSurfaceMaterial{
+      normalTextureIndex,
+      transmittanceTextureIndex,
+      emissiveColorTextureIndex,
+      translucentMaterialData.getRefractiveIndex() * std::clamp(TranslucentMaterialOptions::refractiveIndexScale(), 0.0f, 3.0f),
+      translucentMaterialData.getTransmittanceMeasurementDistance(),
+      translucentMaterialData.getTransmittanceColor(),
+      translucentMaterialData.getEnableEmission(),
+      translucentMaterialData.getEmissiveIntensity() * RtxOptions::emissiveIntensity(),
+      translucentMaterialData.getEmissiveColorConstant(),
+      translucentMaterialData.getEnableThinWalled(),
+      translucentMaterialData.getThinWallThickness(),
+      translucentMaterialData.getEnableDiffuseLayer(),
+      samplerIndex,
+      samplerFeedbackStamp
+    };
+  }
+
+  Rc<DxvkSampler> SceneManager::getOrCreateExternalSampler() {
+    if (m_externalSampler == nullptr) {
+      auto s = DxvkSamplerCreateInfo {};
+      {
+        s.magFilter = VK_FILTER_LINEAR;
+        s.minFilter = VK_FILTER_LINEAR;
+        s.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        s.mipmapLodBias = 0.f;
+        s.mipmapLodMin = 0.f;
+        s.mipmapLodMax = 0.f;
+        s.useAnisotropy = VK_FALSE;
+        s.maxAnisotropy = 1.f;
+        s.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        s.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        s.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        s.compareToDepth = VK_FALSE;
+        s.compareOp = VK_COMPARE_OP_NEVER;
+        s.borderColor = VkClearColorValue {};
+        s.usePixelCoord = VK_FALSE;
+      }
+      m_externalSampler = m_device->createSampler(s);
+    }
+
+    return m_externalSampler;
+  }
+
+  void SceneManager::setExternalStartInMediumMaterial(const MaterialData& translucentMaterial) {
+    assert(translucentMaterial.getType() == MaterialDataType::Translucent);
+
+    const auto samplerIndex = trackSampler(getOrCreateExternalSampler());
+    const auto surfaceMaterial = RtSurfaceMaterial(
+      createTranslucentSurfaceMaterial(translucentMaterial.getTranslucentMaterialData(), samplerIndex, true));
+
+    m_externalStartInMediumMaterialIndex_inCache = m_surfaceMaterialCache.track(surfaceMaterial);
+  }
+
+  void SceneManager::clearExternalStartInMediumMaterial() {
+    m_externalStartInMediumMaterialIndex_inCache = UINT32_MAX;
+  }
+
+  void SceneManager::setStartInMediumMaterial(const MaterialData& translucentMaterial) {
+    assert(translucentMaterial.getType() == MaterialDataType::Translucent);
+    std::lock_guard lock { m_startInMediumMaterialMutex };
+    m_pendingClearStartInMediumMaterial = false;
+    m_pendingStartInMediumMaterial = translucentMaterial;
+  }
+
+  void SceneManager::clearStartInMediumMaterial() {
+    std::lock_guard lock { m_startInMediumMaterialMutex };
+    m_pendingStartInMediumMaterial.reset();
+    m_pendingClearStartInMediumMaterial = true;
   }
 
   std::optional<XXH64_hash_t> SceneManager::findLegacyTextureHashByObjectPickingValue(uint32_t objectPickingValue) {
@@ -6144,12 +6528,39 @@ namespace dxvk {
     const RtLight rtLight = lightData->toRtLight();
     const std::vector<AssetReplacement>* pReplacements = m_pReplacer->getReplacementsForLight(rtLight.getInitialHash());
 
+    // Build identity hash from the light's stable hash + position. Used by
+    // both the replacement and the toggle-off cleanup paths below; must stay
+    // in sync between them so they target the same RI.
+    const XXH64_hash_t lightAssetHash = rtLight.getInitialHash();
+    const Vector3 lightPos = rtLight.getPosition();
+    const XXH64_hash_t lightIdHash = XXH64(&lightPos, sizeof(Vector3), lightAssetHash);
+
     if (pReplacements) {
       const Matrix4 lightTransform = LightUtils::getLightTransform(light);
 
-      ReplacementInstance* replacementInstance = nullptr;
+      // Build identity hash from the light's stable hash + position
+      const XXH64_hash_t lightAssetHash = rtLight.getInitialHash();
+      const Vector3 lightPos = rtLight.getPosition();
+      XXH64_hash_t lightIdHash = lightAssetHash;
+      lightIdHash = XXH64(&lightPos, sizeof(Vector3), lightIdHash);
 
+      const ReplacementInstance::LookupKey lightKey { lightIdHash, lightAssetHash, kEmptyHash, kEmptyHash, lightPos, lightTransform };
+      ReplacementInstance* replacementInstance = m_drawCallTracker.findOrCreateReplacementInstance(lightKey);
+
+      // Reinitialize the RI if the prim count doesn't match the replacement count.
+      // This handles the transition from unreplaced (1 prim) to replaced (N prims)
+      // when replacements finish loading asynchronously.
+      if (replacementInstance->root.getUntyped() != nullptr &&
+          replacementInstance->prims.size() != pReplacements->size()) {
+        replacementInstance->clear();
+      }
+
+      // All lights in a light replacement are externally tracked, with their
+      // lifecycle managed by the ReplacementInstance. This unifies root and sub-light
+      // handling: create on first frame, update on subsequent frames.
       // TODO(TREX-1091) to implement meshes as light replacements, replace the below loop with a call to drawReplacements.
+      const bool needsBBoxUpdate = replacementInstance->boundingBoxDirty;
+      AxisAlignedBoundingBox litBBox;
       for (size_t i = 0; i < pReplacements->size(); i++) {
         const auto& replacement = (*pReplacements)[i];
         if (replacement.type == AssetReplacement::eLight && replacement.lightData.has_value()) {
@@ -6159,46 +6570,68 @@ namespace dxvk {
           replacementLight.merge(light);
 
           // Convert to runtime light
-          RtLight rtReplacementLight = replacementLight.toRtLight(&rtLight);
+          RtLight rtReplacementLight = replacementLight.toRtLight();
+
+          if (needsBBoxUpdate) {
+            const Vector3 pos = rtReplacementLight.getPosition();
+            float lightRadius = 0.f;
+            if (rtReplacementLight.getType() == RtLightType::Sphere) {
+              lightRadius = rtReplacementLight.getSphereLight().getRadius();
+            }
+            for (uint32_t j = 0; j < 3; j++) {
+              litBBox.minPos[j] = std::min(litBBox.minPos[j], pos[j] - lightRadius);
+              litBBox.maxPos[j] = std::max(litBBox.maxPos[j], pos[j] + lightRadius);
+            }
+          }
 
           // Transform the replacement light by the legacy light
           if (replacementLight.relativeTransform()) {
-            rtReplacementLight.applyTransform(lightTransform); // note: we dont need to consider the transform of parent replacement light in this scenario, this is detected on mod load and so absolute transform is used
+            rtReplacementLight.applyTransform(lightTransform);
           }
 
-          if (replacementInstance == nullptr) {
-            // Handle the root light as a normal light.
-            RtLight* newLight;
-
-            // Setup Light Replacement for Anti-Culling
-            RtLightAntiCullingType antiCullingType = RtLightAntiCullingType::Ignore;
-            if (RtxOptions::AntiCulling::isLightAntiCullingEnabled() && rtLight.getType() == RtLightType::Sphere) {
-              antiCullingType = RtLightAntiCullingType::LightReplacement;
-            }
-
-            // Apply the light
-            newLight = m_lightManager.addLight(rtReplacementLight, antiCullingType);
-
-            // Setup tracking for all the lights created for this replacement.
-            if (newLight != nullptr) {
-              // This is the first light created, so it will be the root.
-              replacementInstance = newLight->getPrimInstanceOwner().getOrCreateReplacementInstance(newLight, PrimInstance::Type::Light, i, pReplacements->size());
-            }
+          RtLight* existingLight = (replacementInstance->prims.size() > i)
+              ? replacementInstance->prims[i].getLight() : nullptr;
+          if (existingLight != nullptr) {
+            m_lightManager.updateExternallyTrackedLight(existingLight, rtReplacementLight);
           } else {
-            // Handle all non-root lights as externally tracked lights - they'll be cleaned up when the root is garbage collected.
-            RtLight* existingLight = replacementInstance->prims[i].getLight();
-            if (existingLight != nullptr) {
-              m_lightManager.updateExternallyTrackedLight(existingLight, rtReplacementLight);
-            } else {
-              RtLight* newLight = m_lightManager.createExternallyTrackedLight(rtReplacementLight);
+            RtLight* newLight = m_lightManager.createExternallyTrackedLight(rtReplacementLight);
+            if (newLight != nullptr) {
+              if (replacementInstance->prims.empty()) {
+                replacementInstance->setup(PrimInstance(newLight, PrimInstance::Type::Light), pReplacements->size(), pReplacements);
+              }
               newLight->getPrimInstanceOwner().setReplacementInstance(replacementInstance, i, newLight, PrimInstance::Type::Light);
+              if (replacementInstance->root.getUntyped() == nullptr) {
+                replacementInstance->root = PrimInstance(newLight, PrimInstance::Type::Light);
+              }
             }
           }
         } else {
           assert(false); // We don't support meshes as children of lights yet.
         }
       }
+
+      replacementInstance->frameLastSeen = m_device->getCurrentFrameId();
+      replacementInstance->objectToWorld = lightTransform;
+      if (needsBBoxUpdate) {
+        if (litBBox.isValid()) {
+          replacementInstance->lightBoundingBox = litBBox;
+        }
+        replacementInstance->boundingBoxDirty = false;
+      }
     } else {
+      // If this light previously had a replacement (e.g. enableReplacementLights
+      // was just toggled off), the externally-tracked replacement lights are
+      // still alive in LightManager -- they have no frame-age GC; their
+      // lifecycle is owned by the RI. Tear down the RI so its prims get marked
+      // for GC; otherwise the user sees the replacement lights and the original
+      // game light rendering simultaneously until DrawCallTracker collects the
+      // RI ~numFramesToKeepInstances frames later.
+      if (ReplacementInstance* stale = m_drawCallTracker.findReplacementInstanceByIdentity(lightIdHash)) {
+        if (stale->activeReplacements != nullptr) {
+          stale->clear();
+        }
+      }
+
       // This is a light coming from the game directly, so use the appropriate API for filter rules
       m_lightManager.addGameLight(light.Type, rtLight);
     }
@@ -6433,6 +6866,25 @@ namespace dxvk {
     garbageCollection();
     markPs(ps_gc);
 
+    // Re-register buffers, textures, and materials for anti-culled instances.
+    // These instances survived GC but the game didn't submit draw calls for them
+    // this frame, so their per-frame table indices (buffer cache, material cache)
+    // are stale. Without this, they would render with wrong geometry or textures.
+    {
+      const uint32_t currentFrameId = m_device->getCurrentFrameId();
+      for (auto& ri : m_drawCallTracker.getReplacementInstances()) {
+        if (ri->frameLastSeen == currentFrameId) {
+          continue;
+        }
+        for (auto& prim : ri->prims) {
+          RtInstance* instance = prim.getInstance();
+          if (instance != nullptr) {
+            preserveInstance(*instance);
+          }
+        }
+      }
+    }
+
     m_graphManager.applySceneOverrides(ctx);
 
     m_terrainBaker->prepareSceneData(ctx);
@@ -6610,6 +7062,64 @@ namespace dxvk {
       m_cameraManager.getCamera(CameraType::Main),
       m_cameraManager.isCameraValid(CameraType::ViewModel) ? &m_cameraManager.getCamera(CameraType::ViewModel) : nullptr);
 
+    {
+      const uint32_t previousStartInMediumMaterialIndexInCache = m_lastResolvedStartInMediumMaterialIndexInCache;
+      std::optional<MaterialData> pendingStartInMediumMaterial;
+      uint32_t persistentStartInMediumMaterialIndexInCache = kInvalidMaterialCacheIndex;
+      bool clearStartInMediumMaterial = false;
+      {
+        std::lock_guard lock { m_startInMediumMaterialMutex };
+        clearStartInMediumMaterial = m_pendingClearStartInMediumMaterial;
+        m_pendingClearStartInMediumMaterial = false;
+        if (m_pendingStartInMediumMaterial.has_value()) {
+          pendingStartInMediumMaterial = std::move(m_pendingStartInMediumMaterial);
+          m_pendingStartInMediumMaterial.reset();
+        }
+      }
+
+      if (clearStartInMediumMaterial) {
+        m_persistentStartInMediumMaterial.reset();
+      }
+
+      if (pendingStartInMediumMaterial.has_value()) {
+        m_persistentStartInMediumMaterial = std::move(pendingStartInMediumMaterial);
+      }
+
+      if (m_persistentStartInMediumMaterial.has_value()) {
+        assert(m_persistentStartInMediumMaterial->getType() == MaterialDataType::Translucent);
+        const auto samplerIndex = trackSampler(getOrCreateExternalSampler());
+        const auto surfaceMaterial = RtSurfaceMaterial(
+          createTranslucentSurfaceMaterial(m_persistentStartInMediumMaterial->getTranslucentMaterialData(), samplerIndex, true));
+        persistentStartInMediumMaterialIndexInCache = m_surfaceMaterialCache.track(surfaceMaterial);
+      }
+
+      m_startInMediumMaterialIndex_inCache = m_externalStartInMediumMaterialIndex_inCache != kInvalidMaterialCacheIndex
+        ? m_externalStartInMediumMaterialIndex_inCache
+        : persistentStartInMediumMaterialIndexInCache != kInvalidMaterialCacheIndex
+          ? persistentStartInMediumMaterialIndexInCache
+          : m_fogStartInMediumMaterialIndex_inCache;
+
+      if (m_startInMediumMaterialIndex_inCache != kInvalidMaterialCacheIndex &&
+          m_startInMediumMaterialIndex_inCache >= m_surfaceMaterialCache.getObjectTable().size()) {
+        Logger::debug(str::format(
+          "[RTX] Ignoring stale camera medium material cache index ", m_startInMediumMaterialIndex_inCache,
+          " on frame ", m_device->getCurrentFrameId(),
+          "; surfaceMaterialCacheSize=", m_surfaceMaterialCache.getObjectTable().size()));
+        m_startInMediumMaterialIndex_inCache = kInvalidMaterialCacheIndex;
+      }
+
+      if (m_startInMediumMaterialIndex_inCache != previousStartInMediumMaterialIndexInCache) {
+        Logger::debug(str::format(
+          "[RTX] View history invalidated due to camera medium change on frame ", m_device->getCurrentFrameId(),
+          ": previousStartInMediumInCache=", previousStartInMediumMaterialIndexInCache,
+          ", currentStartInMediumInCache=", m_startInMediumMaterialIndex_inCache,
+          ", cleared=", clearStartInMediumMaterial ? "true" : "false",
+          ", pendingSet=", pendingStartInMediumMaterial.has_value() ? "true" : "false"));
+        m_cameraManager.getMainCamera().invalidateViewHistory(m_device->getCurrentFrameId());
+      }
+      m_lastResolvedStartInMediumMaterialIndexInCache = m_startInMediumMaterialIndex_inCache;
+    }
+
     if (m_cameraManager.isCameraCutThisFrame()) {
       // Ignore camera cut events on teleportation so we don't flush the caches
       if (!didTeleport) {
@@ -6628,9 +7138,13 @@ namespace dxvk {
 
         m_opacityMicromapManager = std::make_unique<OpacityMicromapManager>(m_device);
         m_instanceManager.addEventHandler(m_opacityMicromapManager->getInstanceEventHandler());
+        // Seed candidates with instances that were added before the event handler was registered
+        m_opacityMicromapManager->seedCandidates(m_instanceManager.getInstanceTable());
         Logger::info("[RTX] Opacity Micromap: enabled");
       }
     } else if (m_opacityMicromapManager.get()) {
+      m_accelManager.invalidateOpacityMicromapBindings();
+      m_instanceManager.notifySceneChanged();
       m_instanceManager.removeEventHandler(m_opacityMicromapManager.get());
       m_opacityMicromapManager = nullptr;
       Logger::info("[RTX] Opacity Micromap: disabled");
@@ -6677,21 +7191,33 @@ namespace dxvk {
     // Upload surface material buffer BEFORE the GPU culling dispatch so the
     // compute shader can copy template material entries to per-instance slots.
     // For PointInstancer duplicate entries we skip writeGPUData and advance past
-    // the gap — the GPU shader will fill those slots.
-    {
+    // the gap - the GPU shader will fill those slots.
+    //
+    // When the scene is unchanged (fast-skip path in mergeInstancesIntoBlas),
+    // the surface order and material data are normally identical to last frame.
+    // Baked terrain materials are updated independently of acceleration-structure
+    // scene generation, so keep their surface-material upload live.
+    const bool startInMediumStateChanged = m_startInMediumMaterialIndex_inCache != m_lastUploadedStartInMediumMaterialIndexInCache;
+    const bool updateSurfaceMaterials =
+      !m_accelManager.wasSceneUnchangedThisFrame() ||
+      TerrainBaker::needsTerrainBaking() ||
+      startInMediumStateChanged;
+    if (updateSurfaceMaterials) {
       DxvkBufferCreateInfo matInfo;
       matInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
-                    | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
-                    | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
+        | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
       matInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
-                     | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
       matInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT;
 
       if (m_surfaceMaterialCache.getTotalCount() > 0) {
         ScopedGpuProfileZone(ctx, "updateSurfaceMaterials");
         // Note: We duplicate the materials in the buffer so we don't have to do pointer chasing on the GPU
         size_t surfaceMaterialsGPUSize = m_accelManager.getSurfaceCount() * kSurfaceMaterialGPUSize;
-        if (m_startInMediumMaterialIndex_inCache != UINT32_MAX) {
+        const uint32_t expectedSurfaceMaterialEntries = m_accelManager.getSurfaceCount()
+          + (m_startInMediumMaterialIndex_inCache != kInvalidMaterialCacheIndex ? 1u : 0u);
+        if (m_startInMediumMaterialIndex_inCache != kInvalidMaterialCacheIndex) {
           surfaceMaterialsGPUSize += kSurfaceMaterialGPUSize;
         }
 
@@ -6705,31 +7231,40 @@ namespace dxvk {
         std::vector<unsigned char> surfaceMaterialsGPUData(surfaceMaterialsGPUSize);
         for (auto&& pInstance : m_accelManager.getOrderedInstances()) {
           // For PointInstancer duplicates (entries beyond the template), skip
-          // writeGPUData — the GPU culling shader copies the template material.
+          // writeGPUData - the GPU culling shader copies the template material.
           const auto& surf = pInstance->surface;
           if (surf.instancesToObject != nullptr &&
               surf.surfaceIndexOfFirstInstance != SIZE_MAX &&
               surfaceIndex > surf.surfaceIndexOfFirstInstance) {
             dataOffset += kSurfaceMaterialGPUSize;
           } else {
+            assert(surf.surfaceMaterialIndex < m_surfaceMaterialCache.getObjectTable().size());
             auto&& surfaceMaterial = m_surfaceMaterialCache.getObjectTable()[surf.surfaceMaterialIndex];
             surfaceMaterial.writeGPUData(surfaceMaterialsGPUData.data(), dataOffset, surfaceIndex);
           }
           surfaceIndex++;
         }
 
-        if (m_startInMediumMaterialIndex_inCache != UINT32_MAX) {
+        if (m_startInMediumMaterialIndex_inCache != kInvalidMaterialCacheIndex) {
           auto&& surfaceMaterial = m_surfaceMaterialCache.getObjectTable()[m_startInMediumMaterialIndex_inCache];
           surfaceMaterial.writeGPUData(surfaceMaterialsGPUData.data(), dataOffset, surfaceIndex);
           m_startInMediumMaterialIndex = surfaceIndex;
           surfaceIndex++;
+        } else {
+          m_startInMediumMaterialIndex = SURFACE_INDEX_INVALID;
         }
 
+        assert(surfaceIndex == expectedSurfaceMaterialEntries);
         assert(dataOffset == surfaceMaterialsGPUSize);
         assert(surfaceMaterialsGPUData.size() == surfaceMaterialsGPUSize);
+        m_lastUploadedStartInMediumMaterialIndexInCache = m_startInMediumMaterialIndex_inCache;
 
         ctx->writeToBuffer(m_surfaceMaterialBuffer, 0, surfaceMaterialsGPUData.size(), surfaceMaterialsGPUData.data());
       }
+    } else {
+      m_startInMediumMaterialIndex = m_startInMediumMaterialIndex_inCache != kInvalidMaterialCacheIndex
+        ? m_accelManager.getSurfaceCount()
+        : SURFACE_INDEX_INVALID;
     }
     markPs(ps_surfMat);
 
@@ -6746,7 +7281,8 @@ namespace dxvk {
 
     // Todo: These updates require a lot of temporary buffer allocations and memcopies, ideally we should memcpy directly into a mapped pointer provided by Vulkan,
     // but we have to create a buffer to pass to DXVK's updateBuffer for now.
-    {
+    // Skip when scene is unchanged - buffers from last frame are still valid.
+    if (!m_accelManager.wasSceneUnchangedThisFrame()) {
       // Allocate the instance buffer and copy its contents from host to device memory
       DxvkBufferCreateInfo info;
       info.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
@@ -6814,6 +7350,7 @@ namespace dxvk {
     m_device->statCounters().setCtr(DxvkStatCounter::RtxBlasCount, AccelManager::getBlasCount());
     m_device->statCounters().setCtr(DxvkStatCounter::RtxBufferCount, m_bufferCache.getActiveCount());
     m_device->statCounters().setCtr(DxvkStatCounter::RtxTextureCount, textureManager.getTextureTable().size());
+    m_device->statCounters().setCtr(DxvkStatCounter::RtxReplacementTextureCount, textureManager.getActiveReplacementTextures());
     m_device->statCounters().setCtr(DxvkStatCounter::RtxInstanceCount, m_instanceManager.getActiveCount());
     m_device->statCounters().setCtr(DxvkStatCounter::RtxSurfaceMaterialCount, m_surfaceMaterialCache.getActiveCount());
     m_device->statCounters().setCtr(DxvkStatCounter::RtxSurfaceMaterialExtensionCount, m_surfaceMaterialExtensionCache.getActiveCount());
@@ -7011,61 +7548,93 @@ namespace dxvk {
 
   static_assert(std::is_same_v< decltype(RtSurface::objectPickingValue), ObjectPickingValue>);
 
-  void SceneManager::submitExternalDraw(Rc<DxvkContext> ctx, ExternalDrawState&& state) {
-    if (m_externalSampler == nullptr) {
-      auto s = DxvkSamplerCreateInfo {};
-      {
-        s.magFilter = VK_FILTER_LINEAR;
-        s.minFilter = VK_FILTER_LINEAR;
-        s.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-        s.mipmapLodBias = 0.f;
-        s.mipmapLodMin = 0.f;
-        s.mipmapLodMax = 0.f;
-        s.useAnisotropy = VK_FALSE;
-        s.maxAnisotropy = 1.f;
-        s.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        s.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        s.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        s.compareToDepth = VK_FALSE;
-        s.compareOp = VK_COMPARE_OP_NEVER;
-        s.borderColor = VkClearColorValue {};
-        s.usePixelCoord = VK_FALSE;
-      }
-      m_externalSampler = m_device->createSampler(s);
-    }
+  void SceneManager::submitExternalDraw(const Rc<DxvkContext>& ctx, std::unique_ptr<ExternalDrawState> pstate) {
+    ScopedCpuProfileZone();
+
+    Rc<DxvkSampler> externalSampler = getOrCreateExternalSampler();
+
+    auto& state = *pstate;
 
     {
-      state.drawCall.materialData.samplers[0] = m_externalSampler;
-      state.drawCall.materialData.samplers[1] = m_externalSampler;
+      state.drawCall.modifyMaterialData().samplers[0] = externalSampler;
+      state.drawCall.modifyMaterialData().samplers[1] = externalSampler;
     }
     {
       const RtCamera& rtCamera = ctx->getCommonObjects()->getSceneManager().getCameraManager()
         .getCamera(state.cameraType);
-      state.drawCall.transformData.worldToView = Matrix4 { rtCamera.getWorldToView() };
-      state.drawCall.transformData.viewToProjection = Matrix4 { rtCamera.getViewToProjection() };
-      state.drawCall.transformData.objectToView = state.drawCall.transformData.worldToView * state.drawCall.transformData.objectToWorld;
+      state.drawCall.modifyTransformData().worldToView = rtCamera.getWorldToViewf();
+      state.drawCall.modifyTransformData().viewToProjection = rtCamera.getViewToProjectionf();
+      state.drawCall.modifyTransformData().objectToView = state.drawCall.getTransformData().worldToView * state.drawCall.getTransformData().objectToWorld;
     }
 
     if (!state.gpuInstancingTransforms.empty()) {
-      m_externalGpuInstancingTransforms.push_back(std::move(state.gpuInstancingTransforms));
-      state.drawCall.transformData.instancesToObject = &m_externalGpuInstancingTransforms.back();
+      state.drawCall.modifyTransformData().instancesToObject =
+        std::make_shared<const std::vector<Matrix4>>(std::move(state.gpuInstancingTransforms));
     }
 
-    for (const RasterGeometry& submesh : m_pReplacer->accessExternalMesh(state.mesh)) {
-      state.drawCall.geometryData = submesh;
-      state.drawCall.geometryData.cullMode = state.doubleSided ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT;
+    const auto& submeshes = m_pReplacer->accessExternalMesh(state.mesh);
 
-      const MaterialData* material = m_pReplacer->accessExternalMaterial(submesh.externalMaterial);
+    const XXH64_hash_t identityHash = state.computeExternalDrawIdentityHash();
+    const XXH64_hash_t spatialMapHash = spatialMapHashForExternalDrawMesh(state.mesh);
+    const Matrix4& xform = state.drawCall.getTransformData().objectToWorld;
+    const XXH64_hash_t matHash = state.drawCall.getMaterialData().getHash();
+    const Vector3 worldPos = xform[3].xyz();
+
+    const ReplacementInstance::LookupKey externalKey { identityHash, spatialMapHash, matHash, kEmptyHash, worldPos, xform };
+    ReplacementInstance* replacementInstance = m_drawCallTracker.findOrCreateReplacementInstance(externalKey);
+    replacementInstance->dirtyFlags.clr(ReplacementInstance::kDynamicFeatureMask);
+
+    AxisAlignedBoundingBox geometryBBox;
+
+    for (size_t i = 0; i < submeshes.size(); i++) {
+      state.drawCall.overrideGeometryData(&submeshes[i]);
+      state.drawCall.overrideCullMode(state.doubleSided ? VK_CULL_MODE_NONE : VK_CULL_MODE_BACK_BIT);
+
+      const MaterialData* material = m_pReplacer->accessExternalMaterial(submeshes[i].externalMaterial);
       if (material != nullptr) {
-        state.drawCall.materialData.setHashOverride(material->getHash());
+        state.drawCall.modifyMaterialData().setHashOverride(material->getHash());
       } 
 
       const RtxParticleSystemDesc* pParticles = nullptr;
-      if(state.optionalParticleDesc.has_value()) {
+      if (state.optionalParticleDesc.has_value()) {
         pParticles = &state.optionalParticleDesc.value();
       }
 
-      processDrawCallState(ctx, state.drawCall, material != nullptr ? MaterialData(*material) : LegacyMaterialData().as<OpaqueMaterialData>(), nullptr, pParticles);
+      RtInstance* existingInstance = (replacementInstance->prims.size() > i)
+          ? replacementInstance->prims[i].getInstance() : nullptr;
+
+      static MaterialData defaultMaterialData(LegacyMaterialData::createDefault());
+      auto& materialData = material != nullptr ? *material : defaultMaterialData;
+
+      RtInstance* instance = processDrawCallState(ctx, state.drawCall, materialData, *replacementInstance, existingInstance, pParticles);
+
+      if (instance != nullptr) {
+        if (replacementInstance->root.getUntyped() == nullptr) {
+          replacementInstance->setup(PrimInstance(instance, PrimInstance::Type::Instance), submeshes.size(), nullptr);
+        }
+        if (replacementInstance->prims.size() > i &&
+            replacementInstance->prims[i].getUntyped() != instance) {
+          instance->getPrimInstanceOwner().setReplacementInstance(replacementInstance, i, instance,
+              PrimInstance::Type::Instance);
+        }
+      }
+
+      geometryBBox.unionWith(submeshes[i].boundingBox);
+    }
+
+    replacementInstance->frameLastSeen = m_device->getCurrentFrameId();
+
+    if (geometryBBox.isValid()) {
+      replacementInstance->geometryBoundingBox = geometryBBox;
+      replacementInstance->objectToWorld = xform;
+    }
+  }
+
+  void SceneManager::destroyExternalMesh(remixapi_MeshHandle handle) {
+    if (handle) {
+      m_drawCallTracker.removeReplacementInstancesWithSpatialMapHash(
+          spatialMapHashForExternalDrawMesh(handle));
+      m_pReplacer->destroyExternalMesh(handle);
     }
   }
 
@@ -7304,4 +7873,4 @@ namespace dxvk {
     m_currentFrameMeshHashes.clear();
   }
 
-}  // namespace nvvk
+}  // namespace dxvk
