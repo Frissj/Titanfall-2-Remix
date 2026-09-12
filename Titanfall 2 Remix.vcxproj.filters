@@ -1311,6 +1311,12 @@
     <ClCompile Include="src\dxvk\rtx_render\rtx_render_object.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\dxvk\rtx_render\rtx_gpu_scene.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\dxvk\rtx_render\rtx_scene_cull.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\dxvk\rtx_render\rtx_resident_scene.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -100755,6 +100761,15 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\dxvk\rtx_render\rtx_render_object.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\dxvk\rtx_render\rtx_gpu_scene.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\dxvk\rtx_render\rtx_scene_cull.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\dxvk\shaders\rtx\pass\instance_culling\scene_cull_binding_indices.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\dxvk\rtx_render\rtx_replacement_material_texture_type.h">

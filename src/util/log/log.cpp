@@ -655,6 +655,48 @@ namespace dxvk {
           // "[CamMgr.hyst",
           // "[CamMgr.latch",
           // "[CamMgr.hist",
+          //
+          // NV-DXVK [perf] ARCHITECTURE_OVERHAUL slice 0, 2026-09-12. The per-frame
+          // emitters still live in the default conf, with their line counts from
+          // the 05:21 run (~1215 frames). The investigations they served are closed
+          // -- [FindStage] exact 606/607, [ReapJoin] respawn=0, [MatChurn]
+          // matNew=0 texNew=0 -- and those three gates stay ON (throttled to one
+          // line per second at their sites). Unlike most of the list above, every
+          // site below checks Logger::tagDenied BEFORE its gather, so denying the
+          // tag removes the WORK (per-draw mutexes and maps, per-instance atomics,
+          // O(instances) censuses), not just the file write. Re-enable any one
+          // with rtx.logDenyTags = -[Tag] (prefix semantics: -[ReFile takes the
+          // whole family).
+          "[MtnDedup]",             // 45,408 -- all from rtx.findSimilarProbeVsHashes (the two trim VSes); re-silenced
+          "[HullSAT]",              //  7,188 -- dropship family, with [Ship / [Widow above
+          "[InstReap]",             //  4,797 -- re-silenced; [Respawn] (the rare case) stays on
+          "[BoneWindow]",           //  3,707 -- mutex + map per skinned draw; its fix has landed
+          "[ReFile",                //  3,674 Jit + 2,037 Move + the [ReFile] aggregate
+          "[HeldRaw]",              //  2,904 -- [HeldCensus] keeps the acceptance column
+          "[FanoutPrevMiss]",       //  2,490 -- O(map) nearest walk per history miss
+          "[FindSim]",              //  2,043 -- also gates [ClassRelinkRecord] (1,768)
+          "[ClassRelinkRecord]",
+          "[SceneCensus]",          // with [VsResidency] (1,452): the census stops unless one is re-enabled
+          "[VsResidency]",
+          "[VM.instance]",
+          "[VM.final]",
+          "[VM.created]",
+          "[VM.classVM]",
+          "[VM.candidate]",
+          "[SliceCollide]",         // O(instances) map + XXH3 per frame under residentScene.logStats
+          "[CamMgr.hist]",
+          "[RsPlace",               // [RsPlace] + [RsPlaceFrame]: XXH64 over every fanout batch's placements
+          "[MapSupply]",
+          "[KeyDiverge]",
+          "[CloudPremultProbe]",
+          "[W2vStable]",
+          "[SubViewKey",            // aggregate + .create (the .create string was built, then dropped)
+          "[BucketRescue]",
+          "[PropIdCensus]",         // with [SubViewPropId*]: per-draw census under residentScene.logStats
+          "[SubViewPropId",
+          "[RsGateFrame]",
+          "[FanoutPrev]",           // the aggregate only; the bracket keeps [FanoutPrevMiss] separate
+          "[BigDraw]",
         };
         // NV-DXVK [perf]: this used to strlen + memcmp all ~90 tags for EVERY
         // info/warn message, filtered or not — ~90 calls into the CRT per log

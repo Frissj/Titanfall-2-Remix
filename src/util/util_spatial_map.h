@@ -465,7 +465,13 @@ namespace dxvk {
         //   d large
         //       Genuine motion. The re-file is correct, the churn is explained,
         //       and this is not where the instability lives.
-        {
+        //
+        // NV-DXVK [perf] slice 0 (2026-09-12): a slot probe plus process-global
+        // atomics per re-file, contended across the fanout workers. Runs only
+        // when [ReFile] is not denied; the "[ReFile" family is in log.cpp's
+        // default deny list. Re-enable with rtx.logDenyTags = -[ReFile.
+        static const bool kReFileDenied = Logger::tagDenied("[ReFile]");
+        if (!kReFileDenied) {
           struct ReFileAgg {
             std::atomic<uint32_t> frame { 0u };
             std::atomic<uint32_t> n     { 0 };

@@ -37,6 +37,7 @@
 #include "../dxvk_staging.h"
 #include "../dxvk_bind_mask.h"
 #include "../util/util_hashtable.h"
+#include "../../util/util_job_graph.h"
 
 #include "rtx_globals.h"
 #include "rtx_retained_buffer_table.h"
@@ -508,6 +509,11 @@ public:
   void processDeferredDrawBatch(std::vector<ShardedDrawBatchItem>& batch, const ShardScheduleFn& schedule, uint32_t maxTasks);
 
 private:
+  // NV-DXVK [JobGraph] slice 6: the graph processDeferredDrawBatch's bundles run
+  // on. Long-lived so a worker returning through it after the join never
+  // outlives it; rebuilt (reset + setDispatch) on every call.
+  std::unique_ptr<JobGraph> m_shardGraph;
+
   // Handles conversion of geometry data coming from a draw call, to the data used by the raytracing backend
   template<bool isNew>
   ObjectCacheState processGeometryInfo(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, BlasEntry* pBlas);
@@ -696,6 +702,21 @@ private:
   Rc<DxvkBuffer> m_surfaceMaterialBuffer;
   Rc<DxvkBuffer> m_surfaceMaterialExtensionBuffer;
   Rc<DxvkBuffer> m_volumeMaterialBuffer;
+  // NV-DXVK [GpuScene] slice 8: delta mirrors for the three material tables.
+  // The surface-material table is indexed by the persistent surface slots, so
+  // it inherits their stability; the extension and volume tables are indexed
+  // by material-cache slot. All three used to be rebuilt into a fresh heap
+  // vector and uploaded whole every frame -- the "unchanged scene" skip that
+  // guarded them never fires in this fork (wasSceneUnchangedThisFrame is
+  // hard-false, see mergeInstancesIntoBlas).
+  DeltaUploadTable m_surfaceMaterialDelta { uint32_t(kSurfaceMaterialGPUSize), "material" };
+  DeltaUploadTable m_surfaceMaterialExtensionDelta { uint32_t(kSurfaceMaterialGPUSize), "materialExt" };
+  DeltaUploadTable m_volumeMaterialDelta { uint32_t(kVolumeMaterialGPUSize), "volume" };
+  bool m_surfaceMaterialBufferReplaced = false;
+  bool m_surfaceMaterialExtensionBufferReplaced = false;
+  bool m_volumeMaterialBufferReplaced = false;
+  uint32_t m_gpuSceneLastLogFrame = 0u;
+  void logGpuSceneStats();
 
   uint32_t m_activePOMCount = 0;
   

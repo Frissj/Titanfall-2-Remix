@@ -1562,6 +1562,17 @@ struct DrawCallState {
   //
   // 0 for the same reason residentKey is 0: no usable identity.
   uint64_t residentIdentity = 0ull;
+  // NV-DXVK [RenderObject] slice 2: THE ENGINE HANDLE -- the IClientRenderable*
+  // the join latch named for this draw (joinprobe::currentRenderable), as an
+  // opaque token and never dereferenced. The object resolver's authoritative
+  // identity: every primitive a renderable draws resolves to one RenderObject.
+  // Carried on the draw for the same reason residentKey is -- the latch is a
+  // frame-thread thread_local and the resolver runs on the CS side. 0 = no
+  // renderable (world batches never have one; they partition the frame with
+  // renderables). The CS side trusts it only if the engine's renderable
+  // registry listed it (RenderableEnum), so a stale latch cannot name an
+  // object that no longer exists.
+  uint64_t residentEngineHandle = 0ull;
   uint64_t residentGenHash = 0ull;
   // The engine buffers this draw was made of, as raw addresses. The record keeps
   // them so that ~D3D11Buffer freeing one can retire it -- a resident instance

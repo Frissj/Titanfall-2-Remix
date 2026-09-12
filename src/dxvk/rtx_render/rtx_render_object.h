@@ -328,9 +328,32 @@ namespace dxvk {
       // ResidentScene::Stats::wiped: an eviction that happens and then reads 0
       // by the time the line comes out is how a policy hides.
       uint32_t evicted = 0;
+
+      // NV-DXVK slice 2: THE ENGINE HANDLE, and the reading that says whether
+      // it can be trusted.
+      //
+      //   withHandle     resolves that carried a registry-listed handle
+      //   unlisted       a latched handle the registry did not list -- dropped,
+      //                  the draw resolved as if it had none
+      //   joined         a NEW primitive that found its renderable's object
+      //   merged         an existing primitive moved under its renderable's
+      //                  object (the pre-slice-2 1:1 objects folding together)
+      //   rebound        THE FALSIFIER. An object that had handle A was named
+      //                  by handle B. One renderable is one object for its whole
+      //                  life, so on a held scene this must read ~0; if it does
+      //                  not, the latch is naming the wrong renderable and the
+      //                  grouping it produces is false.
+      uint32_t withHandle = 0;
+      uint32_t handleUnlisted = 0;
+      uint32_t handleJoined = 0;
+      uint32_t handleMerged = 0;
+      uint32_t handleRebound = 0;
     };
 
     const Stats& stats() const { return m_stats; }
+    // Slice 2: a latched handle the engine's registry did not list, dropped by
+    // the caller before resolve(). Counted here so it reads beside withHandle.
+    void noteHandleUnlisted() { ++m_stats.handleUnlisted; }
     void resetStats() {
       const uint32_t keepEvicted = m_stats.evicted;
       m_stats = Stats();
@@ -345,6 +368,14 @@ namespace dxvk {
     RenderPrimitiveId allocPrimitive();
     void freeObject(RenderObjectId id);
     void freePrimitive(RenderPrimitiveId id);
+    // Slice 2: re-parent one primitive under `to`. The primitive, not the
+    // object, is the unit: an object that already carries a handle may hold
+    // primitives of that renderable, and a disagreeing latch must move only
+    // the draw it named. An owner left empty is freed WITHOUT being recorded as
+    // retired -- its identity did not go away, it moved -- so its iaIdentity
+    // entry is re-pointed at `to` instead of being filed in m_retiredIa, where
+    // it would make the identity's next copy count as reminted churn.
+    void movePrimitiveTo(RenderPrimitiveId pid, RenderObjectId to);
 
     // The identity a primitive is looked up by while engineHandle is absent.
     // Folding the occurrence into the map key rather than searching a per
@@ -376,15 +407,15 @@ namespace dxvk {
 
     std::unordered_map<uint64_t, RenderPrimitiveId> m_primitivesByKey;
 
-    // THE MERGE ANCHOR, and the reason resolve() will not need rewriting when
-    // slice 2 lands. sec 2's resolver is `handle ?: iaIdentity+occurrence`, and
-    // that is written out in full below even though nothing supplies a handle
-    // yet: when one arrives, several primitives find the SAME object here and
-    // the 1:1 relation becomes the many-to-one sec 1.3 specifies, with no
-    // change to the resolver's shape and no migration of the stored records.
+    // THE MERGE ANCHOR, and the reason resolve() did not need rewriting when
+    // slice 2 landed. sec 2's resolver is `handle ?: iaIdentity+occurrence`:
+    // several primitives find the SAME object here and the 1:1 relation becomes
+    // the many-to-one sec 1.3 specifies, with no change to the resolver's shape.
+    // The records minted 1:1 before a handle reached them are folded in on
+    // their next resolve (mergeObjectInto) rather than migrated in bulk.
     //
-    // Empty today. That is the honest state, not an oversight -- see the class
-    // comment on why no grouping signal exists before sec 7 slice B.
+    // Fed since slice 2 from the join latch's renderable, and only with handles
+    // the engine's renderable registry listed (SceneManager, at the resolve).
     std::unordered_map<uint64_t, RenderObjectId>    m_objectsByHandle;
 
     // Every iaIdentity ever resolved, to the object of its first-seen

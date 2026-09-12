@@ -2369,23 +2369,22 @@ namespace dxvk {
     // and GI. d3d11_rtx.cpp's [CullOff] patches turn them off; this replaces them
     // with a scope limit we control.
     //
-    // WHERE THIS RUNS AND WHAT IT COSTS: the test lives in
-    // AccelManager::mergeInstancesIntoBlas, immediately before the existing
-    // `mask == 0` early-out, and culls by zeroing the instance mask. That point
-    // is deliberate:
-    //   - the BlasEntry has already been touched this frame by SceneManager, so
-    //     the BLAS and its geometry buffers stay resident (scene GC keeps them
-    //     for numFramesToKeepBLAS frames after the last touch) and a culled
-    //     object costs nothing to bring back;
-    //   - the instance never enters a BLAS bucket, so no BLAS build/refit runs
-    //     for it, it gets no TLAS entry and no surface, and no ray can hit it;
+    // WHERE THIS RUNS AND WHAT IT COSTS (ARCHITECTURE_OVERHAUL.md slice 9,
+    // rtx_scene_cull.h): on the GPU, per TLAS ENTRY. After the instance table is
+    // uploaded, scene_cull.comp copies every CPU-owned entry into the TLAS input
+    // with mask = 0 where the verdict culls, and the PointInstancer culling
+    // shader applies the same verdict to every PI instance. The CPU loop that
+    // used to zero instance masks inside mergeInstancesIntoBlas is deleted.
+    //   - a culled entry keeps its BLAS, its bucket, its surface slot and its
+    //     TLAS entry (mask 0): nothing is rebuilt when it returns, and the BLAS
+    //     set no longer changes with the camera. What it saves is traversal;
+    //     BLAS build work is no longer view-dependent at all;
+    //   - a merged bucket is one entry, judged by the union of its members'
+    //     world boxes and kept whole if any part is kept (over-keeps, the safe
+    //     direction);
     //   - it does NOT save the CPU cost of the draw call itself (SubmitDraw,
     //     geometry extraction, hashing, instance update) — that work happens
     //     upstream. Cull here to save GPU/BVH work, not draw-submission CPU.
-    // Zeroing the mask (rather than skipping the instance) is also required for
-    // correctness: instances merged into a shared BLAS have their geometry baked
-    // into it and the bucket mask is the OR of its members, so the mask must be
-    // cleared before bucketing. Same reasoning as perfCullInstancesLargerThan.
     //
     // CAVEAT worth knowing before turning frustum culling on: anything culled
     // stops casting shadows into the view and stops appearing in reflections and
@@ -2405,9 +2404,9 @@ namespace dxvk {
                  "Master switch for Remix-side culling of ray-traced instances, structured as a\n"
                  "union of keeps: an instance is kept if the frustum keep, the radius keep, or the\n"
                  "light-influence keep covers it, and culled only when every enabled keep misses.\n"
-                 "Culls by zeroing the instance mask in mergeInstancesIntoBlas, which keeps the BLAS\n"
-                 "and geometry resident (no rebuild when the object returns) but removes the instance\n"
-                 "from the TLAS. Intended to replace the engine culling disabled by rtx.cullOff.*.\n"
+                 "Runs on the GPU per TLAS entry (and per PointInstancer instance): a culled entry gets\n"
+                 "mask 0 in the TLAS input and keeps its BLAS, bucket and surface, so nothing is rebuilt\n"
+                 "when it returns. Intended to replace the engine culling disabled by rtx.cullOff.*.\n"
                  "If no keep term is enabled the cull is inert (nothing is removed), never cull-all.");
       RTX_OPTION("rtx.sceneCull", float, radius, 0.0f,
                  "KEEP term: instances whose world-space bounding box comes within this many world\n"
@@ -2473,9 +2472,19 @@ namespace dxvk {
                  "world units of a positioned (non-distant) light, however small it looks — near a\n"
                  "light, a small occluder throws a large shadow.");
       RTX_OPTION("rtx.sceneCull", bool, logStats, false,
-                 "Log one [SceneCull] line per second: instances tested, which keep term covered\n"
+                 "Log one [SceneCull] line per second: TLAS entries tested, which keep term covered\n"
                  "them first (keptFrustum/keptRadius/keptLight/keptSkinned), how many the keep\n"
-                 "union culled (culled), and how many the solid-angle reject removed (culledSmall).");
+                 "union culled (culled), and how many the solid-angle reject removed (culledSmall);\n"
+                 "pi{} the same for PointInstancer instances; rec{} the cull-record upload (up ~0 on\n"
+                 "a held scene); verify{} the gate below.");
+      RTX_OPTION("rtx.sceneCull", bool, verify, true,
+                 "THE ACCEPTANCE GATE FOR SLICE 9. Every rtx.gpuScene.verifyInterval frames the GPU's\n"
+                 "per-entry and per-PointInstancer verdicts and the TLAS input are read back (no stall)\n"
+                 "and compared against the CPU reference verdict on the same inputs. A mismatch next to\n"
+                 "a threshold, where float contraction legitimately decides, counts as edge; any other\n"
+                 "mismatch is FAIL, and a TLAS input entry that is not the instance-table entry with the\n"
+                 "verdict's mask is copyFail. FAIL and copyFail print [SceneCull] VERIFY-FAIL\n"
+                 "unthrottled and must read 0. Only runs while rtx.sceneCull.enable is on.");
     };
 
     // ==================================================================
@@ -3176,6 +3185,53 @@ namespace dxvk {
                  "that culling is leaking into the list, which is the failure that kept rung 5\n"
                  "unsolved -- and it is evidence FOR that reading, not against it.\n"
                  "breaks= counts how many times the run of flat frames was interrupted.");
+    };
+
+    // ==================================================================
+    // NV-DXVK [GpuScene] -- ARCHITECTURE_OVERHAUL.md slice 8 (sec 5.1).
+    //
+    // Persistent surface slots plus element-granular delta upload of the
+    // surface, surface-material and merged-BLAS transform tables. No enable:
+    // the per-frame rebuild it replaces is deleted, not kept behind a flag
+    // (sec 6.2). verify defaults ON and is the acceptance gate (I8).
+    // ==================================================================
+    struct GpuScene {
+      friend class ImGUI;
+      friend class RtxOptions;
+
+      RTX_OPTION("rtx.gpuScene", bool, verify, true,
+                 "THE ACCEPTANCE GATE FOR SLICE 8. Every frame: every TLAS surface index and every\n"
+                 "PointInstancer range must land on a slot this frame's walk owns, and no slot may be\n"
+                 "claimed twice. Every rtx.gpuScene.verifyInterval frames: the surface and surface-material\n"
+                 "device buffers are copied back and compared byte-for-byte against the delta mirrors,\n"
+                 "for every element the mirror vouches for. Any mismatch prints [GpuScene] VERIFY-FAIL\n"
+                 "unthrottled. Turn off only after structFail=0 and rbFail=0 across a pitch-and-yaw sweep\n"
+                 "and a level transition.");
+
+      RTX_OPTION("rtx.gpuScene", uint32_t, verifyInterval, 64,
+                 "Frames between readback verifies. Each copies the surface table (~0.5 MB) and the\n"
+                 "surface-material table to host memory; the compare runs when the GPU is done with the\n"
+                 "copy, so it never stalls.");
+
+      RTX_OPTION("rtx.gpuScene", uint32_t, compactSlack, 4096,
+                 "Free slots tolerated below the high-water mark before the slot table compacts. It\n"
+                 "compacts only when holes exceed BOTH this and the live slot count, i.e. when the table\n"
+                 "is more than half empty, so a settled scene never pays for a relocation.");
+
+      RTX_OPTION("rtx.gpuScene", bool, logStats, false,
+                 "One [GpuScene] line per second. THE GATE READ OFF IT: on a held scene surf{up=} must\n"
+                 "be a small fraction of surf{full=} (only animated surfaces change) and runs{new= moved=}\n"
+                 "must read ~0. A held scene reading up~full means the output test is seeing a change\n"
+                 "every frame that is not really there -- find which field, do not raise a threshold.");
+
+      RTX_OPTION("rtx.gpuScene", uint32_t, tlasRefitMaxFrames, 8,
+                 "G5 (sec 5.2): TLAS builds may refit (UPDATE) instead of rebuilding when the instance\n"
+                 "topology is unchanged -- same per-type count and region split, and no entry changed its\n"
+                 "instance flags or active status. A full rebuild is forced after this many consecutive\n"
+                 "refits, which bounds how far node overlap can grow as instances move. 0 disables refit.\n"
+                 "THE GATE: [GpuScene] tlas{refit= build=} shows the mechanism; [Perf.GpuPass]\n"
+                 "gb_primaryRays must not rise against a refit-off run of the same scene -- if it does,\n"
+                 "lower this or set 0.");
     };
 
     // Resolve Options
@@ -4796,14 +4852,10 @@ namespace dxvk {
     // sort per frame. Every count-based instrument reports this scene as
     // perfectly stable while meshes are visibly missing, so a count is known to
     // be the wrong shape for this artifact.
-    RTX_OPTION("rtx", bool, logSurfaceDelta, false,
-               "One [SurfaceDelta] line per second. SLICE 8'S PRECONDITION (\u00a79 item 5): how many of the\n"
-               "surface bytes uploaded every frame actually differ from last frame, and how many instances\n"
-               "had their surface slot move while surviving.\n"
-               "changed~0 on a stationary scene = delta upload is worth building. changed high = it is not,\n"
-               "whatever the O(scene) argument says. slotChurn high = stable slots must land first, because\n"
-               "a delta against an array that renumbers itself every frame is not expressible.\n"
-               "Costs one memcmp and one copy of the surface array per frame while enabled.");
+    // NV-DXVK: rtx.logSurfaceDelta DELETED 2026-09-12 with slice 8. It measured
+    // the delta-upload opportunity without changing what was uploaded; its reading
+    // (changed=26/1897 = 1%, slotChurn=1 on a held scene) is what cleared slice 8,
+    // and [GpuScene] now reports the same quantities off the live mechanism.
     RTX_OPTION("rtx", bool, logTlasSet, false,
                "DIAGNOSTIC, O(instances) PER FRAME: logs [TlasSet], one line per "
                "frame per TLAS giving the order-independent signature of the "
@@ -4837,7 +4889,8 @@ namespace dxvk {
     // comes back without the measurement.
     RTX_OPTION("rtx", bool, logMaterialChurn, true,
                "DIAGNOSTIC, ~free: logs [MatChurn], one aggregate line per "
-               "gameplay frame giving the rate at which NEW material and texture "
+               "second (exact sums over the window's gameplay frames; worst{} "
+               "names the single frame with the most) giving the rate at which NEW material and texture "
                "identities are created (matNew / texNew / imgNew), how the "
                "bindless texture table changed (blChg / blDrop / blRecov), and "
                "replacement-asset streaming transitions (mt*). Join f= against "

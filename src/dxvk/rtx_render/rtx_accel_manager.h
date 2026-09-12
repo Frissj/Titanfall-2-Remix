@@ -31,6 +31,8 @@
 #include "rtx_gpu_crash_recorder.h"
 #include "rtx_staging.h"
 #include "rtx_point_instancer_system.h"
+#include "rtx_gpu_scene.h"
+#include "rtx_scene_cull.h"
 #include "../util/util_vector.h"
 #include "../util/util_matrix.h"
 #include "../util/util_struct_hash.h"
@@ -163,8 +165,59 @@ public:
   // Returns the number of live BLAS objects
   static uint32_t getBlasCount();
 
+  // NV-DXVK [GpuScene] slice 8: m_reorderedSurfaces is now the SLOT table --
+  // index = persistent surface slot, value = owning instance, nullptr = a hole
+  // no run owns. getSurfaceCount() is the high-water mark, so every per-slot
+  // buffer and every shader bound is sized exactly as before. Callers that
+  // dereference entries must skip nullptr.
   uint32_t getSurfaceCount() const { return m_reorderedSurfaces.size(); }
   const std::vector<RtInstance*>& getOrderedInstances() const { return m_reorderedSurfaces; }
+
+  // [GpuScene] read side, for SceneManager's surface-material table (which is
+  // indexed by the same slots) and the one [GpuScene] stats line.
+  const SurfaceSlotTable& getSurfaceSlots() const { return m_surfaceSlots; }
+  const DeltaUploadTable& getSurfaceDelta() const { return m_surfaceDelta; }
+  const DeltaUploadTable& getTransformDelta() const { return m_transformDelta; }
+  bool wereSurfaceSlotsCompacted() const { return m_surfaceSlotsCompacted; }
+  struct GpuSceneVerify {
+    uint32_t frames = 0;        // frames the structural verify ran
+    uint32_t tlasRefs = 0;      // TLAS surface indices checked
+    uint32_t piRanges = 0;      // PointInstancer ranges checked
+    uint32_t structFail = 0;    // CUMULATIVE. Must stay 0.
+    uint32_t doubleClaim = 0;   // CUMULATIVE. A slot handed to two owners in one walk.
+  };
+  const GpuSceneVerify& getGpuSceneVerify() const { return m_gsVerify; }
+  // Merged-bucket BLAS selection, summed since the last resetGpuSceneStats().
+  struct MergedBlasStats {
+    uint32_t frames = 0;
+    uint32_t buckets = 0;   // bucket-frames
+    uint32_t sizeHit = 0;   // size query served from the per-bucket cache
+    uint32_t pinHit = 0;    // bucket built into one of its own pinned BLASes
+    uint32_t created = 0;   // new BLAS allocated for a bucket (first sight, growth)
+    uint32_t skip = 0;      // content unchanged: no GPU build
+    uint32_t update = 0;
+    uint32_t build = 0;
+  };
+  const MergedBlasStats& getMergedBlasStats() const { return m_mergedBlasStats; }
+  const DeltaUploadTable& getInstanceDelta() const { return m_instanceDelta; }
+  // G5 TLAS refit, per build summed over types, since the last reset.
+  struct TlasRefitStats {
+    uint32_t refit = 0;          // builds done as UPDATE
+    uint32_t build = 0;          // full builds
+    uint32_t whyCadence = 0;     // full build forced by rtx.gpuScene.tlasRefitMaxFrames
+    uint32_t whyTopology = 0;    // region split, count, flags or active status changed
+    uint32_t whyRealloc = 0;     // destination AS was (re)created this build
+  };
+  const TlasRefitStats& getTlasRefitStats() const { return m_tlasRefitStats; }
+  void resetGpuSceneStats();
+
+  // NV-DXVK [SceneCull] slice 9: the buffer the TLAS is built from this frame.
+  // With the GPU scene cull running it is the cull pass's output (the instance
+  // table with the verdict's masks, PointInstancer entries written into it by
+  // the PI pass); otherwise the instance table itself.
+  const Rc<DxvkBuffer>& tlasInstanceBuffer() const {
+    return m_sceneCull.used() ? m_sceneCull.culledBuffer() : m_vkInstanceBuffer;
+  }
 
   // Returns true if the last mergeInstancesIntoBlas call took the fast-skip
   // path (scene generation unchanged).  When true, m_reorderedSurfaces and
@@ -238,14 +291,96 @@ private:
 
   // Persistent containers to reduce frame to frame reallocations in ::uploadSurfaceData()
   struct {
-    std::vector<unsigned char> surfacesGPUData;
-    // NV-DXVK [SurfaceDelta] §9 item 5: last frame's copy, for the changed-byte
-    // count. Only allocated while rtx.logSurfaceDelta is on.
-    std::vector<unsigned char> prevSurfacesGPUData;
-    uint32_t surfaceDeltaLastLogFrame = 0u;
     std::vector<uint32_t> surfaceIndexMapping;
+    // NV-DXVK [GpuScene]: what the mapping buffer currently holds, so an
+    // identical mapping (the settled-scene case, now that slots persist) is not
+    // re-sent.
+    std::vector<uint32_t> uploadedSurfaceIndexMapping;
     uint32_t previousFrameSurfaceCount = 0; // Tracks last frame's surface count for mapping coverage
   } uploadSurfaceDataFuncState;
+
+  // ------------------------------------------------------------------------
+  // NV-DXVK [GpuScene] -- ARCHITECTURE_OVERHAUL.md slice 8. See rtx_gpu_scene.h.
+  // ------------------------------------------------------------------------
+  SurfaceSlotTable m_surfaceSlots;
+  bool m_surfaceSlotsCompacted = false;
+  DeltaUploadTable m_surfaceDelta { uint32_t(kSurfaceGPUSize), "surface" };
+  DeltaUploadTable m_transformDelta { uint32_t(sizeof(VkTransformMatrixKHR)), "transform" };
+  // NV-DXVK [GpuScene] G5: the CPU half of m_vkInstanceBuffer, and what a TLAS
+  // refit needs to know about it. m_tlasInstSig[t][i] = (instance flags << 1)
+  // | active, per CPU entry of type t, as of the last upload.
+  DeltaUploadTable m_instanceDelta { uint32_t(sizeof(VkAccelerationStructureInstanceKHR)), "instance" };
+  bool m_instanceBufferReplaced = false;
+  std::vector<uint32_t> m_tlasInstSig[Tlas::Count];
+  uint32_t m_tlasPiSlotsLast[Tlas::Count] = {};
+  uint64_t m_tlasPiSigLast[Tlas::Count] = {};
+  VkBuildAccelerationStructureFlagsKHR m_tlasLastFlags[Tlas::Count] = {};
+  bool m_tlasTopologySame[Tlas::Count] = {};
+  uint32_t m_tlasRefitRun[Tlas::Count] = {};   // consecutive refits since the last full build
+  TlasRefitStats m_tlasRefitStats;
+  // Set when the device buffer behind a delta table was (re)created this frame.
+  bool m_surfaceBufferReplaced = false;
+  bool m_transformBufferReplaced = false;
+  // Per-slot claim stamp for the double-claim check (verify only).
+  std::vector<uint32_t> m_slotClaimEpoch;
+  uint32_t m_slotClaimWalk = 0;
+  GpuSceneVerify m_gsVerify;
+  // Acquire a run and publish its owner + firstIndex offsets into the slot
+  // table. Returns the base slot or SurfaceSlotTable::kNoSlot.
+  uint32_t acquireSurfaceRun(uint64_t key, uint32_t count, RtInstance* uniformOwner,
+                             RtInstance* const* perSlotOwners,
+                             const uint32_t* firstIndexOffsets = nullptr);
+  void verifyGpuSceneStructure();
+  // The bucket's compatibility key -- the same key its surface run is filed
+  // under, so a bucket's slots and its BLAS pair share one identity.
+  static uint64_t bucketCompatKey(const BlasBucket& bucket);
+
+  // NV-DXVK [GpuScene] merged-bucket BLAS pinning. There is exactly one bucket
+  // per compatibility key (tryAddInstance has no size cap), so the key is a
+  // stable identity for the bucket's BLAS as it already is for its slots.
+  // Before this, every bucket every frame re-ran the driver size query and
+  // best-fit scanned the whole m_blasPool, which could hand a bucket another
+  // bucket's BLAS -- whose topology/content hashes are not this bucket's, so
+  // the UPDATE and build-skip paths were defeated by a pool shuffle.
+  //
+  // A PAIR, because with rtx.enablePreviousTLAS the BLAS built last frame is
+  // still referenced by the previous TLAS and may not be written this frame;
+  // the bucket alternates between two. The pins are SECOND references: every
+  // pinned BLAS is also in m_blasPool, so GC, the resource tracking in
+  // buildTlas and the crash recorder see it exactly as before, and a pin is
+  // dropped on the same evidence the pool evicts on.
+  struct MergedBucketBlas {
+    Rc<PooledBlas> pinned[2];
+    uint64_t sizeKey = 0;  // 0 = no cached size
+    VkAccelerationStructureBuildSizesInfoKHR sizeInfo {};
+    uint32_t lastFrame = kInvalidFrameIndex;  // frame this entry was last claimed
+  };
+  std::unordered_map<uint64_t, MergedBucketBlas> m_mergedBucketBlas;
+  MergedBlasStats m_mergedBlasStats;
+
+  // NV-DXVK [SceneCull] slice 9 -- see rtx_scene_cull.h. m_mergedSources[t][i]
+  // is what produced m_mergedInstances[t][i], so the entry's cull record can be
+  // derived: a dynamic-BLAS instance (the entry carries the instance's
+  // transform; the record is its BLAS's object box), a merged bucket (identity
+  // transform; the record is the union of its members' world boxes), or
+  // neither (a billboard: never tested). Pushed beside every m_mergedInstances
+  // push, cleared and truncated with it. Valid for the frame it was pushed in:
+  // the bucket lives in m_persistBuckets until the next merge.
+  struct MergedEntrySource {
+    RtInstance* instance = nullptr;
+    const BlasEntry* blas = nullptr;
+    const BlasBucket* bucket = nullptr;
+  };
+  std::vector<MergedEntrySource> m_mergedSources[Tlas::Count];
+  SceneCullPass m_sceneCull;
+  void packSceneCullRecord(const MergedEntrySource& src, SceneCullRecord& record);
+
+  // The primitive-ID prefix sum is double-buffered by SWAPPING the two device
+  // buffers rather than re-uploading last frame's array into the second one:
+  // after the swap the "last frame" buffer already holds last frame's data.
+  // m_prefixSumHeld[i] is what buffer i holds, so a repeat is not re-sent.
+  std::vector<uint32_t> m_prefixSumHeldCurrent;
+  std::vector<uint32_t> m_prefixSumHeldLast;
 
   void buildBlases(Rc<DxvkContext> ctx, DxvkBarrierSet& execBarriers,
                    const CameraManager& cameraManager, OpacityMicromapManager* opacityMicromapManager, const InstanceManager& instanceManager,
@@ -273,11 +408,6 @@ private:
 
   std::vector<RtInstance*> m_reorderedSurfaces;
   std::vector<uint32_t> m_reorderedSurfacesFirstIndexOffset;
-  // NV-DXVK [perf] 2026-08-08 (handoff d §3, merge loop): scratch for the
-  // stable-partition ordering in mergeInstancesIntoBlas — members so their
-  // ~15.5k-pointer capacity survives across frames instead of reallocating.
-  std::vector<RtInstance*> m_mergeSortScratch;
-  std::vector<RtInstance*> m_mergeUntaggedScratch;
   // NV-DXVK [Perf.MergeP] 2026-08-08f: persistent-bucket cache. The buckets
   // themselves persist in m_persistBuckets (aliased as `blasBuckets` inside
   // mergeInstancesIntoBlas); m_persistMembers is the ordered merged-instance

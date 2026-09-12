@@ -154,6 +154,7 @@ namespace dxvk {
   void AccelManager::clear() {
     m_gpuCrashRecorder.clear();
     m_blasPool.clear();
+    m_mergedBucketBlas.clear();
     // NV-DXVK [Perf.MergeP]: the persistent buckets hold RtInstance*/device
     // addresses from the torn-down scene -- never let a post-clear frame
     // sequence-match against them.
@@ -168,6 +169,228 @@ namespace dxvk {
     resetUniqueDynamicBlasGroups();
     m_lastProcessedGeneration = UINT64_MAX;
     m_ommBindPending = false;
+
+    // NV-DXVK [GpuScene]: the runs name instances of the torn-down scene. The
+    // device buffers survive, but nothing may be assumed about what they hold
+    // relative to the next scene, so the mirrors stop vouching.
+    m_surfaceSlots.clear();
+    m_reorderedSurfaces.clear();
+    m_reorderedSurfacesFirstIndexOffset.clear();
+    m_surfaceDelta.invalidateAll();
+    m_transformDelta.invalidateAll();
+    m_instanceDelta.invalidateAll();
+    for (int t = 0; t < Tlas::Count; ++t) {
+      m_tlasInstSig[t].clear();
+      m_tlasPiSlotsLast[t] = 0u;
+      m_tlasPiSigLast[t] = 0ull;
+      m_tlasLastFlags[t] = 0u;
+      m_tlasTopologySame[t] = false;
+      m_tlasRefitRun[t] = 0u;
+      // [SceneCull]: the sources name buckets m_persistBuckets just freed.
+      m_mergedSources[t].clear();
+    }
+    m_sceneCull.invalidate();
+    m_prefixSumHeldCurrent.clear();
+    m_prefixSumHeldLast.clear();
+    uploadSurfaceDataFuncState.uploadedSurfaceIndexMapping.clear();
+  }
+
+  // NV-DXVK [GpuScene] slice 8: acquire a persistent run and publish it into
+  // the slot table (owner + firstIndex offset per slot). Every surface enters
+  // the table through here; there is no other writer of m_reorderedSurfaces.
+  uint32_t AccelManager::acquireSurfaceRun(uint64_t key, uint32_t count, RtInstance* uniformOwner,
+                                           RtInstance* const* perSlotOwners,
+                                           const uint32_t* firstIndexOffsets) {
+    const uint32_t base = m_surfaceSlots.acquire(key, count, SURFACE_INDEX_MAX_VALUE);
+    if (base == SurfaceSlotTable::kNoSlot) {
+      return base;
+    }
+
+    const uint32_t hw = m_surfaceSlots.highWater();
+    if (m_reorderedSurfaces.size() < hw) {
+      m_reorderedSurfaces.resize(hw, nullptr);
+      m_reorderedSurfacesFirstIndexOffset.resize(hw, 0u);
+    }
+
+    const bool verify = RtxOptions::GpuScene::verify();
+    if (verify && m_slotClaimEpoch.size() < hw) {
+      m_slotClaimEpoch.resize(hw, 0u);
+    }
+
+    for (uint32_t i = 0; i < count; ++i) {
+      const uint32_t slot = base + i;
+      if (verify) {
+        // THE DOUBLE-CLAIM TRIPWIRE. The allocator never hands a live slot to a
+        // second run within a walk; if it ever did, two surfaces would share one
+        // slot and one of them would render with the other's data.
+        if (m_slotClaimEpoch[slot] == m_slotClaimWalk) {
+          ++m_gsVerify.doubleClaim;
+          ++m_gsVerify.structFail;
+        }
+        m_slotClaimEpoch[slot] = m_slotClaimWalk;
+      }
+      m_reorderedSurfaces[slot] = (perSlotOwners != nullptr) ? perSlotOwners[i] : uniformOwner;
+      m_reorderedSurfacesFirstIndexOffset[slot] = (firstIndexOffsets != nullptr) ? firstIndexOffsets[i] : 0u;
+    }
+    return base;
+  }
+
+  // NV-DXVK [GpuScene] slice 8, structural half of the gate. Every surface
+  // index the TLAS will carry, and every PointInstancer range, must land on
+  // slots this walk published. Runs after buildBlases (so bucket TLAS entries
+  // exist) and before billboards are appended (their customIndex is a
+  // billboard index, not a surface slot).
+  void AccelManager::verifyGpuSceneStructure() {
+    ++m_gsVerify.frames;
+    const uint32_t slotCount = static_cast<uint32_t>(m_reorderedSurfaces.size());
+    uint32_t bad = 0u, firstBadType = 0u, firstBadSlot = ~0u;
+
+    for (int t = 0; t < Tlas::Count; ++t) {
+      for (const VkAccelerationStructureInstanceKHR& inst : m_mergedInstances[t]) {
+        ++m_gsVerify.tlasRefs;
+        const uint32_t slot = inst.instanceCustomIndex & uint32_t(CUSTOM_INDEX_SURFACE_MASK);
+        if (slot >= slotCount || m_reorderedSurfaces[slot] == nullptr) {
+          if (bad == 0u) {
+            firstBadType = uint32_t(t);
+            firstBadSlot = slot;
+          }
+          ++bad;
+        }
+      }
+    }
+    for (const PointInstancerBatch& b : m_pointInstancerBatches) {
+      ++m_gsVerify.piRanges;
+      const uint64_t end = uint64_t(b.baseSurfaceIndex) + b.instanceCount;
+      bool ok = end <= slotCount;
+      if (ok) {
+        const RtInstance* owner = m_reorderedSurfaces[b.baseSurfaceIndex];
+        for (uint32_t i = 0; ok && i < b.instanceCount; ++i) {
+          ok = (owner != nullptr) && (m_reorderedSurfaces[b.baseSurfaceIndex + i] == owner);
+        }
+      }
+      if (!ok) {
+        if (bad == 0u) {
+          firstBadType = 100u + uint32_t(b.tlasType);
+          firstBadSlot = b.baseSurfaceIndex;
+        }
+        ++bad;
+      }
+    }
+
+    if (bad != 0u) {
+      m_gsVerify.structFail += bad;
+      // Unthrottled: a TLAS entry pointing at a slot nobody owns is a surface
+      // rendered with a hole's (or another object's) data.
+      Logger::warn(str::format(
+        "[GpuScene] STRUCT-FAIL f=", m_device->getCurrentFrameId(),
+        " bad=", bad,
+        " first{type=", firstBadType, " slot=", firstBadSlot, "}",
+        " slots=", slotCount,
+        "  <- a TLAS surface index or PointInstancer range lands on a slot this walk did not publish"
+        " (type>=100 = PointInstancer batch)"));
+    }
+  }
+
+  void AccelManager::resetGpuSceneStats() {
+    m_surfaceSlots.resetStats();
+    m_surfaceDelta.resetStats();
+    m_transformDelta.resetStats();
+    m_gsVerify.frames = 0u;
+    m_gsVerify.tlasRefs = 0u;
+    m_gsVerify.piRanges = 0u;
+    m_mergedBlasStats = MergedBlasStats();
+    m_instanceDelta.resetStats();
+    m_tlasRefitStats = TlasRefitStats();
+  }
+
+  // NV-DXVK [SceneCull] slice 9: the cull record of one CPU-owned TLAS entry.
+  // A dynamic-BLAS entry records its BLAS's object box -- the shader applies the
+  // entry's own transform, as the deleted CPU loop applied getTransform() -- so
+  // a static entry's record never changes and never re-uploads. A merged
+  // bucket's entry has an identity transform (its geometry is baked
+  // world-space), so it records the union of its members' world boxes, each
+  // served from the member's cullAabbCache (keyed on the raw transform bits and
+  // the object box, as the CPU loop keyed it). A member without a BLAS or a
+  // valid box leaves the whole bucket untested, i.e. kept: fail safe.
+  void AccelManager::packSceneCullRecord(const MergedEntrySource& src, SceneCullRecord& record) {
+    record = SceneCullRecord {};
+    if (src.instance != nullptr) {
+      const BlasEntry* blas = (src.blas != nullptr) ? src.blas : src.instance->getBlas();
+      if (blas == nullptr) {
+        return;
+      }
+      const AxisAlignedBoundingBox& box = blas->input.getGeometryData().boundingBox;
+      if (!box.isValid()) {
+        return;
+      }
+      record.boxMin = box.minPos;
+      record.boxMax = box.maxPos;
+      record.flags = SCENE_CULL_RECORD_TESTED
+                   | (SceneCullPass::isSkinned(*blas) ? SCENE_CULL_RECORD_SKINNED : 0u);
+      return;
+    }
+    if (src.bucket == nullptr || src.bucket->originalInstances.empty()) {
+      return;
+    }
+
+    Vector3 lo {  FLT_MAX,  FLT_MAX,  FLT_MAX };
+    Vector3 hi { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+    bool skinned = false;
+    for (RtInstance* member : src.bucket->originalInstances) {
+      const BlasEntry* blas = (member != nullptr) ? member->getBlas() : nullptr;
+      if (blas == nullptr) {
+        return;
+      }
+      const AxisAlignedBoundingBox& box = blas->input.getGeometryData().boundingBox;
+      if (!box.isValid()) {
+        return;
+      }
+      const auto& xf = member->getVkInstance().transform;
+      RtInstance::CullAabbCache& cache = member->cullAabbCache;
+      const bool hit = cache.valid
+        && std::memcmp(cache.xform, xf.matrix, sizeof(cache.xform)) == 0
+        && cache.boxMin.x == box.minPos.x && cache.boxMin.y == box.minPos.y && cache.boxMin.z == box.minPos.z
+        && cache.boxMax.x == box.maxPos.x && cache.boxMax.y == box.maxPos.y && cache.boxMax.z == box.maxPos.z;
+      if (!hit) {
+        const Matrix4 o2w = member->getTransform();
+        Vector3 clo {  FLT_MAX,  FLT_MAX,  FLT_MAX };
+        Vector3 chi { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+        for (uint32_t c = 0; c < 8; ++c) {
+          const Vector4 w4 = o2w * Vector4(
+            (c & 1u) ? box.maxPos.x : box.minPos.x,
+            (c & 2u) ? box.maxPos.y : box.minPos.y,
+            (c & 4u) ? box.maxPos.z : box.minPos.z,
+            1.0f);
+          clo.x = std::min(clo.x, w4.x); chi.x = std::max(chi.x, w4.x);
+          clo.y = std::min(clo.y, w4.y); chi.y = std::max(chi.y, w4.y);
+          clo.z = std::min(clo.z, w4.z); chi.z = std::max(chi.z, w4.z);
+        }
+        std::memcpy(cache.xform, xf.matrix, sizeof(cache.xform));
+        cache.boxMin = box.minPos;
+        cache.boxMax = box.maxPos;
+        cache.lo = clo;
+        cache.hi = chi;
+        cache.valid = true;
+      }
+      lo.x = std::min(lo.x, cache.lo.x); hi.x = std::max(hi.x, cache.hi.x);
+      lo.y = std::min(lo.y, cache.lo.y); hi.y = std::max(hi.y, cache.hi.y);
+      lo.z = std::min(lo.z, cache.lo.z); hi.z = std::max(hi.z, cache.hi.z);
+      skinned = skinned || SceneCullPass::isSkinned(*blas);
+    }
+    record.boxMin = lo;
+    record.boxMax = hi;
+    record.flags = SCENE_CULL_RECORD_TESTED | (skinned ? SCENE_CULL_RECORD_SKINNED : 0u);
+  }
+
+  uint64_t AccelManager::bucketCompatKey(const BlasBucket& bucket) {
+    BlasBucketKey key;
+    key.instanceShaderBindingTableRecordOffset = bucket.instanceShaderBindingTableRecordOffset;
+    key.customIndexFlags = bucket.customIndexFlags;
+    key.instanceFlags = bucket.instanceFlags;
+    key.instanceMask = bucket.instanceMask;
+    key.usesUnorderedApproximations = bucket.usesUnorderedApproximations;
+    key.isSubsurface = bucket.hasSssInstances;
+    return static_cast<uint64_t>(BlasBucketKeyHash {}(key));
   }
 
   void AccelManager::resetUniqueDynamicBlasGroups() {
@@ -209,6 +432,23 @@ namespace dxvk {
         continue;
       }
       ++i;
+    }
+
+    // NV-DXVK [GpuScene]: a pin never outlives the pool's claim on its BLAS --
+    // same predicate, so a pinned BLAS is always also a pool BLAS.
+    for (auto it = m_mergedBucketBlas.begin(); it != m_mergedBucketBlas.end();) {
+      MergedBucketBlas& entry = it->second;
+      for (Rc<PooledBlas>& pinned : entry.pinned) {
+        if (pinned != nullptr && pinned->frameLastTouched + numFramesToKeepBLAS < currentFrame) {
+          pinned = nullptr;
+        }
+      }
+      if (entry.pinned[0] == nullptr && entry.pinned[1] == nullptr &&
+          entry.lastFrame + numFramesToKeepBLAS < currentFrame) {
+        it = m_mergedBucketBlas.erase(it);
+      } else {
+        ++it;
+      }
     }
   }
   
@@ -972,7 +1212,9 @@ namespace dxvk {
 
     // Allocate the transform buffer
     DxvkBufferCreateInfo info;
-    info.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+    // NV-DXVK [GpuScene]: TRANSFER_SRC so rtx.gpuScene.verify can read it back.
+    info.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+               | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
     info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
     info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
 
@@ -981,6 +1223,7 @@ namespace dxvk {
     if (m_transformBuffer == nullptr || info.size > m_transformBuffer->info().size) {
       // TODO: allocate with some spare space to make reallocations less frequent
       m_transformBuffer = m_device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXAccelerationStructure, "Transform Buffer");
+      m_transformBufferReplaced = true;
       Logger::debug("DxvkRaytrace: Vulkan Transform Buffer Realloc");
     }
 
@@ -1015,8 +1258,20 @@ namespace dxvk {
                                       m_pointInstancerSlotsPerType[2], "]"));
       }
     }
-    m_reorderedSurfaces.clear();
-    m_reorderedSurfacesFirstIndexOffset.clear();
+    // NV-DXVK [GpuScene] slice 8: m_reorderedSurfaces.clear() is GONE. A
+    // surface's slot is no longer its position in this frame's array; it is
+    // the base of a persistent run in m_surfaceSlots, kept across frames while
+    // its key (instance cacheIdentity / bucket compat key) is acquired with the
+    // same count. The owner table is rebuilt every walk -- it holds raw
+    // RtInstance* and GC has just run, so a pointer carried over from last
+    // frame could name a destroyed instance -- but the SLOTS persist, and the
+    // run keys are integers, so nothing cross-frame can dangle.
+    m_surfaceSlotsCompacted = m_surfaceSlots.beginFrame(RtxOptions::GpuScene::compactSlack());
+    m_reorderedSurfaces.assign(m_surfaceSlots.highWater(), nullptr);
+    m_reorderedSurfacesFirstIndexOffset.assign(m_surfaceSlots.highWater(), 0u);
+    if (++m_slotClaimWalk == 0u) {
+      m_slotClaimWalk = 1u;
+    }
     m_pointInstancerBatches.clear();
     m_activeDynamicBlases.clear();
     memset(m_pointInstancerSlotsPerType, 0, sizeof(m_pointInstancerSlotsPerType));
@@ -1101,6 +1356,9 @@ namespace dxvk {
     s_probeF_valid = false;
     for (auto& instances : m_mergedInstances) {
       instances.clear();
+    }
+    for (auto& sources : m_mergedSources) {
+      sources.clear();
     }
 
     if (instances.size() > CUSTOM_INDEX_SURFACE_MASK) {
@@ -1189,25 +1447,19 @@ namespace dxvk {
     // vectors, preserving relative order in each) and a sort of only the
     // tagged block. Byte-identical output order by construction; the
     // [SurfaceIndexStability] contract above is unchanged.
-    m_mergeSortScratch.clear();      // becomes the final ordered list
-    m_mergeUntaggedScratch.clear();
-    m_mergeSortScratch.reserve(instances.size());
-    m_mergeUntaggedScratch.reserve(instances.size());
-    for (RtInstance* inst : instances) {
-      const uint64_t pid = (inst != nullptr) ? inst->getStablePropId() : 0ull;
-      if (pid != 0ull) m_mergeSortScratch.push_back(inst);
-      else             m_mergeUntaggedScratch.push_back(inst);
-    }
-    // stable_sort keeps equal-propId entries in arrival order, matching the
-    // old comparator's tie behavior. ~63 elements — cost is noise.
-    std::stable_sort(m_mergeSortScratch.begin(), m_mergeSortScratch.end(),
-      [](const RtInstance* a, const RtInstance* b) {
-        return a->getStablePropId() < b->getStablePropId();
-      });
-    m_mergeSortScratch.insert(m_mergeSortScratch.end(),
-                              m_mergeUntaggedScratch.begin(),
-                              m_mergeUntaggedScratch.end());
-    std::vector<RtInstance*>& sortedInstances = m_mergeSortScratch;
+    //
+    // NV-DXVK [GpuScene] slice 8: SUPERSEDED, and the partition + sort above is
+    // DELETED. Both existed only to make an unstable thing -- a slot that was a
+    // position in this frame's array -- look stable, and sec 5.1 said they
+    // would fall out once slots were real. They are: a surface's slot is now
+    // its persistent run in m_surfaceSlots, so iteration order no longer
+    // decides any slot. The one place order still matters is INSIDE a merged
+    // bucket (geometry index = slot offset), and that is fixed at the source:
+    // m_persistScratch is sorted by instance cacheIdentity before the buckets
+    // are compared or built, so bucket contents are independent of the
+    // instance table's GC reshuffles, and a newly created instance (highest
+    // cacheIdentity) lands at the END of its bucket instead of shifting it.
+    const std::vector<RtInstance*>& sortedInstances = instances;
 
     // NV-DXVK [TlasCensus]: COMPLETE per-frame inventory of every instance that
     // reaches TLAS build — including point-instancer / fanout / sub-view content
@@ -1290,172 +1542,17 @@ namespace dxvk {
     // ~15k instances per frame (the perfCullInstancesLargerThan block below).
     const float    mrgOptCullLargerThan  = RtxOptions::perfCullInstancesLargerThan();
 
-    // NV-DXVK [SceneCull]: Remix-side culling — the replacement for the engine
-    // culls that d3d11_rtx.cpp's [CullOff] patches switch off.
-    // See the RtxOptions::SceneCull comment for why the cull lives here (BLAS is
-    // kept, only the TLAS instance goes away) and what it does and does not save.
-    //
-    // RESTRUCTURED 2026-08-06 to the RT_CULLING_2026-08-05.md §1A shape: a UNION
-    // OF KEEPS, not a set of rejects. An instance is kept if ANY enabled keep
-    // covers it, and culled only when every keep misses:
-    //   frustum keep  — case #1, directly visible (margin-widened, as before)
-    //   radius keep   — case #3, reflections/GI near the camera (position-only)
-    //   light keep    — case #2, shadow casters: the CSM trick — extrude the
-    //                   visible bounds toward each light, keep what falls inside
-    // A bug in any keep term over-keeps (perf), it cannot make an occluder
-    // vanish. The old form (radius reject OR frustum reject) could: the frustum
-    // REJECT was direction-keyed and dropped off-screen shadow casters, which is
-    // §1's unsound class. frustumCullBehindCamera is obsolete in this shape —
-    // "behind the camera" is simply "not covered by the frustum keep", and
-    // whether it survives is the other keeps' decision.
-    //
-    // Everything is hoisted out of the per-instance loop: option reads, the
-    // camera matrices, the world-to-projection product, and the per-light
-    // swept volumes. The per-instance work is 8 corner transforms + outcode,
-    // and the light segment tests only for instances no other keep covered.
-    //
-    // The "visible bounds" feeding the light extrusion is the camera-centered
-    // cube of half-extent visibleRange — a strict superset of the capped view
-    // frustum, so conservative in the safe direction, and deliberately
-    // rotation-INVARIANT (the keep set only moves with position, §1's rule).
-    // Tightening it to true frustum corners is a later refinement; it needs the
-    // projection handedness verified first, and the cost of not doing it is
-    // only perf.
-    struct SceneCullCtx {
-      bool  enabled = false;
-      bool  radiusOn = false;
-      bool  frustumOn = false;
-      bool  lightOn = false;
-      float radiusSq = 0.0f;
-      float sideScale = 1.0f;       // 1 + frustumMargin, widens L/R/T/B
-      Vector3 camPos { 0.0f, 0.0f, 0.0f };
-      Matrix4 worldToProj;
-      // One entry per light: a segment [a,b] plus a pad radius. The capsule
-      // (segment swept by pad) contains the convex hull of the visible-bounds
-      // cube and the light — for a distant light, of the cube swept along the
-      // light axis. Instance test = segment vs instance AABB expanded by pad.
-      struct LightSeg { Vector3 a, b; float pad; };
-      std::vector<LightSeg> lightSegs;
-      // True when the light keep must cover EVERYTHING: no lights are known
-      // this frame or last, so "which off-screen geometry can shadow the
-      // visible region" cannot be answered, and the only safe answer is all
-      // of it. Without this, an empty light table silently degrades the
-      // union to frustum-only — the exact direction-keyed cull §1 bans, and
-      // the 2026-08-06 BT vanish.
-      bool lightAllKeep = false;
-      // §2.2 solid-angle reject — the ONE magnitude-based reject in the §1A
-      // formula, applied to the kept set. Never orientation-derived.
-      bool solidAngleOn = false;
-      float solidAngleMinSq = 0.0f;        // (radians)^2, compared against extent^2/dist^2
-      float lightExemptDistSq = 0.0f;      // near-light exemption for the reject
-      std::vector<Vector3> lightPoints;    // positioned lights only, for the exemption
-      uint32_t tested = 0, culled = 0, culledSmall = 0;
-      uint32_t keptFrustum = 0, keptRadius = 0, keptLight = 0, keptSkinned = 0;
-      uint32_t aabbCacheHits = 0;   // [Perf.CullAabbCache]
-    } sceneCull;
-    if (RtxOptions::SceneCull::enable()) {
-      const RtCamera& scCam = cameraManager.getMainCamera();
-      // A camera that was never updated this session has no usable matrices; its
-      // worldToProj would cull the entire scene. isValid() is the same gate the
-      // rest of the frame uses before trusting a camera.
-      if (scCam.isValid(m_device->getCurrentFrameId())) {
-        const float scRadius = RtxOptions::SceneCull::radius();
-        sceneCull.radiusOn   = (scRadius > 0.0f);
-        sceneCull.radiusSq   = scRadius * scRadius;
-        sceneCull.frustumOn  = RtxOptions::SceneCull::frustumEnable();
-        sceneCull.lightOn    = RtxOptions::SceneCull::lightInfluenceEnable();
-        sceneCull.sideScale  = 1.0f + std::max(0.0f, RtxOptions::SceneCull::frustumMargin());
-        sceneCull.camPos     = scCam.getPosition();
-        sceneCull.worldToProj = Matrix4(scCam.getViewToProjection() * scCam.getWorldToView());
-        if (sceneCull.lightOn) {
-          float visR = RtxOptions::SceneCull::visibleRange();
-          if (visR <= 0.0f)
-            visR = (scRadius > 0.0f) ? scRadius : 50000.0f;
-          // Half-diagonal of the visible-bounds cube: the capsule pad that makes
-          // the segment sweep contain the cube sweep.
-          const float visPad = 1.7320508f * visR;
-          const float sunLen = std::max(visR, RtxOptions::SceneCull::lightInfluenceSunLength());
-          // Live table, no snapshot, no lag. m_lights is filled by addLight()
-          // during draw submission, which precedes this, so an empty table
-          // here is REAL emptiness, not ordering: measured 2026-08-06,
-          // [EngineLights.census] resident=0 active=0 on every frame of the
-          // BT mission — TF2 lights that map entirely with the sky/dome
-          // environment, which never enters the light table.
-          const auto& scLights =
-            ctx->getCommonObjects()->getSceneManager().getLightManager().getLightTable();
-          sceneCull.lightSegs.reserve(scLights.size());
-          for (const auto& [scHash, scLight] : scLights) {
-            if (scLight.getType() == RtLightType::Distant) {
-              // Direction sign convention unverified against the shader side, so
-              // sweep BOTH ways along the axis. Wrong-signing a one-way sweep
-              // would cull real sun occluders — recreating the original leak —
-              // while both ways only over-keeps. Tighten only with the
-              // convention proven.
-              const Vector3 scDir = scLight.getDirection();
-              sceneCull.lightSegs.push_back({ sceneCull.camPos - scDir * sunLen,
-                                              sceneCull.camPos + scDir * sunLen, visPad });
-            } else {
-              // Position-carrying lights (Sphere/Rect/Disk/Cylinder). Only the
-              // sphere exposes a radius; the areal lights' physical extents are
-              // negligible against visPad.
-              const float scLr = (scLight.getType() == RtLightType::Sphere)
-                ? scLight.getSphereLight().getRadius() : 0.0f;
-              sceneCull.lightSegs.push_back({ sceneCull.camPos, scLight.getPosition(), visPad + scLr });
-              sceneCull.lightPoints.push_back(scLight.getPosition());
-            }
-          }
-          // No lights in the table => the scene is lit by the sky/dome
-          // environment, and dome light arrives from EVERY direction — no
-          // extrusion can bound its occluders, so the only sound light keep
-          // is everything (RT_CULLING doc §2.1's sun case, amplified). The
-          // perf lever on such maps is the solid-angle reject below, not
-          // this term.
-          if (sceneCull.lightSegs.empty()) {
-            sceneCull.lightAllKeep = true;
-            static bool s_scWarnedNoLights = false;
-            if (!s_scWarnedNoLights) {
-              s_scWarnedNoLights = true;
-              Logger::warn("[SceneCull] light table empty (sky/dome-lit scene) — "
-                           "light keep covers everything; solid-angle is the active cull");
-            }
-          }
-        }
-        // §2.2 solid-angle: magnitude, not orientation, so it is sound by §1's
-        // rule and it is the term that actually culls on sky/dome-lit maps
-        // where the light keep must cover everything.
-        const float scSaMin = RtxOptions::SceneCull::solidAngleMin();
-        sceneCull.solidAngleOn = RtxOptions::SceneCull::solidAngleCull() && scSaMin > 0.0f;
-        sceneCull.solidAngleMinSq = scSaMin * scSaMin;
-        const float scSaEx = RtxOptions::SceneCull::solidAngleLightExemptRadius();
-        sceneCull.lightExemptDistSq = scSaEx * scSaEx;
-        // No keep enabled would make the union empty and cull the whole scene;
-        // treat it as disabled instead. The solid-angle reject rides along only
-        // when at least one keep term is on (it prunes the KEPT set).
-        sceneCull.enabled = sceneCull.radiusOn || sceneCull.frustumOn || sceneCull.lightOn;
-      }
-    }
-    // Segment [a,b] vs AABB [lo,hi] expanded by pad: standard slab test.
-    // Conservative on degenerate axes (d ~ 0 inside the slab passes).
-    const auto sceneCullSegHitsBox = [](const Vector3& a, const Vector3& b, float pad,
-                                        const Vector3& lo, const Vector3& hi) -> bool {
-      float t0 = 0.0f, t1 = 1.0f;
-      for (int ax = 0; ax < 3; ++ax) {
-        const float sLo = lo[ax] - pad, sHi = hi[ax] + pad;
-        const float d = b[ax] - a[ax];
-        if (std::abs(d) < 1e-6f) {
-          if (a[ax] < sLo || a[ax] > sHi)
-            return false;
-          continue;
-        }
-        float ta = (sLo - a[ax]) / d, tb = (sHi - a[ax]) / d;
-        if (ta > tb) std::swap(ta, tb);
-        t0 = std::max(t0, ta);
-        t1 = std::min(t1, tb);
-        if (t0 > t1)
-          return false;
-      }
-      return true;
-    };
+    // NV-DXVK [SceneCull] ARCHITECTURE_OVERHAUL.md slice 9: the scene cull moved
+    // to the GPU (rtx_scene_cull.h). The union-of-keeps loop that ran in the
+    // instance loop below -- per RtInstance, 8 corner transforms, a clip-space
+    // outcode, the keep terms and the solid-angle reject, zeroing the mask before
+    // bucketing -- is DELETED. Its hoisted setup (options, camera, per-light
+    // extrusions) is SceneCullPass::beginFrame, called here; its verdict is
+    // scene_cull.slangh, run over every CPU-owned TLAS entry after the instance
+    // upload (prepareSceneData) and over every PointInstancer instance by the PI
+    // culling shader. The BLAS set, the bucket membership and the surface slots
+    // no longer depend on the view. RtxOptions::SceneCull documents every term.
+    m_sceneCull.beginFrame(ctx, cameraManager, currentFrame);
 
     markMrg(mrg_setup);
     for (RtInstance* instance : sortedInstances) {
@@ -1690,280 +1787,11 @@ namespace dxvk {
         }
       }
 
-      // NV-DXVK [SceneCull]: radius + frustum cull. Placed with (and for the same
-      // reason as) the perfCullInstancesLargerThan block above: clearing the mask
-      // BEFORE the mask==0 early-out routes the instance through the existing
-      // mask0 path, which already keeps the OMM and billboard bookkeeping correct,
-      // and works for instances that get merged into a shared BLAS (where the
-      // bucket mask is the OR of its members, so a later clear would do nothing).
-      //
-      // The box used is BlasEntry::input.getGeometryData().boundingBox, which is
-      // computed over the draw's whole vertex RANGE rather than the vertices its
-      // index buffer references — i.e. it is too large, never too small. That is
-      // the right direction for a cull: it over-keeps, it cannot over-cull.
-      if (sceneCull.enabled && instance->getVkInstance().mask != 0) {
-        const BlasEntry* scBlas = instance->getBlas();
-        const AxisAlignedBoundingBox* scBox =
-          (scBlas != nullptr) ? &scBlas->input.getGeometryData().boundingBox : nullptr;
-        if (scBox != nullptr && scBox->isValid()) {
-          ++sceneCull.tested;
-          // NV-DXVK [Perf.CullAabbCache] 2026-08-08g: the world AABB is a pure
-          // function of (transform bits, object box) -- serve it from the
-          // per-instance cache when neither changed, skipping getTransform()'s
-          // transpose and the 8 corner transforms. The corners themselves are
-          // only rebuilt lazily for the few instances whose outcode pass
-          // actually runs (small-reject candidates / open-keep frames).
-          const auto& scXf = instance->getVkInstance().transform;
-          RtInstance::CullAabbCache& scCache = instance->cullAabbCache;
-          const bool scCacheHit = scCache.valid
-            && std::memcmp(scCache.xform, scXf.matrix, sizeof(scCache.xform)) == 0
-            && scCache.boxMin.x == scBox->minPos.x
-            && scCache.boxMin.y == scBox->minPos.y
-            && scCache.boxMin.z == scBox->minPos.z
-            && scCache.boxMax.x == scBox->maxPos.x
-            && scCache.boxMax.y == scBox->maxPos.y
-            && scCache.boxMax.z == scBox->maxPos.z;
-          if (scCacheHit) ++sceneCull.aabbCacheHits;
-
-          // World AABB of the 8 transformed corners, plus the clip-space outcode
-          // AND, in one pass. The outcode convention is D3D clip space
-          // (-w <= x,y <= w, 0 <= z <= w) with the side planes widened by
-          // sideScale. A bit that survives the AND across all 8 corners means
-          // every corner failed that plane => the box is entirely outside it.
-          // Corners with w <= 0 are behind the eye and cannot be rejected on the
-          // side planes (the comparison flips), so they contribute no side bits.
-          Vector3 scLo {  FLT_MAX,  FLT_MAX,  FLT_MAX };
-          Vector3 scHi { -FLT_MAX, -FLT_MAX, -FLT_MAX };
-          bool scCornersValid = false;   // [Perf.CullAabbCache] corners lazily rebuilt on hits
-          uint32_t scOutcodeAnd = 0x1Fu;   // L,R,T,B,near
-          // NV-DXVK [perf] 2026-08-08e (merge loop, [SceneCull] evidence):
-          // every capture on this level reads lightAllKeep=1 (no lights known)
-          // and culled=0 -- the light keep covers EVERY instance, so the
-          // KEEP verdict is decided before any corner math runs. In that
-          // state the clip-space half of the corner pass (a worldToProj 4x4
-          // multiply per corner, 8 per instance, ~8.9k tested instances per
-          // frame) contributes nothing to the keep decision; its ONLY
-          // remaining consumer is the solid-angle small-reject's on-screen
-          // exemption, which applies to just ~600 small instances per frame.
-          // So: world-AABB pass always (both consumers need it), clip pass
-          // LAZY -- run it only when the keep decision is genuinely open, or
-          // when this instance is a small-reject candidate (decided from the
-          // AABB afterwards). MASK OUTCOMES ARE BIT-IDENTICAL by construction;
-          // only the keptFrustum/keptLight diagnostic attribution shifts
-          // (all-keep frames report keptLight instead of keptFrustum).
-          const bool scAllKept = sceneCull.lightOn && sceneCull.lightAllKeep;
-          float scWorldCorners[8][3];
-          if (scCacheHit) {
-            scLo = scCache.lo;
-            scHi = scCache.hi;
-          } else {
-            const Matrix4 scO2w = instance->getTransform();
-            for (uint32_t c = 0; c < 8; ++c) {
-              const Vector3 corner {
-                (c & 1u) ? scBox->maxPos.x : scBox->minPos.x,
-                (c & 2u) ? scBox->maxPos.y : scBox->minPos.y,
-                (c & 4u) ? scBox->maxPos.z : scBox->minPos.z,
-              };
-              const Vector4 w4 = scO2w * Vector4(corner.x, corner.y, corner.z, 1.0f);
-              scWorldCorners[c][0] = w4.x;
-              scWorldCorners[c][1] = w4.y;
-              scWorldCorners[c][2] = w4.z;
-              scLo.x = std::min(scLo.x, w4.x); scHi.x = std::max(scHi.x, w4.x);
-              scLo.y = std::min(scLo.y, w4.y); scHi.y = std::max(scHi.y, w4.y);
-              scLo.z = std::min(scLo.z, w4.z); scHi.z = std::max(scHi.z, w4.z);
-            }
-            scCornersValid = true;
-            std::memcpy(scCache.xform, scXf.matrix, sizeof(scCache.xform));
-            scCache.boxMin = scBox->minPos;
-            scCache.boxMax = scBox->maxPos;
-            scCache.lo = scLo;
-            scCache.hi = scHi;
-            scCache.valid = true;
-          }
-          // Decide whether the clip pass is needed at all this instance.
-          bool scNeedOutcode = sceneCull.frustumOn && !scAllKept;
-          if (sceneCull.frustumOn && scAllKept && sceneCull.solidAngleOn) {
-            // Small-reject candidacy from the AABB alone -- same math the
-            // reject itself uses below; only candidates need the on-screen
-            // exemption, which is what the outcode feeds.
-            const float scMaxExtPre = std::max(scHi.x - scLo.x,
-                                      std::max(scHi.y - scLo.y, scHi.z - scLo.z));
-            const float pdx = std::max(0.0f, std::max(scLo.x - sceneCull.camPos.x, sceneCull.camPos.x - scHi.x));
-            const float pdy = std::max(0.0f, std::max(scLo.y - sceneCull.camPos.y, sceneCull.camPos.y - scHi.y));
-            const float pdz = std::max(0.0f, std::max(scLo.z - sceneCull.camPos.z, sceneCull.camPos.z - scHi.z));
-            const float scDistSqPre = pdx * pdx + pdy * pdy + pdz * pdz;
-            scNeedOutcode = std::isfinite(scDistSqPre) && scDistSqPre > 0.0f
-              && std::isfinite(scMaxExtPre)
-              && scMaxExtPre * scMaxExtPre < sceneCull.solidAngleMinSq * scDistSqPre;
-          }
-          if (scNeedOutcode) {
-            // [Perf.CullAabbCache]: a cache hit skipped the corner build;
-            // rebuild the 8 corners here for the few instances whose outcode
-            // pass actually runs. Same math as the miss path.
-            if (!scCornersValid) {
-              const Matrix4 scO2wLate = instance->getTransform();
-              for (uint32_t c = 0; c < 8; ++c) {
-                const Vector3 corner {
-                  (c & 1u) ? scBox->maxPos.x : scBox->minPos.x,
-                  (c & 2u) ? scBox->maxPos.y : scBox->minPos.y,
-                  (c & 4u) ? scBox->maxPos.z : scBox->minPos.z,
-                };
-                const Vector4 w4 = scO2wLate * Vector4(corner.x, corner.y, corner.z, 1.0f);
-                scWorldCorners[c][0] = w4.x;
-                scWorldCorners[c][1] = w4.y;
-                scWorldCorners[c][2] = w4.z;
-              }
-              scCornersValid = true;
-            }
-            for (uint32_t c = 0; c < 8; ++c) {
-              const Vector4 clip = sceneCull.worldToProj
-                * Vector4(scWorldCorners[c][0], scWorldCorners[c][1], scWorldCorners[c][2], 1.0f);
-              uint32_t oc = 0u;
-              if (clip.w > 0.0f) {
-                const float lim = clip.w * sceneCull.sideScale;
-                if (clip.x < -lim) oc |= 0x01u;
-                if (clip.x >  lim) oc |= 0x02u;
-                if (clip.y < -lim) oc |= 0x04u;
-                if (clip.y >  lim) oc |= 0x08u;
-              }
-              // Behind-near bit, unconditional now: as a KEEP, "in the frustum"
-              // must exclude boxes wholly behind the camera, or the frustum term
-              // would cover everything behind you and the union would never
-              // narrow. (The old reject-mode option frustumCullBehindCamera is
-              // obsolete: behind-camera geometry is kept exactly when the radius
-              // or light keep covers it, which is the §1A-correct answer.)
-              if (clip.z < 0.0f) oc |= 0x10u;
-              scOutcodeAnd &= oc;
-            }
-          } else if (!sceneCull.frustumOn) {
-            // Frustum term disabled: the pre-existing semantics -- outcodeAnd
-            // stays 0x1F and the frustum keep below never fires.
-          } else {
-            // Clip pass skipped on an all-keep frame for a non-candidate:
-            // report "not frustum-proven" so the keep chain falls through to
-            // the light term (which covers it) and the small-reject below
-            // never runs (candidacy already failed). scOutcodeAnd != 0 is the
-            // only reading either consumer performs in this state.
-            scOutcodeAnd = 0x1Fu;
-          }
-
-          // Union of keeps: kept the moment any term covers the instance, culled
-          // only if every enabled term missed. Ordered cheapest-first; the light
-          // segments only run for instances frustum and radius both missed.
-          bool scKept = false;
-          // Frustum-kept means ON SCREEN (within margin): never subject to the
-          // solid-angle reject below — a visible object popping out is a
-          // guaranteed artifact however small it is, while an off-screen
-          // occluder's absence is bounded by the quadratic solid-angle
-          // argument (see the reject).
-          bool scFrustumKept = false;
-          if (sceneCull.frustumOn && scOutcodeAnd == 0u) {
-            scKept = true;
-            scFrustumKept = true;
-            ++sceneCull.keptFrustum;
-          }
-          if (!scKept && sceneCull.radiusOn) {
-            // Squared distance from the camera to the closest point of the world
-            // box: zero while the camera is inside it, so large objects survive
-            // until they are fully outside the sphere.
-            const float dx = std::max(0.0f, std::max(scLo.x - sceneCull.camPos.x, sceneCull.camPos.x - scHi.x));
-            const float dy = std::max(0.0f, std::max(scLo.y - sceneCull.camPos.y, sceneCull.camPos.y - scHi.y));
-            const float dz = std::max(0.0f, std::max(scLo.z - sceneCull.camPos.z, sceneCull.camPos.z - scHi.z));
-            const float d2 = dx * dx + dy * dy + dz * dz;
-            // Non-finite box => keep, never cull on garbage.
-            if (!std::isfinite(d2) || d2 <= sceneCull.radiusSq) {
-              scKept = true;
-              ++sceneCull.keptRadius;
-            }
-          }
-          if (!scKept && sceneCull.lightOn) {
-            if (sceneCull.lightAllKeep) {
-              // No lights known — the fail-safe: light keep covers everything.
-              scKept = true;
-              ++sceneCull.keptLight;
-            } else {
-              for (const auto& seg : sceneCull.lightSegs) {
-                if (sceneCullSegHitsBox(seg.a, seg.b, seg.pad, scLo, scHi)) {
-                  scKept = true;
-                  ++sceneCull.keptLight;
-                  break;
-                }
-              }
-            }
-          }
-          // SKINNED EXEMPTION (2026-08-06, the BT vanish): every keep above
-          // reasons from the world-space bounding box, and for skinned
-          // geometry that box bounds the PRE-SKIN vertices — the bones place
-          // the drawn surface somewhere else entirely, so the box is not
-          // where the character is. The cull's premise fails, so the verdict
-          // is void: never cull skinned instances. (The corner math above
-          // still ran — skinned instances are a small population and gating
-          // the decision, not the arithmetic, keeps this diff readable.)
-          const auto& scSkinData = scBlas->input.getSkinningState();
-          const bool scSkinned = (scSkinData.numBones > 0)
-            || (scBlas->input.getGeometryData().numBonesPerVertex > 0);
-          if (scSkinned) {
-            if (!scKept)
-              ++sceneCull.keptSkinned;   // only count ones the keeps would have culled
-          } else if (!scKept) {
-            instance->getVkInstance().mask = 0;
-            ++sceneCull.culled;
-          } else if (sceneCull.solidAngleOn && !scFrustumKept) {
-            // §2.2 — the one magnitude reject, applied to the kept OFF-SCREEN
-            // set only. WHY OFF-SCREEN CAN BE CULLED AGGRESSIVELY (the far-
-            // field occluder bound, 2026-08-06): under dome/environment light
-            // an occluder changes a receiver's illumination in proportion to
-            // the SOLID ANGLE it subtends from the receiver — quadratic in
-            // angular size, so a 5-pixel-wide occluder blocks ~0.001% of the
-            // hemisphere. And strong occlusion is LOCAL: only surfaces within
-            // a few multiples of the occluder's own size are significantly
-            // darkened, and those surfaces project to roughly the same few
-            // pixels the occluder itself would. So camera-based angular size
-            // bounds the ON-SCREEN ERROR of culling it — the same bounded-
-            // error reasoning Lightcuts applies to light clusters. Mirrors are
-            // covered (a reflection images the occluder at a comparable
-            // angular scale), point-light penumbra magnification is the
-            // near-light exemption below, and skinned boxes never get here.
-            // KNOWN LIMIT, deliberate: many sub-threshold occluders can
-            // aggregate (a forest each tree below threshold). Instances are
-            // draw batches with combined AABBs, which blunts this; if an
-            // aggregate shadow visibly vanishes, lower solidAngleMin.
-            //
-            // Apparent angular size ≈ longest world-box axis / distance to the
-            // box's closest point. Both terms err toward keeping: longest axis
-            // because bounding spheres lie about long thin things (doc §2.2's
-            // cables/railings caveat), closest-point distance because it
-            // maximises apparent size.
-            const float scMaxExtent = std::max(scHi.x - scLo.x,
-                                      std::max(scHi.y - scLo.y, scHi.z - scLo.z));
-            const float sdx = std::max(0.0f, std::max(scLo.x - sceneCull.camPos.x, sceneCull.camPos.x - scHi.x));
-            const float sdy = std::max(0.0f, std::max(scLo.y - sceneCull.camPos.y, sceneCull.camPos.y - scHi.y));
-            const float sdz = std::max(0.0f, std::max(scLo.z - sceneCull.camPos.z, sceneCull.camPos.z - scHi.z));
-            const float scDistSq = sdx * sdx + sdy * sdy + sdz * sdz;
-            if (std::isfinite(scDistSq) && scDistSq > 0.0f && std::isfinite(scMaxExtent)
-                && scMaxExtent * scMaxExtent < sceneCull.solidAngleMinSq * scDistSq) {
-              // Doc §2.2 caveat: a small object next to a light casts a large
-              // shadow — exempt anything near a positioned light. (Distant/
-              // dome light needs no exemption: it magnifies nothing, a small
-              // occluder's shadow stays small.)
-              bool scNearLight = false;
-              for (const Vector3& lp : sceneCull.lightPoints) {
-                const float lx = std::max(0.0f, std::max(scLo.x - lp.x, lp.x - scHi.x));
-                const float ly = std::max(0.0f, std::max(scLo.y - lp.y, lp.y - scHi.y));
-                const float lz = std::max(0.0f, std::max(scLo.z - lp.z, lp.z - scHi.z));
-                if (lx * lx + ly * ly + lz * lz <= sceneCull.lightExemptDistSq) {
-                  scNearLight = true;
-                  break;
-                }
-              }
-              if (!scNearLight) {
-                instance->getVkInstance().mask = 0;
-                ++sceneCull.culledSmall;
-              }
-            }
-          }
-        }
-      }
+      // NV-DXVK [SceneCull] slice 9: the per-instance cull that sat here (mask=0
+      // before the mask==0 early-out below, so a culled instance left its
+      // bucket) is DELETED -- see m_sceneCull.beginFrame above. The verdict runs
+      // on the GPU per TLAS entry, where a culled entry keeps its BLAS, its
+      // bucket and its surface slot.
 
       // If the instance has zero mask, do not build BLAS for it: no ray can intersect this instance.
       if (instance->getVkInstance().mask == 0) {
@@ -1976,11 +1804,12 @@ namespace dxvk {
         // OMM requests and billboards need a valid surface.
         // Particles on the player model generate valid billboards but their geometric instance mask is set to 0.
         if (needsOpacityMicromap || hasBillboards) {
-          instance->setSurfaceIndex(m_reorderedSurfaces.size());
-
-          m_reorderedSurfaces.push_back(instance);
-          m_reorderedSurfacesFirstIndexOffset.push_back(0);
-          tallyReorderedPush(instance, "mask0bb");
+          const uint32_t slot = acquireSurfaceRun(
+            SurfaceSlotTable::instanceRunKey(instance->getCacheIdentity()), 1u, instance, nullptr);
+          if (slot != SurfaceSlotTable::kNoSlot) {
+            instance->setSurfaceIndex(slot);
+            tallyReorderedPush(instance, "mask0bb");
+          }
         }
 
         continue;
@@ -2217,7 +2046,13 @@ namespace dxvk {
         // every BSP-merged draw shows up in the DrawIn↔DrawOut
         // diff. Without this, ~half of draws appear "dropped" in
         // the diff when in reality they reached the merged path.
-        {
+        //
+        // NV-DXVK [perf] slice 0 (2026-09-12): gated on rtx.logGeomDiag with the
+        // rest of the [SpawnGeomDiag] family. Ungated it took a process-global
+        // mutex and an unordered_set insert for EVERY merged instance EVERY frame
+        // on dxvk-cs to decide whether to print a one-shot line -- the same
+        // defect class the 2026-08-08 pass fixed in logDrop one screen up.
+        if (geomDiagOn) {
           BlasEntry* be = instance->getBlas();
           if (be != nullptr) {
             const uint64_t vsHash = static_cast<uint64_t>(
@@ -2300,6 +2135,15 @@ namespace dxvk {
         }
       }
     }
+
+    // NV-DXVK [GpuScene] slice 8: the merged sequence in a table-order-free
+    // order. See the note where the stable partition used to be. cacheIdentity
+    // is unique per allocation, so the order is total and the sort need not be
+    // stable.
+    std::sort(m_persistScratch.begin(), m_persistScratch.end(),
+      [](const MergePersistMember& a, const MergePersistMember& b) {
+        return a.inst->getCacheIdentity() < b.inst->getCacheIdentity();
+      });
 
     // ================================================================
     // NV-DXVK [Perf.MergeP] 2026-08-08f: PERSISTENT-BUCKET MERGE.
@@ -2488,32 +2332,8 @@ namespace dxvk {
     }
     markMrg(mrg_loop);
 
-    // NV-DXVK [SceneCull]: one line per second while enabled. `tested` is the set
-    // that reached the cull (mask != 0, valid box). The kept* fields are which
-    // KEEP term covered the instance FIRST (frustum before radius before light,
-    // so keptLight counts instances only the light extrusion saved). culled is
-    // what left the TLAS. keptLight is the number to watch when tuning
-    // visibleRange/sunLength — it is the §2.3 term earning its keep.
-    if (sceneCull.enabled && RtxOptions::SceneCull::logStats()) {
-      static auto s_lastSceneCullLog = std::chrono::steady_clock::now();
-      const auto now = std::chrono::steady_clock::now();
-      if (std::chrono::duration_cast<std::chrono::milliseconds>(now - s_lastSceneCullLog).count() >= 1000) {
-        s_lastSceneCullLog = now;
-        Logger::warn(str::format("[SceneCull] f=", m_device->getCurrentFrameId(),
-          " tested=", sceneCull.tested,
-          " keptFrustum=", sceneCull.keptFrustum,
-          " keptRadius=", sceneCull.keptRadius,
-          " keptLight=", sceneCull.keptLight,
-          " keptSkinned=", sceneCull.keptSkinned,
-          " aabbHit=", sceneCull.aabbCacheHits,
-          " culled=", sceneCull.culled,
-          " culledSmall=", sceneCull.culledSmall,
-          " lights=", sceneCull.lightSegs.size(),
-          " lightAllKeep=", (sceneCull.lightAllKeep ? 1 : 0),
-          " radius=", RtxOptions::SceneCull::radius(),
-          " margin=", RtxOptions::SceneCull::frustumMargin()));
-      }
-    }
+    // NV-DXVK [SceneCull] slice 9: the [SceneCull] line is SceneCullPass::logStats,
+    // read from the GPU's own verdict counters.
 
     // [TlasCensus] flush — one line per VS bucket for this frame's TLAS build.
     // Only real scene frames (>=100 built instances) to skip menu/load; cap 60
@@ -2562,6 +2382,28 @@ namespace dxvk {
     // once separated. Now gated (with its per-instance accumulation) on
     // rtx.logGeomDiag, so tcFlush reads ~0 unless that option is on.
     markMrg(mrg_tcFlush);
+
+    // NV-DXVK [GpuScene] G5 prerequisite: a STABLE m_mergedInstances order.
+    // uniqueBlasOrder was first-seen order over the instance walk, and the walk
+    // order changes whenever GC swap-pops m_instances -- so TLAS entry i named a
+    // different object from frame to frame. A refit needs entry i to be the
+    // same object, and the instance-buffer delta needs it for "unchanged" to
+    // mean anything. Order instances by cacheIdentity (unique per allocation,
+    // monotonic) and groups by their oldest instance: a settled scene keeps its
+    // order, and new geometry lands at the end instead of shifting everything.
+    for (auto& [entry, insts] : uniqueBlas) {
+      std::sort(insts.begin(), insts.end(), [](const RtInstance* a, const RtInstance* b) {
+        return a->getCacheIdentity() < b->getCacheIdentity();
+      });
+    }
+    std::sort(uniqueBlasOrder.begin(), uniqueBlasOrder.end(),
+              [&uniqueBlas](BlasEntry* a, BlasEntry* b) {
+      const std::vector<RtInstance*>& ia = uniqueBlas.at(a);
+      const std::vector<RtInstance*>& ib = uniqueBlas.at(b);
+      const uint64_t ka = ia.empty() ? UINT64_MAX : ia.front()->getCacheIdentity();
+      const uint64_t kb = ib.empty() ? UINT64_MAX : ib.front()->getCacheIdentity();
+      return ka < kb;
+    });
 
     // Build/Update the dynamic BLAS
     for (BlasEntry* blasEntry : uniqueBlasOrder) {
@@ -2791,7 +2633,25 @@ namespace dxvk {
     // Copy the instance transform data to the device (only needed on full rebuild path;
     // dynamics-only path doesn't populate instanceTransforms for merged instances)
     if (instanceTransforms.size() > 0) {
-      ctx->writeToBuffer(m_transformBuffer, 0, instanceTransforms.size() * sizeof(VkTransformMatrixKHR), instanceTransforms.data());
+      // NV-DXVK [GpuScene] slice 8: delta, not whole-table. The merged members
+      // are in cacheIdentity order (see the m_persistScratch sort), so on a
+      // settled scene element i is the same instance every frame and only a
+      // moved instance's 48 bytes are sent. This is the transform half of sec
+      // 2's "GPU SCENE: surfaces (delta), transforms (delta)".
+      m_transformDelta.beginFrame(uint32_t(instanceTransforms.size()), m_transformBufferReplaced);
+      m_transformBufferReplaced = false;
+      for (uint32_t ti = 0; ti < uint32_t(instanceTransforms.size()); ++ti) {
+        std::memcpy(m_transformDelta.scratch(), &instanceTransforms[ti], sizeof(VkTransformMatrixKHR));
+        m_transformDelta.commit(ti);
+      }
+      m_transformDelta.upload(ctx.ptr(), m_transformBuffer);
+      if (RtxOptions::GpuScene::verify()) {
+        const uint32_t tfFrame = m_device->getCurrentFrameId();
+        m_transformDelta.harvestVerify(tfFrame);
+        if ((tfFrame % std::max(1u, RtxOptions::GpuScene::verifyInterval())) == 0u) {
+          m_transformDelta.scheduleVerify(ctx.ptr(), m_device, m_transformBuffer, tfFrame);
+        }
+      }
 
       ctx->getCommandList()->trackResource<DxvkAccess::Write>(m_transformBuffer);
       ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_transformBuffer);
@@ -2807,9 +2667,31 @@ namespace dxvk {
         VK_ACCESS_SHADER_READ_BIT);
     }
 
-    // Collect surfaces from this frame's buckets
+    // Collect surfaces from this frame's buckets.
+    //
+    // NV-DXVK [GpuScene] slice 8: each bucket owns ONE contiguous run (the
+    // merged BLAS addresses its surfaces as base + GeometryIndex()), keyed by
+    // the bucket's compatibility key. tryAddInstance has no size cap, so there
+    // is exactly one bucket per compatibility key and the key is a stable
+    // identity across both reuse and rebuild frames.
     for (const auto& blasBucket : blasBuckets) {
-      blasBucket->reorderedSurfacesOffset = static_cast<uint32_t>(m_reorderedSurfaces.size());
+      const uint32_t memberCount = static_cast<uint32_t>(blasBucket->originalInstances.size());
+      if (memberCount == 0u) {
+        blasBucket->reorderedSurfacesOffset = 0u;
+        continue;
+      }
+      const uint64_t compat = bucketCompatKey(*blasBucket);
+
+      const bool offsetsAligned = blasBucket->indexOffsets.size() == memberCount;
+      const uint32_t base = acquireSurfaceRun(SurfaceSlotTable::bucketRunKey(compat), memberCount,
+                                              nullptr, blasBucket->originalInstances.data(),
+                                              offsetsAligned ? blasBucket->indexOffsets.data() : nullptr);
+      if (base == SurfaceSlotTable::kNoSlot) {
+        ONCE(Logger::err("[GpuScene] surface slot table is at SURFACE_INDEX_MAX_VALUE; a merged bucket has no surface range"));
+        blasBucket->reorderedSurfacesOffset = 0u;
+        continue;
+      }
+      blasBucket->reorderedSurfacesOffset = base;
 
       // [BulkPush] Per-instance tally before the bulk insert. The merged-
       // bucket path can dump many instances at once; we attribute each to
@@ -2817,11 +2699,13 @@ namespace dxvk {
       for (RtInstance* inst : blasBucket->originalInstances) {
         tallyReorderedPush(inst, "bucket");
       }
-
-      // Append the bucket's instances to the reordered surface list
-      m_reorderedSurfaces.insert(m_reorderedSurfaces.end(), blasBucket->originalInstances.begin(), blasBucket->originalInstances.end());
-      m_reorderedSurfacesFirstIndexOffset.insert(m_reorderedSurfacesFirstIndexOffset.end(), blasBucket->indexOffsets.begin(), blasBucket->indexOffsets.end());
     }
+
+    // NV-DXVK [GpuScene]: every run this walk needs has been acquired. Free the
+    // rest (evidence: this walk did not name them) and trim the high-water mark.
+    m_surfaceSlots.endFrame();
+    m_reorderedSurfaces.resize(m_surfaceSlots.highWater(), nullptr);
+    m_reorderedSurfacesFirstIndexOffset.resize(m_surfaceSlots.highWater(), 0u);
 
     // Build prefix sum array
     // Collect primitive count for each surface object
@@ -2832,8 +2716,10 @@ namespace dxvk {
     for (uint32_t i = 0; i < m_reorderedSurfaces.size(); i++) {
       auto surface = m_reorderedSurfaces[i];
       int primitiveCount = 0;
-      for (const auto& buildRange: surface->getBlas()->buildRanges) {
-        primitiveCount += buildRange.primitiveCount;
+      if (surface != nullptr) {  // [GpuScene] a hole contributes no primitives
+        for (const auto& buildRange: surface->getBlas()->buildRanges) {
+          primitiveCount += buildRange.primitiveCount;
+        }
       }
       m_reorderedSurfacesPrimitiveIDPrefixSum[i + 1] = primitiveCount;
     }
@@ -2865,7 +2751,11 @@ namespace dxvk {
     //   addBlas -> per-instance addBlas push at line ~1242
     {
       const size_t orderedSize = m_reorderedSurfaces.size();
-      if (orderedSize > 1000) {
+      // NV-DXVK [perf]: gated with its producer. tallyReorderedPush has been
+      // behind rtx.logGeomDiag since 2026-08-07, so ungated this dump sorted an
+      // EMPTY tally and printed a "totalTallied=0" header every frame the table
+      // held >1000 slots -- 946 lines in the 2026-09-12 run, all empty.
+      if (geomDiagOn && orderedSize > 1000) {
         std::vector<std::pair<uint64_t, BulkPushStat>> ranked(
           g_bulkPushTally.begin(), g_bulkPushTally.end());
         std::sort(ranked.begin(), ranked.end(),
@@ -2900,6 +2790,11 @@ namespace dxvk {
                 textures, instances, blasBuckets, blasToBuild, blasRangesToBuild,
                 instanceTransforms, totalScratchMemory);
     markMrg(mrg_buildBlases);
+
+    // NV-DXVK [GpuScene] slice 8: structural gate, every frame while verify is on.
+    if (RtxOptions::GpuScene::verify()) {
+      verifyGpuSceneStructure();
+    }
 
     // Save baseline counts (before billboards are appended in prepareSceneData),
     // which truncates back to them so billboard entries never accumulate.
@@ -2951,6 +2846,16 @@ namespace dxvk {
   }
 
   void AccelManager::addBlas(RtInstance* instance, BlasEntry* blasEntry, const Matrix4* instanceToObject) {
+    // NV-DXVK [GpuScene] slice 8: the slot is this instance's persistent run,
+    // not m_reorderedSurfaces.size(). Acquired first because the TLAS entry
+    // below bakes it into instanceCustomIndex.
+    const uint32_t surfaceSlot = acquireSurfaceRun(
+      SurfaceSlotTable::instanceRunKey(instance->getCacheIdentity()), 1u, instance, nullptr);
+    if (surfaceSlot == SurfaceSlotTable::kNoSlot) {
+      ONCE(Logger::err("[GpuScene] surface slot table is at SURFACE_INDEX_MAX_VALUE; instance dropped from the TLAS"));
+      return;
+    }
+
     // [SpawnGeomDiag.DrawOut] Companion to [SpawnGeomDiag.DrawIn] in
     // submitDrawState — fires once per (vsHash, matHash) when a draw
     // makes it all the way through to the merged-bucket BLAS path
@@ -2958,7 +2863,10 @@ namespace dxvk {
     // both tags by matHash to find DrawIn entries with NO matching
     // DrawOut — those are the draws being silently dropped between
     // submitDrawState and addBlas.
-    {
+    //
+    // NV-DXVK [perf] slice 0: gated on rtx.logGeomDiag -- a mutex + set insert
+    // per dynamic instance per frame otherwise. See the kind=merged twin.
+    if (RtxOptions::logGeomDiag()) {
       const uint64_t vsHash = static_cast<uint64_t>(
         blasEntry->input.getTransformData().vertexShaderHash);
       const uint64_t matHash = static_cast<uint64_t>(
@@ -2981,7 +2889,7 @@ namespace dxvk {
           " matHash=0x", std::hex, matHash, std::dec,
           " primCnt=", primCount,
           " vCnt=", blasEntry->modifiedGeometryData.vertexCount,
-          " surfIdx=", m_reorderedSurfaces.size(),
+          " surfIdx=", surfaceSlot,
           " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")"));
       }
     }
@@ -3020,7 +2928,7 @@ namespace dxvk {
     }
     blasInstance.instanceCustomIndex =
       (blasInstance.instanceCustomIndex & ~uint32_t(CUSTOM_INDEX_SURFACE_MASK)) |
-      uint32_t(m_reorderedSurfaces.size()) & uint32_t(CUSTOM_INDEX_SURFACE_MASK);
+      (surfaceSlot & uint32_t(CUSTOM_INDEX_SURFACE_MASK));
 
     if (instanceToObject) {
       // The D3D matrix on input, needs to be transposed before feeding to the VK API (left/right handed conversion)
@@ -3071,7 +2979,7 @@ namespace dxvk {
           " vkT=(", tvals[3], ",", tvals[7], ",", tvals[11], ")",
           " tlas=", (instance->usesUnorderedApproximations() && RtxOptions::enableSeparateUnorderedApproximations())
                       ? "Unordered" : "Opaque",
-          " surfIdx=", m_reorderedSurfaces.size()));
+          " surfIdx=", surfaceSlot));
       }
     }
 
@@ -3080,19 +2988,22 @@ namespace dxvk {
       blasInstance.flags ^= VK_GEOMETRY_INSTANCE_TRIANGLE_FLIP_FACING_BIT_KHR;
     }
 
+    // NV-DXVK [SceneCull] slice 9: every entry pushed with its source.
+    const MergedEntrySource source { instance, blasEntry, nullptr };
     if (instance->usesUnorderedApproximations() && RtxOptions::enableSeparateUnorderedApproximations()) {
       m_mergedInstances[Tlas::Unordered].push_back(blasInstance);
+      m_mergedSources[Tlas::Unordered].push_back(source);
     } else {
       m_mergedInstances[Tlas::Opaque].push_back(blasInstance);
+      m_mergedSources[Tlas::Opaque].push_back(source);
       if (instance->isSubsurface()) {
         m_mergedInstances[Tlas::SSS].push_back(blasInstance);
+        m_mergedSources[Tlas::SSS].push_back(source);
       }
     }
 
-    // Append the instance to the reordered surface list
-    // Note: this happens *after* the instance is appended, because the size of m_reorderedSurfaces is used above
-    m_reorderedSurfaces.push_back(instance);
-    m_reorderedSurfacesFirstIndexOffset.push_back(0);
+    // NV-DXVK [GpuScene]: the slot table entry was published by
+    // acquireSurfaceRun at the top of this function.
     tallyReorderedPush(instance, "addBlas");
   }
 
@@ -3103,6 +3014,7 @@ namespace dxvk {
                                                    size_t& totalScratchMemory) {
 
     const uint32_t currentFrame = m_device->getCurrentFrameId();
+    ++m_mergedBlasStats.frames;
 
     struct BucketGeometryContentHashData {
       XXH64_hash_t vertexHash;
@@ -3125,21 +3037,84 @@ namespace dxvk {
       buildInfo.geometryCount = bucket->geometries.size();
       buildInfo.pGeometries = bucket->geometries.data();
 
-      // Calculate the build sizes for this bucket
+      // NV-DXVK [GpuScene]: the bucket's pinned BLAS pair and cached size query
+      // (see MergedBucketBlas in the header).
+      // Two buckets on one key in one frame would fight over one pair and
+      // allocate every frame; re-key the second deterministically, the way
+      // SurfaceSlotTable::acquire does. tryAddInstance makes this unreachable
+      // today -- it is here so that stays a correctness property.
+      const uint64_t pinKey = bucketCompatKey(*bucket);
+      MergedBucketBlas* pinEntry = &m_mergedBucketBlas[pinKey];
+      for (uint64_t salt = 1; pinEntry->lastFrame == currentFrame; ++salt) {
+        pinEntry = &m_mergedBucketBlas[pinKey ^ (salt * 0x9E3779B97F4A7C15ull)];
+      }
+      MergedBucketBlas& pin = *pinEntry;
+      pin.lastFrame = currentFrame;
+      ++m_mergedBlasStats.buckets;
+
+      // Calculate the build sizes for this bucket.
+      //
+      // Cached on exactly the inputs the size query reads -- the [BlasSizeCache]
+      // rule the dynamic path already uses, extended over every geometry: the
+      // spec ignores address members, but the NULL-ness of transformData and
+      // the whole opacity-micromap chain (usage counts decide the size) count.
       VkAccelerationStructureBuildSizesInfoKHR sizeInfo {};
       sizeInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
-      m_device->vkd()->vkGetAccelerationStructureBuildSizesKHR(m_device->handle(), VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
-                                                               &buildInfo, bucket->primitiveCounts.data(), &sizeInfo);
+      {
+        uint64_t sizeKey = 0xcbf29ce484222325ull;  // FNV-1a
+        auto mix = [&sizeKey](uint64_t v) {
+          sizeKey ^= v;
+          sizeKey *= 1099511628211ull;
+        };
+        mix(uint64_t(buildInfo.flags));
+        mix(bucket->geometries.size());
+        for (size_t gi = 0; gi < bucket->geometries.size(); ++gi) {
+          const VkAccelerationStructureGeometryKHR& geo = bucket->geometries[gi];
+          mix(bucket->primitiveCounts[gi]);
+          mix(uint64_t(geo.geometryType));
+          mix(uint64_t(geo.flags));
+          if (geo.geometryType != VK_GEOMETRY_TYPE_TRIANGLES_KHR) {
+            continue;
+          }
+          const VkAccelerationStructureGeometryTrianglesDataKHR& tri = geo.geometry.triangles;
+          mix(uint64_t(tri.vertexFormat));
+          mix(uint64_t(tri.vertexStride));
+          mix(tri.maxVertex);
+          mix(uint64_t(tri.indexType));
+          mix(tri.transformData.deviceAddress != 0 ? 1u : 0u);
+          for (const VkBaseInStructure* ext = reinterpret_cast<const VkBaseInStructure*>(tri.pNext);
+               ext != nullptr; ext = ext->pNext) {
+            mix(uint64_t(ext->sType));
+            if (ext->sType != VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_TRIANGLES_OPACITY_MICROMAP_EXT) {
+              continue;
+            }
+            const auto* omm = reinterpret_cast<const VkAccelerationStructureTrianglesOpacityMicromapEXT*>(ext);
+            mix(uint64_t(omm->indexType));
+            mix(uint64_t(reinterpret_cast<uintptr_t>(omm->micromap)));
+            mix(omm->usageCountsCount);
+            for (uint32_t u = 0; u < omm->usageCountsCount; ++u) {
+              const VkMicromapUsageEXT* usage = omm->pUsageCounts != nullptr ? &omm->pUsageCounts[u]
+                : (omm->ppUsageCounts != nullptr ? omm->ppUsageCounts[u] : nullptr);
+              if (usage != nullptr) {
+                mix(usage->count);
+                mix(usage->subdivisionLevel);
+                mix(usage->format);
+              }
+            }
+          }
+        }
+        if (sizeKey == 0) {
+          sizeKey = 1;  // reserve 0 as "not cached"
+        }
 
-      // Try to find an existing BLAS that is minimally sufficient to fit this bucket of geometries
-      PooledBlas* selectedBlas = nullptr;
-      for (const auto& blas : m_blasPool) {
-        size_t bufferSize = blas->accelStructure->info().size;
-        uint32_t paddedLastTouched = blas->frameLastTouched + 1 + (RtxOptions::enablePreviousTLAS() ? 1u : 0u); /* note: +2 because frameLastTouched is unsigned and init'd with UINT32_MAX, and keep the BLAS'es for one extra frame for previous TLAS access */
-        if (bufferSize >= sizeInfo.accelerationStructureSize &&
-            (!selectedBlas || bufferSize < selectedBlas->accelStructure->info().size) &&
-            paddedLastTouched <= currentFrame) {
-          selectedBlas = blas.ptr();
+        if (pin.sizeKey == sizeKey) {
+          sizeInfo = pin.sizeInfo;
+          ++m_mergedBlasStats.sizeHit;
+        } else {
+          m_device->vkd()->vkGetAccelerationStructureBuildSizesKHR(m_device->handle(), VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                                                                   &buildInfo, bucket->primitiveCounts.data(), &sizeInfo);
+          pin.sizeKey = sizeKey;
+          pin.sizeInfo = sizeInfo;
         }
       }
 
@@ -3166,6 +3141,53 @@ namespace dxvk {
             &TopologyHashData::firstVertex>(topologyHashData);
       }
 
+      // NV-DXVK [GpuScene]: build into one of the bucket's own pinned BLASes.
+      // Writable = not referenced by a TLAS that is still live: last frame's
+      // with previous-TLAS on (+2), else the frame before (+1); the +1/+2 also
+      // wraps a never-touched kInvalidFrameIndex to 0/1. Of the writable pins
+      // take the most recently built -- its contents are the nearest to this
+      // frame's, so it is the one whose topology/content hashes can let the
+      // build UPDATE or skip.
+      PooledBlas* selectedBlas = nullptr;
+      {
+        const VkDeviceSize need = sizeInfo.accelerationStructureSize;
+        const uint32_t pad = 1u + (RtxOptions::enablePreviousTLAS() ? 1u : 0u);
+        for (const Rc<PooledBlas>& pinned : pin.pinned) {
+          if (pinned == nullptr || pinned->accelStructure->info().size < need ||
+              pinned->frameLastTouched + pad > currentFrame) {
+            continue;
+          }
+          if (selectedBlas == nullptr || pinned->frameLastTouched > selectedBlas->frameLastTouched) {
+            selectedBlas = pinned.ptr();
+          }
+        }
+
+        if (selectedBlas != nullptr) {
+          ++m_mergedBlasStats.pinHit;
+        } else {
+          // Replace the least useful pin: an empty one, then one too small,
+          // then the older. A replaced BLAS is still in m_blasPool, so a TLAS
+          // that references it keeps it alive until the pool evicts it.
+          auto keepRank = [&](const Rc<PooledBlas>& p) -> uint64_t {
+            if (p == nullptr) {
+              return 0ull;
+            }
+            const uint64_t fits = p->accelStructure->info().size >= need ? 2ull : 1ull;
+            return (fits << 32) | uint64_t(p->frameLastTouched);
+          };
+          Rc<PooledBlas>& slot = keepRank(pin.pinned[0]) <= keepRank(pin.pinned[1]) ? pin.pinned[0] : pin.pinned[1];
+          // A bucket that outgrew its BLAS is growing: leave 1/8 headroom so
+          // the next few members do not each cost an allocation.
+          const bool grew = (pin.pinned[0] != nullptr && pin.pinned[0]->accelStructure->info().size < need) ||
+                            (pin.pinned[1] != nullptr && pin.pinned[1]->accelStructure->info().size < need);
+          Rc<PooledBlas> newBlas = createPooledBlas(size_t(need + (grew ? need / 8 : 0)), "BLAS Merged");
+          m_blasPool.push_back(newBlas);
+          slot = newBlas;
+          selectedBlas = newBlas.ptr();
+          ++m_mergedBlasStats.created;
+        }
+      }
+
       // Must ensure that if we are updating an existing blas, rather than rebuilding, the blas is compatible with our new build info
       // Cannot update a blas that contains OMM instances, this leads to sporadic device lost errors
       const bool updateLayoutCompatible = selectedBlas &&
@@ -3183,14 +3205,6 @@ namespace dxvk {
         buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;
       }
 
-      // There is no such BLAS - create one and put it into the pool
-      if (!selectedBlas) {
-        auto newBlas = createPooledBlas(sizeInfo.accelerationStructureSize, "BLAS Merged");
-
-        selectedBlas = newBlas.ptr();
-
-        m_blasPool.push_back(std::move(newBlas));
-      }
       assert(selectedBlas);
       selectedBlas->frameLastTouched = currentFrame;
       selectedBlas->topologyHash = newTopologyHash;
@@ -3240,6 +3254,13 @@ namespace dxvk {
                                  (selectedBlas->contentHash == newContentHash) &&
                                  (newContentHash != kEmptyHash);
       selectedBlas->contentHash = newContentHash;
+      if (canSkipBuild) {
+        ++m_mergedBlasStats.skip;
+      } else if (buildInfo.mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR) {
+        ++m_mergedBlasStats.update;
+      } else {
+        ++m_mergedBlasStats.build;
+      }
 
       if (!canSkipBuild) {
         // Use the selected BLAS for the build
@@ -3340,12 +3361,17 @@ namespace dxvk {
         (bucket->reorderedSurfacesOffset & uint32_t(CUSTOM_INDEX_SURFACE_MASK));
       memcpy(static_cast<void*>(&instance.transform.matrix[0][0]), &identityTransform[0][0], sizeof(VkTransformMatrixKHR));
 
+      // NV-DXVK [SceneCull] slice 9: every entry pushed with its source.
+      const MergedEntrySource source { nullptr, nullptr, bucket.get() };
       if (bucket->usesUnorderedApproximations && RtxOptions::enableSeparateUnorderedApproximations()) {
         m_mergedInstances[Tlas::Unordered].push_back(instance);
+        m_mergedSources[Tlas::Unordered].push_back(source);
       } else {
         m_mergedInstances[Tlas::Opaque].push_back(instance);
+        m_mergedSources[Tlas::Opaque].push_back(source);
         if (bucket->hasSssInstances) {
           m_mergedInstances[Tlas::SSS].push_back(instance);
+          m_mergedSources[Tlas::SSS].push_back(source);
         }
       }
 
@@ -3361,7 +3387,12 @@ namespace dxvk {
       // traverses, with a valid BLAS reference and a primary-acceptable mask, or
       // flips to Unordered / mask 0 / a stale UPDATE-refit. Cross-ref by f=
       // against [SkyTrace.primaryMiss] (top=100% => black) and [SpikeRB].
-      {
+      //
+      // NV-DXVK [perf] slice 0: gated on rtx.logGeomDiag. Ungated, this walked
+      // EVERY member of EVERY merged bucket every frame (getBlas + a VS compare
+      // each) to look for two hard-coded trim shaders -- and printed nothing on
+      // maps without them (0 [TlasMember] lines in the 2026-09-12 run).
+      if (RtxOptions::logGeomDiag()) {
         // The static BSP merge groups MANY same-mask world geometries into one
         // bucket, so the trim is rarely originalInstances[0] — SCAN all of them
         // (this is how [SpikeRB] finds the trim: per-instance VS check).
@@ -3532,6 +3563,9 @@ namespace dxvk {
       if (m_mergedInstances[t].size() > m_mergedInstancesBaselineCount[t]) {
         m_mergedInstances[t].resize(m_mergedInstancesBaselineCount[t]);
       }
+      if (m_mergedSources[t].size() > m_mergedInstancesBaselineCount[t]) {
+        m_mergedSources[t].resize(m_mergedInstancesBaselineCount[t]);
+      }
     }
 
     bool haveInstances = false;
@@ -3615,6 +3649,8 @@ namespace dxvk {
         memcpy(instance.transform.matrix, &transform, sizeof(VkTransformMatrixKHR));
 
         m_mergedInstances[Tlas::Unordered].push_back(instance);
+        // [SceneCull]: a billboard entry has no source and is never tested.
+        m_mergedSources[Tlas::Unordered].push_back(MergedEntrySource {});
 
         ++index;
       }
@@ -3713,6 +3749,7 @@ namespace dxvk {
 
     if ((m_vkInstanceBuffer == nullptr || info.size > m_vkInstanceBuffer->info().size) && info.size != 0) {
       m_vkInstanceBuffer = m_device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXAccelerationStructure, "Instance Buffer");
+      m_instanceBufferReplaced = true;
       Logger::debug("DxvkRaytrace: Vulkan AS Instance Realloc");
     }
 
@@ -3746,14 +3783,118 @@ namespace dxvk {
 
     // Write only the CPU-populated (normal) instance data.  PointInstancer
     // regions are left for the GPU culling shader to fill directly.
-    size_t offset = 0;
-    for (int t = 0; t < Tlas::Count; ++t) {
-      if (!m_mergedInstances[t].empty()) {
-        const size_t size = m_mergedInstances[t].size() * sizeof(VkAccelerationStructureInstanceKHR);
-        ctx->writeToBuffer(m_vkInstanceBuffer, offset, size, m_mergedInstances[t].data());
+    //
+    // NV-DXVK [GpuScene] G5: through a DeltaUploadTable, like the surface and
+    // transform tables -- element i of each TLAS region is the same object from
+    // frame to frame now that the emit order is stable (see the dynamic-BLAS
+    // loop in mergeInstancesIntoBlas), so only changed entries are sent.
+    // PointInstancer slots are GPU-owned: the mirror never vouches for them and
+    // a coalesced region never spans one. The [InstUpBarrier] above still
+    // orders last frame's (untracked) TLAS-build reads before these copies.
+    //
+    // Refit legality is decided here, where the CPU entries are final
+    // (billboards included): a type may refit only if its region split is
+    // unchanged and no entry changed its instance flags or its active status
+    // (reference zero vs non-zero) since the build it would refit from.
+    {
+      uint32_t totalElements = 0;
+      for (int t = 0; t < Tlas::Count; ++t) {
+        totalElements += uint32_t(m_mergedInstances[t].size()) + m_pointInstancerSlotsPerType[t];
       }
-      // Advance past both normal and PointInstancer regions for this TLAS type
-      offset += (m_mergedInstances[t].size() + m_pointInstancerSlotsPerType[t]) * sizeof(VkAccelerationStructureInstanceKHR);
+      m_instanceDelta.beginFrame(totalElements, m_instanceBufferReplaced);
+      m_instanceBufferReplaced = false;
+
+      // NV-DXVK [SceneCull] slice 9: one cull record per CPU-owned entry, packed
+      // in the same walk and the same order as the entries themselves.
+      const bool sceneCullOn = m_sceneCull.enabled();
+      uint32_t cullRecord = 0;
+      uint32_t typeFirstRecord[Tlas::Count] = {};
+      uint32_t typeBaseElement[Tlas::Count] = {};
+      if (sceneCullOn) {
+        uint32_t cullRecordCount = 0;
+        for (int t = 0; t < Tlas::Count; ++t) {
+          cullRecordCount += uint32_t(m_mergedInstances[t].size());
+        }
+        m_sceneCull.beginRecords(m_device, cullRecordCount);
+      }
+
+      uint32_t element = 0;
+      for (int t = 0; t < Tlas::Count; ++t) {
+        const std::vector<VkAccelerationStructureInstanceKHR>& insts = m_mergedInstances[t];
+        std::vector<uint32_t>& sig = m_tlasInstSig[t];
+        bool same = sig.size() == insts.size()
+                 && m_tlasPiSlotsLast[t] == m_pointInstancerSlotsPerType[t];
+        sig.resize(insts.size());
+        typeFirstRecord[t] = cullRecord;
+        typeBaseElement[t] = element;
+        if (sceneCullOn && m_mergedSources[t].size() != insts.size()) {
+          // An m_mergedInstances push without its source. The missing records
+          // pack untested (kept) -- fail safe -- but the push site must be found.
+          const size_t entryN = insts.size();
+          const size_t sourceN = m_mergedSources[t].size();
+          ONCE(Logger::err(str::format("[SceneCull] TLAS type ", t, " has ", entryN,
+                                       " entries but ", sourceN, " sources")));
+        }
+        for (uint32_t i = 0; i < uint32_t(insts.size()); ++i) {
+          const VkAccelerationStructureInstanceKHR& vi = insts[i];
+          std::memcpy(m_instanceDelta.scratch(), &vi, sizeof(vi));
+          m_instanceDelta.commit(element++);
+          const uint32_t s = (uint32_t(vi.flags) << 1) | (vi.accelerationStructureReference != 0ull ? 1u : 0u);
+          same = same && sig[i] == s;
+          sig[i] = s;
+          if (sceneCullOn) {
+            SceneCullRecord record {};
+            if (i < m_mergedSources[t].size()) {
+              packSceneCullRecord(m_mergedSources[t][i], record);
+            }
+            m_sceneCull.commitRecord(cullRecord++, record);
+          }
+        }
+        for (uint32_t i = 0; i < m_pointInstancerSlotsPerType[t]; ++i) {
+          m_instanceDelta.gpuOwned(element++);
+        }
+        // The PointInstancer entries are GPU-written, so their layout and
+        // flags are checked from the batch descriptors that drive the writes.
+        uint64_t piSig = 0xcbf29ce484222325ull;
+        for (const PointInstancerBatch& b : m_pointInstancerBatches) {
+          if (b.tlasType != uint32_t(t)) {
+            continue;
+          }
+          const uint64_t words[3] = {
+            (uint64_t(b.firstIndexInType) << 32) | b.instanceCount,
+            uint64_t(b.sbtOffsetAndFlags),
+            b.blasReference != 0ull ? 1ull : 0ull };
+          for (const uint64_t w : words) {
+            piSig ^= w;
+            piSig *= 1099511628211ull;
+          }
+        }
+        same = same && m_tlasPiSigLast[t] == piSig;
+        m_tlasPiSigLast[t] = piSig;
+        m_tlasPiSlotsLast[t] = m_pointInstancerSlotsPerType[t];
+        m_tlasTopologySame[t] = same;
+      }
+
+      m_instanceDelta.upload(ctx.ptr(), m_vkInstanceBuffer);
+      if (RtxOptions::GpuScene::verify()) {
+        const uint32_t ivFrame = m_device->getCurrentFrameId();
+        m_instanceDelta.harvestVerify(ivFrame);
+        if ((ivFrame % std::max(1u, RtxOptions::GpuScene::verifyInterval())) == 0u) {
+          m_instanceDelta.scheduleVerify(ctx.ptr(), m_device, m_vkInstanceBuffer, ivFrame);
+        }
+      }
+
+      // NV-DXVK [SceneCull] slice 9: the table is final and uploaded; the cull
+      // pass copies it into the TLAS input with the verdict's masks. From here
+      // on tlasInstanceBuffer() is that input, and the PI pass writes there.
+      if (sceneCullOn) {
+        uint32_t piInstances = 0;
+        for (const PointInstancerBatch& b : m_pointInstancerBatches) {
+          piInstances += b.instanceCount;
+        }
+        m_sceneCull.dispatch(ctx, m_device, m_vkInstanceBuffer, typeFirstRecord, typeBaseElement,
+                             piInstances, m_device->getCurrentFrameId());
+      }
     }
     markAcc(acc_upload);
 
@@ -4403,11 +4544,17 @@ namespace dxvk {
 
     // Resolve each batch's instanceBufferByteOffset.
     // PointInstancer slots sit after the normal instances within each type's region.
+    // NV-DXVK [SceneCull] slice 9: and its verdict slots, which follow the CPU
+    // entries' in the scene cull's verdict buffer (SceneCullPass::dispatch
+    // sized it for exactly these batches).
+    uint32_t cullVerdictNext = m_sceneCull.used() ? m_sceneCull.entryCount() : 0u;
     for (auto& batch : m_pointInstancerBatches) {
       batch.instanceBufferByteOffset = static_cast<uint32_t>(
         typeBaseOffset[batch.tlasType]
         + m_mergedInstances[batch.tlasType].size() * sizeof(VkAccelerationStructureInstanceKHR)
         + batch.firstIndexInType * sizeof(VkAccelerationStructureInstanceKHR));
+      batch.cullVerdictBase = cullVerdictNext;
+      cullVerdictNext += batch.instanceCount;
     }
 
     // ========================================================================
@@ -5027,8 +5174,13 @@ namespace dxvk {
     // can record, per surfaceIndex, what it wrote into each TLAS instance entry.
     // Same buffer and same index space [ResolveCensus] uses, so the two halves
     // land on one log line per VS per frame with no correlation step.
-    system.dispatchCulling(ctx, m_vkInstanceBuffer, m_surfaceBuffer, surfaceMaterialBuffer, m_pointInstancerBatches, cameraPos,
-                           m_device->getCommon()->getResources().getRaytracingOutput().m_surfaceCoverageBuffer);
+    //
+    // NV-DXVK [SceneCull] slice 9: the entries go into the buffer the TLAS is
+    // built from this frame (the scene cull's output when it ran), and the
+    // shader applies the scene cull's verdict per instance.
+    system.dispatchCulling(ctx, tlasInstanceBuffer(), m_surfaceBuffer, surfaceMaterialBuffer, m_pointInstancerBatches, cameraPos,
+                           m_device->getCommon()->getResources().getRaytracingOutput().m_surfaceCoverageBuffer,
+                           m_sceneCull.pointInstancerBindings(ctx, m_device));
 
     // NV-DXVK debug: definitive test. Overwrite the FIRST PI batch's first slot in
     // m_vkInstanceBuffer with a copy of a known-working merged-Opaque instance entry,
@@ -5178,14 +5330,16 @@ namespace dxvk {
         const uint32_t byteOff = b0.instanceBufferByteOffset;
         const uint32_t copyCount = std::min<uint32_t>(b0.instanceCount, kProbeMaxInstances);
         const uint32_t copyBytes = copyCount * kProbeBytesPerEntry;
-        if (copyBytes > 0 && byteOff + copyBytes <= m_vkInstanceBuffer->info().size) {
+        // [SceneCull] slice 9: the PI entries live in the TLAS input buffer.
+        const Rc<DxvkBuffer>& piEntries = tlasInstanceBuffer();
+        if (copyBytes > 0 && byteOff + copyBytes <= piEntries->info().size) {
           // Barrier: GPU culling writes (shader write) → transfer read.
           ctx->emitMemoryBarrier(0,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_ACCESS_SHADER_WRITE_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_ACCESS_TRANSFER_READ_BIT);
-          ctx->copyBuffer(sStaging[writeSlot], 0, m_vkInstanceBuffer, byteOff, copyBytes);
+          ctx->copyBuffer(sStaging[writeSlot], 0, piEntries, byteOff, copyBytes);
           sCaptureValid[writeSlot] = true;
           sCaptureCount[writeSlot] = copyCount;
           sCaptureBaseSurf[writeSlot] = b0.baseSurfaceIndex;
@@ -7866,6 +8020,11 @@ namespace dxvk {
     surfaceInfoLists[currIndex].resize(m_reorderedSurfaces.size());
     std::unordered_map<uint32_t, std::vector<int>> curMaterialHashToSurfaceMap;
     for (uint32_t surfaceIndex = 0; surfaceIndex < m_reorderedSurfaces.size(); surfaceIndex++) {
+      if (m_reorderedSurfaces[surfaceIndex] == nullptr) {
+        // [GpuScene] hole
+        surfaceInfoLists[currIndex][surfaceIndex].surfaceMaterialIndex = kSurfaceInvalidSurfaceMaterialIndex;
+        continue;
+      }
       RtInstance& surface = *m_reorderedSurfaces[surfaceIndex];
 
       // Only record objects that use unordered approximations.
@@ -7948,11 +8107,12 @@ namespace dxvk {
     }
 
     // Simplify syntax for accessing the persistent containers
-    auto& surfacesGPUData = uploadSurfaceDataFuncState.surfacesGPUData;
     auto& surfaceIndexMapping = uploadSurfaceDataFuncState.surfaceIndexMapping;
 
-    // Surface buffer
-    const auto surfacesGPUSize = m_reorderedSurfaces.size() * kSurfaceGPUSize;
+    // Surface buffer. m_reorderedSurfaces is the SLOT table (slice 8), so its
+    // size is the high-water mark and holes are nullptr.
+    const uint32_t slotCount = static_cast<uint32_t>(m_reorderedSurfaces.size());
+    const auto surfacesGPUSize = size_t(slotCount) * kSurfaceGPUSize;
 
     // Allocate the instance buffer and copy its contents from host to device memory
     // STORAGE_BUFFER_BIT is required for the GPU PointInstancer culling shader
@@ -7978,49 +8138,17 @@ namespace dxvk {
     info.size = align(surfacesGPUSize, kBufferAlignment);
     if (m_surfaceBuffer == nullptr || info.size > m_surfaceBuffer->info().size) {
       m_surfaceBuffer = m_device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXAccelerationStructure, "Surface Buffer");
+      m_surfaceBufferReplaced = true;
     }
 
     uint32_t maxPreviousSurfaceIndex = 0;
 
-    // Write surface data
-    std::size_t dataOffset = 0;
-    surfacesGPUData.resize(surfacesGPUSize);
-
-    for (uint32_t i = 0; i < m_reorderedSurfaces.size(); ++i) {
-      const auto& currentInstance = *m_reorderedSurfaces[i];
-      RtSurface& currentSurface = m_reorderedSurfaces[i]->surface;
-
-      // For PointInstancer entries beyond the first, do nothing.  The GPU culling shader will 
-      // patch per-instance transforms and set per-instance customInstanceIndex later.
-      if (currentSurface.instancesToObject != nullptr &&  currentSurface.surfaceIndexOfFirstInstance != SIZE_MAX && i > currentSurface.surfaceIndexOfFirstInstance) {
-        dataOffset += kSurfaceGPUSize;
-      } else {
-        // Split instance geometry need to have their first index offset set in their corresponding surface instances
-        currentSurface.firstIndex += m_reorderedSurfacesFirstIndexOffset[i];
-        currentSurface.writeGPUData(surfacesGPUData.data(), dataOffset, i);
-        currentSurface.firstIndex -= m_reorderedSurfacesFirstIndexOffset[i];
-      }
-
-      // Find the size of the surface mapping buffer
-      // Skip SURFACE_INDEX_INVALID (new instances with no previous-frame data) to avoid
-      // oversizing the mapping vector 
-      const uint32_t prevIdx = currentInstance.getPreviousSurfaceIndex();
-      if (prevIdx != SURFACE_INDEX_INVALID) {
-        maxPreviousSurfaceIndex = std::max(maxPreviousSurfaceIndex, prevIdx);
-      }
-    }
-
-    // The GPU's SharedSurfaceIndex texture may reference any surface index from the
-    // previous frame.  Ensure the mapping covers at least the previous frame's surface
-    // count so those GPU lookups read SURFACE_INDEX_INVALID rather than stale buffer data.
-    auto& previousFrameSurfaceCount = uploadSurfaceDataFuncState.previousFrameSurfaceCount;
-    if (previousFrameSurfaceCount > 0) {
-      maxPreviousSurfaceIndex = std::max(maxPreviousSurfaceIndex, previousFrameSurfaceCount - 1);
-    }
-    previousFrameSurfaceCount = static_cast<uint32_t>(m_reorderedSurfaces.size());
-
-    assert(dataOffset == surfacesGPUSize);
-    assert(surfacesGPUData.size() == surfacesGPUSize);
+    // NV-DXVK [GpuScene] slice 8: THE OUTPUT TEST. Every live slot is packed
+    // and compared against the delta mirror; only slots whose bytes differ are
+    // sent (m_surfaceDelta.upload below). This replaced a whole-table pack into
+    // a scratch vector and a whole-table upload every frame.
+    m_surfaceDelta.beginFrame(slotCount, m_surfaceBufferReplaced);
+    m_surfaceBufferReplaced = false;
 
     // NV-DXVK [StaleTape, 2026-08-21]: do the surfaces we are about to upload
     // still index buffers that exist? This is the acceptance gate for stable
@@ -8059,20 +8187,51 @@ namespace dxvk {
     // [Coverage] OOBWhy counts an out-of-range SURFACE index, and this failure
     // produces none -- the surface index is perfectly valid, it is the BUFFER
     // index inside the surface that is stale.
-    {
-      SceneManager& sceneManager = m_device->getCommon()->getSceneManager();
-      const std::vector<RaytraceBuffer>& bufferTable = sceneManager.getBufferTable();
-      const uint32_t tableCount = static_cast<uint32_t>(bufferTable.size());
-      const uint32_t frameId = m_device->getCurrentFrameId();
+    //
+    // I7 -- SLICE 8 MUST NOT SHORTEN THIS. The reference marking below is the
+    // evidence BufferSlotTable::reclaim() frees on (ARCHITECTURE_OVERHAUL sec
+    // 0.1 item 4). The delta upload skips unchanged slots, but it does NOT skip
+    // this: every live surface still marks all nine of its indices every frame,
+    // from inside the same loop that packs it, so no delta decision can ever
+    // starve the reclaim sweep of a reference.
+    SceneManager& sceneManager = m_device->getCommon()->getSceneManager();
+    const std::vector<RaytraceBuffer>& bufferTable = sceneManager.getBufferTable();
+    const uint32_t tableCount = static_cast<uint32_t>(bufferTable.size());
+    const uint32_t frameId = m_device->getCurrentFrameId();
+    uint32_t staleSurfaces = 0;
+    uint32_t maxBufferIndex = 0;
+    uint32_t oobIndices = 0;
+    uint32_t deadIndices = 0;
+    uint32_t liveSurfaces = 0;
 
-      uint32_t staleSurfaces = 0;
-      uint32_t maxBufferIndex = 0;
-      uint32_t oobIndices = 0;
-      uint32_t deadIndices = 0;
+    for (uint32_t i = 0; i < slotCount; ++i) {
+      RtInstance* const currentInstancePtr = m_reorderedSurfaces[i];
+      if (currentInstancePtr == nullptr) {
+        continue;  // a hole: no run owns it and nothing references it
+      }
+      ++liveSurfaces;
+      const auto& currentInstance = *currentInstancePtr;
+      RtSurface& currentSurface = currentInstancePtr->surface;
 
-      for (uint32_t i = 0; i < m_reorderedSurfaces.size(); ++i) {
-        const RtSurface& s = m_reorderedSurfaces[i]->surface;
+      // For PointInstancer entries beyond the first, do nothing.  The GPU culling shader will
+      // patch per-instance transforms and set per-instance customInstanceIndex later.
+      const bool isPiRun = currentSurface.instancesToObject != nullptr && currentSurface.surfaceIndexOfFirstInstance != SIZE_MAX;
+      if (isPiRun && i > currentSurface.surfaceIndexOfFirstInstance) {
+        m_surfaceDelta.gpuOwned(i);
+      } else {
+        // Split instance geometry need to have their first index offset set in their corresponding surface instances
+        std::size_t dataOffset = 0;
+        currentSurface.firstIndex += m_reorderedSurfacesFirstIndexOffset[i];
+        currentSurface.writeGPUData(m_surfaceDelta.scratch(), dataOffset, i);
+        currentSurface.firstIndex -= m_reorderedSurfacesFirstIndexOffset[i];
+        assert(dataOffset == kSurfaceGPUSize);
+        // The PI template is written back by the culling shader (instance 0's
+        // transform, in GPU float), so the mirror stops vouching for it.
+        m_surfaceDelta.commit(i, isPiRun);
 
+        // [StaleTape] + the reference observation, once per packed surface. PI
+        // duplicates carry the template's indices, so the template marks them.
+        //
         // kSurfaceInvalidBufferIndex is the "not bound" sentinel and is never
         // dereferenced by the shader, so it must not count as stale.
         //
@@ -8080,6 +8239,7 @@ namespace dxvk {
         // surfaces: those slices come from the game's own dynamic SRVs, so they
         // are the ones that actually churn, and a slot nobody reports a
         // reference for is a slot the sweep will reclaim.
+        const RtSurface& s = currentSurface;
         const uint32_t indices[] = {
           s.positionBufferIndex, s.previousPositionBufferIndex, s.normalBufferIndex,
           s.texcoordBufferIndex, s.color0BufferIndex, s.indexBufferIndex,
@@ -8087,14 +8247,12 @@ namespace dxvk {
           static_cast<uint32_t>(s.vguiImgBoundsBufferIndex),
           static_cast<uint32_t>(s.vguiStylesBufferIndex),
         };
-
         bool stale = false;
         for (const uint32_t idx : indices) {
           if (idx == kSurfaceInvalidBufferIndex) {
             continue;
           }
           maxBufferIndex = std::max(maxBufferIndex, idx);
-
           if (idx >= tableCount) {
             ++oobIndices;
             stale = true;
@@ -8105,8 +8263,7 @@ namespace dxvk {
             stale = true;
             continue;
           }
-
-          // THE REFERENCE OBSERVATION. Every live surface is rewritten here every
+          // THE REFERENCE OBSERVATION. Every live surface is packed here every
           // frame, so this is the complete set of slots in use, and a slot that
           // stops appearing has genuinely stopped being read -- which is what
           // lets the reclaim sweep recycle it without guessing at instance
@@ -8116,90 +8273,57 @@ namespace dxvk {
         staleSurfaces += stale ? 1u : 0u;
       }
 
-      // Silent when clean. A non-zero count is the defect, so it must not be
-      // throttled away on the frame it first appears.
-      if (staleSurfaces != 0) {
-        Logger::warn(str::format(
-          "[StaleTape] f=", frameId,
-          " staleSurfaces=", staleSurfaces,
-          "/", m_reorderedSurfaces.size(),
-          " oob=", oobIndices,
-          " dead=", deadIndices,
-          " maxBufferIndex=", maxBufferIndex,
-          " tableCount=", tableCount,
-          "  <- surfaces uploaded with buffer indices that name no live buffer"));
+      // Find the size of the surface mapping buffer
+      // Skip SURFACE_INDEX_INVALID (new instances with no previous-frame data) to avoid
+      // oversizing the mapping vector
+      const uint32_t prevIdx = currentInstance.getPreviousSurfaceIndex();
+      if (prevIdx != SURFACE_INDEX_INVALID) {
+        maxPreviousSurfaceIndex = std::max(maxPreviousSurfaceIndex, prevIdx);
       }
     }
 
-    // NV-DXVK [SurfaceDelta] slice 8's precondition, §9 item 5. Measures the
-    // delta-upload opportunity WITHOUT changing what is uploaded.
-    //
-    // §5.1 argues from the code that a level-sized resident set makes this
-    // whole-array upload expensive. That is a prediction; this is the number.
-    // Two things are counted and they answer different questions:
-    //
-    //   slotChurn      instances whose surface slot MOVED between frames while
-    //                  the instance itself survived. Slot instability is what
-    //                  makes a delta impossible in the first place, so a high
-    //                  churn says stable slots must come before delta upload --
-    //                  which is exactly §5.1's "the delta has to start at the
-    //                  walk", stated as a measurement instead of an argument.
-    //   bytesChanged   of the bytes about to be written, how many differ from
-    //                  what was written last frame. This is the ceiling on what
-    //                  a delta upload could save. If a stationary scene does
-    //                  not read ~0 here, slice 8 saves nothing and drops down
-    //                  the list whatever the O(scene) argument says.
-    //
-    // Costs one memcmp + one copy of the surface array per frame while on, and
-    // nothing at all while off.
-    if (RtxOptions::logSurfaceDelta()) {
-      auto& prev = uploadSurfaceDataFuncState.prevSurfacesGPUData;
-      uint32_t changed = 0u, bytesChanged = 0u, churn = 0u;
+    m_surfaceDelta.upload(ctx.ptr(), m_surfaceBuffer);
 
-      for (uint32_t i = 0; i < m_reorderedSurfaces.size(); ++i) {
-        const RtInstance& inst = *m_reorderedSurfaces[i];
-        const uint32_t p = inst.getPreviousSurfaceIndex();
-        if (p != SURFACE_INDEX_INVALID && p != i) {
-          ++churn;
-        }
-      }
+    // Silent when clean. A non-zero count is the defect, so it must not be
+    // throttled away on the frame it first appears.
+    if (staleSurfaces != 0) {
+      Logger::warn(str::format(
+        "[StaleTape] f=", frameId,
+        " staleSurfaces=", staleSurfaces,
+        "/", liveSurfaces,
+        " oob=", oobIndices,
+        " dead=", deadIndices,
+        " maxBufferIndex=", maxBufferIndex,
+        " tableCount=", tableCount,
+        "  <- surfaces uploaded with buffer indices that name no live buffer"));
+    }
 
-      const size_t n = surfacesGPUData.size();
-      if (prev.size() != n) {
-        // First frame, or the array resized. Everything counts as changed --
-        // which is honest: a resize IS a full upload.
-        changed = static_cast<uint32_t>(n / kSurfaceGPUSize);
-        bytesChanged = static_cast<uint32_t>(n);
-      } else {
-        for (size_t off = 0; off + kSurfaceGPUSize <= n; off += kSurfaceGPUSize) {
-          if (std::memcmp(prev.data() + off, surfacesGPUData.data() + off, kSurfaceGPUSize) != 0) {
-            ++changed;
-            bytesChanged += static_cast<uint32_t>(kSurfaceGPUSize);
-          }
-        }
-      }
-      prev.assign(surfacesGPUData.begin(), surfacesGPUData.end());
-
-      const uint32_t frameId = m_device->getCurrentFrameId();
-      auto& lastLog = uploadSurfaceDataFuncState.surfaceDeltaLastLogFrame;
-      if (frameId - lastLog >= 60u) {
-        lastLog = frameId;
-        const uint32_t surfaces = static_cast<uint32_t>(m_reorderedSurfaces.size());
-        Logger::warn(str::format(
-          "[SurfaceDelta] f=", frameId,
-          " surfaces=", surfaces,
-          " uploadBytes=", static_cast<uint32_t>(n),
-          " changed=", changed,
-          " bytesChanged=", bytesChanged,
-          " slotChurn=", churn,
-          " changedPct=", (surfaces ? (100u * changed) / surfaces : 0u),
-          " churnPct=", (surfaces ? (100u * churn) / surfaces : 0u),
-          "  <- stationary scene: changed~0 means slice 8 pays; churn high means"
-          " stable slots must come first"));
+    // [GpuScene] THE GATE: device buffer vs mirror, read back. See rtx.gpuScene.verify.
+    if (RtxOptions::GpuScene::verify()) {
+      m_surfaceDelta.harvestVerify(frameId);
+      const uint32_t interval = std::max(1u, RtxOptions::GpuScene::verifyInterval());
+      if ((frameId % interval) == 0u) {
+        m_surfaceDelta.scheduleVerify(ctx.ptr(), m_device, m_surfaceBuffer, frameId);
       }
     }
 
-    ctx->writeToBuffer(m_surfaceBuffer, 0, surfacesGPUData.size(), surfacesGPUData.data());
+    // The GPU's SharedSurfaceIndex texture may reference any surface index from the
+    // previous frame.  Ensure the mapping covers at least the previous frame's surface
+    // count so those GPU lookups read SURFACE_INDEX_INVALID rather than stale buffer data.
+    auto& previousFrameSurfaceCount = uploadSurfaceDataFuncState.previousFrameSurfaceCount;
+    if (previousFrameSurfaceCount > 0) {
+      maxPreviousSurfaceIndex = std::max(maxPreviousSurfaceIndex, previousFrameSurfaceCount - 1);
+    }
+    previousFrameSurfaceCount = static_cast<uint32_t>(m_reorderedSurfaces.size());
+
+    // NV-DXVK [SurfaceDelta]: probe REMOVED with slice 8 (2026-09-12). It
+    // measured the delta-upload opportunity without changing what was uploaded
+    // (one memcmp + one copy of the whole surface array per frame). Its reading
+    // on a held scene -- changed=26/1897 (1%), slotChurn=1 -- is what cleared
+    // slice 8 to be built; the [GpuScene] line now reports the same two
+    // quantities (surf{chg=,up=} and runs{moved=}) off the live mechanism, and
+    // rtx.logSurfaceDelta went with it. The [StaleTape] block that used to sit
+    // here now runs inside the pack loop above.
 
     // Allocate and initialize the surface mapping buffer
     surfaceIndexMapping.resize(maxPreviousSurfaceIndex + 1);
@@ -8217,6 +8341,9 @@ namespace dxvk {
     // early setSurfaceIndex path for zero-mask OMM/billboard instances).
     // Also populate the previous-->current frame surface index mapping.
     for (uint32_t surfaceIndex = 0; surfaceIndex < m_reorderedSurfaces.size(); surfaceIndex++) {
+      if (m_reorderedSurfaces[surfaceIndex] == nullptr) {
+        continue;  // [GpuScene] hole
+      }
       RtInstance& surface = *m_reorderedSurfaces[surfaceIndex];
 
       if (surface.getSurfaceIndex() == SURFACE_INDEX_INVALID) {
@@ -8316,30 +8443,52 @@ namespace dxvk {
       buildParticleSurfaceMapping(surfaceIndexMapping);
     }
 
-    // Create and upload the primitive id prefix sum buffer
-    auto updatePrefixSumBuffer = [&info, this, ctx](std::vector<uint32_t>& prefixSumList, Rc<DxvkBuffer>& prefixSumBuffer) {
+    // Create and upload the primitive id prefix sum buffers.
+    //
+    // NV-DXVK [GpuScene] slice 8: SWAP, then send only what differs. The old
+    // path re-uploaded BOTH arrays every frame, including last frame's array
+    // into the second buffer -- which, after a swap, already holds it. Each
+    // buffer's CPU twin (m_prefixSumHeld*) is compared before sending, so a
+    // settled scene sends nothing, and a frame that skipped this function
+    // (no surfaces) cannot leave the "last" buffer out of step: it is checked
+    // against the array it must hold, not assumed.
+    auto updatePrefixSumBuffer = [&info, this, ctx](const std::vector<uint32_t>& prefixSumList, Rc<DxvkBuffer>& prefixSumBuffer,
+                                                    std::vector<uint32_t>& held) {
       info.size = std::max(prefixSumList.size(), 1llu) * sizeof(prefixSumList[0]);
 
+      bool replaced = false;
       if (prefixSumBuffer == nullptr || info.size > prefixSumBuffer->info().size) {
         prefixSumBuffer = m_device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXAccelerationStructure, "Prefixsum Buffer");
+        replaced = true;
       }
 
-      if (prefixSumList.size() > 0) {
+      if (prefixSumList.size() > 0 && (replaced || prefixSumList != held)) {
         ctx->writeToBuffer(prefixSumBuffer, 0, prefixSumList.size() * sizeof(prefixSumList[0]), prefixSumList.data());
+        held = prefixSumList;
       }
     };
 
-    updatePrefixSumBuffer(m_reorderedSurfacesPrimitiveIDPrefixSum, m_primitiveIDPrefixSumBuffer);
-    updatePrefixSumBuffer(m_reorderedSurfacesPrimitiveIDPrefixSumLastFrame, m_primitiveIDPrefixSumBufferLastFrame);
+    std::swap(m_primitiveIDPrefixSumBuffer, m_primitiveIDPrefixSumBufferLastFrame);
+    std::swap(m_prefixSumHeldCurrent, m_prefixSumHeldLast);
+    updatePrefixSumBuffer(m_reorderedSurfacesPrimitiveIDPrefixSum, m_primitiveIDPrefixSumBuffer, m_prefixSumHeldCurrent);
+    updatePrefixSumBuffer(m_reorderedSurfacesPrimitiveIDPrefixSumLastFrame, m_primitiveIDPrefixSumBufferLastFrame, m_prefixSumHeldLast);
 
-    // Create and upload the surface mapping buffer
+    // Create and upload the surface mapping buffer. With persistent slots the
+    // mapping is identity for everything that survived, so on a settled scene
+    // it repeats exactly; an identical mapping is not re-sent.
     if (!surfaceIndexMapping.empty()) {
       info.size = align(surfaceIndexMapping.size() * sizeof(int), kBufferAlignment);
+      bool replaced = false;
       if (m_surfaceMappingBuffer == nullptr || info.size > m_surfaceMappingBuffer->info().size) {
         m_surfaceMappingBuffer = m_device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXAccelerationStructure, "Surface Mapping Buffer");
+        replaced = true;
       }
 
-      ctx->writeToBuffer(m_surfaceMappingBuffer, 0, surfaceIndexMapping.size() * sizeof(surfaceIndexMapping[0]), surfaceIndexMapping.data());
+      auto& uploadedMapping = uploadSurfaceDataFuncState.uploadedSurfaceIndexMapping;
+      if (replaced || surfaceIndexMapping != uploadedMapping) {
+        ctx->writeToBuffer(m_surfaceMappingBuffer, 0, surfaceIndexMapping.size() * sizeof(surfaceIndexMapping[0]), surfaceIndexMapping.data());
+        uploadedMapping = surfaceIndexMapping;
+      }
     }
   }
 
@@ -9475,6 +9624,20 @@ namespace dxvk {
       ctx->getCommandList()->trackResource<DxvkAccess::Read>(blas->accelStructure);
     }
 
+    // NV-DXVK [SceneCull] slice 9: both producers of the TLAS input have run --
+    // stats every frame, the verify readback on verify frames. And the build's
+    // read of the TLAS input is invisible to dxvk's tracker (raw vkCmdBuild),
+    // so hold the buffer for this submission explicitly.
+    if (m_sceneCull.used()) {
+      uint32_t totalElements = 0;
+      for (int t = 0; t < Tlas::Count; ++t) {
+        totalElements += uint32_t(m_mergedInstances[t].size()) + m_pointInstancerSlotsPerType[t];
+      }
+      m_sceneCull.recordReadbacks(ctx, m_device, m_mergedInstances, m_pointInstancerBatches,
+                                  totalElements, m_device->getCurrentFrameId());
+      ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_sceneCull.culledBuffer());
+    }
+
     // NV-DXVK debug: write override RIGHT BEFORE TLAS build so nothing can clobber it.
     {
       static uint32_t s_lateOverrideFrame = 0;
@@ -9587,16 +9750,19 @@ namespace dxvk {
                             m_vkInstanceBuffer, slot.regionByteOff[t], mBytes);
           }
           if (pBytes > 0) {
-            if (slot.piRegionByteOff[t] + pBytes > m_vkInstanceBuffer->info().size) {
+            // [SceneCull] slice 9: the PI entries are written into the TLAS
+            // input; the merged region above stays on the table (CPU truth).
+            const Rc<DxvkBuffer>& piEntries = tlasInstanceBuffer();
+            if (slot.piRegionByteOff[t] + pBytes > piEntries->info().size) {
               Logger::warn(str::format(
                 "[InstUpProbe] f=", frameId, " snapshot SKIPPED: PI region ", t,
                 " off=", slot.piRegionByteOff[t], "+", pBytes,
-                " exceeds bufSize=", m_vkInstanceBuffer->info().size));
+                " exceeds bufSize=", piEntries->info().size));
               recorded = false;
               break;
             }
             ctx->copyBuffer(slot.staging, slot.piPackedByteOff[t],
-                            m_vkInstanceBuffer, slot.piRegionByteOff[t], pBytes);
+                            piEntries, slot.piRegionByteOff[t], pBytes);
           }
         }
         slot.gpuRecorded = recorded;
@@ -9639,7 +9805,8 @@ namespace dxvk {
     // This wraps a device pointer to the above uploaded instances.
     VkAccelerationStructureGeometryInstancesDataKHR instancesVk { VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR };
     instancesVk.arrayOfPointers = VK_FALSE;
-    instancesVk.data.deviceAddress = m_vkInstanceBuffer->getDeviceAddress();
+    // NV-DXVK [SceneCull] slice 9: the scene cull's output when it ran this frame.
+    instancesVk.data.deviceAddress = tlasInstanceBuffer()->getDeviceAddress();
 
     // Rewind address to tlas start (normal + PointInstancer slots per preceding type)
     VkDeviceSize instanceBufferOffset = 0;
@@ -9674,6 +9841,13 @@ namespace dxvk {
       // NV-DXVK [TlasOrphans]: the built-count travels with its buffer.
       std::swap(tlas.builtInstanceCount, tlas.previousBuiltInstanceCount);
     }
+
+    // NV-DXVK [GpuScene] G5: the structure a refit would read -- the one built
+    // LAST frame. Opaque swaps its pair every frame, so after the swap that is
+    // previousAccelStructure; the other types rebuild in place.
+    Rc<DxvkAccelStructure> refitSrc = (type == Tlas::Opaque) ? tlas.previousAccelStructure : tlas.accelStructure;
+    const uint32_t refitSrcCount = (type == Tlas::Opaque) ? tlas.previousBuiltInstanceCount : tlas.builtInstanceCount;
+    bool tlasReallocated = false;
 
     // NV-DXVK [AS-Shrink-Realloc]: also force a fresh AS object when the new
     // build's required size is less than half of the existing AS-backing
@@ -9725,6 +9899,7 @@ namespace dxvk {
       info.size = sizeInfo.accelerationStructureSize;
 
       tlas.accelStructure = m_device->createAccelStructure(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, names[type]);
+      tlasReallocated = true;
 
       // NV-DXVK [TlasRealloc]: INFO, not debug — realloc frames are suspected
       // of being exactly the flicker's dropout frames (growth frames were 63%
@@ -9744,14 +9919,52 @@ namespace dxvk {
     // the realloc diagnostics even though the shrink condition was reverted).
     tlas.builtInstanceCount = numInstances;
 
+    // NV-DXVK [GpuScene] G5: refit when it is legal and inside the cadence.
+    // Legal = the structure built last frame exists, was built with these
+    // flags (ALLOW_UPDATE among them) from the same instance count, and this
+    // frame's entries keep the topology prepareSceneData checked -- region
+    // split, flags and active status per entry, PointInstancer layout. A
+    // reallocated destination is always rebuilt. The cadence bounds node
+    // overlap: every rtx.gpuScene.tlasRefitMaxFrames refits, a full build.
+    const uint32_t refitMax = RtxOptions::GpuScene::tlasRefitMaxFrames();
+    const bool refitFlagsOk = (flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) != 0
+                           && m_tlasLastFlags[type] == flags;
+    const bool refitTopologyOk = refitSrc != nullptr && refitSrcCount == numInstances
+                              && refitFlagsOk && m_tlasTopologySame[type];
+    const bool refit = refitMax != 0u && !tlasReallocated && refitTopologyOk
+                    && m_tlasRefitRun[type] < refitMax;
+    if (refit) {
+      ++m_tlasRefitRun[type];
+      ++m_tlasRefitStats.refit;
+    } else {
+      m_tlasRefitRun[type] = 0u;
+      ++m_tlasRefitStats.build;
+      if (refitMax != 0u) {
+        if (tlasReallocated) {
+          ++m_tlasRefitStats.whyRealloc;
+        } else if (!refitTopologyOk) {
+          ++m_tlasRefitStats.whyTopology;
+        } else {
+          ++m_tlasRefitStats.whyCadence;
+        }
+      }
+    }
+    m_tlasLastFlags[type] = flags;
+
     // Allocate the scratch memory, we share the same buffer between all TLAS types, so just ensure we handle the offsetting correctly here.
-    const size_t requiredScratchAllocSize = align(sizeInfo.buildScratchSize + m_scratchAlignment, m_scratchAlignment);
+    const VkDeviceSize scratchNeed = refit ? sizeInfo.updateScratchSize : sizeInfo.buildScratchSize;
+    const size_t requiredScratchAllocSize = align(scratchNeed + m_scratchAlignment, m_scratchAlignment);
     buildInfo.scratchData.deviceAddress = getScratchMemory(totalScratchSize + requiredScratchAllocSize)->getDeviceAddress() + totalScratchSize;
     totalScratchSize += requiredScratchAllocSize;
 
     // Update build information
-    buildInfo.srcAccelerationStructure = nullptr;
+    buildInfo.mode = refit ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR
+                           : VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    buildInfo.srcAccelerationStructure = refit ? refitSrc->getAccelStructure() : VK_NULL_HANDLE;
     buildInfo.dstAccelerationStructure = tlas.accelStructure->getAccelStructure();
+    if (refit) {
+      ctx->getCommandList()->trackResource<DxvkAccess::Read>(refitSrc);
+    }
 
     assert(buildInfo.scratchData.deviceAddress % m_scratchAlignment == 0); // Note: Required by the Vulkan specification.
 
@@ -9922,7 +10135,15 @@ namespace dxvk {
     // [SpawnGeomDiag.piAddEntry] which throttles 1/30 calls, this
     // captures the FIRST occurrence of every unique (vs,mat) tuple
     // so the DrawIn vs DrawOut diff is honest across both paths.
-    {
+    //
+    // NV-DXVK [perf] slice 0: this and the next three probes ([MtnPIAdd],
+    // [SpawnGeomDiag.piAddEntry], [SpawnGeomDiag.PIBlasGeomCount]) ran on every
+    // PointInstancer batch every frame -- two mutex + set inserts, a 1/30
+    // str::format, and for the sky mountains up to 24 matrix products plus a
+    // formatted line per batch per frame. All four are [SpawnGeomDiag]-family
+    // forensics for closed investigations; gated on rtx.logGeomDiag.
+    const bool piDiagOn = RtxOptions::logGeomDiag();
+    if (piDiagOn) {
       const uint64_t vsHash = static_cast<uint64_t>(
         blasEntry->input.getTransformData().vertexShaderHash);
       const uint64_t matHash = static_cast<uint64_t>(
@@ -9969,7 +10190,7 @@ namespace dxvk {
     // ptr), total PI instances, and how many instances land on each of the
     // ~8 segment positions — i.e. exactly where and by how much the TLAS is
     // being over-instanced.
-    {
+    if (piDiagOn) {
       const uint64_t vsHashMpi = static_cast<uint64_t>(
         blasEntry->input.getTransformData().vertexShaderHash);
       const bool isMtnVsMpi = (vsHashMpi == 0x2904d2163ef31a17ull)
@@ -10011,7 +10232,9 @@ namespace dxvk {
     // covered by this batch is [base..base+instanceCount-1]; cross-
     // reference with [SpawnGeomDiag.VisibleSurf]'s top= list to see if
     // primary rays actually hit any of these IDs.
-    {
+    // (slice 0: surfRange= predates persistent slots; the real base is logged
+    // by [SpawnGeomDiag.ReorderedSize] insert# below.)
+    if (piDiagOn) {
       static uint32_t sPiAddEntry = 0;
       if ((sPiAddEntry++ % 30u) == 0) {
         const XXH64_hash_t vsHash = blasEntry->input.getTransformData().vertexShaderHash;
@@ -10042,7 +10265,7 @@ namespace dxvk {
     // we allocated (`instanceCount` entries), reading stale surface-buffer
     // data and producing the blot. Throttled to first-seen-per-VS so we
     // see each distinct PI BLAS variant exactly once without flooding.
-    {
+    if (piDiagOn) {
       static std::mutex sPiGeomCountMu;
       static std::unordered_set<uint64_t> sPiGeomCountSeen;
       const uint64_t vsHashGc = static_cast<uint64_t>(
@@ -10172,24 +10395,24 @@ namespace dxvk {
     // Reserve N surface entries — same RtInstance* for each, but each gets
     // a unique surfaceIndex.  The first entry is the "template" that
     // uploadSurfaceData writes fully; entries 1..N-1 are copies.
-    const uint32_t surfaceIndex = static_cast<uint32_t>(m_reorderedSurfaces.size());
-
-    // Clamp instance count so the last reserved surface index stays within the 21-bit limit.
-    // Exceeding SURFACE_INDEX_MAX_VALUE would cause the GPU culling shader to write
-    // truncated customInstanceIndex values, leading to surface/material aliasing or OOB access.
-    if (surfaceIndex + instanceCount - 1 > SURFACE_INDEX_MAX_VALUE) {
-      const uint32_t maxAllowed = (surfaceIndex <= SURFACE_INDEX_MAX_VALUE) ? (SURFACE_INDEX_MAX_VALUE - surfaceIndex + 1) : 0;
-      ONCE(Logger::err(str::format("DxvkRaytrace: PointInstancer needs ", instanceCount, " surface slots starting at ", surfaceIndex, " but only ", maxAllowed,
-                                   " fit within SURFACE_INDEX_MAX_VALUE (", SURFACE_INDEX_MAX_VALUE, "). Clamping to ", maxAllowed, " instances.")));
-      instanceCount = maxAllowed;
-      if (instanceCount == 0) {
-        return;
-      }
+    //
+    // NV-DXVK [GpuScene] slice 8: the N slots are ONE persistent run keyed by
+    // this instance, so the batch's base holds still across frames instead of
+    // being wherever the array had grown to ([PIWatch] measured the base moving
+    // on 67-86 of 86 batches every frame). The run is refused rather than
+    // clamped at SURFACE_INDEX_MAX_VALUE: a clamped batch would silently draw a
+    // prefix of its placements, and the ceiling is ~2M slots against ~2k live.
+    const uint32_t surfaceIndex = acquireSurfaceRun(
+      SurfaceSlotTable::instanceRunKey(rtInstance->getCacheIdentity()), instanceCount, rtInstance, nullptr);
+    if (surfaceIndex == SurfaceSlotTable::kNoSlot) {
+      ONCE(Logger::err(str::format("DxvkRaytrace: PointInstancer needs ", instanceCount,
+                                   " surface slots and the slot table is at SURFACE_INDEX_MAX_VALUE (",
+                                   SURFACE_INDEX_MAX_VALUE, "); batch dropped.")));
+      rtInstance->surface.surfaceIndexOfFirstInstance = SIZE_MAX;
+      return;
     }
 
     rtInstance->surface.surfaceIndexOfFirstInstance = surfaceIndex;
-    m_reorderedSurfaces.insert(m_reorderedSurfaces.end(), instanceCount, rtInstance);
-    m_reorderedSurfacesFirstIndexOffset.insert(m_reorderedSurfacesFirstIndexOffset.end(), instanceCount, 0);
 
     // [BulkPush] PI fanout — attribute all instanceCount slots to this
     // batch's vsHash in a single map update. Inline (rather than calling
@@ -10276,6 +10499,19 @@ namespace dxvk {
     batch.firstIndexInType = firstIndexInType;
     batch.tlasType = primaryType;
     batch.instanceBufferByteOffset = 0; // resolved before dispatch
+    // NV-DXVK [SceneCull] slice 9: the scene cull verdict's per-instance inputs
+    // -- the template BLAS's object box, which each instance's F places in the
+    // world. No valid box: never tested (kept).
+    {
+      const AxisAlignedBoundingBox& piBox = blasEntry->input.getGeometryData().boundingBox;
+      if (piBox.isValid()) {
+        batch.cullBoxMin = piBox.minPos;
+        batch.cullBoxMax = piBox.maxPos;
+        batch.cullRecordFlags = SCENE_CULL_RECORD_TESTED
+                              | (SceneCullPass::isSkinned(*blasEntry) ? SCENE_CULL_RECORD_SKINNED : 0u);
+      }
+      batch.cullVerdictBase = 0;  // resolved before dispatch
+    }
     // NV-DXVK debug: hold a strong ref to the BLAS for validation at TLAS-build time
     batch.debugBlasRef = blasEntry->dynamicBlas;
     batch.debugAsBuiltAtCapture = (blasEntry->dynamicBlas->accelStructure != nullptr);

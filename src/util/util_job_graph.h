@@ -241,6 +241,15 @@ namespace dxvk {
 
     void reset();
 
+    // Replace the dispatcher. Only legal on an idle graph (nothing outstanding),
+    // so a Dispatch never changes under a node that is being handed out. This
+    // is what lets a long-lived graph be rebuilt each frame around a scheduler
+    // whose captures are per-call (the flush's owning thread, a per-call
+    // schedule function) -- the graph object, and with it every mutex and
+    // counter a finishing worker may still be returning through, outlives the
+    // frame instead of dying at the end of the function that waited on it.
+    void setDispatch(Dispatch dispatch);
+
     // ----------------------------------------------------------------------
     // SLICE 6'S ACCEPTANCE GATE, AS CODE. sec 4.2.1 states it exactly:
     //

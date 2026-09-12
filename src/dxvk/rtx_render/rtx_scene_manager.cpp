@@ -470,6 +470,19 @@ namespace dxvk {
   void SceneManager::garbageCollection() {
     ScopedCpuProfileZone();
 
+    // NV-DXVK [Perf.Gc]: sub-split of [Perf.PrepScene] gc=, the largest CS leaf
+    // on the 2026-09-12 14:37 baseline (4.6-5.7 ms/frame against merge=2.4).
+    // Same gate and cadence as [Perf.PrepScene]; the buckets sum to its gc=.
+    // [Perf.GcInst] splits the inst= bucket further.
+    auto tGc = std::chrono::steady_clock::now();
+    int64_t gc_blas = 0, gc_repl = 0, gc_inst = 0, gc_accel = 0, gc_light = 0,
+            gc_portal = 0, gc_reclaim = 0;
+    auto markGc = [&tGc](int64_t& sink) {
+      const auto now = std::chrono::steady_clock::now();
+      sink = std::chrono::duration_cast<std::chrono::microseconds>(now - tGc).count();
+      tGc = now;
+    };
+
     // NV-DXVK [perf, GPU index stash]: return index-stash buffers that nobody
     // has re-acquired for a long time. In steady state this frees nothing (every
     // pooled buffer is reused within a frame or two); it exists to hand back
@@ -688,7 +701,13 @@ namespace dxvk {
           //     at how m_isInsideFrustum is left/handled on cut frames).
           // Logged OUTSIDE the cut gate so cut frames are captured too; box is
           // re-fetched here because the gate-scoped reference is out of scope.
-          if (sceneGcInGameplay) {
+          //
+          // NV-DXVK [perf] slice 0 (2026-09-12): in log.cpp's default deny list
+          // with the rest of the dropship family ([Ship*], [Widow*]); this was a
+          // getBlas + VS compare per instance per frame. Re-enable with
+          // rtx.logDenyTags = -[HullSAT].
+          static const bool kHullSatDenied = Logger::tagDenied("[HullSAT]");
+          if (sceneGcInGameplay && !kHullSatDenied) {
             const uint64_t hullVs = static_cast<uint64_t>(
               instance->getBlas()->input.getTransformData().vertexShaderHash);
             if (hullVs == 0x292b6ba0d1854f28ull) {
@@ -805,6 +824,7 @@ namespace dxvk {
         }
       }
     }
+    markGc(gc_blas);
 
     // NV-DXVK [SceneGcSummary]: one line per GC pass during gameplay,
     // before the instance/accel/light/portal managers run their GC. Tells
@@ -832,12 +852,17 @@ namespace dxvk {
     // while they are still alive, so the instance reap below removes them.
     m_drawCallTracker.garbageCollectReplacementInstances(
         getCamera(), m_isAntiCullingSupported);
+    markGc(gc_repl);
 
     // Perform GC on the other managers
     m_instanceManager.garbageCollection();
+    markGc(gc_inst);
     m_accelManager.garbageCollection();
+    markGc(gc_accel);
     m_lightManager.garbageCollection(getCamera());
+    markGc(gc_light);
     m_rayPortalManager.garbageCollection();
+    markGc(gc_portal);
 
     // NV-DXVK [stable buffer identity]: free the bindless slots of retired
     // buffers that nothing reads through any more.
@@ -857,6 +882,17 @@ namespace dxvk {
     // How many it freed is reported through [MatChurn] bufFreed, which reads the
     // table's own monotonic counter rather than this call's return.
     m_bufferCache.reclaim(m_device->getCurrentFrameId(), kMaxFramesInFlight);
+    markGc(gc_reclaim);
+
+    if (RtxOptions::logPrepSceneSplit() && (sceneGcFrame % 10u) == 5u) {
+      Logger::warn(str::format(
+        "[Perf.Gc] frame=", sceneGcFrame,
+        " blas=", gc_blas, " repl=", gc_repl, " inst=", gc_inst,
+        " accel=", gc_accel, " light=", gc_light, " portal=", gc_portal,
+        " reclaim=", gc_reclaim,
+        " | blasIterated=", sceneGcBlasIterated, " instSeen=", sceneGcInstSeen,
+        " antiCull=", (RtxOptions::AntiCulling::isObjectAntiCullingEnabled() ? 1 : 0)));
+    }
   }
 
   void SceneManager::onDestroy() {
@@ -4736,7 +4772,16 @@ namespace dxvk {
       // folding it would mint a fresh key and leave the batch with no record to
       // serve. A high count there means fanout batches are not residency
       // candidates at all and belong in skipUnsafe, not in the key.
+      //
+      // NV-DXVK [perf] slice 0 (2026-09-12): residentScene.logStats is on for the
+      // [ResidentScene] reading, and it was also paying an XXH64 over every
+      // placement matrix of every fanout batch here. The [RsPlace*] family is
+      // in log.cpp's default deny list; re-enable with
+      // rtx.logDenyTags = -[RsPlace.
+      static const bool kRsPlaceDenied = Logger::tagDenied("[RsPlace]")
+                                      && Logger::tagDenied("[RsPlaceFrame]");
       if (RtxOptions::ResidentScene::logStats()
+          && !kRsPlaceDenied
           && drawCallState.getTransformData().isFanoutBatch
           && drawCallState.getTransformData().instancesToObject != nullptr) {
         const std::vector<Matrix4>& places = *drawCallState.getTransformData().instancesToObject;
@@ -4955,12 +5000,34 @@ namespace dxvk {
       // touch forever -- which reads as a hit and does nothing, the worst of
       // both. build() rejects it below; this test only saves the call.
       if (!sFanoutInstances.empty()) {
+        // NV-DXVK slice 2: THE ENGINE HANDLE, checked once for the record and
+        // the resolver below. The draw carries the renderable the join latch
+        // named (DrawCallState::residentEngineHandle); it is used ONLY if the
+        // engine's pre-cull renderable registry listed it. That registry passed
+        // its promotion gate (listed= flat 2415/600 frames on the 18:12 sweep),
+        // so "listed" means "this renderable exists". A latched pointer the
+        // registry does not hold is a stale latch or not a client renderable,
+        // and naming a record or an object with it would be a false identity;
+        // it is dropped and counted (unlisted). The list is the one
+        // RenderableEnum read at the end of LAST frame's GC: a renderable born
+        // this frame goes without a handle once and adopts it next frame.
+        RenderObjectDB& objectDb = m_instanceManager.getRenderObjectDB();
+        uint64_t engineHandle = drawCallState.residentEngineHandle;
+        if (engineHandle != 0ull) {
+          const RenderableEnum& renderables = m_instanceManager.getRenderableEnum();
+          if (!renderables.stats().resolved || !renderables.visibility().listed(engineHandle)) {
+            objectDb.noteHandleUnlisted();
+            engineHandle = 0ull;
+          }
+        }
+
         residentScene.build(drawCallState.residentKey,
                             drawCallState.residentGenHash,
                             drawCallState.residentSrcVertexBuffer,
                             drawCallState.residentSrcIndexBuffer,
                             m_device->getCurrentFrameId(),
-                            sFanoutInstances);
+                            sFanoutInstances,
+                            engineHandle);
 
         // NV-DXVK [RenderObject] slice 1: THE RESOLVER, fed from the same point
         // and under the same condition as the record above.
@@ -4977,22 +5044,17 @@ namespace dxvk {
         // let [RenderObject] be watched for a window before anything is allowed
         // to depend on an id.
         //
-        // engineHandle IS STILL 0, and that is now a narrower statement than it
-        // used to be. Slice B has landed -- the pre-cull renderable registry is
-        // read and passes its gate -- but it publishes a VisibilitySource and
-        // retires nothing, and no record carries a handle yet, so there is
-        // nothing to pass here. Wiring one is a separate step from this one.
-        //
-        // WHAT DID CHANGE IS residentIdentity. For batched world draws it is
-        // now the surface-set key rather than the draw range, which is the
-        // population newObjects was churning on -- see the [WorldBatch] block
-        // in d3d11_rtx.cpp, and rtx_render_object.h on why that key is fed here
-        // as an IA identity and deliberately NOT as an engineHandle.
-        RenderObjectDB& objectDb = m_instanceManager.getRenderObjectDB();
+        // NV-DXVK slice 2: the handle checked above is the resolver's
+        // authoritative identity: every primitive one renderable draws resolves
+        // to one RenderObject. residentIdentity is unchanged -- for batched
+        // world draws it is the surface-set key (the [WorldBatch] block in
+        // d3d11_rtx.cpp; rtx_render_object.h on why that key is an IA identity
+        // and NOT an engineHandle), and world draws never carry a handle
+        // (residentDrawKey zeroes it under a world key).
         const RenderPrimitiveId prim =
             objectDb.resolve(drawCallState.residentIdentity,
                              drawCallState.residentOrdinal,
-                             0ull,
+                             engineHandle,
                              m_device->getCurrentFrameId());
         if (prim.valid()) {
           objectDb.bindResidentKey(prim, drawCallState.residentKey);
@@ -5316,9 +5378,7 @@ namespace dxvk {
     // milliseconds, so a bundle can still straggle; that is what the pool's
     // work stealing and the tail timer are for, and it is strictly better than
     // paying 460 task setups to find out.
-    static thread_local std::vector<Future<void>> sShardFuts;
     static thread_local std::vector<uint32_t> sBundleStart;  // shard indices, + end sentinel
-    sShardFuts.clear();
     sBundleStart.clear();
 
     if (liveShards > 0) {
@@ -5341,35 +5401,54 @@ namespace dxvk {
 
     const uint32_t nBundles = sBundleStart.empty()
       ? 0u : static_cast<uint32_t>(sBundleStart.size() - 1u);
-    for (uint32_t b = 0; b < nBundles; ++b) {
-      const uint32_t s0 = sBundleStart[b];
-      const uint32_t s1 = sBundleStart[b + 1u];
-      // sShards is a game-thread thread_local of static duration and is not
-      // touched again until the join, so a pointer into it is safe on a worker.
+
+    // NV-DXVK [JobGraph] slice 6 (ARCHITECTURE_OVERHAUL.md sec 4.2.1): the
+    // bundles are a parallelFor on a join node, drained by waitAll -- the same
+    // contract and the same thread rule as Phase B in flushGeometryBatch.
+    // `schedule` is the pool's SPSC Schedule and may only be called from this
+    // (game) thread; a node made runnable on a worker (the last bundle releasing
+    // the join) is refused and queued for waitAll to run here. The inline
+    // fallback for a full queue is the graph's, not this call site's, and no
+    // Future is held past Schedule. The graph is long-lived for the reason
+    // m_flushGraph is: a worker still returning through it must not outlive it.
+    if (!m_shardGraph) {
+      m_shardGraph = std::make_unique<JobGraph>(JobGraph::Dispatch {});
+    }
+    JobGraph& shardGraph = *m_shardGraph;
+    shardGraph.reset();
+    {
+      const std::thread::id driverThread = std::this_thread::get_id();
+      shardGraph.setDispatch([&schedule, driverThread](std::function<void()> fn) -> bool {
+        if (std::this_thread::get_id() != driverThread) {
+          return false;
+        }
+        return schedule(std::move(fn)).valid();
+      });
+    }
+    {
+      // sShards / sBundleStart are game-thread thread_locals of static duration
+      // and are not touched again until the join, so pointers into them are
+      // safe on a worker.
       std::vector<std::vector<uint32_t>>* pShards = &sShards;
+      const std::vector<uint32_t>* pBundleStart = &sBundleStart;
       std::vector<ShardedDrawBatchItem>* pBatch = &batch;
       SceneManager* self = this;
-      Future<void> f = schedule([self, pShards, pBatch, s0, s1]() {
+      const JobGraph::JobHandle shardJoin = shardGraph.createNode("Shard.join", nullptr);
+      shardGraph.parallelFor(shardJoin, nBundles, [self, pShards, pBundleStart, pBatch](uint32_t b) {
+        const uint32_t s0 = (*pBundleStart)[b];
+        const uint32_t s1 = (*pBundleStart)[b + 1u];
         for (uint32_t s = s0; s < s1; ++s) {
           for (const uint32_t idx : (*pShards)[s]) {
             self->runShardedDrawItem((*pBatch)[idx]);
           }
         }
       });
-      if (f.valid()) {
-        sShardFuts.push_back(f);
-      } else {
-        for (uint32_t s = s0; s < s1; ++s) {
-          for (const uint32_t idx : sShards[s]) {
-            runShardedDrawItem(batch[idx]);
-          }
-        }
-      }
+      shardGraph.waitAll();
     }
-    for (auto& f : sShardFuts) {
-      f.get();
-    }
-    sShardFuts.clear();
+    // The dispatcher captured `schedule` by reference; drop it now that nothing
+    // is outstanding, so the idle graph holds no reference past this call.
+    const JobGraph::Stats shardGraphStats = shardGraph.stats();
+    shardGraph.setDispatch(JobGraph::Dispatch {});
 
     const auto t2bPar = std::chrono::steady_clock::now();
 
@@ -5413,8 +5492,12 @@ namespace dxvk {
       static thread_local uint64_t sLgTerrain = 0, sLgCam = 0, sLgGeom = 0, sLgRepl = 0;
       static thread_local int64_t sPreFinNs = 0, sPreCamNs = 0, sPreFogNs = 0;
       static thread_local int64_t sPreHashNs = 0, sPreMatNs = 0, sPreGetNs = 0;
+      // NV-DXVK [JobGraph] slice 6: the bundle graph. threw/stale must read 0.
+      static thread_local uint64_t sGraphDisp = 0, sGraphInline = 0, sGraphThrew = 0, sGraphStale = 0;
       if (!sInit) { sLast = t2b0; sInit = true; }
       ++sFrames;
+      sGraphDisp += shardGraphStats.dispatched; sGraphInline += shardGraphStats.ranInline;
+      sGraphThrew += shardGraphStats.threw;     sGraphStale += shardGraphStats.staleHandles;
       sSharded += nSharded; sLegacy += nLegacy; sIgnored += nIgnored;
       sDeferred += nDeferred; sShardCnt += liveShards; sBundleCnt += nBundles;
       sLgAdmit += nLgAdmit; sLgFut += nLgFut; sLgFinal += nLgFinal; sLgSky += nLgSky;
@@ -5444,7 +5527,9 @@ namespace dxvk {
           " deferred=", sDeferred / fr,
           " | preUs=", sPreNs / 1000 / fr,
           " parUs=", sParNs / 1000 / fr,
-          " tailUs=", sTailNs / 1000 / fr));
+          " tailUs=", sTailNs / 1000 / fr,
+          " graph{disp=", sGraphDisp / uint64_t(fr), " inline=", sGraphInline / uint64_t(fr),
+          " threw=", sGraphThrew, " stale=", sGraphStale, "}"));
 
         // WHY the legacy draws are legacy. terrain is permanent (it records GPU
         // work); sky is the four-way over-approximation and the one worth
@@ -5485,6 +5570,7 @@ namespace dxvk {
         sLast = t2b1;
         sFrames = sSharded = sLegacy = sIgnored = sDeferred = sShardCnt = sBundleCnt = 0;
         sPreNs = sParNs = sTailNs = 0;
+        sGraphDisp = sGraphInline = sGraphThrew = sGraphStale = 0;
         sLgAdmit = sLgFut = sLgFinal = sLgSky = sLgTerrain = sLgCam = sLgGeom = sLgRepl = 0;
         sPreFinNs = sPreCamNs = sPreFogNs = sPreHashNs = sPreMatNs = sPreGetNs = 0;
       }
@@ -6870,10 +6956,31 @@ namespace dxvk {
     cur.mtFailed        = RtxTextureManager::getManagedFailedCount();
     cur.valid           = true;
 
+    // NV-DXVK [perf] slice 0 (2026-09-12): ONE LINE PER SECOND. This is not the
+    // fixed-stride sampler trap 9 warns about -- that trap SAMPLED one frame in
+    // N. Here every delta is cur - (sample at the last emit), i.e. the exact SUM
+    // over every frame of the window, the per-frame table stats (bl*, *ReDummied)
+    // are summed frame by frame, and worst{} carries the single frame with the
+    // largest matNew / texNew, so a one-frame dropout still reads non-zero.
+    struct ChurnWin {
+      std::chrono::steady_clock::time_point start {};
+      uint32_t frames = 0;
+      uint64_t prevFrameMat = 0, prevFrameTex = 0;
+      uint64_t blChg = 0, blDrop = 0, blRecov = 0, blGrew = 0, bufReDummied = 0, texReDummied = 0;
+      uint64_t worstMat = 0, worstTex = 0;
+      uint32_t worstMatFrame = 0, worstTexFrame = 0;
+    };
+    static ChurnWin s_cw;  // CS thread only
+    const auto cwNow = std::chrono::steady_clock::now();
+
     // First gameplay frame establishes the baseline. Emitting a delta against a
     // zeroed sample would report the entire load-in as one frame of churn.
     if (!m_prevChurn.valid) {
       m_prevChurn = cur;
+      s_cw = ChurnWin {};
+      s_cw.start = cwNow;
+      s_cw.prevFrameMat = cur.matInserts;
+      s_cw.prevFrameTex = cur.texInserts;
       return;
     }
 
@@ -6897,13 +7004,33 @@ namespace dxvk {
     // not changing, and every timing number in the report is then incomparable to
     // any other capture -- so the report prints a loud banner on it rather than
     // letting a reader assume the table is clean.
-    perfreport::publish(perfreport::Slot::HygMatNew,
-      double(d(cur.matInserts, p.matInserts)));
+    // Per FRAME, as before -- the report's hygiene gate is not windowed.
+    const uint64_t frameMatNew = d(cur.matInserts, s_cw.prevFrameMat);
+    const uint64_t frameTexNew = d(cur.texInserts, s_cw.prevFrameTex);
+    s_cw.prevFrameMat = cur.matInserts;
+    s_cw.prevFrameTex = cur.texInserts;
+    perfreport::publish(perfreport::Slot::HygMatNew, double(frameMatNew));
     perfreport::publish(perfreport::Slot::HygMatTotal,
       double(m_surfaceMaterialCache.getTotalCount()));
 
+    s_cw.frames += 1u;
+    s_cw.blChg += bl.changed;
+    s_cw.blDrop += bl.dropped;
+    s_cw.blRecov += bl.recovered;
+    s_cw.blGrew += bl.grew;
+    s_cw.bufReDummied += bufTable.reDummied;
+    s_cw.texReDummied += texTable.reDummied;
+    if (frameMatNew > s_cw.worstMat) { s_cw.worstMat = frameMatNew; s_cw.worstMatFrame = fid; }
+    if (frameTexNew > s_cw.worstTex) { s_cw.worstTex = frameTexNew; s_cw.worstTexFrame = fid; }
+    if (cwNow - s_cw.start < std::chrono::seconds(1)) {
+      return;
+    }
+
     Logger::info(str::format(
       "[MatChurn] f=", fid,
+      " frames=", s_cw.frames,
+      " worst{matNew=", s_cw.worstMat, "@", s_cw.worstMatFrame,
+      " texNew=", s_cw.worstTex, "@", s_cw.worstTexFrame, "}",
       // Materials. matNew is the headline: a nonzero steady-state value means
       // material identities are being minted for a scene that is not changing.
       " matLookup=", d(cur.matLookups, p.matLookups),
@@ -6942,10 +7069,10 @@ namespace dxvk {
       " mtFail=", d(cur.mtFailed, p.mtFailed),
       // Bindless texture table, as actually written this frame.
       " | blSlots=", bl.slots,
-      " blChg=", bl.changed,
-      " blDrop=", bl.dropped,
-      " blRecov=", bl.recovered,
-      " blGrew=", bl.grew,
+      " blChg=", s_cw.blChg,
+      " blDrop=", s_cw.blDrop,
+      " blRecov=", s_cw.blRecov,
+      " blGrew=", s_cw.blGrew,
       // NV-DXVK [BindlessTail]: the BUFFER table, which is the one the
       // device-loss chain runs through and the one nothing was measuring.
       // blSlots above is the TEXTURE table, and in TF2 that only ever grows
@@ -6964,7 +7091,7 @@ namespace dxvk {
       // back, which is what bufFreed counts.
       " | bufSlots=", bufTable.live,
       " bufPeak=", bufTable.peakLive,
-      " bufReDummied=", bufTable.reDummied,
+      " bufReDummied=", s_cw.bufReDummied,
       // NV-DXVK [stable buffer identity]: the identity side of the same table.
       // bufLive is how many slots hold a buffer, bufRetired how many of those
       // their owner has released and the sweep has not yet been able to free.
@@ -6981,9 +7108,81 @@ namespace dxvk {
       " bufRevived=", d(cur.bufRevives, p.bufRevives),
       " texTableSlots=", texTable.live,
       " texTablePeak=", texTable.peakLive,
-      " texReDummied=", texTable.reDummied));
+      " texReDummied=", s_cw.texReDummied));
 
     m_prevChurn = cur;
+    const uint64_t keepMat = s_cw.prevFrameMat, keepTex = s_cw.prevFrameTex;
+    s_cw = ChurnWin {};
+    s_cw.start = cwNow;
+    s_cw.prevFrameMat = keepMat;
+    s_cw.prevFrameTex = keepTex;
+  }
+
+  // NV-DXVK [GpuScene] slice 8: one line per second under rtx.gpuScene.logStats.
+  // Per-frame averages for the steady quantities (kept/chg/up/full/regions),
+  // window totals for the events (new/moved/freed/...). The verify totals are
+  // cumulative and are the gate: struct= and rbFail= must read 0.
+  void SceneManager::logGpuSceneStats() {
+    if (!RtxOptions::GpuScene::logStats()) {
+      return;
+    }
+    static auto s_last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - s_last < std::chrono::seconds(1)) {
+      return;
+    }
+    s_last = now;
+
+    const SurfaceSlotTable& slots = m_accelManager.getSurfaceSlots();
+    const SurfaceSlotTable::Stats& ss = slots.stats();
+    const DeltaUploadTable::Stats& sd = m_accelManager.getSurfaceDelta().stats();
+    const DeltaUploadTable::Stats& td = m_accelManager.getTransformDelta().stats();
+    const DeltaUploadTable::Stats& md = m_surfaceMaterialDelta.stats();
+    const DeltaUploadTable::Stats& ed = m_surfaceMaterialExtensionDelta.stats();
+    const DeltaUploadTable::Stats& vd = m_volumeMaterialDelta.stats();
+    const AccelManager::GpuSceneVerify& vfy = m_accelManager.getGpuSceneVerify();
+    const AccelManager::MergedBlasStats& mb = m_accelManager.getMergedBlasStats();
+    const DeltaUploadTable::Stats& id = m_accelManager.getInstanceDelta().stats();
+    const AccelManager::TlasRefitStats& tr = m_accelManager.getTlasRefitStats();
+
+    auto perFrame = [](uint64_t v, uint32_t frames) -> uint64_t {
+      return frames != 0u ? v / frames : 0u;
+    };
+    auto table = [&perFrame](const char* tag, const DeltaUploadTable::Stats& s) -> std::string {
+      return str::format(" ", tag, "{chg=", perFrame(s.changed, s.frames),
+                         "/", perFrame(s.elements, s.frames),
+                         " up=", perFrame(s.uploadBytes, s.frames),
+                         " full=", perFrame(s.fullBytes, s.frames),
+                         " rgn=", perFrame(s.regions, s.frames),
+                         " new=", s.replaced, "}");
+    };
+
+    const uint32_t rb = sd.verifyReadbacks + td.verifyReadbacks + md.verifyReadbacks + id.verifyReadbacks;
+    const uint32_t rbFail = sd.verifyFail + td.verifyFail + md.verifyFail + id.verifyFail;
+    Logger::warn(str::format(
+      "[GpuScene] f=", m_device->getCurrentFrameId(),
+      " slots{live=", slots.liveSlots(), " hw=", slots.highWater(), " runs=", slots.runCount(), "}",
+      " runs{kept=", perFrame(ss.kept, sd.frames), " new=", ss.created, " moved=", ss.moved,
+      " resized=", ss.resized, " freed=", ss.freed, " rekey=", ss.rekeyed,
+      " overflow=", ss.overflow, " compact=", ss.compactions, "}",
+      table("surf", sd), table("mat", md), table("xform", td), table("ext", ed), table("vol", vd),
+      table("inst", id),
+      " tlas{refit=", tr.refit, " build=", tr.build,
+      " why{cadence=", tr.whyCadence, " topo=", tr.whyTopology, " realloc=", tr.whyRealloc, "}}",
+      " bktBlas{n=", perFrame(mb.buckets, mb.frames), " pin=", perFrame(mb.pinHit, mb.frames),
+      " szHit=", perFrame(mb.sizeHit, mb.frames), " skip=", perFrame(mb.skip, mb.frames),
+      " upd=", perFrame(mb.update, mb.frames), " build=", perFrame(mb.build, mb.frames),
+      " new=", mb.created, "}",
+      " verify{on=", (RtxOptions::GpuScene::verify() ? 1 : 0),
+      " struct=", vfy.structFail, " dbl=", vfy.doubleClaim,
+      " tlasRefs=", perFrame(vfy.tlasRefs, vfy.frames), " pi=", perFrame(vfy.piRanges, vfy.frames),
+      " rb=", rb, " rbFail=", rbFail, "}",
+      "  <- held scene: surf up << full, runs{new moved}~0, bktBlas{pin=szHit=n new=0}; struct=0 and rbFail=0 before verify goes off"));
+
+    m_accelManager.resetGpuSceneStats();
+    m_surfaceMaterialDelta.resetStats();
+    m_surfaceMaterialExtensionDelta.resetStats();
+    m_volumeMaterialDelta.resetStats();
   }
 
   void SceneManager::prepareSceneData(Rc<RtxContext> ctx, DxvkBarrierSet& execBarriers) {
@@ -7376,14 +7575,20 @@ namespace dxvk {
     // the surface order and material data are normally identical to last frame.
     // Baked terrain materials are updated independently of acceleration-structure
     // scene generation, so keep their surface-material upload live.
-    const bool startInMediumStateChanged = m_startInMediumMaterialIndex_inCache != m_lastUploadedStartInMediumMaterialIndexInCache;
-    const bool updateSurfaceMaterials =
-      !m_accelManager.wasSceneUnchangedThisFrame() ||
-      TerrainBaker::needsTerrainBaking() ||
-      startInMediumStateChanged;
-    if (updateSurfaceMaterials) {
+    // NV-DXVK [GpuScene] slice 8: the surface-material table, indexed by the
+    // same persistent slots as the surface table, packed into its delta mirror
+    // every frame; only slots whose bytes changed are sent.
+    //
+    // The gate that used to guard this (!wasSceneUnchangedThisFrame ||
+    // terrain baking || start-in-medium change) is gone: wasSceneUnchanged is
+    // hard-false in this fork, so the gate was always open and the table was
+    // re-packed into a fresh heap vector and uploaded whole every frame. The
+    // delta compare now IS the change test, and it covers terrain-baked and
+    // start-in-medium changes by construction because it compares bytes.
+    {
       DxvkBufferCreateInfo matInfo;
-      matInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+      // NV-DXVK [GpuScene]: TRANSFER_SRC so rtx.gpuScene.verify can read it back.
+      matInfo.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
         | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
         | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
       matInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
@@ -7393,57 +7598,64 @@ namespace dxvk {
       if (m_surfaceMaterialCache.getTotalCount() > 0) {
         ScopedGpuProfileZone(ctx, "updateSurfaceMaterials");
         // Note: We duplicate the materials in the buffer so we don't have to do pointer chasing on the GPU
-        size_t surfaceMaterialsGPUSize = m_accelManager.getSurfaceCount() * kSurfaceMaterialGPUSize;
-        const uint32_t expectedSurfaceMaterialEntries = m_accelManager.getSurfaceCount()
-          + (m_startInMediumMaterialIndex_inCache != kInvalidMaterialCacheIndex ? 1u : 0u);
-        if (m_startInMediumMaterialIndex_inCache != kInvalidMaterialCacheIndex) {
-          surfaceMaterialsGPUSize += kSurfaceMaterialGPUSize;
-        }
+        const uint32_t surfaceCount = m_accelManager.getSurfaceCount();
+        const bool hasStartInMedium = m_startInMediumMaterialIndex_inCache != kInvalidMaterialCacheIndex;
+        const uint32_t entries = surfaceCount + (hasStartInMedium ? 1u : 0u);
 
-        matInfo.size = align(surfaceMaterialsGPUSize, kBufferAlignment);
+        matInfo.size = align(size_t(entries) * kSurfaceMaterialGPUSize, kBufferAlignment);
         if (m_surfaceMaterialBuffer == nullptr || matInfo.size > m_surfaceMaterialBuffer->info().size) {
           m_surfaceMaterialBuffer = m_device->createBuffer(matInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, "Surface Material Buffer");
+          m_surfaceMaterialBufferReplaced = true;
         }
 
-        std::size_t dataOffset = 0;
-        uint32_t surfaceIndex = 0;
-        std::vector<unsigned char> surfaceMaterialsGPUData(surfaceMaterialsGPUSize);
-        for (auto&& pInstance : m_accelManager.getOrderedInstances()) {
+        m_surfaceMaterialDelta.beginFrame(entries, m_surfaceMaterialBufferReplaced);
+        m_surfaceMaterialBufferReplaced = false;
+
+        const auto& ordered = m_accelManager.getOrderedInstances();
+        const auto& materialTable = m_surfaceMaterialCache.getObjectTable();
+        for (uint32_t surfaceIndex = 0; surfaceIndex < surfaceCount; ++surfaceIndex) {
+          const RtInstance* pInstance = ordered[surfaceIndex];
+          if (pInstance == nullptr) {
+            continue;  // hole
+          }
           // For PointInstancer duplicates (entries beyond the template), skip
           // writeGPUData - the GPU culling shader copies the template material.
           const auto& surf = pInstance->surface;
           if (surf.instancesToObject != nullptr &&
               surf.surfaceIndexOfFirstInstance != SIZE_MAX &&
               surfaceIndex > surf.surfaceIndexOfFirstInstance) {
-            dataOffset += kSurfaceMaterialGPUSize;
-          } else {
-            assert(surf.surfaceMaterialIndex < m_surfaceMaterialCache.getObjectTable().size());
-            auto&& surfaceMaterial = m_surfaceMaterialCache.getObjectTable()[surf.surfaceMaterialIndex];
-            surfaceMaterial.writeGPUData(surfaceMaterialsGPUData.data(), dataOffset, surfaceIndex);
+            m_surfaceMaterialDelta.gpuOwned(surfaceIndex);
+            continue;
           }
-          surfaceIndex++;
+          assert(surf.surfaceMaterialIndex < materialTable.size());
+          std::size_t dataOffset = 0;
+          materialTable[surf.surfaceMaterialIndex].writeGPUData(m_surfaceMaterialDelta.scratch(), dataOffset, surfaceIndex);
+          assert(dataOffset == kSurfaceMaterialGPUSize);
+          m_surfaceMaterialDelta.commit(surfaceIndex);
         }
 
-        if (m_startInMediumMaterialIndex_inCache != kInvalidMaterialCacheIndex) {
-          auto&& surfaceMaterial = m_surfaceMaterialCache.getObjectTable()[m_startInMediumMaterialIndex_inCache];
-          surfaceMaterial.writeGPUData(surfaceMaterialsGPUData.data(), dataOffset, surfaceIndex);
-          m_startInMediumMaterialIndex = surfaceIndex;
-          surfaceIndex++;
+        if (hasStartInMedium) {
+          std::size_t dataOffset = 0;
+          materialTable[m_startInMediumMaterialIndex_inCache].writeGPUData(m_surfaceMaterialDelta.scratch(), dataOffset, surfaceCount);
+          m_surfaceMaterialDelta.commit(surfaceCount);
+          m_startInMediumMaterialIndex = surfaceCount;
         } else {
           m_startInMediumMaterialIndex = SURFACE_INDEX_INVALID;
         }
-
-        assert(surfaceIndex == expectedSurfaceMaterialEntries);
-        assert(dataOffset == surfaceMaterialsGPUSize);
-        assert(surfaceMaterialsGPUData.size() == surfaceMaterialsGPUSize);
         m_lastUploadedStartInMediumMaterialIndexInCache = m_startInMediumMaterialIndex_inCache;
 
-        ctx->writeToBuffer(m_surfaceMaterialBuffer, 0, surfaceMaterialsGPUData.size(), surfaceMaterialsGPUData.data());
+        m_surfaceMaterialDelta.upload(ctx.ptr(), m_surfaceMaterialBuffer);
+
+        if (RtxOptions::GpuScene::verify()) {
+          const uint32_t vFrame = m_device->getCurrentFrameId();
+          m_surfaceMaterialDelta.harvestVerify(vFrame);
+          if ((vFrame % std::max(1u, RtxOptions::GpuScene::verifyInterval())) == 0u) {
+            m_surfaceMaterialDelta.scheduleVerify(ctx.ptr(), m_device, m_surfaceMaterialBuffer, vFrame);
+          }
+        }
+      } else {
+        m_startInMediumMaterialIndex = SURFACE_INDEX_INVALID;
       }
-    } else {
-      m_startInMediumMaterialIndex = m_startInMediumMaterialIndex_inCache != kInvalidMaterialCacheIndex
-        ? m_accelManager.getSurfaceCount()
-        : SURFACE_INDEX_INVALID;
     }
     markPs(ps_surfMat);
 
@@ -7458,66 +7670,73 @@ namespace dxvk {
     m_accelManager.buildTlas(ctx);
     markPs(ps_tlas);
 
-    // Todo: These updates require a lot of temporary buffer allocations and memcopies, ideally we should memcpy directly into a mapped pointer provided by Vulkan,
-    // but we have to create a buffer to pass to DXVK's updateBuffer for now.
-    // Skip when scene is unchanged - buffers from last frame are still valid.
-    if (!m_accelManager.wasSceneUnchangedThisFrame()) {
-      // Allocate the instance buffer and copy its contents from host to device memory
+    // NV-DXVK [GpuScene] slice 8: the extension and volume material tables.
+    // These were rebuilt into a fresh heap vector and uploaded whole behind a
+    // !wasSceneUnchangedThisFrame() gate that is always true in this fork (the
+    // scene-generation fast path is disabled in mergeInstancesIntoBlas). Now
+    // they are packed into their delta mirrors every frame and only the
+    // material-cache slots whose bytes changed are sent.
+    {
       DxvkBufferCreateInfo info;
-      info.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+      info.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                 | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
       info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
       info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
 
       // Surface Material Extension Buffer
       if (m_surfaceMaterialExtensionCache.getTotalCount() > 0) {
         ScopedGpuProfileZone(ctx, "updateSurfaceMaterialExtensions");
-        const auto surfaceMaterialExtensionsGPUSize = m_surfaceMaterialExtensionCache.getTotalCount() * kSurfaceMaterialGPUSize;
-
-        info.size = align(surfaceMaterialExtensionsGPUSize, kBufferAlignment);
-        info.usage |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+        const uint32_t extCount = static_cast<uint32_t>(m_surfaceMaterialExtensionCache.getTotalCount());
+        info.size = align(size_t(extCount) * kSurfaceMaterialGPUSize, kBufferAlignment);
         if (m_surfaceMaterialExtensionBuffer == nullptr || info.size > m_surfaceMaterialExtensionBuffer->info().size) {
           m_surfaceMaterialExtensionBuffer = m_device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, "Surface Material Extension Buffer");
+          m_surfaceMaterialExtensionBufferReplaced = true;
         }
 
-        std::size_t dataOffset = 0;
-        std::vector<unsigned char> surfaceMaterialExtensionsGPUData(surfaceMaterialExtensionsGPUSize);
-
+        m_surfaceMaterialExtensionDelta.beginFrame(extCount, m_surfaceMaterialExtensionBufferReplaced);
+        m_surfaceMaterialExtensionBufferReplaced = false;
         uint32_t surfaceIndex = 0;
         for (auto&& surfaceMaterialExtension : m_surfaceMaterialExtensionCache.getObjectTable()) {
-          surfaceMaterialExtension.writeGPUData(surfaceMaterialExtensionsGPUData.data(), dataOffset, surfaceIndex);
+          if (surfaceIndex >= extCount) {
+            break;
+          }
+          std::size_t dataOffset = 0;
+          surfaceMaterialExtension.writeGPUData(m_surfaceMaterialExtensionDelta.scratch(), dataOffset, surfaceIndex);
+          assert(dataOffset == kSurfaceMaterialGPUSize);
+          m_surfaceMaterialExtensionDelta.commit(surfaceIndex);
           surfaceIndex++;
         }
-
-        assert(dataOffset == surfaceMaterialExtensionsGPUSize);
-        assert(surfaceMaterialExtensionsGPUData.size() == surfaceMaterialExtensionsGPUSize);
-
-        ctx->writeToBuffer(m_surfaceMaterialExtensionBuffer, 0, surfaceMaterialExtensionsGPUData.size(), surfaceMaterialExtensionsGPUData.data());
+        m_surfaceMaterialExtensionDelta.upload(ctx.ptr(), m_surfaceMaterialExtensionBuffer);
       }
 
       // Volume Material buffer
       if (m_volumeMaterialCache.getTotalCount() > 0) {
         ScopedGpuProfileZone(ctx, "updateVolumeMaterials");
-        const auto volumeMaterialsGPUSize = m_volumeMaterialCache.getTotalCount() * kVolumeMaterialGPUSize;
-
-        info.size = align(volumeMaterialsGPUSize, kBufferAlignment);
-        info.usage |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+        const uint32_t volCount = static_cast<uint32_t>(m_volumeMaterialCache.getTotalCount());
+        info.size = align(size_t(volCount) * kVolumeMaterialGPUSize, kBufferAlignment);
         if (m_volumeMaterialBuffer == nullptr || info.size > m_volumeMaterialBuffer->info().size) {
           m_volumeMaterialBuffer = m_device->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, DxvkMemoryStats::Category::RTXBuffer, "Volume Material Buffer");
+          m_volumeMaterialBufferReplaced = true;
         }
 
-        std::size_t dataOffset = 0;
-        std::vector<unsigned char> volumeMaterialsGPUData(volumeMaterialsGPUSize);
-
+        m_volumeMaterialDelta.beginFrame(volCount, m_volumeMaterialBufferReplaced);
+        m_volumeMaterialBufferReplaced = false;
+        uint32_t volIndex = 0;
         for (auto&& volumeMaterial : m_volumeMaterialCache.getObjectTable()) {
-          volumeMaterial.writeGPUData(volumeMaterialsGPUData.data(), dataOffset);
+          if (volIndex >= volCount) {
+            break;
+          }
+          std::size_t dataOffset = 0;
+          volumeMaterial.writeGPUData(m_volumeMaterialDelta.scratch(), dataOffset);
+          assert(dataOffset == kVolumeMaterialGPUSize);
+          m_volumeMaterialDelta.commit(volIndex);
+          volIndex++;
         }
-
-        assert(dataOffset == volumeMaterialsGPUSize);
-        assert(volumeMaterialsGPUData.size() == volumeMaterialsGPUSize);
-
-        ctx->writeToBuffer(m_volumeMaterialBuffer, 0, volumeMaterialsGPUData.size(), volumeMaterialsGPUData.data());
+        m_volumeMaterialDelta.upload(ctx.ptr(), m_volumeMaterialBuffer);
       }
     }
+
+    logGpuSceneStats();
 
     ctx->emitMemoryBarrier(0,
       VK_PIPELINE_STAGE_TRANSFER_BIT,

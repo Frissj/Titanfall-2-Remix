@@ -112,7 +112,13 @@ namespace dxvk {
     // graph that assumes Schedule yields a token that will complete deadlocks
     // the first time a worker queue fills, and the existing tree survives that
     // only because flushGeometryBatch checks f.valid() by hand.
-    if (m_dispatch) {
+    //
+    // A pure join point (empty body) is never dispatched: handing a worker a
+    // node with nothing to run costs a full Schedule round trip to decrement
+    // counters. It goes to the ready queue like a refused node, and waitAll
+    // signals it on the calling thread.
+    const Node* n = get(h);
+    if (m_dispatch && n != nullptr && n->body) {
       const bool taken = m_dispatch([this, h]() { runNode(h); });
       if (taken) {
         m_stats.dispatched.fetch_add(1u, std::memory_order_relaxed);
@@ -332,6 +338,12 @@ namespace dxvk {
     }
     m_outstanding.store(0u, std::memory_order_release);
     m_stats.reset();
+  }
+
+  void JobGraph::setDispatch(Dispatch dispatch) {
+    assert(m_outstanding.load(std::memory_order_acquire) == 0u &&
+           "JobGraph::setDispatch on a graph with work outstanding");
+    m_dispatch = std::move(dispatch);
   }
 
   bool JobGraph::selfTest() {

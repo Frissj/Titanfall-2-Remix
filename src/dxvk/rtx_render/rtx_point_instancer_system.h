@@ -83,6 +83,14 @@ namespace dxvk {
     uint32_t firstIndexInType;                     // Index of first placeholder within its TLAS type array
     uint32_t tlasType;                             // Tlas::Type (Opaque, Unordered, SSS)
     uint32_t instanceBufferByteOffset;             // Absolute byte offset in m_vkInstanceBuffer (resolved before dispatch)
+    // NV-DXVK [SceneCull] slice 9: the scene cull's per-instance inputs -- the
+    // template BLAS's object box and SCENE_CULL_RECORD_* flags (0 = never
+    // tested) -- and this batch's first slot in the scene cull's verdict
+    // buffer (resolved before dispatch, like instanceBufferByteOffset).
+    Vector3 cullBoxMin;
+    Vector3 cullBoxMax;
+    uint32_t cullRecordFlags;
+    uint32_t cullVerdictBase;
     // NV-DXVK debug: hold a strong ref to the BLAS so we can validate at TLAS build
     // that the captured `blasReference` still matches a live AS handle.
     Rc<PooledBlas> debugBlasRef;
@@ -178,6 +186,16 @@ namespace dxvk {
     BlasEntry* debugSourceBlasEntry;
   };
 
+  // NV-DXVK [SceneCull] slice 9: the scene cull pass's constants, light list,
+  // stats and verdict buffers (SceneCullPass::pointInstancerBindings), bound by
+  // the culling dispatch so every PI instance gets the scene cull's verdict.
+  struct PointInstancerSceneCullBindings {
+    DxvkBufferSlice constants;
+    DxvkBufferSlice lights;
+    DxvkBufferSlice stats;
+    DxvkBufferSlice verdicts;
+  };
+
   class RtxPointInstancerSystem : public CommonDeviceObject {
   public:
     explicit RtxPointInstancerSystem(DxvkDevice* device);
@@ -206,7 +224,8 @@ namespace dxvk {
                          const Rc<DxvkBuffer>& surfaceMaterialBuffer,
                          const std::vector<PointInstancerBatch>& batches,
                          const Vector3& cameraPosition,
-                         const Rc<DxvkBuffer>& coverageBuffer);
+                         const Rc<DxvkBuffer>& coverageBuffer,
+                         const PointInstancerSceneCullBindings& sceneCull);
 
     /**
       * Displays ImGui settings for the point instancer culling system.

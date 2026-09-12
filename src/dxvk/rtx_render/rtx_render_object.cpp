@@ -207,12 +207,32 @@ namespace dxvk {
         ++m_stats.hits;
 
         // A handle arriving for a primitive that already exists is slice 2's
-        // path: promote the object's identity without disturbing the primitive.
+        // path. If the renderable already has an object, this primitive joins
+        // it -- which is how the objects minted 1:1 before any handle existed
+        // fold together, one resolve at a time. Otherwise this object becomes
+        // the renderable's.
         if (engineHandle != 0ull) {
+          ++m_stats.withHandle;
           RenderObject* o = getObject(p->owner);
+          const auto anchorIt = m_objectsByHandle.find(engineHandle);
+          const RenderObjectId anchor =
+            (anchorIt != m_objectsByHandle.end() && getObject(anchorIt->second) != nullptr)
+              ? anchorIt->second : RenderObjectId();
           if (o != nullptr && o->engineHandle != engineHandle) {
-            o->engineHandle = engineHandle;
-            m_objectsByHandle[engineHandle] = p->owner;
+            if (o->engineHandle != 0ull) {
+              // THE FALSIFIER: an object one renderable owns, named by another.
+              ++m_stats.handleRebound;
+            }
+            if (anchor.valid() && anchor != p->owner) {
+              movePrimitiveTo(pit->second, anchor);
+              ++m_stats.handleMerged;
+            } else if (o->engineHandle == 0ull) {
+              o->engineHandle = engineHandle;
+              m_objectsByHandle[engineHandle] = p->owner;
+            }
+            // A rebound with no object for the new handle stays where it is;
+            // the counter is the finding, and moving it would act on a latch
+            // the counter says not to trust.
           }
         }
 
@@ -231,12 +251,13 @@ namespace dxvk {
     bool ownerIsNew = false;
 
     // 1. THE HANDLE WINS WHEN PRESENT. This is the branch that makes the object
-    //    level many-to-one, and it is written now so slice 2 only has to start
-    //    supplying a non-zero handle.
+    //    level many-to-one; slice 2 supplies the handle.
     if (engineHandle != 0ull) {
+      ++m_stats.withHandle;
       const auto hit = m_objectsByHandle.find(engineHandle);
       if (hit != m_objectsByHandle.end() && getObject(hit->second) != nullptr) {
         owner = hit->second;
+        ++m_stats.handleJoined;
       }
     }
 
@@ -314,6 +335,45 @@ namespace dxvk {
     }
 
     return pid;
+  }
+
+  void RenderObjectDB::movePrimitiveTo(RenderPrimitiveId pid, RenderObjectId to) {
+    RenderPrimitive* p = getPrimitive(pid);
+    RenderObject* dst = getObject(to);
+    if (p == nullptr || dst == nullptr || p->owner == to) {
+      return;
+    }
+
+    const RenderObjectId from = p->owner;
+    RenderObject* src = getObject(from);
+    if (src != nullptr) {
+      auto& v = src->primitives;
+      v.erase(std::remove(v.begin(), v.end(), pid), v.end());
+    }
+    p->owner = to;
+    dst->primitives.push_back(pid);
+
+    if (src != nullptr && src->primitives.empty()) {
+      // THE IDENTITY MOVED, IT DID NOT RETIRE. Re-point the ia anchor at the
+      // object that now holds it and clear both identities on the husk before
+      // freeing it, so freeObject files nothing in m_retiredIa -- a later copy
+      // of this identity is an ordinalShift under `to`, not reminted churn.
+      if (src->iaIdentity != 0ull) {
+        const auto it = m_objectsByIa.find(src->iaIdentity);
+        if (it != m_objectsByIa.end() && it->second == from) {
+          it->second = to;
+        }
+        src->iaIdentity = 0ull;
+      }
+      if (src->engineHandle != 0ull) {
+        const auto it = m_objectsByHandle.find(src->engineHandle);
+        if (it != m_objectsByHandle.end() && it->second == from) {
+          m_objectsByHandle.erase(it);
+        }
+        src->engineHandle = 0ull;
+      }
+      freeObject(from);
+    }
   }
 
   void RenderObjectDB::bindResidentKey(RenderPrimitiveId id, uint64_t residentKey) {

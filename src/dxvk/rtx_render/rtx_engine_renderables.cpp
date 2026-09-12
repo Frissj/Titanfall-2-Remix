@@ -104,8 +104,12 @@ namespace dxvk {
   }
 
   void RenderableEnum::update(uint32_t frame, const Vector3& cameraPos) {
-    if (!RtxOptions::RenderableEnum::enable())
+    if (!RtxOptions::RenderableEnum::enable()) {
+      // Not read this frame: nothing may be retired on a list that is not this
+      // frame's.
+      m_existenceUsable = false;
       return;
+    }
 
     uint32_t capacity = 0u;
     const uintptr_t base = registryBase(capacity);
@@ -118,6 +122,14 @@ namespace dxvk {
       // is the one thing the gate must never confuse.
       m_promotion.reset();
       m_haveCameraPos = false;
+      // A list we could not read is a list we can no longer vouch for: the
+      // promoted source goes with it and has to be earned again.
+      if (m_existence != nullptr) {
+        Logger::warn("[ExistenceSource] demoted 'client.RenderableRegistry' -- the registry"
+                     " became unreadable; absence stops meaning death until it re-promotes");
+        m_existence.reset();
+      }
+      m_existenceUsable = false;
       return;
     }
 
@@ -128,6 +140,12 @@ namespace dxvk {
     const uint8_t*  entries = reinterpret_cast<const uint8_t*>(base + kOffEntries);
 
     m_visible.beginFrame(frame);
+    // The promoted list is the same walk, noted into both. It exists only
+    // from the frame AFTER promotion, so it is always a complete frame.
+    ExistenceSource* existence = m_existence.get();
+    if (existence != nullptr) {
+      existence->beginFrame(frame);
+    }
 
     uint32_t listed  = 0u;
     uint32_t maxSlot = 0u;
@@ -152,14 +170,34 @@ namespace dxvk {
           continue;
 
         m_visible.note(handle);
+        if (existence != nullptr) {
+          existence->note(handle);
+        }
         ++listed;
         if (slot > maxSlot)
           maxSlot = slot;
       }
     }
 
+    m_visible.endFrame();
+    if (existence != nullptr) {
+      existence->endFrame();
+    }
+
     m_stats.listed  = listed;
     m_stats.maxSlot = maxSlot;
+
+    // NV-DXVK slice 2: THE COLLAPSE GUARD. A torn read during a registry resize
+    // yields a short list for one frame, and on a promoted source every handle
+    // missing from it is a death. Half the previous count is far below what
+    // any real frame does -- the sweep that promoted this source held listed=
+    // flat to the unit -- so a drop that deep is the read, not the world.
+    const bool collapsed = (m_lastListed != 0u) && (listed < m_lastListed / 2u);
+    if (collapsed && existence != nullptr) {
+      ++m_collapseSkips;
+    }
+    m_existenceUsable = (existence != nullptr) && !collapsed;
+    m_lastListed = listed;
 
     // ------------------------------------------------------------------
     // THE PROMOTION EVIDENCE.
@@ -186,6 +224,13 @@ namespace dxvk {
       m_haveCameraPos = true;
     }
 
+    // NV-DXVK slice 2: PROMOTE ONCE, the first frame the gate reads flat, and
+    // keep it -- see existence(). promote() logs the promotion. The list is
+    // first filled on the next walk, so it is not usable this frame.
+    if (m_existence == nullptr && m_promotion.flat()) {
+      m_existence = m_promotion.promote(m_visible.name());
+    }
+
     if (RtxOptions::RenderableEnum::logStats() && frame - m_lastLogFrame >= 60u) {
       m_lastLogFrame = frame;
       Logger::warn(str::format(
@@ -201,6 +246,10 @@ namespace dxvk {
         "/", ExistenceSourcePromotion::kRequiredFlatFrames,
         " breaks=", m_promotion.breaks(),
         " promotable=", m_promotion.flat() ? 1u : 0u,
+        // Slice 2: promoted and trusted this frame -- absence is death for
+        // records that carry a handle. collapseSkips: frames the guard refused.
+        " existence=", existence() != nullptr ? 1u : 0u,
+        " collapseSkips=", m_collapseSkips,
         " reads=", m_stats.reads,
         " readFail=", m_stats.readFailures,
         " | listed FLAT under a fixed-position sweep = pre-cull;"
@@ -213,6 +262,10 @@ namespace dxvk {
     m_stats         = Stats();
     m_haveCameraPos = false;
     m_lastLogFrame  = 0u;
+    // A new scene is a new map: the promotion was earned on the old one.
+    m_existence.reset();
+    m_existenceUsable = false;
+    m_lastListed = 0u;
   }
 
 } // namespace dxvk

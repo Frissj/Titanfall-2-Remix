@@ -1201,7 +1201,14 @@ namespace dxvk {
       //       split placements pass an empty hint deliberately (see the
       //       processSceneObjectFanout call site) — and the probe has to move to
       //       the write sites that serve splits before any of this is readable.
-      {
+      //
+      // NV-DXVK [perf] slice 0 (2026-09-12): three process-global atomics per
+      // transform write, contended across the fanout workers, for a question
+      // the hint path has since answered. Runs only when [KeyDiverge] is not
+      // denied; it is in log.cpp's default deny list. Re-enable with
+      // rtx.logDenyTags = -[KeyDiverge].
+      static const bool kKeyDivergeDenied = Logger::tagDenied("[KeyDiverge]");
+      if (!kKeyDivergeDenied) {
         struct KeyDivergeAgg {
           // Starts at 0 rather than the usual kInvalidFrameIndex sentinel because
           // the rollover below is a MONOTONIC test — see the note on sDivFrame.
@@ -1344,7 +1351,12 @@ namespace dxvk {
       // instToObj is there because a populated instancesToObject means the write
       // composes objectToWorld * instancesToObject[0], which is a second place
       // the wobble could enter.
-      if (newKey != m_spatialCacheHash && m_linkedBlas != nullptr) {
+      //
+      // NV-DXVK [perf] slice 0 (2026-09-12): the [ReFile*] family is in log.cpp's
+      // default deny list, so the centroid lookup runs only when it is not
+      // denied. Re-enable with rtx.logDenyTags = -[ReFile.
+      static const bool kReFileJitDenied = Logger::tagDenied("[ReFileJit]");
+      if (!kReFileJitDenied && newKey != m_spatialCacheHash && m_linkedBlas != nullptr) {
         Vector3 oldC;
         if (m_linkedBlas->getSpatialMap().debugCentroidOf(m_spatialCacheHash, oldC)) {
           const Vector3 dv = newPos - oldC;
@@ -2079,6 +2091,16 @@ namespace dxvk {
     // are read-only (no effect on the real reaper below); flip to true to re-enable
     // any of these investigations.
     constexpr bool kEnableGcCensus = false;
+
+    // NV-DXVK [Perf.GcInst]: sub-split of [Perf.Gc] inst= -- pre (everything
+    // ahead of the reap loop), reap (the loop), post (ReapJoin, resident and
+    // RenderObject frame ends). Same gate and cadence as [Perf.PrepScene].
+    const auto tGcInst0 = std::chrono::steady_clock::now();
+    auto tGcInstPre = tGcInst0, tGcInstReap = tGcInst0;
+    // post{} split: head (GcExit/ReapJoin), rs (ResidentScene::onFrameEnd),
+    // ro (RenderObjectDB::onFrameEnd), enum (RenderableEnum::update), tail.
+    auto tGcPostHead = tGcInst0, tGcPostRs = tGcInst0, tGcPostRo = tGcInst0,
+         tGcPostEnum = tGcInst0;
 
     // Can be configured per game: 'rtx.numFramesToKeepInstances'
     const uint32_t numFramesToKeepInstances = RtxOptions::numFramesToKeepInstances();
@@ -3392,7 +3414,14 @@ namespace dxvk {
     // No buffer contents are read. These are device-local and mapPtr is null,
     // which is why the earlier attempts at a content test went through hashes in
     // the first place.
-    if (RtxOptions::ResidentScene::enable() && RtxOptions::ResidentScene::logStats()) {
+    // NV-DXVK [perf] slice 0 (2026-09-12): this census allocates a map of
+    // 2 x instances and XXH3s every geometry slice, every frame, whenever
+    // residentScene.logStats is on -- which it is for the [ResidentScene]
+    // gate reading. It now also needs [SliceCollide] not denied; the tag is in
+    // log.cpp's default deny list (the stretched-plane question it answered is
+    // closed). Re-enable with rtx.logDenyTags = -[SliceCollide].
+    if (RtxOptions::ResidentScene::enable() && RtxOptions::ResidentScene::logStats()
+        && !Logger::tagDenied("[SliceCollide]")) {
       struct SliceOwner {
         const BlasEntry* blas = nullptr;
         uint32_t touchAge = 0;
@@ -3493,6 +3522,8 @@ namespace dxvk {
     }
 
     const bool forceGarbageCollection = (m_instances.size() >= RtxOptions::AntiCulling::Object::numObjectsToKeep());
+    const uint32_t gcInstCount = static_cast<uint32_t>(m_instances.size());
+    tGcInstPre = std::chrono::steady_clock::now();
     for (uint32_t i = 0; i < m_instances.size();) {
       RtInstance*& pInstance = m_instances[i];
       assert(pInstance != nullptr);
@@ -3767,11 +3798,15 @@ namespace dxvk {
       // STALE ONLY. An instance drawn this frame is being maintained by the full
       // path and is not what residency is doing to the scene; the population at
       // issue is the one the keep is preserving without a draw.
+      // NV-DXVK [perf] slice 0 (2026-09-12): [HeldRaw] is in log.cpp's default
+      // deny list; [HeldCensus] above carries the acceptance column. Re-enable
+      // with rtx.logDenyTags = -[HeldRaw].
       if (residencyHolds
           && RtxOptions::ResidentScene::logStats()
           && pInstance->m_frameLastUpdated != currentFrame
           && s_heldRawBurstFrame == currentFrame
-          && s_heldRawPrinted < 24u) {
+          && s_heldRawPrinted < 24u
+          && !Logger::tagDenied("[HeldRaw]")) {
         s_heldRawPrinted += 1;
         const auto& sf = pInstance->surface;
         const auto& as = sf.alphaState;
@@ -4229,6 +4264,7 @@ namespace dxvk {
       probeKeptThisPass += 1;
       ++i;
     }
+    tGcInstReap = std::chrono::steady_clock::now();
 
     // [GcExit]: summarize this GC pass. If probeRemovedThisPass > 0 but
     // probeRemovedMarked == 0 && probeRemovedLifetime == 0, removeInstance
@@ -4261,16 +4297,42 @@ namespace dxvk {
     // Cost is two increments per reap plus one line per frame — safe to leave
     // on. It is NOT gated on the engine-hook capture counter, unlike the
     // [InstReap] detail lines, so the totals cover every reap in the pass.
+    //
+    // NV-DXVK [perf] slice 0 (2026-09-12): ONE LINE PER SECOND. Every pass is
+    // still summed, so a single respawn anywhere in the window shows in
+    // respawn=; worst{} names the pass with the most. kept/live are this pass's.
     if (probeRemovedThisPass > 0 || probeKeptThisPass > 0) {
-      Logger::info(str::format(
-        "[ReapJoin] f=", probeFrame,
-        " removed=", probeRemovedThisPass,
-        " respawn=", probeReapRespawn,
-        " starved=", probeReapStarved,
-        " pctRespawn=", (probeRemovedThisPass > 0
-          ? (100u * probeReapRespawn) / probeRemovedThisPass : 0u),
-        " kept=", probeKeptThisPass,
-        " live=", static_cast<uint32_t>(m_instances.size())));
+      struct ReapJoinWin {
+        std::chrono::steady_clock::time_point start {};
+        uint32_t passes = 0, removed = 0, respawn = 0, starved = 0;
+        uint32_t worstRespawn = 0, worstFrame = 0;
+      };
+      static ReapJoinWin s_rj;  // GC runs on the CS thread only
+      s_rj.passes += 1u;
+      s_rj.removed += probeRemovedThisPass;
+      s_rj.respawn += probeReapRespawn;
+      s_rj.starved += probeReapStarved;
+      if (probeReapRespawn >= s_rj.worstRespawn) {
+        s_rj.worstRespawn = probeReapRespawn;
+        s_rj.worstFrame = probeFrame;
+      }
+      const auto rjNow = std::chrono::steady_clock::now();
+      if (s_rj.start == std::chrono::steady_clock::time_point {}) {
+        s_rj.start = rjNow;
+      } else if (rjNow - s_rj.start >= std::chrono::seconds(1)) {
+        Logger::info(str::format(
+          "[ReapJoin] f=", probeFrame,
+          " passes=", s_rj.passes,
+          " removed=", s_rj.removed,
+          " respawn=", s_rj.respawn,
+          " starved=", s_rj.starved,
+          " pctRespawn=", (s_rj.removed > 0 ? (100u * s_rj.respawn) / s_rj.removed : 0u),
+          " kept=", probeKeptThisPass,
+          " live=", static_cast<uint32_t>(m_instances.size()),
+          " worst{f=", s_rj.worstFrame, " respawn=", s_rj.worstRespawn, "}"));
+        s_rj = ReapJoinWin {};
+        s_rj.start = rjNow;
+      }
     }
 
     // NV-DXVK [ResidentScene]: LRU / invalidated-record sweep, and the stats
@@ -4278,7 +4340,9 @@ namespace dxvk {
     // an instance this pass has already deleted -- removeInstance invalidated
     // each one on the way out, and this is where the husks are erased.
     {
+      tGcPostHead = std::chrono::steady_clock::now();
       m_residentScene.onFrameEnd(probeFrame);
+      tGcPostRs = std::chrono::steady_clock::now();
 
       // NV-DXVK [RenderObject] slice 1: retire and evict on the same schedule,
       // and AFTER the reap for the same reason the resident sweep is -- an
@@ -4287,6 +4351,7 @@ namespace dxvk {
       m_renderObjectDB.onFrameEnd(probeFrame,
                                   RtxOptions::RenderObject::quietFrames(),
                                   RtxOptions::RenderObject::maxObjects());
+      tGcPostRo = std::chrono::steady_clock::now();
 
       // NV-DXVK [RenderableEnum] sec 7 slice B. Read the engine's registry
       // beside the two stores that will eventually consume it. Self-gated on
@@ -4301,6 +4366,25 @@ namespace dxvk {
         probeFrame,
         m_device->getCommon()->getSceneManager().getCameraManager()
           .getCamera(CameraType::Main).getPosition(false));
+      // Stamped BEFORE the death signal below, so [Perf.GcInst] enum= stays the
+      // registry read alone -- the number the RenderableEnum cost fix is judged
+      // on -- and the retire pass lands in tail=.
+      tGcPostEnum = std::chrono::steady_clock::now();
+
+      // NV-DXVK slice 2: THE DEATH SIGNAL. Once the registry has been promoted
+      // on this map (a fixed-position pitch-and-yaw sweep held listed= flat for
+      // ExistenceSourcePromotion::kRequiredFlatFrames), a record whose engine
+      // handle is absent from it names an object the engine destroyed: retire
+      // it now instead of letting it ghost until its buffers die or it ages
+      // out. Records without a handle are outside the list's authority and are
+      // skipped, so this can only ever act on handles a draw proved and the
+      // registry listed when the record was built. Watch absentRetired against
+      // [ReapJoin] starved= (sec 3.1): a drain reads as starved FALLING.
+      if (RtxOptions::ResidentScene::enable()) {
+        if (const ExistenceSource* existence = m_renderableEnum.existence()) {
+          m_residentScene.invalidateAbsent(*existence, probeFrame);
+        }
+      }
 
       if (RtxOptions::RenderObject::logStats()) {
         static uint32_t sRoLastLogFrame = 0u;
@@ -4331,6 +4415,14 @@ namespace dxvk {
             // CUMULATIVE, like [ResidentScene] wiped=: a ceiling that fires and
             // then reads 0 by the time the line comes out is how a policy hides.
             " evicted=", ro.evicted,
+            // SLICE 2. objects < prims is the handle grouping primitives;
+            // rebound must read ~0 on a held scene or the latch is naming the
+            // wrong renderable and the grouping is false.
+            " handle{with=", ro.withHandle,
+            " joined=", ro.handleJoined,
+            " merged=", ro.handleMerged,
+            " rebound=", ro.handleRebound,
+            " unlisted=", ro.handleUnlisted, "}",
             " | newObjects ~0 = identity stable; newObjects high = THE KEY IS CHASING SOMETHING"));
           m_renderObjectDB.resetStats();
         }
@@ -4396,6 +4488,12 @@ namespace dxvk {
             " srcDied=", rs.sourceDestroyed,
             " srcNotices=", rs.srcNotices,
             " srcDrained=", rs.srcDrained,
+            // Slice 2, CUMULATIVE: records retired because the promoted
+            // renderable registry stopped listing their handle, and (this
+            // frame) records it had no authority over. absentRetired climbing
+            // while [ReapJoin] starved= falls is the scene draining (sec 3.1).
+            " absentRetired=", rs.absentRetired,
+            " absentSkipped=", rs.absentSkipped,
             " instStamped=", rs.instancesStamped,
             " liveInst=", static_cast<uint32_t>(m_instances.size()),
             // THE VERIFY VERDICT, and it is the gate for arming this feature.
@@ -4457,6 +4555,25 @@ namespace dxvk {
     // Tracking is cheap (two uint32 writes); only the log is gated.
     sLastGcExitSize  = static_cast<uint32_t>(m_instances.size());
     sLastGcExitFrame = probeFrame;
+
+    if (RtxOptions::logPrepSceneSplit() && (probeFrame % 10u) == 5u) {
+      const auto tGcInstEnd = std::chrono::steady_clock::now();
+      auto us = [](auto a, auto b) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+      };
+      Logger::warn(str::format(
+        "[Perf.GcInst] frame=", probeFrame,
+        " pre=", us(tGcInst0, tGcInstPre),
+        " reap=", us(tGcInstPre, tGcInstReap),
+        " post=", us(tGcInstReap, tGcInstEnd),
+        "{head=", us(tGcInstReap, tGcPostHead),
+        " rs=", us(tGcPostHead, tGcPostRs),
+        " ro=", us(tGcPostRs, tGcPostRo),
+        " enum=", us(tGcPostRo, tGcPostEnum),
+        " tail=", us(tGcPostEnum, tGcInstEnd), "}",
+        " | walked=", gcInstCount, " removed=", probeRemovedThisPass,
+        " residency=", (RtxOptions::ResidentScene::enable() ? 1 : 0)));
+    }
   }
 
   void InstanceManager::onFrameEnd() {
@@ -6349,7 +6466,13 @@ namespace dxvk {
         + firstInstanceObjectToWorld[0][1] * firstInstanceObjectToWorld[0][1]
         + firstInstanceObjectToWorld[0][2] * firstInstanceObjectToWorld[0][2];
       const bool svScaled = svSc0Sq > 10000.0f;  // col0 len > 100 => reprojected
-      if (svGameplay && (svPropId != 0ull || svScaled)) {
+      // NV-DXVK [perf] slice 0 (2026-09-12): the [SubViewKey] family (the
+      // per-frame aggregate and the .create detail, whose string was built and
+      // then dropped by the deny list) runs only when not denied; "[SubViewKey"
+      // is in log.cpp's default deny list. Re-enable with
+      // rtx.logDenyTags = -[SubViewKey.
+      static const bool kSubViewKeyDenied = Logger::tagDenied("[SubViewKey]");
+      if (!kSubViewKeyDenied && svGameplay && (svPropId != 0ull || svScaled)) {
         psoSplit.noteSubvk();   // NV-DXVK [Perf.MidWork]
         struct SvKeyAgg {
           uint32_t frame = 0xFFFFFFFFu;
@@ -7349,6 +7472,17 @@ namespace dxvk {
       std::atomic<uint32_t> calls { 0 }, exact { 0 }, withPropId { 0 }, propIdMiss { 0 }, noPropIdMiss { 0 };
     };
     static FindStageAgg sFindStage;
+    // NV-DXVK [perf] slice 0 (2026-09-12): ONE LINE PER SECOND, not per frame.
+    // Each frame is still closed exactly as before and summed into the window,
+    // so exact/calls reads the same; worst{} carries the single frame with the
+    // most non-exact finds, which is the one thing a sum would hide.
+    struct FindStageWin {
+      std::atomic<int64_t>  startNs { 0 };
+      std::atomic<uint32_t> frames { 0 }, calls { 0 }, exact { 0 }, withPropId { 0 },
+                            propIdMiss { 0 }, noPropIdMiss { 0 };
+      std::atomic<uint32_t> worstMiss { 0 }, worstFrame { 0 }, worstCalls { 0 };
+    };
+    static FindStageWin sFindWin;
     {
       uint32_t seenFrame = sFindStage.frame.load(std::memory_order_relaxed);
       if (seenFrame != currentFrameIdx
@@ -7359,13 +7493,38 @@ namespace dxvk {
         const uint32_t emitPm    = sFindStage.propIdMiss.exchange(0, std::memory_order_relaxed);
         const uint32_t emitNpm   = sFindStage.noPropIdMiss.exchange(0, std::memory_order_relaxed);
         if (seenFrame != 0xFFFFFFFFu && emitCalls > 0u) {
-          Logger::info(str::format(
-            "[FindStage] f=", seenFrame,
-            " calls=", emitCalls,
-            " exact=", emitExact,
-            " withPropId=", emitWith,
-            " propIdMiss=", emitPm,
-            " noPropIdMiss=", emitNpm));
+          constexpr std::memory_order kRx = std::memory_order_relaxed;
+          sFindWin.frames.fetch_add(1u, kRx);
+          sFindWin.calls.fetch_add(emitCalls, kRx);
+          sFindWin.exact.fetch_add(emitExact, kRx);
+          sFindWin.withPropId.fetch_add(emitWith, kRx);
+          sFindWin.propIdMiss.fetch_add(emitPm, kRx);
+          sFindWin.noPropIdMiss.fetch_add(emitNpm, kRx);
+          const uint32_t miss = emitCalls - std::min(emitExact, emitCalls);
+          if (miss >= sFindWin.worstMiss.load(kRx)) {
+            sFindWin.worstMiss.store(miss, kRx);
+            sFindWin.worstFrame.store(seenFrame, kRx);
+            sFindWin.worstCalls.store(emitCalls, kRx);
+          }
+          const int64_t nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+          const int64_t startNs = sFindWin.startNs.load(kRx);
+          if (startNs == 0) {
+            sFindWin.startNs.store(nowNs, kRx);
+          } else if (nowNs - startNs >= 1000000000ll) {
+            sFindWin.startNs.store(nowNs, kRx);
+            Logger::info(str::format(
+              "[FindStage] f=", seenFrame,
+              " frames=", sFindWin.frames.exchange(0u, kRx),
+              " calls=", sFindWin.calls.exchange(0u, kRx),
+              " exact=", sFindWin.exact.exchange(0u, kRx),
+              " withPropId=", sFindWin.withPropId.exchange(0u, kRx),
+              " propIdMiss=", sFindWin.propIdMiss.exchange(0u, kRx),
+              " noPropIdMiss=", sFindWin.noPropIdMiss.exchange(0u, kRx),
+              " worst{f=", sFindWin.worstFrame.load(kRx),
+              " miss=", sFindWin.worstMiss.exchange(0u, kRx),
+              "/", sFindWin.worstCalls.load(kRx), "}"));
+          }
         }
       }
     }
@@ -7426,12 +7585,19 @@ namespace dxvk {
       Slot slots[kSlots];
     };
     static MapSupplyAgg sMapSupply;
+    // NV-DXVK [perf] slice 0 (2026-09-12): the census (a 16-probe atomic claim
+    // per lookup, a 2048-slot walk per frame) runs only when [MapSupply] is not
+    // denied. It is in log.cpp's default deny list -- its pre-registered
+    // question was answered and the churn it measured is closed ([FindStage]
+    // exact 606/607, [ReapJoin] respawn=0). Re-enable with
+    // rtx.logDenyTags = -[MapSupply]. Static for the reason kFindSimDenied is.
+    static const bool kMapSupplyDenied = Logger::tagDenied("[MapSupply]");
 
     // Frame rollover: one thread emits the worst maps and clears the table.
     // Same election shape as [FindStage] above, and the same tolerance — a late
     // straggler from the old frame lands in the new frame's counts, which moves
     // a deficit by ones and never by the tens the verdict turns on.
-    {
+    if (!kMapSupplyDenied) {
       uint32_t seenFrame = sMapSupply.frame.load(std::memory_order_relaxed);
       if (seenFrame != currentFrameIdx
           && sMapSupply.frame.compare_exchange_strong(seenFrame, currentFrameIdx, std::memory_order_relaxed)) {
@@ -7501,7 +7667,7 @@ namespace dxvk {
     // silently attributed one map's queries to another would invent exactly the
     // deficit it is meant to measure.
     size_t mapSupplySlot = MapSupplyAgg::kSlots;
-    {
+    if (!kMapSupplyDenied) {
       const uintptr_t blasKey = reinterpret_cast<uintptr_t>(&blas);
       // Pointer bits 0-3 are always zero for a heap object of this size, so the
       // low bits alone would collide every allocation onto few buckets.
@@ -8079,7 +8245,14 @@ namespace dxvk {
         // (mapSz=11..20 against 113 placements) where a miss is meaningless --
         // the same mistake the [RsGate] note in d3d11_rtx.cpp already records,
         // made again. A small per-frame cap samples the steady state instead.
-        {
+        //
+        // NV-DXVK [perf] slice 0 (2026-09-12): the detail (an O(map) nearest
+        // walk, two ledger probes and a matrix recompose per miss) runs only when
+        // [FanoutPrevMiss] is not denied; it is in log.cpp's default deny list.
+        // The [MapLedger] verdict counters above stay live. Re-enable with
+        // rtx.logDenyTags = -[FanoutPrevMiss].
+        static const bool kPrevMissDenied = Logger::tagDenied("[FanoutPrevMiss]");
+        if (!kPrevMissDenied) {
           static std::atomic<uint32_t> sPrevMissFrame { 0xFFFFFFFFu };
           static std::atomic<uint32_t> sPrevMissLines { 0 };
           constexpr uint32_t kMaxPrevMissPerFrame = 4u;

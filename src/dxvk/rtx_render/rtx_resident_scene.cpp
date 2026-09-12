@@ -101,7 +101,8 @@ namespace dxvk {
                             uint64_t srcVertexBuffer,
                             uint64_t srcIndexBuffer,
                             uint32_t frame,
-                            const std::vector<RtInstance*>& instances) {
+                            const std::vector<RtInstance*>& instances,
+                            uint64_t engineHandle) {
     if (key == 0ull) {
       // 0 is the "no record" sentinel on RtInstance::m_residentKey, exactly as
       // it is on m_batchRecordKey. A record under key 0 could never be
@@ -128,6 +129,12 @@ namespace dxvk {
     rec.frameLastSeen = frame;
     rec.frameLastBuilt = frame;
     rec.valid = true;
+    // NV-DXVK slice 2: the handle that gives invalidateAbsent() authority over
+    // this record. Only ever set, never cleared by a handle-less build -- see
+    // the declaration.
+    if (engineHandle != 0ull) {
+      rec.engineHandle = engineHandle;
+    }
 
     // Arm the death notice. Doing it here rather than at construction means a
     // run with residency off never pays for it, and a run with residency on
@@ -800,18 +807,33 @@ namespace dxvk {
   void EnumerationSource::beginFrame(uint32_t frame) {
     // Cleared, never accumulated. A union across frames would make "absent"
     // unreachable, and absent is the only question the list exists to answer.
-    m_listed.clear();
+    m_listed.clear();   // keeps capacity: no allocation in steady state
+    m_sorted = true;
     m_frame = frame;
   }
 
   void EnumerationSource::note(uint64_t handle) {
     if (handle != 0ull) {
-      m_listed.insert(handle);
+      m_listed.push_back(handle);
+      m_sorted = false;
+    }
+  }
+
+  void EnumerationSource::endFrame() {
+    if (!m_sorted) {
+      std::sort(m_listed.begin(), m_listed.end());
+      m_listed.erase(std::unique(m_listed.begin(), m_listed.end()), m_listed.end());
+      m_sorted = true;
     }
   }
 
   bool EnumerationSource::listed(uint64_t handle) const {
-    return handle != 0ull && m_listed.find(handle) != m_listed.end();
+    if (handle == 0ull)
+      return false;
+    // A producer that skipped endFrame() still gets a correct answer.
+    return m_sorted
+      ? std::binary_search(m_listed.begin(), m_listed.end(), handle)
+      : std::find(m_listed.begin(), m_listed.end(), handle) != m_listed.end();
   }
 
   void ExistenceSourcePromotion::observe(uint32_t listedCount) {
@@ -895,6 +917,10 @@ namespace dxvk {
       // where absence is allowed to mean death, and the parameter's type is
       // what makes that legal.
       rec.valid = false;
+      // The handle died with the object. A rebuild of this key is a new claim
+      // and must bring its own handle; keeping the dead one would re-retire
+      // every rebuild of a key the latch then misses.
+      rec.engineHandle = 0ull;
 
       detachRecord(kv.first, rec);
 

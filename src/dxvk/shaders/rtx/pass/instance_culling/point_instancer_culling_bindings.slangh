@@ -22,6 +22,7 @@
 #pragma once
 
 #include "rtx/pass/instance_culling/point_instancer_culling_binding_indices.h"
+#include "rtx/pass/instance_culling/scene_cull_binding_indices.h"
 #include "rtx/pass/instance_definitions.h"
 #include "rtx/concept/surface/surface.h"
 #include "rtx/concept/surface_material/surface_material.h"
@@ -51,3 +52,18 @@ RWStructuredBuffer<MemoryPolymorphicSurfaceMaterial> materialBuffer;
 // surfaceIndex, so the two are joinable on the CPU with no correlation step.
 layout(binding = POINT_INSTANCER_CULLING_BINDING_COVERAGE_BUFFER)
 RWStructuredBuffer<uint> SurfaceCoverageBuffer;
+
+// NV-DXVK [SceneCull] slice 9: the names scene_cull.slangh reads.
+layout(binding = POINT_INSTANCER_CULLING_BINDING_SCENE_CULL_CONSTANTS)
+ConstantBuffer<SceneCullConstants> sceneCull;
+
+layout(binding = POINT_INSTANCER_CULLING_BINDING_SCENE_CULL_LIGHTS)
+StructuredBuffer<float4> sceneCullLights;
+
+layout(binding = POINT_INSTANCER_CULLING_BINDING_SCENE_CULL_STATS)
+RWStructuredBuffer<uint> sceneCullStats;
+
+layout(binding = POINT_INSTANCER_CULLING_BINDING_SCENE_CULL_VERDICTS)
+RWStructuredBuffer<uint> sceneCullVerdicts;
+
+#include "rtx/pass/instance_culling/scene_cull.slangh"

@@ -122,6 +122,28 @@ void main(uint3 threadId : SV_DispatchThreadID) {
     }
   }
 
+  // NV-DXVK [SceneCull] slice 9: the scene cull's verdict for this instance --
+  // the same function the scene-cull pass runs over every CPU-owned TLAS entry,
+  // over the template BLAS's object box under this instance's F. It replaces
+  // the CPU loop's per-RtInstance test, which judged a whole batch by the
+  // template box under the batch objectToWorld and so could not see where the
+  // instances actually are. Inert unless rtx.sceneCull.enable (flags carry no
+  // ACTIVE bit, the verdict reads UNTESTED).
+  const uint sceneVerdict = sceneCullVerdict(float4(f00, f01, f02, f03), float4(f10, f11, f12, f13),
+                                             float4(f20, f21, f22, f23),
+                                             cb.sceneCullBoxMin, cb.sceneCullBoxMax,
+                                             cb.sceneCullRecordFlags, cb.instanceMask);
+  if (sceneCullVerdictCulls(sceneVerdict)) {
+    visible = false;
+  }
+  if ((sceneCull.flags & SCENE_CULL_FLAG_ACTIVE) != 0u) {
+    const uint verdictIdx = cb.sceneCullVerdictBase + instanceIdx;
+    if (verdictIdx < sceneCull.verdictCount) {
+      sceneCullVerdicts[verdictIdx] = sceneVerdict;
+    }
+    InterlockedAdd(sceneCullStats[SCENE_CULL_STATS_PI_BASE + sceneVerdict], 1u);
+  }
+
   uint mask = visible ? cb.instanceMask : 0;
 
   // === Per-instance surface data: copy template and patch transforms ===

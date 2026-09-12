@@ -891,6 +891,17 @@ namespace dxvk {
             VkDeviceSize    offset,
             VkDeviceSize    size,
       const void*           data);
+
+    // NV-DXVK [GpuScene] slice 8: scattered partial upload in ONE staging
+    // allocation and ONE vkCmdCopyBuffer. regions[i].srcOffset is an offset
+    // into srcBase (the caller's CPU mirror); regions[i].dstOffset/size address
+    // the buffer. The regions are packed into staging here, so the caller never
+    // builds a second copy of the bytes.
+    void writeToBufferRegions(
+      const Rc<DxvkBuffer>& buffer,
+      const void*           srcBase,
+      const VkBufferCopy*   regions,
+            uint32_t        regionCount);
     // NV-DXVK end
     
     // NV-DXVK start: preserve updateImage

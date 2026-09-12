@@ -650,6 +650,75 @@ namespace dxvk {
   }
 
 
+  // NV-DXVK [Perf.SpinAge]: burst accounting for EVENT spins, see GetData.
+  // Frame thread only. A burst opens on the first not-ready poll of a query
+  // object and closes when that object reads ready (or the app moves to another
+  // object); per-poll cost is one pointer compare.
+  namespace {
+    struct SpinAgeBin { uint64_t bursts = 0, us = 0; };
+    thread_local SpinAgeBin  t_spinAge[3][2];   // [age 0/1/2+][rt ahead 0/1]
+    thread_local const void* t_spinAgeQuery = nullptr;
+    thread_local uint32_t    t_spinAgeAge = 0, t_spinAgeRt = 0;
+    thread_local dxvk::high_resolution_clock::time_point t_spinAgeStart;
+    thread_local dxvk::high_resolution_clock::time_point t_spinAgeLog;
+    thread_local bool        t_spinAgeLogInit = false;
+
+    void SpinAgeClose(dxvk::high_resolution_clock::time_point now) {
+      if (t_spinAgeQuery == nullptr)
+        return;
+      SpinAgeBin& b = t_spinAge[t_spinAgeAge][t_spinAgeRt];
+      b.bursts += 1;
+      b.us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+        now - t_spinAgeStart).count());
+      t_spinAgeQuery = nullptr;
+    }
+
+    void SpinAgeNote(const void* pAsync, const D3D11Query* query, HRESULT hr,
+                     uint64_t presentSeq) {
+      if (hr == S_FALSE) {
+        if (pAsync == t_spinAgeQuery)
+          return;
+        const auto now = dxvk::high_resolution_clock::now();
+        SpinAgeClose(now);
+        const uint64_t age = query->EndSeen() ? presentSeq - query->EndPresentSeq() : 2u;
+        t_spinAgeQuery = pAsync;
+        t_spinAgeAge   = uint32_t(std::min<uint64_t>(age, 2u));
+        t_spinAgeRt    = query->EndRtAhead() ? 1u : 0u;
+        t_spinAgeStart = now;
+        return;
+      }
+
+      if (pAsync != t_spinAgeQuery)
+        return;
+
+      const auto now = dxvk::high_resolution_clock::now();
+      SpinAgeClose(now);
+      if (!t_spinAgeLogInit) {
+        t_spinAgeLog = now;
+        t_spinAgeLogInit = true;
+      }
+      if (now - t_spinAgeLog < std::chrono::seconds(5))
+        return;
+      t_spinAgeLog = now;
+
+      auto bin = [](uint32_t a, uint32_t r) {
+        const SpinAgeBin& b = t_spinAge[a][r];
+        return str::format(b.bursts, "/", b.us / 1000u, "ms");
+      };
+      Logger::warn(str::format(
+        "[Perf.SpinAge]",
+        " age0{rt=", bin(0, 1), " noRt=", bin(0, 0), "}",
+        " age1{rt=", bin(1, 1), " noRt=", bin(1, 0), "}",
+        " age2+{rt=", bin(2, 1), " noRt=", bin(2, 0), "}",
+        "  <- EVENT spin bursts/ms by Presents since the waited event's End;"
+        " rt = that interval's RT was early-injected ahead of the event"));
+      for (auto& row : t_spinAge)
+        for (auto& b : row)
+          b = SpinAgeBin();
+    }
+  }
+
+
   HRESULT STDMETHODCALLTYPE D3D11ImmediateContext::GetData(
           ID3D11Asynchronous*               pAsync,
           void*                             pData,
@@ -690,6 +759,37 @@ namespace dxvk {
     // Get query status directly from the query object
     auto query = static_cast<D3D11Query*>(pAsync);
     HRESULT hr = query->GetData(pData, GetDataFlags);
+
+    // NV-DXVK [Perf.SpinAge].
+    //
+    // THE BUBBLE (2026-09-12 05:21). [Perf.Block] gpuIdleMs=8.6 of a 30.4 ms
+    // frame while [Perf.Busy] reads blockedMs=8.0 on the frame thread: for ~8 ms
+    // of every frame the GPU waits for the CPU and the CPU waits for the GPU.
+    // Every EVENT End already flushes at once ([Perf.QEvent]
+    // tookFlush(stalling)=167/167), so this is no longer us withholding work.
+    // It is the engine's frame sync ([Perf.SyncSite] site1, materialsystem,
+    // ~5.3 ms/burst) waiting on an event that sits BEHIND a frame's injectRTX in
+    // GPU order. Until that wait ends the next injectRTX is not emitted, so the
+    // GPU then idles for as long as the CS thread takes to record it (~9 ms).
+    //
+    // THE COUNTER. [Perf.SpinAge] bills every EVENT spin burst by how many
+    // Presents ago its event was ended (age 0/1/2+) and whether that interval's
+    // RT had already been early-injected ahead of it (rt). age0 rt=... is the
+    // engine waiting on the ray tracing of the frame it is still building.
+    //
+    // THE READING (2026-09-12 14:37 / 15:04, RTX 4080). Every wait is age1
+    // noRt: the engine already runs one frame deep, and on this build the
+    // bubble above is gone (gpuIdleMs 1.3-3.0, blockedMs 1.6-3.8).
+    //
+    // A LAG RELEASE WAS TRIED AND DELETED. d3d11.eventQueryLagFrames = L read an
+    // EVENT complete once the GPU had finished the frame L Presents earlier (a
+    // GPU event recorded after EndFrame). At L=1 it released 148-150 of ~150
+    // waits per window and the spin time did not fall (488-561 ms/5 s against
+    // 456-485 at L=0), nor did blockedMs: the frame thread was then waiting for
+    // frame s-2 exactly as long. The wait is plain GPU back-pressure, and no
+    // event semantics can shorten it -- only GPU time can.
+    if (query->IsEvent())
+      SpinAgeNote(pAsync, query, hr, m_presentSeq);
 
     // NV-DXVK [perf]: [Perf.Entry] measured ~1e6 GetData calls per frame costing
     // 80-130 ms — the largest single item in the frame, bigger than all of
@@ -917,6 +1017,9 @@ namespace dxvk {
 
     if (unlikely(query->IsEvent())) {
       query->NotifyEnd();
+      // NV-DXVK [Perf.SpinAge]: which Present interval this event closes, and
+      // whether that interval's RT is already ahead of it. See GetData.
+      query->NotifyEndFrame(m_presentSeq, m_rtx.EarlyInjectFiredThisFrame());
 
       // NV-DXVK [Perf.QEvent]: which branch an EVENT-query End actually takes.
       //
@@ -980,6 +1083,8 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11ImmediateContext::Flush() {
     Flush1(D3D11_CONTEXT_TYPE_ALL, nullptr);
   }
+
+
 
 
   void STDMETHODCALLTYPE D3D11ImmediateContext::Flush1(

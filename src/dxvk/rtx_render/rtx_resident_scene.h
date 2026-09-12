@@ -111,6 +111,9 @@ namespace dxvk {
     // The engine named this handle this frame.
     void note(uint64_t handle);
 
+    // Close the frame's list: sort and dedupe so listed() is a binary search.
+    void endFrame();
+
     bool listed(uint64_t handle) const;
     uint32_t listedCount() const { return static_cast<uint32_t>(m_listed.size()); }
     uint32_t frame() const { return m_frame; }
@@ -120,7 +123,12 @@ namespace dxvk {
 
     const char* m_name = "";
     uint32_t m_frame = kInvalidFrameIndex;
-    std::unordered_set<uint64_t> m_listed;
+    // NV-DXVK [perf] 2026-09-12: a flat vector, reused frame to frame. It was an
+    // unordered_set rebuilt every frame -- one node freed and one allocated per
+    // listed handle -- and [Perf.GcInst] billed RenderableEnum::update at
+    // enum=1164-1244 us/frame for 1055 handles, the largest leaf of the CS gc.
+    std::vector<uint64_t> m_listed;
+    bool m_sorted = true;
   };
 
   // Post-cull, or pre-cull but unproven. Constructible by anyone, because the
@@ -361,12 +369,18 @@ namespace dxvk {
     // rather than taking ownership of a fresh one: this runs per full-path draw
     // (~538/frame today, and every draw while verify is on), and assigning into
     // the record reuses its capacity instead of allocating each time.
+    //
+    // engineHandle (slice 2): the registry-listed renderable the draw belongs
+    // to, or 0. A non-zero handle is recorded and gives invalidateAbsent()
+    // authority over the record; a 0 build leaves an existing handle in place --
+    // a draw the latch missed does not revoke an identity another draw proved.
     void build(uint64_t key,
                uint64_t srcGenHash,
                uint64_t srcVertexBuffer,
                uint64_t srcIndexBuffer,
                uint32_t frame,
-               const std::vector<RtInstance*>& instances);
+               const std::vector<RtInstance*>& instances,
+               uint64_t engineHandle);
 
     // THE TOUCH. Keep-alive without reprocessing: stamps frameLastUpdated on
     // every instance in the record, replays the camera set the build captured,

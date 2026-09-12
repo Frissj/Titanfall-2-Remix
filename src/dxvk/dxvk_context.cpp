@@ -3107,6 +3107,74 @@ namespace dxvk {
       m_cmd->trackResource<DxvkAccess::Write>(buffer);
     }
   }
+
+  void DxvkContext::writeToBufferRegions(
+    const Rc<DxvkBuffer>& buffer,
+    const void*           srcBase,
+    const VkBufferCopy*   regions,
+          uint32_t        regionCount) {
+    ScopedCpuProfileZone();
+
+    if (regionCount == 0u) {
+      return;
+    }
+
+    VkDeviceSize total = 0;
+    VkDeviceSize spanLo = regions[0].dstOffset;
+    VkDeviceSize spanHi = regions[0].dstOffset + regions[0].size;
+    for (uint32_t i = 0; i < regionCount; ++i) {
+      total += regions[i].size;
+      spanLo = std::min(spanLo, regions[i].dstOffset);
+      spanHi = std::max(spanHi, regions[i].dstOffset + regions[i].size);
+    }
+
+    this->spillRenderPass(true);
+
+    // Same hazard handling as writeToBuffer's staging path, over the span the
+    // regions cover: flush pending accesses before the copy is recorded, then
+    // declare the transfer write for the whole span.
+    DxvkBufferSliceHandle spanSlice = buffer->getSliceHandle(spanLo, spanHi - spanLo);
+    if (m_execBarriers.isBufferDirty(spanSlice, DxvkAccess::Write))
+      m_execBarriers.recordCommands(m_cmd);
+
+    auto stagingSlice = m_staging.alloc(CACHE_LINE_SIZE, total);
+    auto stagingHandle = stagingSlice.getSliceHandle();
+
+    // Pack and retarget in one pass. small_vector keeps the common case (a
+    // handful of regions on a settled scene) off the heap.
+    small_vector<VkBufferCopy, 64> copies;
+    copies.reserve(regionCount);
+    VkDeviceSize packed = 0;
+    const DxvkBufferSliceHandle dstBase = buffer->getSliceHandle();
+    for (uint32_t i = 0; i < regionCount; ++i) {
+      std::memcpy(reinterpret_cast<uint8_t*>(stagingHandle.mapPtr) + packed,
+                  reinterpret_cast<const uint8_t*>(srcBase) + regions[i].srcOffset,
+                  regions[i].size);
+      VkBufferCopy c;
+      c.srcOffset = stagingHandle.offset + packed;
+      c.dstOffset = dstBase.offset + regions[i].dstOffset;
+      c.size = regions[i].size;
+      copies.push_back(c);
+      packed += regions[i].size;
+    }
+
+    m_cmd->cmdCopyBuffer(DxvkCmdBuffer::ExecBuffer,
+                         stagingHandle.handle,
+                         dstBase.handle,
+                         uint32_t(copies.size()),
+                         copies.data());
+
+    m_cmd->trackResource<DxvkAccess::Read>(stagingSlice.buffer());
+
+    m_execBarriers.accessBuffer(
+      spanSlice,
+      VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_ACCESS_TRANSFER_WRITE_BIT,
+      buffer->info().stages,
+      buffer->info().access);
+
+    m_cmd->trackResource<DxvkAccess::Write>(buffer);
+  }
 // NV-DXVK end
 
 // NV-DXVK start: preserve updateImage function

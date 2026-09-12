@@ -1392,6 +1392,10 @@ namespace dxvk {
     void OnPresent(const Rc<DxvkImage>& swapchainImage);
 
     uint32_t getDrawCallID() const { return m_drawCallID; }
+    // NV-DXVK [Perf.SpinAge]: whether this frame's injectRTX has already been
+    // emitted (the UI-texture early inject), i.e. sits ahead of anything the
+    // immediate context records from here to Present.
+    bool EarlyInjectFiredThisFrame() const { return m_earlyInjectFiredThisFrame; }
 
     // NV-DXVK: Cross-context draw-count transfer. Deferred contexts record
     // draws onto their own D3D11Rtx instance, so their m_drawCallID is
@@ -1551,6 +1555,12 @@ namespace dxvk {
     // so they keep the per-draw EmitCs path and cannot orphan the arena). Accessed only
     // on the owning (game) thread, so no lock is needed.
     std::unique_ptr<GeometryBatchArena>  m_geoBatch;
+    // NV-DXVK [JobGraph] slice 6: the graph flushGeometryBatch's Phase B runs on.
+    // Long-lived on purpose: the worker that releases the join's last hold is
+    // still returning through the graph when this thread's waitAll sees the
+    // join complete, so a graph local to the flush could be destroyed under it.
+    // Rebuilt (reset + setDispatch) at the top of every flush.
+    std::unique_ptr<JobGraph>            m_flushGraph;
     // Runs the frame-end batch: parallel-for over m_geoBatch finalizing each draw's
     // deferred compute, JOIN, then re-emit commitGeometryToRT in original draw order.
     // No-op when the arena is empty. Called at the top of EndFrame (before its own
@@ -3574,6 +3584,11 @@ namespace dxvk {
     // which is the same reason the key itself is carried and not re-derived.
     // Values are joinprobe::t_keyClass's: 1 world, 2 studio, 3 IA-only.
     uint32_t m_rsDrawKeyClass = 0u;
+    // NV-DXVK [RenderObject] slice 2: the renderable the join latch named for
+    // this draw, taken in residentDrawKey beside the key class and carried to
+    // the judge the same way, for the same reason: the latch is thread-local
+    // and the judge must not re-read it. See DrawCallState::residentEngineHandle.
+    uint64_t m_rsDrawEngineHandle = 0ull;
     // Did this draw carry a producer key. Read by residentGeomGenFold to
     // decide whether the index selection is already proven upstream, so it
     // is written unconditionally rather than under logStats.

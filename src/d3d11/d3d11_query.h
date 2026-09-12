@@ -72,6 +72,19 @@ namespace dxvk {
       m_stallMask |= 1;
       m_stallFlag |= bit::popcnt(m_stallMask) >= 16;
     }
+
+    // NV-DXVK [Perf.SpinAge] / d3d11.eventQueryLagFrames: the immediate
+    // context's Present sequence when this EVENT was ended, and whether that
+    // frame's RT had already been injected ahead of it. Frame thread only.
+    void NotifyEndFrame(uint64_t presentSeq, bool rtAhead) {
+      m_endPresentSeq = presentSeq;
+      m_endRtAhead    = rtAhead;
+      m_endSeen       = true;
+    }
+
+    bool     EndSeen()         const { return m_endSeen; }
+    uint64_t EndPresentSeq()   const { return m_endPresentSeq; }
+    bool     EndRtAhead()      const { return m_endRtAhead; }
     static HRESULT ValidateDesc(const D3D11_QUERY_DESC1* pDesc);
 
     static ID3D11Predicate* AsPredicate(ID3D11Query* pQuery) {
@@ -94,6 +107,10 @@ namespace dxvk {
     std::array<Rc<DxvkGpuEvent>, MaxGpuEvents>  m_event;
     uint32_t m_stallMask = 0;
     bool     m_stallFlag = false;
+
+    uint64_t m_endPresentSeq = 0;
+    bool     m_endRtAhead    = false;
+    bool     m_endSeen       = false;
 
     std::atomic<uint32_t> m_resetCtr = { 0u };
 

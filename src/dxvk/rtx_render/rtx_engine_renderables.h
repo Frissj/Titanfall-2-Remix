@@ -22,6 +22,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "rtx_resident_scene.h"
@@ -119,6 +120,23 @@ namespace dxvk {
     // Evidence, and the only door to an ExistenceSource.
     const ExistenceSourcePromotion& promotion() const { return m_promotion; }
 
+    // NV-DXVK slice 2: THE PROMOTED LIST, or null. Promoted ONCE, the first
+    // frame the gate reads flat on this map, and kept after the camera moves:
+    // the sweep proves a property of the SOURCE (the registry is pre-cull), not
+    // of one frame, and a death signal that only armed while the camera stood
+    // still would retire nothing. Dropped with the scene (clear) and on any
+    // read failure, so a new map, or a registry we can no longer vouch for,
+    // must earn it again.
+    //
+    // Null on a frame where it cannot be trusted even though promoted: the
+    // frame it was promoted (its list is not filled until the next walk) and a
+    // frame whose listed= collapsed below half the previous one -- a torn read
+    // during a registry resize would otherwise be read as a mass death.
+    const ExistenceSource* existence() const {
+      return (m_existence != nullptr && m_existenceUsable) ? m_existence.get() : nullptr;
+    }
+    uint32_t collapseSkips() const { return m_collapseSkips; }
+
     const Stats& stats() const { return m_stats; }
     void clear();
 
@@ -129,6 +147,10 @@ namespace dxvk {
 
     VisibilitySource         m_visible { "client.RenderableRegistry" };
     ExistenceSourcePromotion m_promotion;
+    std::unique_ptr<ExistenceSource> m_existence;
+    bool                     m_existenceUsable = false;
+    uint32_t                 m_lastListed = 0u;
+    uint32_t                 m_collapseSkips = 0u;   // cumulative
     Stats                    m_stats;
 
     Vector3  m_lastCameraPos { 0.0f, 0.0f, 0.0f };

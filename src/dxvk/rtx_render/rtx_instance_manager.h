@@ -124,6 +124,8 @@ public:
   // even though most instances are static. Keyed on the RAW 48-byte
   // transform bits, so a hit also skips getTransform()'s per-call
   // transpose. Written and read only by the SceneCull block (CS thread).
+  // Since slice 9 (GPU scene cull) that is AccelManager::packSceneCullRecord,
+  // which unions merged-bucket members' world boxes from it.
   struct CullAabbCache {
     float   xform[3][4];      // VkTransformMatrixKHR bits at capture
     Vector3 boxMin, boxMax;   // object box at capture

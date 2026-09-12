@@ -114,9 +114,15 @@ namespace dxvk {
 
     void SynchronizeCsThread(
             uint64_t                          SequenceNumber);
-    
+
+    // NV-DXVK [Perf.SpinAge]: called by the swap chain on the frame thread
+    // after EndFrame; advances the Present sequence events are aged by.
+    void NotifyPresent() { ++m_presentSeq; }
+
   private:
-    
+
+    uint64_t                m_presentSeq = 0ull;
+
     DxvkCsThread            m_csThread;
     uint64_t                m_csSeqNum = 0ull;
     bool                    m_csIsBusy = false;

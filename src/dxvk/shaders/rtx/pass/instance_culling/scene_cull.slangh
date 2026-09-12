@@ -1,0 +1,213 @@
+/*
+* Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+*
+* Permission is hereby granted, free of charge, to any person obtaining a
+* copy of this software and associated documentation files (the "Software"),
+* to deal in the Software without restriction, including without limitation
+* the rights to use, copy, modify, merge, publish, distribute, sublicense,
+* and/or sell copies of the Software, and to permit persons to whom the
+* Software is furnished to do so, subject to the following conditions:
+*
+* The above copyright notice and this permission notice shall be included in
+* all copies or substantial portions of the Software.
+*
+* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+* IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+* FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+* THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+* LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+* FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+* DEALINGS IN THE SOFTWARE.
+*/
+#pragma once
+
+// NV-DXVK [SceneCull] slice 9: THE verdict, one function for both producers.
+//
+// The including shader declares, before including this file:
+//   ConstantBuffer<SceneCullConstants> sceneCull;
+//   StructuredBuffer<float4>           sceneCullLights;
+//
+// This is the old CPU loop (AccelManager::mergeInstancesIntoBlas, deleted) as a
+// union of keeps -- see RtxOptions::SceneCull for the reasoning behind every
+// term. The CPU reference in rtx_scene_cull.cpp (SceneCullPass::verdictCpu) is
+// the same function line for line; the verify compares the two per entry, so
+// a change here without the same change there reports itself as VERIFY-FAIL.
+//
+// Every min/max below is written as a compare-and-select rather than min()/
+// max(): SPIR-V's FMin/FMax are undefined for NaN operands, while the CPU's
+// std::min(a, b) is defined as (b < a) ? b : a. Written this way both sides
+// ignore a NaN corner identically.
+
+#include "rtx/pass/instance_culling/scene_cull_binding_indices.h"
+
+bool sceneCullFinite(float x) {
+  return !isnan(x) && !isinf(x);
+}
+
+// Squared distance from p to the closest point of [lo, hi]; zero inside.
+float sceneCullBoxDistSq(float3 p, float3 lo, float3 hi) {
+  float dx = lo.x - p.x; if (p.x - hi.x > dx) { dx = p.x - hi.x; } if (!(dx > 0.0f)) { dx = 0.0f; }
+  float dy = lo.y - p.y; if (p.y - hi.y > dy) { dy = p.y - hi.y; } if (!(dy > 0.0f)) { dy = 0.0f; }
+  float dz = lo.z - p.z; if (p.z - hi.z > dz) { dz = p.z - hi.z; } if (!(dz > 0.0f)) { dz = 0.0f; }
+  return dx * dx + dy * dy + dz * dz;
+}
+
+// Segment [a, b] vs AABB [lo, hi] expanded by pad: standard slab test.
+// Conservative on degenerate axes (d ~ 0 inside the slab passes).
+bool sceneCullSegHitsBox(float3 a, float3 b, float pad, float3 lo, float3 hi) {
+  float t0 = 0.0f;
+  float t1 = 1.0f;
+  for (uint ax = 0; ax < 3; ++ax) {
+    const float sLo = lo[ax] - pad;
+    const float sHi = hi[ax] + pad;
+    const float d = b[ax] - a[ax];
+    if (abs(d) < 1e-6f) {
+      if (a[ax] < sLo || a[ax] > sHi) {
+        return false;
+      }
+      continue;
+    }
+    float ta = (sLo - a[ax]) / d;
+    float tb = (sHi - a[ax]) / d;
+    if (ta > tb) {
+      const float tmp = ta;
+      ta = tb;
+      tb = tmp;
+    }
+    if (ta > t0) { t0 = ta; }
+    if (tb < t1) { t1 = tb; }
+    if (t0 > t1) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// xr0..xr2: the entry's world transform as VkTransformMatrixKHR rows
+// (world.x = dot(xr0, (p, 1))). boxMin/boxMax: the box in that transform's
+// object space. mask: the entry's own mask -- 0 is not tested (nothing to cull).
+uint sceneCullVerdict(float4 xr0, float4 xr1, float4 xr2, float3 boxMin, float3 boxMax,
+                      uint recordFlags, uint mask) {
+  const uint f = sceneCull.flags;
+  if ((f & SCENE_CULL_FLAG_ACTIVE) == 0u || (recordFlags & SCENE_CULL_RECORD_TESTED) == 0u || mask == 0u) {
+    return SCENE_CULL_VERDICT_UNTESTED;
+  }
+
+  const float4 r0 = sceneCull.worldToProjRow0;
+  const float4 r1 = sceneCull.worldToProjRow1;
+  const float4 r2 = sceneCull.worldToProjRow2;
+  const float4 r3 = sceneCull.worldToProjRow3;
+  const bool frustumOn = (f & SCENE_CULL_FLAG_FRUSTUM) != 0u;
+
+  // World AABB of the 8 transformed corners and the clip-space outcode AND in
+  // one pass. D3D clip space (-w <= x,y <= w, 0 <= z <= w), side planes widened
+  // by sideScale. A bit that survives the AND across all 8 corners means every
+  // corner failed that plane. Corners with w <= 0 contribute no side bits.
+  float3 lo = float3( 3.402823466e38f,  3.402823466e38f,  3.402823466e38f);
+  float3 hi = float3(-3.402823466e38f, -3.402823466e38f, -3.402823466e38f);
+  uint outcodeAnd = 0x1Fu;
+  for (uint c = 0; c < 8u; ++c) {
+    const float px = ((c & 1u) != 0u) ? boxMax.x : boxMin.x;
+    const float py = ((c & 2u) != 0u) ? boxMax.y : boxMin.y;
+    const float pz = ((c & 4u) != 0u) ? boxMax.z : boxMin.z;
+    const float wx = xr0.x * px + xr0.y * py + xr0.z * pz + xr0.w;
+    const float wy = xr1.x * px + xr1.y * py + xr1.z * pz + xr1.w;
+    const float wz = xr2.x * px + xr2.y * py + xr2.z * pz + xr2.w;
+    lo.x = (wx < lo.x) ? wx : lo.x;  hi.x = (hi.x < wx) ? wx : hi.x;
+    lo.y = (wy < lo.y) ? wy : lo.y;  hi.y = (hi.y < wy) ? wy : hi.y;
+    lo.z = (wz < lo.z) ? wz : lo.z;  hi.z = (hi.z < wz) ? wz : hi.z;
+    if (frustumOn) {
+      const float cx = r0.x * wx + r0.y * wy + r0.z * wz + r0.w;
+      const float cy = r1.x * wx + r1.y * wy + r1.z * wz + r1.w;
+      const float cz = r2.x * wx + r2.y * wy + r2.z * wz + r2.w;
+      const float cw = r3.x * wx + r3.y * wy + r3.z * wz + r3.w;
+      uint oc = 0u;
+      if (cw > 0.0f) {
+        const float lim = cw * sceneCull.sideScale;
+        if (cx < -lim) { oc |= 0x01u; }
+        if (cx >  lim) { oc |= 0x02u; }
+        if (cy < -lim) { oc |= 0x04u; }
+        if (cy >  lim) { oc |= 0x08u; }
+      }
+      // Behind-near: as a KEEP, "in the frustum" must exclude boxes wholly
+      // behind the camera, or the frustum term would cover everything behind.
+      if (cz < 0.0f) { oc |= 0x10u; }
+      outcodeAnd &= oc;
+    }
+  }
+
+  // Union of keeps: kept the moment any term covers the entry, culled only if
+  // every enabled term missed. Frustum-kept means ON SCREEN (within margin) and
+  // is never subject to the solid-angle reject.
+  bool kept = false;
+  bool frustumKept = false;
+  uint verdict = SCENE_CULL_VERDICT_UNTESTED;
+  if (frustumOn && outcodeAnd == 0u) {
+    kept = true;
+    frustumKept = true;
+    verdict = SCENE_CULL_VERDICT_KEPT_FRUSTUM;
+  }
+  if (!kept && (f & SCENE_CULL_FLAG_RADIUS) != 0u) {
+    // Closest-point distance: zero while the camera is inside the box. A
+    // non-finite box keeps -- never cull on garbage.
+    const float d2 = sceneCullBoxDistSq(sceneCull.camPos, lo, hi);
+    if (!sceneCullFinite(d2) || d2 <= sceneCull.radiusSq) {
+      kept = true;
+      verdict = SCENE_CULL_VERDICT_KEPT_RADIUS;
+    }
+  }
+  if (!kept && (f & SCENE_CULL_FLAG_LIGHT) != 0u) {
+    if ((f & SCENE_CULL_FLAG_LIGHT_ALL) != 0u) {
+      // No lights known: the fail-safe, the light keep covers everything.
+      kept = true;
+      verdict = SCENE_CULL_VERDICT_KEPT_LIGHT;
+    } else {
+      for (uint s = 0; s < sceneCull.lightSegCount; ++s) {
+        const float4 a = sceneCullLights[2u * s];
+        const float4 b = sceneCullLights[2u * s + 1u];
+        if (sceneCullSegHitsBox(a.xyz, b.xyz, a.w, lo, hi)) {
+          kept = true;
+          verdict = SCENE_CULL_VERDICT_KEPT_LIGHT;
+          break;
+        }
+      }
+    }
+  }
+
+  if ((recordFlags & SCENE_CULL_RECORD_SKINNED) != 0u) {
+    return kept ? verdict : SCENE_CULL_VERDICT_KEPT_SKINNED;
+  }
+  if (!kept) {
+    return SCENE_CULL_VERDICT_CULLED;
+  }
+  if ((f & SCENE_CULL_FLAG_SOLID_ANGLE) != 0u && !frustumKept) {
+    // sec 2.2: the one magnitude reject, on the kept OFF-SCREEN set only.
+    // Apparent size ~ longest world-box axis / distance to the box's closest
+    // point; both terms err toward keeping.
+    float maxExtent = hi.x - lo.x;
+    if (hi.y - lo.y > maxExtent) { maxExtent = hi.y - lo.y; }
+    if (hi.z - lo.z > maxExtent) { maxExtent = hi.z - lo.z; }
+    const float distSq = sceneCullBoxDistSq(sceneCull.camPos, lo, hi);
+    if (sceneCullFinite(distSq) && distSq > 0.0f && sceneCullFinite(maxExtent)
+        && maxExtent * maxExtent < sceneCull.solidAngleMinSq * distSq) {
+      // A small occluder next to a positioned light casts a large shadow.
+      bool nearLight = false;
+      const uint pointBase = 2u * sceneCull.lightSegCount;
+      for (uint p = 0; p < sceneCull.lightPointCount; ++p) {
+        const float3 lp = sceneCullLights[pointBase + p].xyz;
+        if (sceneCullBoxDistSq(lp, lo, hi) <= sceneCull.lightExemptDistSq) {
+          nearLight = true;
+          break;
+        }
+      }
+      if (!nearLight) {
+        return SCENE_CULL_VERDICT_CULLED_SMALL;
+      }
+    }
+  }
+  return verdict;
+}
+
+bool sceneCullVerdictCulls(uint verdict) {
+  return verdict == SCENE_CULL_VERDICT_CULLED || verdict == SCENE_CULL_VERDICT_CULLED_SMALL;
+}

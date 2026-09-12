@@ -38728,8 +38728,34 @@ namespace dxvk {
       g_bjChunkSum[slot]  = sum;
     };
 
-    std::vector<Future<void>> futs;
-    futs.reserve(chunks);
+    // NV-DXVK [JobGraph] slice 6 (ARCHITECTURE_OVERHAUL.md sec 4.2, 4.2.1): Phase B
+    // is a parallelFor on a join node, and the join is DRAINED, not spun. What
+    // that removes: Future ring pointers held across the CS drain below (a
+    // retained Future is I2 inside the pool, sec 4.2.1), the call-site
+    // `f.valid()` inline fallback (enqueue-or-run-inline lives in the graph), and
+    // the in-order futs[fi].get() busy spin (waitAll runs what is runnable on
+    // this thread and yields otherwise).
+    //
+    // Dispatch is the pool's Schedule, from THIS thread only: AtomicQueue is SPSC
+    // and this thread is its one producer. A node made runnable on a worker --
+    // the last chunk releasing the join's final hold -- is refused, lands on the
+    // graph's ready queue, and waitAll runs it here. The Future is dropped on
+    // the spot: the graph's own counter is the completion, and nothing holds a
+    // ring slot past Schedule.
+    if (!m_flushGraph) {
+      m_flushGraph = std::make_unique<JobGraph>(JobGraph::Dispatch {});
+    }
+    JobGraph& phaseBGraph = *m_flushGraph;
+    phaseBGraph.reset();
+    {
+      const std::thread::id flushThread = std::this_thread::get_id();
+      phaseBGraph.setDispatch([this, flushThread](std::function<void()> fn) -> bool {
+        if (m_pGeometryWorkers == nullptr || std::this_thread::get_id() != flushThread) {
+          return false;
+        }
+        return m_pGeometryWorkers->Schedule(std::move(fn)).valid();
+      });
+    }
 
     // [BatchJoinSplit] clear this flush's slots before any are written: a flush with
     // fewer chunks than the last one would otherwise fold the previous flush's
@@ -38743,36 +38769,31 @@ namespace dxvk {
       g_bjChunkSum[c]  = BjChunkSum {};
     }
 
-    uint32_t begin = 0;
-    for (uint32_t c = 0; c < chunks; ++c) {
-      const uint32_t end = std::min(begin + chunkSz, n);
-      // The tail chunk is SCHEDULED like every other one rather than kept for this
-      // thread. The original rationale -- "the last range runs on this (game) thread
-      // so it is not idle during the join" -- was measured and came back backwards:
-      // keeping it made the GAME THREAD the straggler for ~6 ms while 29 workers sat
-      // finished, to fill a join that costs ~1 us.
-      const bool lastChunk = (c + 1u == chunks) || (end >= n);
-      const uint32_t hi = lastChunk ? n : end;
-      const uint32_t slot = (c < kBjMaxChunks) ? c : kBjMaxChunks;
-      g_bjChunkSchedNs[slot].store(bjNowNs(), std::memory_order_relaxed);
-      Future<void> f = m_pGeometryWorkers->Schedule([runRange, begin, hi, slot]() {
-        g_bjChunkStartNs[slot].store(bjNowNs(), std::memory_order_relaxed);
-        runRange(begin, hi, slot);
-        g_bjChunkEndNs[slot].store(bjNowNs(), std::memory_order_relaxed);
-      });
-      if (f.valid()) {
-        futs.push_back(f);
-      } else {
-        // Worker queue full: run inline. Stamped the same way so the chunk reads as
-        // "zero wake, ran on the game thread" rather than as a chunk that vanished.
-        g_bjChunkStartNs[slot].store(bjNowNs(), std::memory_order_relaxed);
-        runRange(begin, hi, slot);
-        g_bjChunkEndNs[slot].store(bjNowNs(), std::memory_order_relaxed);
+    // The same contiguous ranges the scheduling loop used to cut: chunk c is
+    // [c*chunkSz, min(n, (c+1)*chunkSz)), so the last one ends at n. Every chunk
+    // is dispatched, the tail included -- keeping the tail for this thread was
+    // measured backwards (it made the GAME THREAD the ~6 ms straggler while 29
+    // workers sat finished, to fill a join that costs ~1 us). A chunk the graph
+    // could not dispatch runs inline inside parallelFor and stamps identically,
+    // so it reads as "zero wake, ran on the game thread" rather than vanishing.
+    // The schedule stamp is taken once for the whole fan-out: wake is measured
+    // from the moment the fan-out started.
+    const uint32_t rangeCount = (n + chunkSz - 1u) / chunkSz;
+    {
+      const uint64_t schedNs = bjNowNs();
+      for (uint32_t c = 0; c < rangeCount; ++c) {
+        g_bjChunkSchedNs[(c < kBjMaxChunks) ? c : kBjMaxChunks].store(schedNs, std::memory_order_relaxed);
       }
-      if (lastChunk)
-        break;
-      begin = end;
     }
+    const JobGraph::JobHandle phaseBJoin = phaseBGraph.createNode("PhaseB.join", nullptr);
+    phaseBGraph.parallelFor(phaseBJoin, rangeCount, [&runRange, chunkSz, n](uint32_t c) {
+      const uint32_t begin = c * chunkSz;
+      const uint32_t hi = std::min(begin + chunkSz, n);
+      const uint32_t slot = (c < kBjMaxChunks) ? c : kBjMaxChunks;
+      g_bjChunkStartNs[slot].store(bjNowNs(), std::memory_order_relaxed);
+      runRange(begin, hi, slot);
+      g_bjChunkEndNs[slot].store(bjNowNs(), std::memory_order_relaxed);
+    });
 
     // NV-DXVK [Phase2b]: DRAIN THE CS THREAD while Phase B runs on the workers.
     // This is the linchpin of the sharded-instance architecture: after it, the
@@ -38800,22 +38821,22 @@ namespace dxvk {
     const auto tDispatch = std::chrono::steady_clock::now();
 
     // [BatchJoin] publish the join state for the watchdog thread. The join below
-    // is a busy spin inside Result::get() with no timeout, so if it never returns
-    // this is the only record of where the frame thread went. Cleared after.
+    // has no timeout, so if it never returns this is the only record of where
+    // the frame thread went. Cleared after. futCount is the chunks the graph
+    // handed to the pool (the rest ran inline); index stays 0 -- the graph join
+    // has no in-order position to report.
     bjStartWatchdog();
     g_bjPhase.store(0u, std::memory_order_relaxed);   // NV-DXVK [Phase2b]: this is the Phase B join
     g_bjFrame.store(g_remixFrameId.load(std::memory_order_relaxed), std::memory_order_relaxed);
     g_bjItems.store(n, std::memory_order_relaxed);
-    g_bjChunks.store(chunks, std::memory_order_relaxed);
-    g_bjFutCount.store(static_cast<uint32_t>(futs.size()), std::memory_order_relaxed);
+    g_bjChunks.store(rangeCount, std::memory_order_relaxed);
+    g_bjFutCount.store(phaseBGraph.stats().dispatched, std::memory_order_relaxed);
     g_bjIndex.store(0u, std::memory_order_relaxed);
     g_bjStartNs.store(bjNowNs(), std::memory_order_relaxed);
     g_bjActive.store(1u, std::memory_order_release);
 
-    for (uint32_t fi = 0; fi < static_cast<uint32_t>(futs.size()); ++fi) {
-      g_bjIndex.store(fi, std::memory_order_relaxed);
-      futs[fi].get();   // single barrier â€” all deferred compute is complete past this point
-    }
+    // Single barrier: all deferred compute is complete past this point.
+    phaseBGraph.waitAll();
 
     g_bjActive.store(0u, std::memory_order_release);
     g_bjFlushes.fetch_add(1u, std::memory_order_relaxed);
@@ -38823,10 +38844,11 @@ namespace dxvk {
     const auto tBatch1 = std::chrono::steady_clock::now();
 
     // ---- [BatchJoinSplit] reduce this flush's per-chunk timestamps ----------
-    // Read AFTER the join, so relaxed loads are safe: every worker's stores happen
-    // before its Result::set(), and the joiner's Result::get() observed that store,
-    // so the whole range is ordered before this point. Inline-fallback chunks ran on
-    // this thread and are trivially ordered.
+    // Read AFTER the join, so relaxed loads are safe: every chunk's stores happen
+    // before its acq_rel release of the join's hold, the join ran only after the
+    // last release, and waitAll's acquire load observed the join's completion, so
+    // the whole range is ordered before this point. Inline chunks ran on this
+    // thread and are trivially ordered.
     uint64_t lastEndNs = 0, wakeSumNs = 0, wakeMaxNs = 0, workSumNs = 0, workMaxNs = 0;
     uint32_t measured = 0;
     // The slowest chunk, and the worst single ITEM inside it. Read together these
@@ -38985,7 +39007,14 @@ namespace dxvk {
       static thread_local BjItemBreak sPeak;     // window peak, with its breakdown
       static thread_local BjChunkSum  sCensus;   // window census, summed over frames
       static thread_local uint64_t sSlowChunkAcc = 0, sSlowItemAcc = 0, sSlowPctAcc = 0;
+      // NV-DXVK [JobGraph] slice 6: the Phase B graph. threw/stale must read 0.
+      static thread_local uint64_t sGraphDisp = 0, sGraphInline = 0, sGraphThrew = 0, sGraphStale = 0;
       if (!sInit) { sLast = tBatch0; sInit = true; }
+      {
+        const JobGraph::Stats gs = phaseBGraph.stats();
+        sGraphDisp += gs.dispatched; sGraphInline += gs.ranInline;
+        sGraphThrew += gs.threw;     sGraphStale += gs.staleHandles;
+      }
       sItemAcc      += n;
       sDispatchAccNs += std::chrono::duration_cast<std::chrono::nanoseconds>(tBatch1 - tBatch0).count();
       sCsDrainAccNs += csDrainNs;   // NV-DXVK [Phase2b]
@@ -39009,7 +39038,9 @@ namespace dxvk {
           " itemsPerFrame=", sItemAcc / uint64_t(fr),
           " parallelForMsPerFrame=", sDispatchAccNs / 1000000 / fr,
           " csDrainUs=", sCsDrainAccNs / 1000 / fr,   // NV-DXVK [Phase2b]: the strict-alternation wait
-          " workers=", workers));
+          " workers=", workers,
+          " graph{disp=", sGraphDisp / uint64_t(fr), " inline=", sGraphInline / uint64_t(fr),
+          " threw=", sGraphThrew, " stale=", sGraphStale, "}"));
         // Per-frame us for the four components, plus the two per-CHUNK distributions.
         // `tax` is the read that Â§6e exists to produce: what one extra parallel pass
         // over this pool costs before it does any useful work. Phase 2b adds two.
@@ -39090,6 +39121,7 @@ namespace dxvk {
         sPeak = BjItemBreak {};
         sCensus = BjChunkSum {};
         sSlowChunkAcc = sSlowItemAcc = sSlowPctAcc = 0;
+        sGraphDisp = sGraphInline = sGraphThrew = sGraphStale = 0;
       }
     }
   }
@@ -43459,6 +43491,12 @@ namespace dxvk {
     // Taken here, after every branch above has had its say on t_keyClass, and
     // carried as a member for the reason on its declaration.
     m_rsDrawKeyClass = joinprobe::t_keyClass;
+    // NV-DXVK [RenderObject] slice 2: the renderable this draw belongs to, from
+    // the same latch family and on the same thread. World-batch draws are never
+    // a renderable's -- the two latches partition the frame -- so a world key
+    // wins and the handle stays 0 rather than inheriting a stale renderable.
+    m_rsDrawEngineHandle = (upstreamKind == 1u)
+      ? 0ull : reinterpret_cast<uint64_t>(joinprobe::currentRenderable());
     // Beside it and unconditional for the same reason: residentGeomGenFold
     // reads this to decide whether the producer already proved the index
     // selection, and a dirty-test input must not depend on a probe.
@@ -44065,6 +44103,15 @@ namespace dxvk {
       s_prevHash = h;
     }
     return s_still.load(std::memory_order_acquire);
+  }
+
+  // NV-DXVK [perf] slice 0 (2026-09-12): the census runs only when one of its
+  // two tags is not denied -- see residentGateBegin. Static for the reason
+  // kFindSimDenied is: the deny list is published once at option init.
+  static bool sceneCensusDenied() {
+    static const bool s_denied = Logger::tagDenied("[SceneCensus]")
+                              && Logger::tagDenied("[VsResidency]");
+    return s_denied;
   }
 
   void D3D11Rtx::censusRecordDraw(bool indexed, UINT count, UINT start, INT base) {
@@ -44950,8 +44997,17 @@ namespace dxvk {
     // census is how the first Phase 0 capture came back reading inst=0 for
     // 1000 frames and got mistaken for a culling result. The floor below is
     // the same idea applied at the only place the frame thread can see it.
+    //
+    // NV-DXVK [perf] slice 0 (2026-09-12): NO LONGER UNCONDITIONAL. It decided
+    // what got built -- residency is built and on -- and it was still paying a
+    // VS-hash fetch, a 40-byte XXH64 and two map lookups per draw on the game
+    // thread. Both tags are in log.cpp's default deny list; the census (and
+    // censusRecordO2w) run when either is re-enabled with
+    // rtx.logDenyTags = -[SceneCensus],-[VsResidency].
     // ------------------------------------------------------------------
-    censusRecordDraw(indexed, count, start, base);
+    if (!sceneCensusDenied()) {
+      censusRecordDraw(indexed, count, start, base);
+    }
 
     // CLEAR THE STASH FIRST, on every draw, before any early return -- and
     // account for what was in it. A key still sitting here belongs to the
@@ -44982,6 +45038,7 @@ namespace dxvk {
     // the judge without going through there -- which would otherwise bill this
     // draw to the PREVIOUS draw's population, silently and plausibly.
     m_rsDrawKeyClass = 0u;
+    m_rsDrawEngineHandle = 0ull;   // [RenderObject] slice 2, same reason
     m_rsDrawUpstreamKeyed = false;
     m_rsDrawSelectionHash = 0ull;
 
@@ -46930,6 +46987,12 @@ namespace dxvk {
   // failures are a record being scored against its own sibling.
   static void rsGateFrameTally(uint32_t frameId, uint32_t prevSeen,
                                bool everSeen, bool predictHit, bool contiguous) {
+    // NV-DXVK [perf] slice 0 (2026-09-12): in log.cpp's default deny list;
+    // re-enable with rtx.logDenyTags = -[RsGateFrame].
+    static const bool kRsGateFrameDenied = Logger::tagDenied("[RsGateFrame]");
+    if (kRsGateFrameDenied) {
+      return;
+    }
     struct GateFrame {
       uint32_t frame = 0xFFFFFFFFu;
       uint32_t draws = 0, hit = 0, missKey = 0, fresh = 0;
@@ -47031,6 +47094,7 @@ namespace dxvk {
     // be by a capture showing otherwise, not by anticipation.
     drawCallState.residentKey             = 0ull;
     drawCallState.residentIdentity        = 0ull;
+    drawCallState.residentEngineHandle    = 0ull;
     drawCallState.residentGenHash         = 0ull;
     drawCallState.residentSrcVertexBuffer = 0ull;
     drawCallState.residentSrcIndexBuffer  = 0ull;
@@ -48558,6 +48622,8 @@ namespace dxvk {
     drawCallState.residentOrdinal         = rsOrdinal;
     // Pre-ordinal half, for the object resolver. See rtx_types.h.
     drawCallState.residentIdentity        = narrowed;
+    // Slice 2: the resolver's authoritative identity, when the draw has one.
+    drawCallState.residentEngineHandle    = m_rsDrawEngineHandle;
     drawCallState.residentGenHash         = m_rsDrawGens;
     drawCallState.residentSrcVertexBuffer = m_rsDrawSrcVb;
     drawCallState.residentSrcIndexBuffer  = m_rsDrawSrcIb;
@@ -49774,7 +49840,10 @@ namespace dxvk {
     //                                                   (re-open Remix BLAS/instance).
     //   ~80988-count draw ABSENT during the vanish   -> matsys dropped it before d3d11
     //                                                   (deferred queue qword_1814F7220 â€” CONFIRMED).
-    if (indexed && count >= 50000u) {
+    // NV-DXVK [perf] slice 0 (2026-09-12): CONFIRMED above, so closed. In log.cpp's
+    // default deny list; re-enable with rtx.logDenyTags = -[BigDraw].
+    static const bool kBigDrawDenied = Logger::tagDenied("[BigDraw]");
+    if (!kBigDrawDenied && indexed && count >= 50000u) {
       const uint32_t bdF = (m_context != nullptr && m_context->m_device != nullptr)
         ? m_context->m_device->getCurrentFrameId() : 0u;
       const bool slotSet = (g_curStudioMaterialSlot != nullptr && *g_curStudioMaterialSlot != 0);
@@ -59007,7 +59076,11 @@ namespace dxvk {
           //   w2vSame=1 o2wSame=1 on still frames
           //       this path is clean and the jittering draws are NOT path 12 --
           //       believe [PropIdRotate]'s pathId over my assumption.
-          {
+          //
+          // NV-DXVK [perf] slice 0 (2026-09-12): in log.cpp's default deny list;
+          // re-enable with rtx.logDenyTags = -[W2vStable].
+          static const bool kW2vStableDenied = Logger::tagDenied("[W2vStable]");
+          if (!kW2vStableDenied) {
             static std::atomic<uint32_t> sW2vFrame { 0u };
             static uint64_t s_prevW2vHash = 0ull;
             static uint64_t s_prevO2wHash = 0ull;
@@ -60799,7 +60872,10 @@ namespace dxvk {
     // point: if THIS reads clean while the camera moves, residency survives
     // camera motion and the gate simply lives downstream of the derivation
     // instead of upstream of it.
-    censusRecordO2w(dcs.transformData.objectToWorld);
+    // NV-DXVK [perf] slice 0: gated with censusRecordDraw (residentGateBegin).
+    if (!sceneCensusDenied()) {
+      censusRecordO2w(dcs.transformData.objectToWorld);
+    }
 
     // NV-DXVK [ResidentScene]: the gate's TAIL half. Same instant, same reason
     // the census hook is here -- objectToWorld is final for EVERY path at this
@@ -63424,7 +63500,14 @@ namespace dxvk {
             // mesh count rather than draw count. Deliberately NOT behind
             // kDiagLogs: that switch enables every diagnostic in this file at
             // once, which would bury this one.
-            {
+            //
+            // NV-DXVK [perf] slice 0 (2026-09-12): the per-draw gather (a
+            // process-global mutex and a map update per skinned draw) runs only
+            // when [BoneWindow] is not denied. The [BoneWindow fix] it verified
+            // has landed; the tag is in log.cpp's default deny list. Re-enable
+            // with rtx.logDenyTags = -[BoneWindow].
+            static const bool kBoneWindowDenied = Logger::tagDenied("[BoneWindow]");
+            if (!kBoneWindowDenied) {
               struct BwStat {
                 uint64_t vs = 0;
                 uint32_t vtx = 0, idx = 0;
@@ -69798,7 +69881,17 @@ namespace dxvk {
           // holds only the draws THIS thread saw last frame and carried=0 means
           // "this thread saw a different set", not "the ids changed". Read
           // [PropIdCensus] instead; it answers the same question globally.
-          if (RtxOptions::ResidentScene::logStats()) {
+          //
+          // NV-DXVK [perf] slice 0 (2026-09-12): residentScene.logStats is on for
+          // the [ResidentScene] gate reading, and it was also running this whole
+          // per-draw census family (shared id tables, thread_local maps). The
+          // family now also needs one of its tags not denied; all three are in
+          // log.cpp's default deny list. Re-enable with
+          // rtx.logDenyTags = -[PropIdCensus],-[SubViewPropId.
+          static const bool kPropIdCensusDenied = Logger::tagDenied("[PropIdCensus]")
+                                               && Logger::tagDenied("[SubViewPropIdLife]")
+                                               && Logger::tagDenied("[SubViewPropIdSep]");
+          if (RtxOptions::ResidentScene::logStats() && !kPropIdCensusDenied) {
             // NV-DXVK [PropIdCensus]: THE GLOBAL, RUN-LENGTH ID CENSUS.
             //
             // WHY THIS EXISTS. [SubViewPropIdLife] below keeps its state in

@@ -562,6 +562,9 @@ namespace dxvk {
     // Vulkan swap chain image.
     if (isPrimary) {
       immediateContext->m_rtx.EndFrame(m_swapImage);
+      // NV-DXVK [Perf.SpinAge]: after this frame's injectRTX, before the Flush
+      // that submits it -- marks the end of this frame's GPU work.
+      immediateContext->NotifyPresent();
     }
 
     // Flush all pending CS work: game draw commands AND (if primary) the

@@ -46,6 +46,14 @@ struct PointInstancerCullingConstants {
   uint enableWriteCensus;
   uint pad1;
   uint pad2;
+  // NV-DXVK [SceneCull] slice 9: the scene cull's verdict runs per instance
+  // here too, over the template BLAS's object box under the instance's world
+  // transform F. sceneCullRecordFlags is SCENE_CULL_RECORD_*; 0 = not tested.
+  // sceneCullVerdictBase is this batch's first slot in the verdict buffer.
+  vec3 sceneCullBoxMin;
+  uint sceneCullRecordFlags;
+  vec3 sceneCullBoxMax;
+  uint sceneCullVerdictBase;
 };
 
 #define POINT_INSTANCER_CULLING_BINDING_CONSTANTS         50
@@ -57,6 +65,13 @@ struct PointInstancerCullingConstants {
 // record per-surfaceIndex what it wrote and the CPU can join it to
 // [ResolveCensus] without a second GPU->host path.
 #define POINT_INSTANCER_CULLING_BINDING_COVERAGE_BUFFER   55
+// NV-DXVK [SceneCull] slice 9: the scene cull pass's constants, light list,
+// stats and verdict buffers, bound here so the PI instances get the SAME
+// verdict function with the same inputs (scene_cull.slangh).
+#define POINT_INSTANCER_CULLING_BINDING_SCENE_CULL_CONSTANTS 56
+#define POINT_INSTANCER_CULLING_BINDING_SCENE_CULL_LIGHTS    57
+#define POINT_INSTANCER_CULLING_BINDING_SCENE_CULL_STATS     58
+#define POINT_INSTANCER_CULLING_BINDING_SCENE_CULL_VERDICTS  59
 
 #define POINT_INSTANCER_CULLING_MIN_BINDING  POINT_INSTANCER_CULLING_BINDING_CONSTANTS
 

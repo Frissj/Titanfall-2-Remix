@@ -68,6 +68,10 @@ namespace dxvk {
         RW_STRUCTURED_BUFFER(POINT_INSTANCER_CULLING_BINDING_SURFACE_BUFFER)
         RW_STRUCTURED_BUFFER(POINT_INSTANCER_CULLING_BINDING_MATERIAL_BUFFER)
         RW_STRUCTURED_BUFFER(POINT_INSTANCER_CULLING_BINDING_COVERAGE_BUFFER)
+        CONSTANT_BUFFER(POINT_INSTANCER_CULLING_BINDING_SCENE_CULL_CONSTANTS)
+        STRUCTURED_BUFFER(POINT_INSTANCER_CULLING_BINDING_SCENE_CULL_LIGHTS)
+        RW_STRUCTURED_BUFFER(POINT_INSTANCER_CULLING_BINDING_SCENE_CULL_STATS)
+        RW_STRUCTURED_BUFFER(POINT_INSTANCER_CULLING_BINDING_SCENE_CULL_VERDICTS)
       END_PARAMETER()
     };
   }
@@ -100,7 +104,8 @@ namespace dxvk {
       const Rc<DxvkBuffer>& surfaceMaterialBuffer,
       const std::vector<PointInstancerBatch>& batches,
       const Vector3& cameraPosition,
-      const Rc<DxvkBuffer>& coverageBuffer) {
+      const Rc<DxvkBuffer>& coverageBuffer,
+      const PointInstancerSceneCullBindings& sceneCull) {
     ScopedGpuProfileZone(ctx, "PointInstancerCulling");
 
     // NV-DXVK [PIWrite]: only record when the census that consumes it is on,
@@ -652,6 +657,11 @@ namespace dxvk {
       constants.blasRefHi         = static_cast<uint32_t>(batch.blasReference >> 32);
       constants.instanceBufferOffset = batch.instanceBufferByteOffset;
       constants.enableWriteCensus = writeCensus ? 1u : 0u;
+      // NV-DXVK [SceneCull] slice 9: the scene cull verdict's per-batch inputs.
+      constants.sceneCullBoxMin = batch.cullBoxMin;
+      constants.sceneCullBoxMax = batch.cullBoxMax;
+      constants.sceneCullRecordFlags = batch.cullRecordFlags;
+      constants.sceneCullVerdictBase = batch.cullVerdictBase;
 
       // NV-DXVK [PIBatchO2w]: THE batch objectToWorld, per batch, per frame,
       // for the aimed VS only.
@@ -833,6 +843,12 @@ namespace dxvk {
       // is null this binds an empty slice and the shader's gate keeps it unused.
       ctx->bindResourceBuffer(POINT_INSTANCER_CULLING_BINDING_COVERAGE_BUFFER,
         coverageBuffer.ptr() != nullptr ? DxvkBufferSlice(coverageBuffer) : DxvkBufferSlice());
+      // NV-DXVK [SceneCull] slice 9: always valid (SceneCullPass creates them on
+      // first use); the constants carry no ACTIVE bit when the pass is unused.
+      ctx->bindResourceBuffer(POINT_INSTANCER_CULLING_BINDING_SCENE_CULL_CONSTANTS, sceneCull.constants);
+      ctx->bindResourceBuffer(POINT_INSTANCER_CULLING_BINDING_SCENE_CULL_LIGHTS, sceneCull.lights);
+      ctx->bindResourceBuffer(POINT_INSTANCER_CULLING_BINDING_SCENE_CULL_STATS, sceneCull.stats);
+      ctx->bindResourceBuffer(POINT_INSTANCER_CULLING_BINDING_SCENE_CULL_VERDICTS, sceneCull.verdicts);
 
       ctx->bindShader(VK_SHADER_STAGE_COMPUTE_BIT, PointInstancerCullingShader::getShader());
 
