@@ -313,8 +313,8 @@ void computeRayConeAnisotropicGradient(
 //   0  = perspective ok, 1 = clip.w<=1, 2 = det<=1, 3 = interpInvW bad,
 //   4  = cap fired, 5 = NaN/Inf, 10 = 1D fallback.
 void computeAnisotropicEllipseAxes(
-  vec3 intersectionPoint, f16vec3 triangleNormal, float twoTriangleArea, f16vec3 rayConeDir,
-  float16_t rayConeRadiusAtIntersection, vec3 positions[3], vec2 txcoords[3], vec2 interpolatedTexCoordsAtIntersection,
+  vec3 intersectionPoint, vec3 triangleNormal, float twoTriangleArea, vec3 rayConeDir,
+  float rayConeRadiusAtIntersection, vec3 positions[3], vec2 txcoords[3], vec2 interpolatedTexCoordsAtIntersection,
   inout vec2 texGradientX, inout vec2 texGradientY,
   inout uint outPathCode,
   // NV-DXVK [VanishDiag-Shader]: diag out-params. Always written, even
@@ -800,6 +800,37 @@ void convert1stCascadeTexCoordsToTargetCascadeLevel(uint targetCascadeLevel, ino
   }
 }
 
+vec3 calcShadowTerminatorOffset(
+  const vec3 positions[3], // world space
+  const vec3 normals[3],   // world space
+  const vec3 bary,
+  const vec3 viewDirection
+)
+{
+  const vec3 hitPosition = interpolateHitAttribute(positions, bary);
+
+  // get distance vectors from triangle vertices
+  vec3 tmpu = hitPosition - positions[0];
+  vec3 tmpv = hitPosition - positions[1];
+  vec3 tmpw = hitPosition - positions[2];
+
+  // project these onto the tangent planes defined by the shading normals
+  tmpu = tmpu - min(0.0, dot(tmpu, normals[0])) * normals[0];
+  tmpv = tmpv - min(0.0, dot(tmpv, normals[1])) * normals[1];
+  tmpw = tmpw - min(0.0, dot(tmpw, normals[2])) * normals[2];
+
+  vec3 terminatorOffset = bary.x * tmpu + bary.y * tmpv + bary.z * tmpw;
+
+  // renormalize, if too long
+  float flen = length(terminatorOffset);
+  if (flen > cb.shadowTerminatorArgs.maxLength)
+  {
+    terminatorOffset *= cb.shadowTerminatorArgs.maxLength / flen;
+  }
+
+  return sanitize(terminatorOffset, vec3(0));
+}
+
 // Adjusts a specified set of texture coordinates and gradients with respect to specified spritesheet information.
 void calcSpriteSheetAdjustment(
   inout vec2 textureCoordinates,
@@ -1083,12 +1114,16 @@ void surfaceInteractionCreateInto<let GenerateTangents : bool>(
   const float worldTwoTriangleArea = dot(worldTriangleVector, worldTriangleNormal);
   surfaceInteraction.triangleArea = worldTwoTriangleArea * 0.5;
 
-  // Note: fp16 conversion done after area calculation so the fp32 normal can be used
-  const f16vec3 triangleNormal = f16vec3(worldTriangleNormal);
-  const bool triangleNormalSameDirection = dot(triangleNormal, rayInteraction.viewDirection) >= float16_t(0.0);
-  const f16vec3 flippedTriangleNormal = triangleNormalSameDirection ? triangleNormal : -triangleNormal;
+  const vec3 triangleNormal = worldTriangleNormal;
+  const bool triangleNormalSameDirection = dot(triangleNormal, rayInteraction.viewDirection) >= 0.0f;
+  const vec3 flippedTriangleNormal = triangleNormalSameDirection ? triangleNormal : -triangleNormal;
 
-  surfaceInteraction.triangleNormal = flippedTriangleNormal;
+#ifdef GBUFFER_FEATURE_DEBUG_VIEW
+#if GBUFFER_FEATURE_DEBUG_VIEW
+  surfaceInteraction.debugTriangleNormal = flippedTriangleNormal;
+  surfaceInteraction.debugInterpolatedVertexNormal = flippedTriangleNormal;
+#endif
+#endif
 
   // NV-DXVK [Perf.SICut] rung 2: + triangle area, triangle normal, cross products
   // and the view-direction flip.
@@ -1109,7 +1144,7 @@ void surfaceInteractionCreateInto<let GenerateTangents : bool>(
 #endif
      )
   {
-    surfaceInteraction.interpolatedNormal = surfaceInteraction.triangleNormal;
+    surfaceInteraction.geometryNormal = flippedTriangleNormal;
   }
   else
   {
@@ -1143,22 +1178,54 @@ void surfaceInteractionCreateInto<let GenerateTangents : bool>(
     // Note: Fall back to the triangle normal when an interpolated normal cannot be derived. Note this will not produce a
     // valid normal for cases where the positional data itself is NaN/Inf, but these cases likely indicate corruption in
     // the original data to begin with.
-    const vec3 objectInterpolatedNormal = safeNormalize(interpolateHitAttribute(normals, bary), triangleNormal);
+    normals[0] = safeNormalize(normals[0], triangleNormal);
+    normals[1] = safeNormalize(normals[1], triangleNormal);
+    normals[2] = safeNormalize(normals[2], triangleNormal);
+
     // Note: This is done due to input data from source applications potentially containing NaNs/Infs and thus needing to be sanitized before being
     // used in Remix. This is done here rather than earlier when normals are read from the buffer to only sanitize once rather than for
     // each of the 3 vertex normals. Do note however that keeping this as close to the interpolation step as possible is important to avoid
     // hiding invalid values from other logic in Remix.
-    const f16vec3 sanitizedObjectInterpolatedNormal = sanitize(objectInterpolatedNormal, triangleNormal);
+    normals[0] = sanitize(normals[0], triangleNormal);
+    normals[1] = sanitize(normals[1], triangleNormal);
+    normals[2] = sanitize(normals[2], triangleNormal);
 
     // Note: Second normalization required as vector may be scaled through a normal transformation
-    const f16vec3 interpolatedNormal = f16vec3(normalize(mul(surface.normalObjectToWorld, sanitizedObjectInterpolatedNormal)));
+    normals[0] = safeNormalize(mul(surface.normalObjectToWorld, normals[0]), triangleNormal);
+    normals[1] = safeNormalize(mul(surface.normalObjectToWorld, normals[1]), triangleNormal);
+    normals[2] = safeNormalize(mul(surface.normalObjectToWorld, normals[2]), triangleNormal);
+
     // Really the only reason to flip this normal is for double-sided geometry.  Do not flip based on view vector!
-    const bool interpolatedNormalSameDirection = dot(interpolatedNormal, flippedTriangleNormal) >= float16_t(0.0);
-    const f16vec3 flippedInterpolatedNormal = interpolatedNormalSameDirection ? interpolatedNormal : -interpolatedNormal;
+    normals[0] *= dot(normals[0], flippedTriangleNormal) >= float16_t(0.0) ? 1 : -1;
+    normals[1] *= dot(normals[1], flippedTriangleNormal) >= float16_t(0.0) ? 1 : -1;
+    normals[2] *= dot(normals[2], flippedTriangleNormal) >= float16_t(0.0) ? 1 : -1;
 
-    const f16vec3 bentInterpolatedNormal = getBentNormal(surfaceInteraction.triangleNormal, flippedInterpolatedNormal, ray.direction);
+    const vec3 interpolatedNormal = safeNormalize(interpolateHitAttribute(normals, bary), triangleNormal);
 
-    surfaceInteraction.interpolatedNormal = bentInterpolatedNormal;
+#ifdef GBUFFER_FEATURE_DEBUG_VIEW
+#if GBUFFER_FEATURE_DEBUG_VIEW
+    surfaceInteraction.debugInterpolatedVertexNormal = interpolatedNormal;
+#endif
+#endif
+
+    const vec3 geometryNormal = getBentNormal(flippedTriangleNormal, interpolatedNormal, ray.direction);
+
+    if (cb.shadowTerminatorArgs.enableOffset)
+    {
+      float maxQuadArea = cb.shadowTerminatorArgs.maxArea;
+
+      // if triangle is small, apply the shadow terminator offset
+      // but on large triangles, skip it, as it introduces light leaking
+      float termScale = 1.0 - smoothstep(maxQuadArea * 0.5, maxQuadArea, worldTwoTriangleArea);
+
+      // since 'surface.normalBufferIndex' is defined, the geometry normal is not flat across the triangle,
+      // we need to apply the shadow terminator fix to prevent harsh shadow edges
+      vec3 terminatorOffset = calcShadowTerminatorOffset(worldPositions, normals, bary, rayInteraction.viewDirection);
+      // project onto the normal: it's more coarse, but requires only vec1 storage instead of vec3
+      surfaceInteraction.shadowTerminatorOffset = termScale * max(0, dot(terminatorOffset, geometryNormal));
+    }
+
+    surfaceInteraction.geometryNormal = geometryNormal;
   }
 
   // NV-DXVK [Perf.SICut] rung 3: + vertex normal decode, interpolation, the
@@ -1393,14 +1460,8 @@ void surfaceInteractionCreateInto<let GenerateTangents : bool>(
       // TBN  in local space, but since we generate the TBN frame in world space this is more applicable. Additionally
       // it removes the need to keep the object space positions around which should ideally reduce register pressure.
       genTangSpace(
-      texcoords, worldPositions, surfaceInteraction.interpolatedNormal,
-      surfaceInteraction.interpolatedTangent, surfaceInteraction.interpolatedBitangent, surfaceInteraction.rawTangent, surfaceInteraction.rawBitangent);
-
-      // Derive triangle TBN based on interpolated TBN. This works in all cases tested,
-      // and should be much cheaper than calling genTangSpace again.
-      f16vec4 interpolatedToTriangle = quaternionCreateOrientation(surfaceInteraction.interpolatedNormal, surfaceInteraction.triangleNormal);
-      surfaceInteraction.triangleTangent = quaternionTransformVector(interpolatedToTriangle, surfaceInteraction.interpolatedTangent);
-      surfaceInteraction.triangleBitangent = quaternionTransformVector(interpolatedToTriangle, surfaceInteraction.interpolatedBitangent);
+      texcoords, worldPositions, surfaceInteraction.geometryNormal,
+      surfaceInteraction.geometryTangent, surfaceInteraction.geometryBitangent, surfaceInteraction.rawTangent, surfaceInteraction.rawBitangent);
     }
 
     // Convert texcoords from the 1st cascade to a corresponding cascade in a combined tiled cascades texture space
@@ -1414,8 +1475,8 @@ void surfaceInteractionCreateInto<let GenerateTangents : bool>(
       {
         // For surfaces with displacement, we need to ensure the final hit point is within a cascade level.
         // To do this, calculate the furthest texcoord that displacement could return, and use a cascade level that includes that point.
-        const f16mat3 worldToTangent = f16mat3(surfaceInteraction.interpolatedTangent, surfaceInteraction.interpolatedBitangent, surfaceInteraction.interpolatedNormal);
-        const f16vec3 viewDirTangentSpace = normalize(mul(worldToTangent, rayInteraction.viewDirection));
+        const mat3 worldToTangent = mat3(surfaceInteraction.geometryTangent, surfaceInteraction.geometryBitangent, surfaceInteraction.geometryNormal);
+        const vec3 viewDirTangentSpace = normalize(mul(worldToTangent, rayInteraction.viewDirection));
         // viewDirection is hitPos to camera, so invert it before converting to a texcoord offset.
         const vec2 maxPossiblePomOffset = viewDirTangentSpace.xy * (-1.f * cb.terrainArgs.displaceIn / viewDirTangentSpace.z);
 
@@ -1466,8 +1527,8 @@ void surfaceInteractionCreateInto<let GenerateTangents : bool>(
        )
     {
       const vec3 positionOffset = surfaceInteraction.position - ray.origin;
-      const f16vec3 direction = footprintMode == kFootprintFromRayDirection ? ray.direction : normalize(positionOffset);
-      const float16_t coneRadius = footprintMode == kFootprintFromRayDirection ? rayInteraction.coneRadius : rayInteraction.coneRadius + length(positionOffset) * ray.spreadAngle;
+      const vec3 direction = footprintMode == kFootprintFromRayDirection ? ray.direction : normalize(positionOffset);
+      const float coneRadius = footprintMode == kFootprintFromRayDirection ? rayInteraction.coneRadius : rayInteraction.coneRadius + length(positionOffset) * ray.spreadAngle;
 
 #if REMIX_SI_DEBUG_FIELDS
       computeAnisotropicEllipseAxes(
@@ -1590,14 +1651,9 @@ void surfaceInteractionCreateInto<let GenerateTangents : bool>(
 
     // Create dummy tangent basis thats reasonable WRT normal
     calcOrthonormalBasis(
-      surfaceInteraction.interpolatedNormal,
-      surfaceInteraction.interpolatedTangent,
-      surfaceInteraction.interpolatedBitangent);
-
-    calcOrthonormalBasis(
-      surfaceInteraction.triangleNormal,
-      surfaceInteraction.triangleTangent,
-      surfaceInteraction.triangleBitangent);
+      surfaceInteraction.geometryNormal,
+      surfaceInteraction.geometryTangent,
+      surfaceInteraction.geometryBitangent);
   }
 
   // Calculate normals for an eye, with a slight bump on a cornea
@@ -1608,7 +1664,7 @@ void surfaceInteractionCreateInto<let GenerateTangents : bool>(
     vec3 enormal, etangent, ebitangent;
     eyeCalcNormalFrame(
       hitPosition,
-      surfaceInteraction.triangleNormal,
+      surfaceInteraction.geometryNormal,
       rayInteraction.viewDirection,
       surface.eyeBasisU,
       surface.eyeBasisV,
@@ -1624,14 +1680,11 @@ void surfaceInteractionCreateInto<let GenerateTangents : bool>(
     surfaceInteraction.textureGradientX      = 0.f;
     surfaceInteraction.textureGradientY      = 0.f;
     // NOTE: disregard the triangle normals
-    surfaceInteraction.triangleNormal        = enormal;
-    surfaceInteraction.interpolatedNormal    = enormal;
-    surfaceInteraction.interpolatedTangent   = etangent;
+    surfaceInteraction.geometryNormal        = enormal;
+    surfaceInteraction.geometryTangent       = etangent;
     surfaceInteraction.rawTangent            = etangent;
-    surfaceInteraction.triangleTangent       = etangent;
-    surfaceInteraction.interpolatedBitangent = ebitangent;
+    surfaceInteraction.geometryBitangent     = ebitangent;
     surfaceInteraction.rawBitangent          = ebitangent;
-    surfaceInteraction.triangleBitangent     = ebitangent;
   }
 
   // Adjust texture coordinates and gradients for animated sprite sheet logic
@@ -1658,7 +1711,7 @@ void surfaceInteractionCreateInto<let GenerateTangents : bool>(
      // They won't get reapplied later anyway
      !isBakedTerrain)
   {
-    f16vec4 color[3];
+    vec4 color[3];
 
     // NV-DXVK [Perf.GeomFetch] rung 1: drop the 3 vertex colour loads. Vertex
     // colour only modulates albedo, so nothing downstream branches on it and the
@@ -1683,10 +1736,10 @@ void surfaceInteractionCreateInto<let GenerateTangents : bool>(
       // VK_FORMAT_B8G8R8A8_UNORM
       const uint colorBits = floatBitsToUint(BUFFER_ARRAY(geometries, color0BufferIndex, color0ElementIndex));
 
-      color[i].x = unorm8ToF16(uint8_t(colorBits >> 16));
-      color[i].y = unorm8ToF16(uint8_t(colorBits >> 8));
-      color[i].z = unorm8ToF16(uint8_t(colorBits));
-      color[i].w = unorm8ToF16(uint8_t(colorBits >> 24));
+      color[i].x = unorm8ToF32(uint8_t(colorBits >> 16));
+      color[i].y = unorm8ToF32(uint8_t(colorBits >> 8));
+      color[i].z = unorm8ToF32(uint8_t(colorBits));
+      color[i].w = unorm8ToF32(uint8_t(colorBits >> 24));
     }
     }
 
@@ -1694,7 +1747,7 @@ void surfaceInteractionCreateInto<let GenerateTangents : bool>(
   }
   else
   {
-    surfaceInteraction.vertexColor = f16vec4(1.0, 1.0, 1.0, 1.0);
+    surfaceInteraction.vertexColor = vec4(1.0, 1.0, 1.0, 1.0);
   }
 
   // NV-DXVK [Perf.ShaderClock]: everything after the position block - normals,

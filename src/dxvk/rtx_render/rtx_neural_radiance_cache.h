@@ -21,10 +21,11 @@
 */
 #pragma once
 
+#include <atomic>
+#include <random>
+
 #include "rtx_option.h"
 #include "rtx_resources.h"
-#include <random>
-#include <atomic>
 
 namespace nrc {
   struct ContextSettings;
@@ -34,6 +35,7 @@ namespace dxvk {
   class RtxContext;
   class DxvkDevice;
   class NrcContext;
+  class DxvkPipelineManager;
 
   // Manages resources for and interactions with Neural Radiance Cache (NRC) context
   class NeuralRadianceCache : public RtxPass {
@@ -199,6 +201,8 @@ namespace dxvk {
     // Returns if NRC is supported
     static bool checkIsSupported(const DxvkDevice* device);
 
+    void prewarmShaders(DxvkPipelineManager& pipelineManager) const;
+
     // To be called after both query and training PT passes completed to get a resolved radiance output
     void dispatchTrainingAndResolve(RtxContext& ctx,  const Resources::RaytracingOutput& rtOutput);
 
@@ -232,6 +236,20 @@ namespace dxvk {
     void setQualityPreset(QualityPreset nrcQualityPreset);
 
     bool isResettingHistory();
+
+    /// Returns the number of NRC training records processed in a recent frame.
+    /// The value is read back from GPU with a kMaxFramesInFlight (4) frame
+    /// delay via a staging buffer.  Transitions from 0 to >0 when the NRC
+    /// CUDA context and JIT-compiled kernels are ready -- i.e., the "cold
+    /// start" phase is complete and training data is flowing.
+    /// Exposed to Python via HdRemix GetRenderStats()["nrcTrainingRecordCount"].
+    uint32_t getNumberOfTrainingRecords() const {
+      return m_numberOfTrainingRecords.load(std::memory_order_relaxed);
+    }
+
+    bool isActiveForStats() const {
+      return m_isActiveForStats.load(std::memory_order_relaxed);
+    }
 
   private:
     // Overrides for inherited RtxPass methods
@@ -272,7 +290,8 @@ namespace dxvk {
     Resources::AliasedResource    m_trainingPathData1;
 
     nrc_uint2              m_activeTrainingDimensions = nrc_uint2 { UINT32_MAX, UINT32_MAX };
-    uint32_t               m_numberOfTrainingRecords = 0;   // Number of training records reported by NRC - reported with kMaxFramesInFlight frame delay
+    std::atomic<bool>       m_isActiveForStats = false;
+    std::atomic<uint32_t>   m_numberOfTrainingRecords = 0;   // Number of training records reported by NRC - reported with kMaxFramesInFlight frame delay
     float                  m_smoothedNumberOfTrainingRecords = 0.f;
     uint32_t               m_smoothingResetFrameIdx = UINT32_MAX;
 
@@ -300,3 +319,16 @@ namespace dxvk {
     static constexpr uint32_t     kNumTrainingRecordsPerIteration = 16 * 1024;
    };
 } // namespace dxvk
+
+// d3d9.dll export consumed by HdRemix.dll (see GetRenderStats() in
+// nv-private/hdremix/renderDelegate.cpp).  Loaded via GetProcAddress; not
+// part of remixapi_Interface and not gated by REMIXAPI_VERSION_*.
+//
+// Queries Neural Radiance Cache status and training progress.
+//   outTrainingRecords  if non-null, receives the number of NRC training
+//                       records processed (lags GPU by kMaxFramesInFlight=4
+//                       frames).  Transitions from 0 to >0 once the CUDA
+//                       context + JIT'd kernels are ready.
+// Returns:
+//   -1 = no Remix device registered, 0 = NRC not active, 1 = NRC active.
+extern "C" __declspec(dllexport) int remixinternal_GetNrcStatus(uint32_t* outTrainingRecords);

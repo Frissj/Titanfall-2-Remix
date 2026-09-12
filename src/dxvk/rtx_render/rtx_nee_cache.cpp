@@ -58,7 +58,6 @@ namespace dxvk {
         RW_STRUCTURED_BUFFER(UPDATE_NEE_CACHE_BINDING_NEE_CACHE)
         RW_STRUCTURED_BUFFER(UPDATE_NEE_CACHE_BINDING_NEE_CACHE_TASK)
         RW_STRUCTURED_BUFFER(UPDATE_NEE_CACHE_BINDING_NEE_CACHE_SAMPLE)
-        TEXTURE2D(UPDATE_NEE_CACHE_BINDING_NEE_CACHE_THREAD_TASK)
         STRUCTURED_BUFFER(UPDATE_NEE_CACHE_BINDING_PRIMITIVE_ID_PREFIX_SUM)
         STRUCTURED_BUFFER(UPDATE_NEE_CACHE_BINDING_LAST_PRIMITIVE_ID_PREFIX_SUM)
       END_PARAMETER()
@@ -68,13 +67,18 @@ namespace dxvk {
   }
 
   NeeCachePass::NeeCachePass(dxvk::DxvkDevice* device)
-    : m_vkd(device->vkd()) {
+    : RtxPass(device)
+    , m_vkd(device->vkd()) {
   }
 
   NeeCachePass::~NeeCachePass() { }
 
   void NeeCachePass::showImguiSettings() {
     RemixGui::Checkbox("Enable NEE Cache", &enableObject());
+    if (ImGui::Button("Reset NEE Cache")) {
+      requestCacheReset();
+    }
+    RemixGui::SetTooltipToLastWidgetOnHover("Clears cached NEE candidates and samples on the next NEE cache update.");
     RemixGui::Checkbox("Enable Importance Sampling", &enableImportanceSamplingObject());
     RemixGui::Checkbox("Enable MIS", &enableMISObject());
     RemixGui::Checkbox("Enable Update", &enableUpdateObject());
@@ -100,8 +104,26 @@ namespace dxvk {
     RemixGui::DragInt("Reshuffle Max Age", &reshuffleMaxAgeObject(), 0.1f, 0, 15, "%d", ImGuiSliderFlags_AlwaysClamp);
   }
 
-  void NeeCachePass::setRaytraceArgs(RaytraceArgs& constants, bool resetHistory) const {    
-    constants.neeCacheArgs.enable = enable();
+  bool NeeCachePass::isEnabled() const {
+    return enable();
+  }
+
+  bool NeeCachePass::onActivation(Rc<DxvkContext>&) {
+    requestCacheReset();
+    return true;
+  }
+
+  void NeeCachePass::onDeactivation() {
+  }
+
+  void NeeCachePass::requestCacheReset() const {
+    m_resetCacheRequested = true;
+  }
+
+  void NeeCachePass::setRaytraceArgs(RaytraceArgs& constants, bool resetHistory) const {
+    const bool neeCacheActive = isActive();
+
+    constants.neeCacheArgs.enable = neeCacheActive;
     constants.neeCacheArgs.enableImportanceSampling = enableImportanceSampling();
     constants.neeCacheArgs.enableMIS = enableMIS();
     constants.neeCacheArgs.enableOnFirstBounce = enableOnFirstBounce();
@@ -125,12 +147,17 @@ namespace dxvk {
     constants.neeCacheArgs.reshuffleMaxAge = reshuffleMaxAge();
 
     static uvec2 oldResolution {0, 0};
-    constants.neeCacheArgs.clearCache = resetHistory || oldResolution.x != constants.camera.resolution.x || oldResolution.y != constants.camera.resolution.y;
+    const bool canClearCache = neeCacheActive && enableUpdate();
+    const bool resetRequested = m_resetCacheRequested;
+    if (canClearCache) {
+      m_resetCacheRequested = false;
+    }
+    constants.neeCacheArgs.clearCache = resetHistory || resetRequested || oldResolution.x != constants.camera.resolution.x || oldResolution.y != constants.camera.resolution.y;
     oldResolution = constants.camera.resolution;
   }
 
   void NeeCachePass::dispatch(RtxContext* ctx, const Resources::RaytracingOutput& rtOutput) {
-    if (!enable() || !enableUpdate()) {
+    if (!isActive() || !enableUpdate()) {
       return;
     }
 
@@ -151,7 +178,6 @@ namespace dxvk {
       ctx->bindResourceBuffer(UPDATE_NEE_CACHE_BINDING_NEE_CACHE_SAMPLE, DxvkBufferSlice(rtOutput.m_neeCacheSample, 0, rtOutput.m_neeCacheSample->info().size));
       ctx->bindResourceBuffer(UPDATE_NEE_CACHE_BINDING_PRIMITIVE_ID_PREFIX_SUM, DxvkBufferSlice(primitiveIDPrefixSumBuffer, 0, primitiveIDPrefixSumBuffer->info().size));
       ctx->bindResourceBuffer(UPDATE_NEE_CACHE_BINDING_LAST_PRIMITIVE_ID_PREFIX_SUM, DxvkBufferSlice(lastPrimitiveIDPrefixSumBuffer, 0, lastPrimitiveIDPrefixSumBuffer->info().size));
-      ctx->bindResourceView(UPDATE_NEE_CACHE_BINDING_NEE_CACHE_THREAD_TASK, rtOutput.m_neeCacheThreadTask.view, nullptr);
 
       // NEE Cache update updates the nee cache based on last frame's record.
       // The cache is a world space hash grid storing short light and emissive triangle lists.

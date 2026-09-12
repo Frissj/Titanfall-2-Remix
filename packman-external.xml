@@ -5,11 +5,11 @@
     <dependency name="fonts" linkPath="external/fonts">
         <package name="rtx-remix-fonts" version="2" />
     </dependency>
-    <dependency name="nv_usd_py310_release" linkPath="external/nv_usd_release">
-      <package name="nv-usd" version="22.11.nv.0.2.8268.07efe1d5-win64_py310_release-dev_omniverse" />
+    <dependency name="usd_release" linkPath="./external/usd_stock_x64/release">
+        <package name="open_usd" version="25.11+07744417-windows-x86_64-release-nopython" />
     </dependency>
-    <dependency name="nv_usd_py310_debug" linkPath="external/nv_usd_debug" tags="non-redist">
-      <package name="nv-usd" version="22.11.nv.0.2.8268.07efe1d5-win64_py310_debug-dev_omniverse" />
+    <dependency name="usd_debug" linkPath="./external/usd_stock_x64/debug" tags="non-redist">
+        <package name="open_usd" version="25.11+07744417-windows-x86_64-debug-nopython" />
     </dependency>
     <dependency name="omni_core_materials" linkPath="external/omni_core_materials">
         <package name="rtx-remix-omni_core_materials" version="16" />
@@ -30,7 +30,7 @@
         <package name="rtx-remix-nv_xxd" version="1" />
     </dependency>
 	<dependency name="ngx_sdk_dlfg" linkPath="external/ngx_sdk_dlfg">
-	    <package name="rtx-remix-ngx_sdk_dlfg" version="3" />
+	    <package name="rtx-remix-ngx_sdk_dlfg" version="4" />
 	</dependency>
 	<dependency name="ngx_sdk_dldn" linkPath="external/ngx_sdk_dldn">
 	    <package name="rtx-remix-ngx_sdk_dldn" version="7" />
@@ -40,5 +40,8 @@
 	</dependency>
     <dependency name="spirv_tools" linkPath="external/spirv_tools">
         <package name="rtx-remix-spirv_tools" version="spirv_tools-vulkan-sdk-1.4.313" />
+    </dependency>
+    <dependency name="sentry-native" linkPath="external/sentry-native">
+        <package name="rtx-remix-sentry-native" version="0.15.3" />
     </dependency>
 </project>

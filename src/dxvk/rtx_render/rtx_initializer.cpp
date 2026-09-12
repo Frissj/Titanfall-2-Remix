@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022-2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -26,11 +26,18 @@
 #include "../../util/thread.h"
 #include "dxvk_context.h"
 #include "dxvk_device.h"
-#include "rtx_render/rtx_shader_manager.h"
-#include "rtx_render/rtx_texture_manager.h"
+#include "rtx_shader_manager.h"
+#include "rtx_texture_manager.h"
 #include "rtx_io.h"
 #include "dxvk_raytracing.h"
 #include "rtx_debug_view.h"
+#include "rtx_sparse_rendering.h"
+#include "rtx_restir_gi_rayquery.h"
+#include "rtx_taa.h"
+#include "rtx_nis.h"
+#include "rtx_tone_mapping.h"
+#include "rtx_neural_radiance_cache.h"
+#include "rtx_ray_reconstruction.h"
 
 namespace dxvk {
   RtxInitializer::RtxInitializer(DxvkDevice* device)
@@ -155,6 +162,14 @@ namespace dxvk {
     pCommon->metaPathtracerIntegrateIndirect().prewarmShaders(pCommon->pipelineManager());
 
     pCommon->metaDebugView().prewarmShaders(pCommon->pipelineManager());
+
+    pCommon->metaSparseRendering().prewarmShaders(pCommon->pipelineManager());
+    pCommon->metaReSTIRGIRayQuery().prewarmShaders(pCommon->pipelineManager());
+    pCommon->metaTAA().prewarmShaders(pCommon->pipelineManager());
+    pCommon->metaNIS().prewarmShaders(pCommon->pipelineManager());
+    pCommon->metaToneMapping().prewarmShaders(pCommon->pipelineManager());
+    pCommon->metaNeuralRadianceCache().prewarmShaders(pCommon->pipelineManager());
+    pCommon->metaRayReconstruction().prewarmShaders(pCommon->pipelineManager());
 
     // Prewarm the rest of the pipelines that can be done automatically
     AutoShaderPipelinePrewarmer::prewarmComputePipelines(pCommon->pipelineManager());

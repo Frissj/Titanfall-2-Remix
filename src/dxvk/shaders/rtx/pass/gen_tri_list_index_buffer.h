@@ -47,7 +47,7 @@ void generateIndices(const uint32_t idx, RWStructuredBuffer<uint32_t> dst, Struc
   uint32_t i0 = 0;
   uint32_t i1 = 0;
   uint32_t i2 = 0;
-    
+
   switch (cb.topology)
   {
   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN:
@@ -71,7 +71,7 @@ void generateIndices(const uint32_t idx, RWStructuredBuffer<uint32_t> dst, Struc
   i1 += cb.firstIndex;
   i2 += cb.firstIndex;
 
-  if (cb.useIndexBuffer != 0) 
+  if (cb.useIndexBuffer != 0)
   {
     uint32_t idx0 = readSrcIndex(src, i0, cb.inputIsU16);
     uint32_t idx1 = readSrcIndex(src, i1, cb.inputIsU16);
@@ -85,12 +85,12 @@ void generateIndices(const uint32_t idx, RWStructuredBuffer<uint32_t> dst, Struc
       idx1 = cb.minVertex;
       idx2 = cb.minVertex;
     }
-    
+
     dst[idx * 3 + 0] = idx0 - cb.minVertex;
     dst[idx * 3 + 1] = idx1 - cb.minVertex;
     dst[idx * 3 + 2] = idx2 - cb.minVertex;
-  } 
-  else 
+  }
+  else
   {
     dst[idx * 3 + 0] = i0 - cb.minVertex;
     dst[idx * 3 + 1] = i1 - cb.minVertex;

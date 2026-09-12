@@ -24,6 +24,8 @@
 #include <memory>
 #include <atomic>
 #include <cstring>
+#include <variant>
+
 #include "rtx_texture.h"
 #include "rtx_option.h"
 #include "rtx_cb_types.h"
@@ -187,9 +189,7 @@ struct RtSurface {
     flags1 |= isTextureFactorBlend ?          (1 << 27) : 0;
     flags1 |= isMotionBlurMaskOut ?           (1 << 28) : 0;
     flags1 |= skipSurfaceInteractionSpritesheetAdjustment ? (1 << 29) : 0;
-    flags1 |= ignoreTransparencyLayer ?       (1 << 30) : 0;
-    // Note: This flag is purely for debug view purpose. If we need to add more functional flags and running out of bits, we should move this flag to other place.
-    flags1 |= isInsideFrustum ?               (1 << 31) : 0;
+    flags1 |= isPreservePath ?                (1u << 30) : 0;
 
     writeGPUHelper(data, offset, flags1);
 
@@ -415,6 +415,8 @@ struct RtSurface {
   bool isEmissive = false;
   bool isMatte = false;
   bool isStatic = false;
+  // True when SceneManager took the preserve replacement-instance path (usePreservePath); unrelated to motion isStatic.
+  bool isPreservePath = false;
   bool hasMaterialChanged = false;
   bool isAnimatedWater = false;
   // NV-DXVK: lightmap UV (TEXCOORD1) presence. Set when the source draw
@@ -453,8 +455,6 @@ struct RtSurface {
   bool isVertexColorBakedLighting = true;
   bool isMotionBlurMaskOut = false;
   bool skipSurfaceInteractionSpritesheetAdjustment = false;
-  bool isInsideFrustum = false;
-  bool ignoreTransparencyLayer = false;
 
   RtTextureArgSource textureColorArg1Source = RtTextureArgSource::Texture;
   RtTextureArgSource textureColorArg2Source = RtTextureArgSource::None;
@@ -531,14 +531,13 @@ struct RtSurface {
       "  isEmissive: ", isEmissive, "\n",
       "  isMatte: ", isMatte, "\n",
       "  isStatic: ", isStatic, "\n",
+      "  isPreservePath: ", isPreservePath, "\n",
       "  hasMaterialChanged: ", hasMaterialChanged, "\n",
       "  isAnimatedWater: ", isAnimatedWater, "\n",
       "  isClipPlaneEnabled: ", isClipPlaneEnabled, "\n",
       "  isTextureFactorBlend: ", isTextureFactorBlend, "\n",
       "  isMotionBlurMaskOut: ", isMotionBlurMaskOut, "\n",
-      "  skipSurfaceInteractionSpritesheetAdjustment: ", skipSurfaceInteractionSpritesheetAdjustment, "\n",
-      "  isInsideFrustum: ", isInsideFrustum, "\n",
-      "  ignoreTransparencyLayer: ", ignoreTransparencyLayer));
+      "  skipSurfaceInteractionSpritesheetAdjustment: ", skipSurfaceInteractionSpritesheetAdjustment));
     
     // Print alpha state
     Logger::warn("=== Alpha State ===");
@@ -622,14 +621,10 @@ struct RtSurface {
   uint32_t objectPickingValue = 0; // NOTE: a value to fill GBUFFER_BINDING_PRIMARY_OBJECT_PICKING_OUTPUT
   uint32_t decalSortOrder = 0; // see: InstanceManager::m_decalSortOrderCounter
 
-  // PointInstancer support - this surface may represent multiple instances, one for each transform in instancesToObject
-  const std::vector<Matrix4>* instancesToObject = nullptr;
-  // NV-DXVK: Lifetime owner for instancesToObject when the pointer references
-  // storage whose lifetime is tied to the frame that created it (e.g. the d3d11
-  // bone-fanout path). Without this, the raw pointer above could dangle once
-  // the originating frame's transform buffer is recycled. Sources with external
-  // ownership leave this null.
-  std::shared_ptr<const std::vector<Matrix4>> instancesToObjectOwner;
+  // PointInstancer support - this surface may represent multiple instances, one for each transform in instancesToObject.
+  // Some API-provided instance transform arrays are not owned by an AssetReplacement and may be destroyed before the
+  // next full scene clear, so surfaces retain shared ownership of the transform data they reference.
+  std::shared_ptr<const std::vector<Matrix4>> instancesToObject;
   // on the GPU, multiple copies of this surface with different transforms will exist.  They will be in a continuous block, starting at surfaceIndexOfFirstInstance.
   size_t surfaceIndexOfFirstInstance = SIZE_MAX;
 };
@@ -638,22 +633,57 @@ struct RtSurface {
 
 struct LegacyMaterialDefaults {
   friend class ImGUI;
-  RTX_OPTION("rtx.legacyMaterial", float, anisotropy, 0.f, "The default roughness anisotropy to use for non-replaced \"legacy\" materials. Should be in the range -1 to 1, where 0 is isotropic.");
-  RTX_OPTION("rtx.legacyMaterial", float, emissiveIntensity, 0.f, "The default emissive intensity to use for non-replaced \"legacy\" materials.");
-  RTX_OPTION("rtx.legacyMaterial", bool, useAlbedoTextureIfPresent, true, "A flag to determine if an \"albedo\" texture (a qualifying color texture) from the original application should be used if present on non-replaced \"legacy\" materials.");
-  RTX_OPTION("rtx.legacyMaterial", Vector3, albedoConstant, Vector3(1.0f, 1.0f, 1.0f), "The default albedo constant to use for non-replaced \"legacy\" materials. Should be a color in sRGB colorspace with gamma encoding.");
-  RTX_OPTION("rtx.legacyMaterial", float, opacityConstant, 1.f, "The default opacity constant to use for non-replaced \"legacy\" materials. Should be in the range 0 to 1.");
-  RTX_OPTION_ENV("rtx.legacyMaterial", float, roughnessConstant, 0.7f, "DXVK_LEGACY_MATERIAL_DEFAULT_ROUGHNESS", "The default perceptual roughness constant to use for non-replaced \"legacy\" materials. Should be in the range 0 to 1.");
-  RTX_OPTION("rtx.legacyMaterial", float, metallicConstant, 0.1f, "The default metallic constant to use for non-replaced \"legacy\" materials. Should be in the range 0 to 1.");
-  RTX_OPTION("rtx.legacyMaterial", Vector3, emissiveColorConstant, Vector3(0.0f, 0.0f, 0.0f), "The default emissive color constant to use for non-replaced \"legacy\" materials. Should be a color in sRGB colorspace with gamma encoding.");
-  RTX_OPTION("rtx.legacyMaterial", bool, enableEmissive, false, "A flag to determine if emission should be used on non-replaced \"legacy\" materials.");
-  RTX_OPTION("rtx.legacyMaterial", bool, ignoreAlphaChannel, false, "A flag to determine if the albedo alpha channel should be ignored on non-replaced \"legacy\" materials.");
-  RTX_OPTION("rtx.legacyMaterial", bool, enableThinFilm, false, "A flag to determine if a thin-film layer should be used on non-replaced \"legacy\" materials.");
-  RTX_OPTION("rtx.legacyMaterial", bool, alphaIsThinFilmThickness, false, "A flag to determine if the alpha channel from the albedo source should be treated as thin film thickness on non-replaced \"legacy\" materials.");
+  RTX_OPTION_ARGS("rtx.legacyMaterial", float, anisotropy, 0.f,
+                  "The default roughness anisotropy to use for non-replaced \"legacy\" materials. "
+                  "Should be in the range -1 to 1, where 0 is isotropic.",
+                  args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
+  RTX_OPTION_ARGS("rtx.legacyMaterial", float, emissiveIntensity, 0.f,
+                  "The default emissive intensity to use for non-replaced \"legacy\" materials.",
+                  args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
+  RTX_OPTION_ARGS("rtx.legacyMaterial", bool, useAlbedoTextureIfPresent, true,
+                  "A flag to determine if an \"albedo\" texture (a qualifying color texture) from the original application "
+                  "should be used if present on non-replaced \"legacy\" materials.",
+                  args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
+  RTX_OPTION_ARGS("rtx.legacyMaterial", Vector3, albedoConstant, Vector3(1.0f, 1.0f, 1.0f),
+                  "The default albedo constant to use for non-replaced \"legacy\" materials. "
+                  "Should be a color in sRGB colorspace with gamma encoding.",
+                  args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
+  RTX_OPTION_ARGS("rtx.legacyMaterial", float, opacityConstant, 1.f,
+                  "The default opacity constant to use for non-replaced \"legacy\" materials. "
+                  "Should be in the range 0 to 1.",
+                  args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
+  RTX_OPTION_ARGS("rtx.legacyMaterial", float, roughnessConstant, 0.7f,
+                  "The default perceptual roughness constant to use for non-replaced \"legacy\" materials. "
+                  "Should be in the range 0 to 1.",
+                  args.environment = "DXVK_LEGACY_MATERIAL_DEFAULT_ROUGHNESS",
+                  args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
+  RTX_OPTION_ARGS("rtx.legacyMaterial", float, metallicConstant, 0.1f,
+                  "The default metallic constant to use for non-replaced \"legacy\" materials. "
+                  "Should be in the range 0 to 1.",
+                  args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
+  RTX_OPTION_ARGS("rtx.legacyMaterial", Vector3, emissiveColorConstant, Vector3(0.0f, 0.0f, 0.0f),
+                  "The default emissive color constant to use for non-replaced \"legacy\" materials. "
+                  "Should be a color in sRGB colorspace with gamma encoding.",
+                  args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
+  RTX_OPTION_ARGS("rtx.legacyMaterial", bool, enableEmissive, false,
+                  "A flag to determine if emission should be used on non-replaced \"legacy\" materials.",
+                  args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
+  RTX_OPTION_ARGS("rtx.legacyMaterial", bool, ignoreAlphaChannel, false,
+                  "A flag to determine if the albedo alpha channel should be ignored on non-replaced \"legacy\" materials.",
+                  args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
+  RTX_OPTION_ARGS("rtx.legacyMaterial", bool, enableThinFilm, false,
+                  "A flag to determine if a thin-film layer should be used on non-replaced \"legacy\" materials.",
+                  args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
+  RTX_OPTION_ARGS("rtx.legacyMaterial", bool, alphaIsThinFilmThickness, false,
+                  "A flag to determine if the alpha channel from the albedo source should be treated as thin film thickness "
+                  "on non-replaced \"legacy\" materials.",
+                  args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
   // Note: Should be something non-zero as 0 is an invalid thickness to have (even if this is just unused).
-  RTX_OPTION("rtx.legacyMaterial", float, thinFilmThicknessConstant, 200.f,
-             "The thickness (in nanometers) of the thin-film layer assuming it is enabled on non-replaced \"legacy\" materials.\n"
-             "Should be any value larger than 0, typically within the wavelength of light, but must be less than or equal to OPAQUE_SURFACE_MATERIAL_THIN_FILM_MAX_THICKNESS (" STRINGIFY(OPAQUE_SURFACE_MATERIAL_THIN_FILM_MAX_THICKNESS) " nm).");
+  RTX_OPTION_ARGS("rtx.legacyMaterial", float, thinFilmThicknessConstant, 200.f,
+                  "The thickness (in nanometers) of the thin-film layer assuming it is enabled on non-replaced \"legacy\" materials.\n"
+                  "Should be any value larger than 0, typically within the wavelength of light, but must be less than or equal to "
+                  "OPAQUE_SURFACE_MATERIAL_THIN_FILM_MAX_THICKNESS (" STRINGIFY(OPAQUE_SURFACE_MATERIAL_THIN_FILM_MAX_THICKNESS) " nm).",
+                  args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
 };
 
 // Surface Materials
@@ -700,7 +730,7 @@ struct RtOpaqueSurfaceMaterial {
     const Vector3& emissiveColorConstant, bool enableEmission,
     bool ignoreAlphaChannel, bool enableThinFilm, bool alphaIsThinFilmThickness, float thinFilmThicknessConstant,
     uint32_t samplerIndex, float displaceIn, float displaceOut,
-    uint32_t subsurfaceMaterialIndex, bool isRaytracedRenderTarget,
+    uint32_t subsurfaceMaterialIndex, bool isRaytracedRenderTarget, bool isHairCard,
     uint16_t samplerFeedbackStamp,
     uint32_t secondaryTextureIndex = 0,
     uint32_t ambientOcclusionTextureIndex = kSurfaceMaterialInvalidTextureIndex,
@@ -768,7 +798,7 @@ struct RtOpaqueSurfaceMaterial {
     m_ignoreAlphaChannel { ignoreAlphaChannel }, m_enableThinFilm { enableThinFilm }, m_alphaIsThinFilmThickness { alphaIsThinFilmThickness },
     m_thinFilmThicknessConstant { thinFilmThicknessConstant }, m_samplerIndex{ samplerIndex }, m_displaceIn{ displaceIn },
     m_displaceOut{ displaceOut }, m_subsurfaceMaterialIndex(subsurfaceMaterialIndex), m_isRaytracedRenderTarget(isRaytracedRenderTarget),
-    m_samplerFeedbackStamp{ samplerFeedbackStamp },
+    m_isHairCard(isHairCard), m_samplerFeedbackStamp{ samplerFeedbackStamp },
     m_alphaModulateEmissive{ alphaModulateEmissive },
     m_emissiveTintFromConstant{ emissiveTintFromConstant },
     m_hasScreenSpaceEmissive{ hasScreenSpaceEmissive },
@@ -953,7 +983,7 @@ struct RtOpaqueSurfaceMaterial {
     //   data[36] = T.x       (packHalf)
     //   data[37] = T.y       (packHalf)
     //   data[38] = screenSpaceEmissiveMaskTextureIndex (uint16)
-    //   data[39] = padding   (0)
+    //   data[39] = isHairCard (uint16, 0/1)
     // Slang reads the matrix + translate as float2 pairs and decodes the
     // mask texture index as a bindless uint16. Default-initialised values
     // for non-screen-space materials produce identity matrix + zero
@@ -965,7 +995,9 @@ struct RtOpaqueSurfaceMaterial {
     writeGPUHelper(data, offset, glm::packHalf1x16(m_screenSpaceEmissiveTranslate.x));
     writeGPUHelper(data, offset, glm::packHalf1x16(m_screenSpaceEmissiveTranslate.y));
     writeGPUHelperExplicit<2>(data, offset, m_screenSpaceEmissiveMaskTextureIndex);
-    writeGPUHelperExplicit<2>(data, offset, uint16_t(0));  // padding to fill 16 bytes
+    // The 16-bit flags word is full in this fork (TF2 flags occupy every bit
+    // after the type bits), so upstream's hair-card flag lives in this word.
+    writeGPUHelperExplicit<2>(data, offset, uint16_t(m_isHairCard ? 1u : 0u));
     assert(offset - oldOffset == kSurfaceMaterialGPUSize);
   }
 
@@ -1034,6 +1066,11 @@ struct RtOpaqueSurfaceMaterial {
   uint32_t getDetailTextureIndex() const { return m_detailTextureIndex; }
   uint32_t getCloudMaskTextureIndex() const { return m_cloudMaskTextureIndex; }
 
+  // Albedo ManagedTexture stamp; used to associate textures for streaming priority.
+  uint16_t getSamplerFeedbackStamp() const {
+    return m_samplerFeedbackStamp;
+  }
+
   float getAnisotropy() const {
     return m_anisotropy;
   }
@@ -1070,6 +1107,18 @@ struct RtOpaqueSurfaceMaterial {
     return m_isRaytracedRenderTarget;
   }
 
+  template<typename Fn>
+  void forEachTextureIndex(Fn&& fn) const {
+    fn(m_albedoOpacityTextureIndex);
+    fn(m_secondaryTextureIndex);
+    fn(m_normalTextureIndex);
+    fn(m_tangentTextureIndex);
+    fn(m_heightTextureIndex);
+    fn(m_roughnessTextureIndex);
+    fn(m_metallicTextureIndex);
+    fn(m_emissiveColorTextureIndex);
+  }
+
 private:
   void updateCachedHash() {
     static_assert(
@@ -1100,6 +1149,7 @@ private:
       float displaceOut;
       uint32_t subsurfaceMaterialIndex;
       uint32_t isRaytracedRenderTarget;   // NOTE: uint32_t to avoid padding
+      uint32_t isHairCard;                // NOTE: uint32_t to avoid padding
       uint32_t samplerFeedbackStamp;      // NOTE: uint32_t to avoid padding
       uint32_t secondaryTextureIndex;
       uint32_t ambientOcclusionTextureIndex;
@@ -1155,6 +1205,7 @@ private:
       m_displaceOut,
       m_subsurfaceMaterialIndex,
       m_isRaytracedRenderTarget,
+      m_isHairCard,
       m_samplerFeedbackStamp,
       m_secondaryTextureIndex,
       m_ambientOcclusionTextureIndex,
@@ -1223,6 +1274,7 @@ private:
   uint32_t m_subsurfaceMaterialIndex;
 
   bool m_isRaytracedRenderTarget;
+  bool m_isHairCard;
 
   uint32_t m_ambientOcclusionTextureIndex = kSurfaceMaterialInvalidTextureIndex;
   uint32_t m_lightmapTextureIndex = kSurfaceMaterialInvalidTextureIndex;
@@ -1401,6 +1453,14 @@ struct RtTranslucentSurfaceMaterial {
   XXH64_hash_t getHash() const {
     return m_cachedHash;
   }
+
+  template<typename Fn>
+  void forEachTextureIndex(Fn&& fn) const {
+    fn(m_normalTextureIndex);
+    fn(m_transmittanceTextureIndex);
+    fn(m_emissiveColorTextureIndex);
+  }
+
 private:
   void updateCachedHash() {
     static_assert(
@@ -1582,6 +1642,12 @@ struct RtRayPortalSurfaceMaterial {
     return m_emissiveIntensity;
   }
 
+  template<typename Fn>
+  void forEachTextureIndex(Fn&& fn) const {
+    fn(m_maskTextureIndex);
+    fn(m_maskTextureIndex2);
+  }
+
 private:
   void updateCachedHash() {
     static_assert(
@@ -1759,6 +1825,13 @@ struct RtSubsurfaceMaterial {
 
   float getSubsurfaceMaxRadius() const {
     return m_subsurfaceMaxSampleRadius;
+  }
+
+  template<typename Fn>
+  void forEachTextureIndex(Fn&& fn) const {
+    fn(m_subsurfaceTransmittanceTextureIndex);
+    fn(m_subsurfaceThicknessTextureIndex);
+    fn(m_subsurfaceSingleScatteringAlbedoTextureIndex);
   }
 
 private:
@@ -2006,6 +2079,35 @@ struct RtSurfaceMaterial {
 
     return m_rayPortalSurfaceMaterial;
   }
+
+  const RtSubsurfaceMaterial& getSubsurfaceMaterial() const {
+    assert(m_type == RtSurfaceMaterialType::Subsurface);
+
+    return m_subsurfaceMaterial;
+  }
+
+  template<typename Fn>
+  void forEachTextureIndex(Fn&& fn) const {
+    switch (m_type) {
+    default:
+      assert(false);
+
+      [[fallthrough]];
+    case RtSurfaceMaterialType::Opaque:
+      m_opaqueSurfaceMaterial.forEachTextureIndex(fn);
+      break;
+    case RtSurfaceMaterialType::Translucent:
+      m_translucentSurfaceMaterial.forEachTextureIndex(fn);
+      break;
+    case RtSurfaceMaterialType::RayPortal:
+      m_rayPortalSurfaceMaterial.forEachTextureIndex(fn);
+      break;
+    case RtSurfaceMaterialType::Subsurface:
+      m_subsurfaceMaterial.forEachTextureIndex(fn);
+      break;
+    }
+  }
+
 private:
   // Type-specific Surface Material Information
 
@@ -2085,6 +2187,9 @@ struct LegacyMaterialData {
   const XXH64_hash_t getHash() const {
     return m_cachedHash;
   }
+
+  // Hash of legacy material inputs that affect dynamic-path material binding.
+  XXH64_hash_t computeIdentityHash() const;
 
   const TextureRef& getColorTexture() const {
     return colorTextures[0];
@@ -2494,6 +2599,7 @@ struct MaterialData {
   static_assert(std::is_same_v<std::variant_alternative_t<(size_t)MaterialDataType::Translucent, MaterialVariant>, TranslucentMaterialData>, "MaterialVariant[Translucent] must be TranslucentMaterialData, please check your change.");
   static_assert(std::is_same_v<std::variant_alternative_t<(size_t)MaterialDataType::RayPortal,   MaterialVariant>, RayPortalMaterialData>,   "MaterialVariant[RayPortal] must be RayPortalMaterialData, please check your change.");
 
+  MaterialData() = default;
   MaterialData(const OpaqueMaterialData& opaque, std::optional<RtxParticleSystemDesc> particleSystem = std::nullopt, bool ignored = false)
     : m_ignored { ignored }, m_data { opaque }, m_particleSystem { particleSystem } {}
 

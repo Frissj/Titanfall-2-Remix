@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2022-2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -20,6 +20,9 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #pragma once
+
+#define COMPOSITE_THREAD_GROUP_WIDTH 16
+#define COMPOSITE_THREAD_GROUP_HEIGHT 8
 
 // Inputs
 
@@ -56,20 +59,24 @@
 #define COMPOSITE_BLUE_NOISE_TEXTURE                                24
 #define COMPOSITE_VALUE_NOISE_SAMPLER                               25
 #define COMPOSITE_SKY_LIGHT_TEXTURE                                 26
+#define COMPOSITE_ACTIVE_PIXEL_MASK_INPUT                           27
+#define COMPOSITE_ACTIVE_LOCAL_PIXEL_COORDS_INPUT                   28
+#define COMPOSITE_PIXEL_SAMPLING_RATE_INPUT                         58
 // NV-DXVK [AerialPerspective]: 3D LUT bound here as Sampler3D so the
 // composite pass can apply distance-based haze to the FINAL radiance
 // (covers direct + indirect + bounce, not just primary emissive).
-#define COMPOSITE_AERIAL_PERSPECTIVE_LUT_INPUT                      27
+#define COMPOSITE_AERIAL_PERSPECTIVE_LUT_INPUT                      29
 
-// Inputs/Outputs                                                   
+// Inputs/Outputs
+
 #define COMPOSITE_PRIMARY_ALBEDO_INPUT_OUTPUT                       30
 #define COMPOSITE_ACCUMULATED_FINAL_OUTPUT_INPUT_OUTPUT             31
 
-// Outputs                                                          
+// Outputs
 
 #define COMPOSITE_FINAL_OUTPUT                                      51
 #define COMPOSITE_LAST_FINAL_OUTPUT                                 52
 #define COMPOSITE_ALPHA_BLEND_RADIANCE_OUTPUT                       53
 
-#define COMPOSITE_RAY_RECONSTRUCTION_PARTICLE_BUFFER_OUTPUT         54
-#define COMPOSITE_DEBUG_VIEW_OUTPUT                                 55
+#define COMPOSITE_DEBUG_VIEW_OUTPUT                                 54
+#define COMPOSITE_RAY_RECONSTRUCTION_HIT_DISTANCE_OUTPUT            55

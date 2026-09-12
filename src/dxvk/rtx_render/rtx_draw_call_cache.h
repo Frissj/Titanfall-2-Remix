@@ -65,6 +65,9 @@ public:
     m_entries.clear();
   }
 
+  // NV-DXVK: the RtInstance spatial maps stay on BlasEntry in this fork (the
+  // instance layer's similarity search depends on them), alongside upstream's
+  // per-asset ReplacementInstance maps in DrawCallTracker.
   void rebuildSpatialMaps() {
     for (auto iter = m_entries.begin(); iter != m_entries.end(); ++iter) {
       iter->second.rebuildSpatialMap();
@@ -79,10 +82,9 @@ public:
 
   // NV-DXVK [MatBind identity]: visit every entry registered under this
   // engine-class key. Used by the instance layer for cross-entry instance
-  // relink — see findSimilarInstance.
+  // relink â€” see findSimilarInstance.
   void forEachEngineClassSibling(XXH64_hash_t engineClassKey,
                                  const std::function<void(BlasEntry&)>& fn);
-
 private:
   MultimapType m_entries;
 

@@ -65,7 +65,7 @@ d3d11_dll = shared_library('d3d11'+dll_ext, dxgi_common_src + d3d11_src,
   cpp_args            : meson.get_compiler('cpp').get_argument_syntax() == 'msvc' ? ['/bigobj'] : [],
   link_args           : [ usd_plugin_delay_load_args, '/DEPENDENTLOADFLAG:0x1100' ],
   dependencies        : [ lib_dxgi, dxbc_dep, dxvk_dep, aftermath_dep ],
-  include_directories : [ dxvk_include_path, dxvk_shader_include_path, usd_include_paths, lssusd_include_paths, d3d11_rtx_include_path ],
+  include_directories : [ dxvk_include_path, dxvk_shader_include_path, usd_include_paths, d3d11_rtx_include_path ],
   install             : true,
   vs_module_defs      : 'd3d11'+def_spec_ext,
   override_options    : ['cpp_std='+dxvk_cpp_std])

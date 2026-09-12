@@ -103,12 +103,23 @@ namespace dxvk
     return { cameraParams[PROJ_ZNEAR], cameraParams[PROJ_ZFAR] };
   }
 
+  void RtCamera::invalidateViewHistory(uint32_t frameIdx) {
+    m_lastViewHistoryInvalidationFrameId = frameIdx;
+  }
+
+  bool RtCamera::isViewHistoryInvalidated(uint32_t frameIdx) const {
+    return m_lastViewHistoryInvalidationFrameId == frameIdx
+        || isCameraCut();
+  }
+
   bool RtCamera::isCameraCut() const {
     return lengthSqr(getViewToWorld()[3] - getPreviousViewToWorld()[3]) > RtxOptions::getUniqueObjectDistanceSqr();
   }
 
+  bool RtCamera::m_isFreeCameraEnabled;
+
   bool RtCamera::isFreeCameraEnabled() {
-    return enableFreeCamera();
+    return m_isFreeCameraEnabled;
   }
 
   Vector3 RtCamera::getHorizontalForwardDirection() const {
@@ -241,6 +252,12 @@ namespace dxvk
     return (freecam && isFreeCameraEnabled()) 
       ? m_matCache[MatrixType::FreeCamWorldToView] 
       : m_matCache[MatrixType::WorldToView]; 
+  }
+
+  const Matrix4& RtCamera::getWorldToViewf(bool freecam) const {
+    return (freecam && isFreeCameraEnabled())
+      ? m_matCachef[MatrixType::FreeCamWorldToView]
+      : m_matCachef[MatrixType::WorldToView];
   }
 
   const Matrix4d& RtCamera::getPreviousWorldToView(bool freecam) const { 
@@ -752,6 +769,7 @@ namespace dxvk
       return false;
     }
 
+    m_isFreeCameraEnabled = enableFreeCamera();
     // [NaNGuard] RtCamera::update is the SINGLE entry point that mutates
     // m_context.{worldToView,viewToProjection}. Every downstream consumer
     // (getVolumeShaderConstants → SetupByAngles + MvpToPlanes,
@@ -1009,8 +1027,12 @@ namespace dxvk
       m_firstUpdate = false;
     }
 
+    // Note: cache some matrices in single precision to save on conversion at runtime
+    m_matCachef[MatrixType::WorldToView] = m_matCache[MatrixType::WorldToView];
+    m_matCachef[MatrixType::ViewToProjection] = m_matCache[MatrixType::ViewToProjection];
+
     // Only calculate free camera matrices for main camera
-    if (!enableFreeCamera() || m_type != CameraType::Main) {
+    if (!m_isFreeCameraEnabled || m_type != CameraType::Main) {
       return isCameraCut();
     }
 
@@ -1036,6 +1058,9 @@ namespace dxvk
     m_matCache[MatrixType::FreeCamViewToTranslatedWorld] = freeCamViewToTranslatedWorld;
 
     m_matCache[MatrixType::ViewToWorldToFreeCamViewToWorld] = m_matCache[MatrixType::WorldToView] * m_matCache[MatrixType::FreeCamViewToWorld];
+
+    // Note: cache some matrices in single precision to save on conversion at runtime
+    m_matCachef[MatrixType::FreeCamWorldToView] = m_matCache[MatrixType::FreeCamWorldToView];
 
     return false; // If we are using the debug/free camera, never do camera cuts
   }
@@ -1166,6 +1191,7 @@ namespace dxvk
     camera.prevTranslatedWorldToView = prevTranslatedWorldToView;
     camera.prevTranslatedWorldToProjection = prevViewToProjection * prevTranslatedWorldToView;
 
+    camera.projectionToPrevProjection = prevViewToProjection * viewToPrevView * projectionToView;
     camera.projectionToPrevProjectionJittered = prevViewToProjectionJittered * viewToPrevView * projectionToViewJittered;
     
     camera.resolution = uvec2 { m_renderResolution[0], m_renderResolution[1] };
@@ -1298,17 +1324,17 @@ namespace dxvk
       RemixGui::Checkbox("View Relative", &freeCameraViewRelativeObject());
 
       if (RemixGui::CollapsingHeader("Show Camera Controls")) {
-        ImGui::TextUnformatted("MoveFaster:");  ImGui::SameLine(150); ImGui::TextUnformatted(buildKeyBindDescriptorString(RtxOptions::FreeCam::keyMoveFaster()).c_str());
-        ImGui::TextUnformatted("MoveForward:"); ImGui::SameLine(150); ImGui::TextUnformatted(buildKeyBindDescriptorString(RtxOptions::FreeCam::keyMoveForward()).c_str());
-        ImGui::TextUnformatted("MoveLeft:");    ImGui::SameLine(150); ImGui::TextUnformatted(buildKeyBindDescriptorString(RtxOptions::FreeCam::keyMoveLeft()).c_str());
-        ImGui::TextUnformatted("MoveBack:");    ImGui::SameLine(150); ImGui::TextUnformatted(buildKeyBindDescriptorString(RtxOptions::FreeCam::keyMoveBack()).c_str());
-        ImGui::TextUnformatted("MoveRight:");   ImGui::SameLine(150); ImGui::TextUnformatted(buildKeyBindDescriptorString(RtxOptions::FreeCam::keyMoveRight()).c_str());
-        ImGui::TextUnformatted("MoveUp:");      ImGui::SameLine(150); ImGui::TextUnformatted(buildKeyBindDescriptorString(RtxOptions::FreeCam::keyMoveUp()).c_str());
-        ImGui::TextUnformatted("MoveDown:");    ImGui::SameLine(150); ImGui::TextUnformatted(buildKeyBindDescriptorString(RtxOptions::FreeCam::keyMoveDown()).c_str());
-        ImGui::TextUnformatted("PitchDown:");   ImGui::SameLine(150); ImGui::TextUnformatted(buildKeyBindDescriptorString(RtxOptions::FreeCam::keyPitchDown()).c_str());
-        ImGui::TextUnformatted("PitchUp:");     ImGui::SameLine(150); ImGui::TextUnformatted(buildKeyBindDescriptorString(RtxOptions::FreeCam::keyPitchUp()).c_str());
-        ImGui::TextUnformatted("YawLeft:");     ImGui::SameLine(150); ImGui::TextUnformatted(buildKeyBindDescriptorString(RtxOptions::FreeCam::keyYawLeft()).c_str());
-        ImGui::TextUnformatted("YawRight:");    ImGui::SameLine(150); ImGui::TextUnformatted(buildKeyBindDescriptorString(RtxOptions::FreeCam::keyYawRight()).c_str());
+        ImGui::TextUnformatted("MoveFaster:");  ImGui::SameLine(150); ImGui::TextUnformatted(buildKeyBindDescriptorStringForDisplay(RtxOptions::FreeCam::keyMoveFaster()).c_str());
+        ImGui::TextUnformatted("MoveForward:"); ImGui::SameLine(150); ImGui::TextUnformatted(buildKeyBindDescriptorStringForDisplay(RtxOptions::FreeCam::keyMoveForward()).c_str());
+        ImGui::TextUnformatted("MoveLeft:");    ImGui::SameLine(150); ImGui::TextUnformatted(buildKeyBindDescriptorStringForDisplay(RtxOptions::FreeCam::keyMoveLeft()).c_str());
+        ImGui::TextUnformatted("MoveBack:");    ImGui::SameLine(150); ImGui::TextUnformatted(buildKeyBindDescriptorStringForDisplay(RtxOptions::FreeCam::keyMoveBack()).c_str());
+        ImGui::TextUnformatted("MoveRight:");   ImGui::SameLine(150); ImGui::TextUnformatted(buildKeyBindDescriptorStringForDisplay(RtxOptions::FreeCam::keyMoveRight()).c_str());
+        ImGui::TextUnformatted("MoveUp:");      ImGui::SameLine(150); ImGui::TextUnformatted(buildKeyBindDescriptorStringForDisplay(RtxOptions::FreeCam::keyMoveUp()).c_str());
+        ImGui::TextUnformatted("MoveDown:");    ImGui::SameLine(150); ImGui::TextUnformatted(buildKeyBindDescriptorStringForDisplay(RtxOptions::FreeCam::keyMoveDown()).c_str());
+        ImGui::TextUnformatted("PitchDown:");   ImGui::SameLine(150); ImGui::TextUnformatted(buildKeyBindDescriptorStringForDisplay(RtxOptions::FreeCam::keyPitchDown()).c_str());
+        ImGui::TextUnformatted("PitchUp:");     ImGui::SameLine(150); ImGui::TextUnformatted(buildKeyBindDescriptorStringForDisplay(RtxOptions::FreeCam::keyPitchUp()).c_str());
+        ImGui::TextUnformatted("YawLeft:");     ImGui::SameLine(150); ImGui::TextUnformatted(buildKeyBindDescriptorStringForDisplay(RtxOptions::FreeCam::keyYawLeft()).c_str());
+        ImGui::TextUnformatted("YawRight:");    ImGui::SameLine(150); ImGui::TextUnformatted(buildKeyBindDescriptorStringForDisplay(RtxOptions::FreeCam::keyYawRight()).c_str());
       }
 
       ImGui::Unindent();
@@ -1536,7 +1562,7 @@ namespace dxvk
     }
 
     int oldFrame = m_currentFrame;
-    IMGUI_ADD_TOOLTIP(ImGui::SliderInt("Current Frame", &m_currentFrame, 0, m_settings.size() -1, "%d", ImGuiSliderFlags_AlwaysClamp), "Current Frame.");
+    IMGUI_ADD_TOOLTIP(RemixGui::SliderInt("Current Frame", &m_currentFrame, 0, m_settings.size() -1, "%d", ImGuiSliderFlags_AlwaysClamp), "Current Frame.");
     m_currentFrame = std::min(m_currentFrame, (int)m_settings.size());
 
     Mode currentMode = mode();

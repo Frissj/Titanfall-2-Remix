@@ -33,16 +33,17 @@
 #include "rtx_demodulate.h"
 #include "rtx_neural_radiance_cache.h"
 #include "rtx_ray_reconstruction.h"
+#include "../util/util_global_time.h"
 
 #include "dxvk_device.h"
 #include "rtx_global_volumetrics.h"
+#include "rtx_scene_manager.h"
 
 namespace dxvk {
   RtxOptions* RtxOptions::s_instance = nullptr;
   HashRule RtxOptions::s_geometryHashGenerationRule = 0;
   HashRule RtxOptions::s_geometryAssetHashRule = 0;
 
-  
   void RtxOptions::graphicsPresetOnChange(DxvkDevice* device) {
     // device will be nullptr during initial config loading.
     if (device == nullptr) {
@@ -81,10 +82,24 @@ namespace dxvk {
     }
   }
 
+  void RtxOptions::onAdvanceTimeChanged(DxvkDevice* device) {
+    GlobalTime::get().setAdvanceTime(RtxOptions::advanceTime());
+  }
+
   void RtxOptions::blockInputToGameInUIOnChange(DxvkDevice* device) {
     const bool doBlock = RtxOptions::blockInputToGameInUI() && RtxOptions::showUI() != UIType::None;
 
     BridgeMessageChannel::get().send("UWM_REMIX_UIACTIVE_MSG", doBlock ? 1 : 0, 0);
+  }
+
+  void RtxOptions::ViewModel::enableOnChange(DxvkDevice* device) {
+    if (device) {
+      // applyPendingValues (which invokes this callback) runs after onFrameEnd,
+      // so no rendering is in flight and we can clear the scene immediately
+      // without a WFI or deferred clear.  Using a delayed clear here would cause
+      // a frame to render with the old scene but the new view model setting.
+      device->getCommon()->getSceneManager().clear(nullptr, false);
+    }
   }
 
   namespace {
@@ -612,17 +627,21 @@ namespace dxvk {
       preferredGBufferRaytraceMode = DxvkPathtracerGbuffer::RaytraceMode::RayQuery;
       preferredIntegrateDirectRaytraceMode = DxvkPathtracerIntegrateDirect::RaytraceMode::RayQuery;
 
-      if (vendorID == static_cast<uint32_t>(DxvkGpuVendor::Nvidia) || driverID == VK_DRIVER_ID_MESA_RADV) {
-        // Default to a mixture of Trace Ray and Ray Query on NVIDIA and RADV
+      if (vendorID == static_cast<uint32_t>(DxvkGpuVendor::Nvidia)
+        || driverID == VK_DRIVER_ID_MESA_RADV
+        || driverID == VK_DRIVER_ID_AMD_PROPRIETARY) {
+        // Default to a mixture of Trace Ray and Ray Query on NVIDIA, RADV, and AMD proprietary
         if (driverID == VK_DRIVER_ID_MESA_RADV) {
           Logger::info("RADV driver detected, setting default raytrace modes to Trace Ray (Indirect Integrate) and Ray Query (GBuffer, Direct Integrate)");
+        } else if (driverID == VK_DRIVER_ID_AMD_PROPRIETARY) {
+          Logger::info("AMD driver detected, setting default raytrace modes to Trace Ray (Indirect Integrate) and Ray Query (GBuffer, Direct Integrate)");
         } else {
           Logger::info("NVIDIA architecture detected, setting default raytrace modes to Trace Ray (Indirect Integrate) and Ray Query (GBuffer, Direct Integrate)");
         }
 
         preferredIntegrateIndirectRaytraceMode = DxvkPathtracerIntegrateIndirect::RaytraceMode::TraceRay;
       } else {
-        // Default to Ray Query on AMD/Intel
+        // Default to Ray Query on Unknown
         Logger::info("Non-NVIDIA architecture detected, setting default raytrace modes to Ray Query");
 
         preferredIntegrateIndirectRaytraceMode = DxvkPathtracerIntegrateIndirect::RaytraceMode::RayQuery;

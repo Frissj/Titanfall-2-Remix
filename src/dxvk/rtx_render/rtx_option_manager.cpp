@@ -31,6 +31,10 @@
 
 namespace dxvk {
 
+  // Indicates that an option with the InvalidatesDrawcallTranslation flag has been changed since the last frame.
+  // This should only ever be modified or read on the dxvk-cs thread.
+  bool RtxOptionManager::s_drawcallTranslationInvalid = false;
+
   // ============================================================================
   // RtxOptionManager static method implementations
   // ============================================================================
@@ -236,7 +240,7 @@ namespace dxvk {
       {
         const auto tResolveStart = Clock::now();
         for (auto& rtxOption : dirtyOptions) {
-          const bool valueChanged = rtxOption.second->resolveValue(rtxOption.second->m_resolvedValue, false);
+          const bool valueChanged = rtxOption.second->resolveValue(rtxOption.second->m_resolvedValue);
           if (forceOnChange || valueChanged) {
             dirtyOptionsVector.push_back(rtxOption.second);
           }
@@ -248,6 +252,12 @@ namespace dxvk {
       lock.unlock();
 
       // Invoke onChange callbacks after promoting all values
+      for (RtxOptionImpl* rtxOption : dirtyOptionsVector) {
+        if ((rtxOption->getFlags() & RtxOptionFlags::InvalidatesDrawcallTranslation) != 0) {
+          s_drawcallTranslationInvalid = true;
+        }
+      }
+
       // Skipped when invokeCallbacks=false: satellite DLLs (e.g. d3d11.dll) need m_resolvedValue
       // populated for their own option statics but must not run callbacks whose side effects
       // (resource allocation, shader recompilation, derived-state propagation) assume they are
@@ -338,6 +348,14 @@ namespace dxvk {
       b.resolveUsSince = 0;
       b.callbackUsSince = 0;
     }
+  }
+
+  void RtxOptionManager::clearDrawcallTranslationInvalid() {
+    s_drawcallTranslationInvalid = false;
+  }
+
+  bool RtxOptionManager::isDrawcallTranslationInvalid() {
+    return s_drawcallTranslationInvalid;
   }
 
   void RtxOptionManager::logEffectiveValues() {

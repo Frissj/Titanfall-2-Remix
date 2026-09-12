@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -32,7 +32,7 @@
 #include <rtx_shaders/dust_particles_vertex.h>
 #include <rtx_shaders/dust_particles_fragment.h>
 #include "dxvk_context_state.h"
-#include "../util/util_globaltime.h"
+#include "../util/util_global_time.h"
 
 namespace dxvk {
 
@@ -209,8 +209,9 @@ namespace dxvk {
   void RtxDustParticles::setupConstants(RtxContext* ctx, const float frameTimeSecs, Resources& resourceManager, DustParticleSystemConstants& pushArgs) {
     pushArgs.minTtl = minParticleLife();
     pushArgs.maxTtl = maxParticleLife();
-    pushArgs.minParticleSize = minParticleSize();
-    pushArgs.maxParticleSize = maxParticleSize();
+    const float resolutionScale = float(resourceManager.getTargetDimensions().height) / 1080.0f;
+    pushArgs.minParticleSize = minParticleSize() * resolutionScale;
+    pushArgs.maxParticleSize = maxParticleSize() * resolutionScale;
     pushArgs.opacity = opacity();
     pushArgs.anisotropy = anisotropy();
     pushArgs.cullDistanceFromCamera = RtxGlobalVolumetrics::froxelMaxDistanceMeters() * RtxOptions::getMeterToWorldUnitScale();

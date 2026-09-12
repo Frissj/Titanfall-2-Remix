@@ -36,16 +36,24 @@
 
 namespace dxvk {
   // A structure to allow for quickly returning data close to a specific position.
+  // Multiple entries may share the same transform hash (e.g. distinct draw calls
+  // at the same position). The cache uses a multimap so callers can iterate over
+  // all colliding entries via a filter function.
   template<class T>
   class SpatialMap {
   private:
     struct Entry {
       const T* data;
       Vector3 centroid;
+      // Hash requested by the caller before collision bumping. Multiple entries
+      // at one transform share this value even though transformHash is unique.
+      XXH64_hash_t lookupTransformHash;
       XXH64_hash_t transformHash;
-      Entry() : data(nullptr), centroid(0.f), transformHash(0) { }
-      Entry(const T* data, const Vector3& centroid, XXH64_hash_t transformHash) : data(data), centroid(centroid), transformHash(transformHash) { }
-      Entry(const Entry& other) : data(other.data), centroid(other.centroid), transformHash(other.transformHash) { }
+      Entry() : data(nullptr), centroid(0.f), lookupTransformHash(0), transformHash(0) { }
+      Entry(const T* data, const Vector3& centroid, XXH64_hash_t lookupTransformHash, XXH64_hash_t transformHash)
+        : data(data), centroid(centroid), lookupTransformHash(lookupTransformHash), transformHash(transformHash) { }
+      Entry(const Entry& other)
+        : data(other.data), centroid(other.centroid), lookupTransformHash(other.lookupTransformHash), transformHash(other.transformHash) { }
       // Declaring the copy constructor above suppresses the implicit MOVE
       // assignment and deprecates the implicit copy assignment. The flat cache
       // below assigns entries when it back-shifts a probe run and when it
@@ -175,8 +183,24 @@ namespace dxvk {
       return nullptr;
     }
 
-    // returns the entry cosest to `centroid` that passes the `filter` and is less than `sqrt(maxDistSqr)` units from `centroid`.
-    // `filter` should return true if the entry is a valid result.
+    // Visits every entry with this exact transform. The flat cache collision-
+    // bumps duplicate physical keys, so match the retained pre-bump hash inside
+    // the query's spatial cell instead of assuming one key maps to one object.
+    template<typename Visitor>
+    void forEachAtTransform(const Vector3& centroid, const Matrix4& transform, Visitor&& visitor) const {
+      const XXH64_hash_t lookupHash = XXH64(&transform, sizeof(transform), 0);
+      const auto cell = m_cells.find(getCellPos(centroid));
+      if (cell == m_cells.end()) {
+        return;
+      }
+      for (const Entry& entry : cell->second) {
+        if (entry.lookupTransformHash == lookupHash && visitor(entry.data)) {
+          return;
+        }
+      }
+    }
+
+    // Returns the entry closest to `centroid` that passes the `filter` and is less than `sqrt(maxDistSqr)` units from `centroid`.
     const T* getNearestData(const Vector3& centroid, float maxDistSqr, float& nearestDistSqr, std::function<bool(const T*)> filter) const {
       static const std::array kOffsets{
         Vector3i{0, 0, 0},
@@ -206,7 +230,6 @@ namespace dxvk {
           if (distSqr <= maxDistSqr && distSqr < nearestDistSqr) {
               nearestDistSqr = distSqr;
             if (nearestDistSqr == 0.0f) {
-              // Not going to find anything closer, so stop the iteration
               return entry.data;
             }
             nearestData = entry.data;
@@ -261,13 +284,13 @@ namespace dxvk {
           ledgerBumped = true;
         }
       }
-      const bool success = m_cache.insert(transformHash, Entry(data, centroid, transformHash));
+      const bool success = m_cache.insert(transformHash, Entry(data, centroid, ledgerKey, transformHash));
       if (!success) {
         ONCE(Logger::err("Failed to add entry in SpatialMap::insert()."));
         assert(false);
         return transformHash;
       }
-      m_cells[getCellPos(centroid)].emplace_back(data, centroid, transformHash);
+      m_cells[getCellPos(centroid)].emplace_back(data, centroid, ledgerKey, transformHash);
       ++m_dbgInserts;
       ledgerRecord(ledgerKey, LedgerOp::Inserted, frame, data, /*otherKey*/ 0, ledgerBumped);
       return transformHash;
@@ -340,7 +363,7 @@ namespace dxvk {
         // ledger while the slot is still valid, and it is only ever compared and
         // printed as an address afterwards.
         const T* const owner = m_cache.valueAt(slot).data;
-        eraseFromCell(centroid, actualHash);
+        eraseFromCell(centroid, actualHash, owner);
         m_cache.eraseAt(slot);
         ++m_dbgErases;
         ledgerRecord(actualHash,
@@ -569,6 +592,7 @@ namespace dxvk {
     }
 
     void rebuild(float cellSize) {
+      m_cellSize = cellSize;
       m_cells.clear();
       m_cache.forEach([this](XXH64_hash_t, const Entry& entry) {
         m_cells[getCellPos(entry.centroid)].emplace_back(entry);
@@ -842,7 +866,7 @@ namespace dxvk {
       return Vector3i(int(std::floor(scaledPos.x)), int(std::floor(scaledPos.y)), int(std::floor(scaledPos.z))); 
     }
 
-    void eraseFromCell(const Vector3& pos, XXH64_hash_t hash) {
+    void eraseFromCell(const Vector3& pos, XXH64_hash_t hash, const T* data) {
       auto cellIter = m_cells.find(getCellPos(pos));
       if (cellIter == m_cells.end()) {
         ONCE(Logger::err("Specified cell was already empty in SpatialMap::erase()."));
@@ -852,9 +876,8 @@ namespace dxvk {
 
       std::vector<Entry>& cell = cellIter->second;
       for (auto iter = cell.begin(); iter != cell.end(); ++iter) {
-        if (iter->transformHash == hash) {
+        if (iter->transformHash == hash && iter->data == data) {
           if (cell.size() > 1) {
-            // Swap & pop - faster than "erase", but doesn't preserve order, which is fine here.
             std::swap(*iter, cell.back());
             cell.pop_back();
           } else {

@@ -121,7 +121,7 @@ namespace dxvk {
     // submitDrawState/processDrawCallState consume the precomputed results and
     // record only the GPU residue. Owned by the Phase C EmitCs lambda.
     void commitGeometryToRT(const DrawParameters& params, DrawCallState& drawCallState, ShardedDrawInfo* shardInfo = nullptr);
-    void commitExternalGeometryToRT(ExternalDrawState&& state);
+    void commitExternalGeometryToRT(std::unique_ptr<ExternalDrawState> state);
 
     // NV-DXVK [ResidentScene] slice 6: the skip lives INSIDE commitGeometryToRT,
     // immediately ahead of submitDrawState. See the comment there for why the
@@ -167,6 +167,9 @@ namespace dxvk {
     bool useRayReconstruction() const;
 
 #ifdef REMIX_DEVELOPMENT
+    /** When crash hotkeys are armed, checks if CPU or GPU crash hotkey was pressed; returns true if injectRTX should return immediately (e.g. after GPU crash). */
+    bool handleCrashHotkeys();
+
     // Note: Cache image views for all resources that used by current frame, so we can do query for resource aliasing at the end of frame.
     //       This is automatically called when binding resources for passes, RtxContext::bindCommonRayTracingResources
     //       When we are not using the binding function in the passes such as DLSSRR, we need to manually cache the image views. Please reference the cache logic in DxvkRayReconstruction::dispatch
@@ -568,7 +571,8 @@ namespace dxvk {
 
     VkExtent3D setDownscaleExtent(const VkExtent3D& upscaleExtent);
 
-    VkExtent3D onFrameBegin(const VkExtent3D& upscaleExtent);
+    VkExtent3D onInjectRtxFrameBegin(const VkExtent3D& upscaleExtent);
+    void onInjectRtxFrameEnd(bool raytracedThisFrame);
 
     void dispatchVolumetrics(const Resources::RaytracingOutput& rtOutput);
     void dispatchIntegrate(const Resources::RaytracingOutput& rtOutput);
@@ -609,16 +613,17 @@ namespace dxvk {
     void dispatchNIS(const Resources::RaytracingOutput& rtOutput);
     void dispatchXeSS(const Resources::RaytracingOutput& rtOutput);
     void dispatchTemporalAA(const Resources::RaytracingOutput& rtOutput);
-    void dispatchToneMapping(const Resources::RaytracingOutput& rtOutput, bool performSRGBConversion);
+    void dispatchToneMapping(const Resources::RaytracingOutput& rtOutput);
     void dispatchAutoExposurePlus(const Resources::RaytracingOutput& rtOutput);
     void dispatchBloom(const Resources::RaytracingOutput& rtOutput);
     void dispatchDepthOfField(const Resources::RaytracingOutput& rtOutput);
-    void dispatchPostFx(Resources::RaytracingOutput& rtOutput);
+    void dispatchPostFxMotionBlur(Resources::RaytracingOutput& rtOutput);
+    void dispatchPostFxLensEffects(Resources::RaytracingOutput& rtOutput);
+    void dispatchSRGBDither(const Resources::RaytracingOutput& rtOutput, bool performSRGBConversion);
     void dispatchDebugView(Rc<DxvkImage>& srcImage, const Resources::RaytracingOutput& rtOutput, bool captureScreenImage);
     void dispatchObjectPicking(Resources::RaytracingOutput& rtOutput, const VkExtent3D& srcExtent, const VkExtent3D& targetExtent);
     void dispatchDLFG();
     void updateMetrics(const float gpuIdleTimeMilliseconds) const;
-
     void rasterizeToSkyMatte(const DrawParameters& params, const DrawCallState& drawCallState);
     void initSkyProbe();
     void rasterizeToSkyProbe(const DrawParameters& params, const DrawCallState& drawCallState);
@@ -706,7 +711,8 @@ namespace dxvk {
     bool m_resetHistory = true;    // Discards use of temporal data in passes
 
     std::chrono::time_point<std::chrono::steady_clock> m_prevRunningTime;
-    uint64_t m_prevGpuIdleTicks;
+    uint64_t m_prevGpuIdleTicks = 0;
+    bool m_prevGpuIdleTicksInitialized = false;
 
     bool m_screenshotFrameEnabled = false;
     bool m_triggerDelayedTerminate = false;

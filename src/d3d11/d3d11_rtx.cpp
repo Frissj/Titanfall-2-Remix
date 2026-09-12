@@ -57279,7 +57279,6 @@ namespace dxvk {
             const DrawCallTransforms& t = dcs.transformData;
             const bool carriesPtr = t.instancesToObject          != nullptr
                                  || t.prevInstancesToObject      != nullptr
-                                 || t.instancesToObjectOwner     != nullptr
                                  || t.prevInstancesToObjectOwner != nullptr
                                  || t.isFanoutBatch;
             if (!carriesPtr) {
@@ -58379,7 +58378,6 @@ namespace dxvk {
           // array to another.
           const bool carriesPtr = t.instancesToObject     != nullptr
                                || t.prevInstancesToObject != nullptr
-                               || t.instancesToObjectOwner     != nullptr
                                || t.prevInstancesToObjectOwner != nullptr
                                || t.isFanoutBatch;
           if (carriesPtr) {
@@ -58543,7 +58541,6 @@ namespace dxvk {
           const bool abSafe = s_xtEligLast
                            && at.instancesToObject          == nullptr
                            && at.prevInstancesToObject      == nullptr
-                           && at.instancesToObjectOwner     == nullptr
                            && at.prevInstancesToObjectOwner == nullptr
                            && !at.isFanoutBatch;
 
@@ -60489,9 +60486,8 @@ namespace dxvk {
       // Since we can't modify the vector here (it's shared, stable pointer),
       // we apply the inverse via objectToWorld. Each i2o[i] is already t31[i],
       // so objectToWorld = inv(worldToView) gives the same math.
-      dcs.transformData.instancesToObject = m_currentInstancesToObject;
-      // NV-DXVK: Pass ownership too so it flows into RtInstance via instance_manager.
-      dcs.transformData.instancesToObjectOwner = m_currentInstancesToObjectOwner;
+      // shared_ptr: ownership flows into the RtInstance via instance_manager.
+      dcs.transformData.instancesToObject = m_currentInstancesToObjectOwner;
       markSub(s_perfFltProbesAcc, s_perfFltProbesMax);  // [flt_probes] SubmitAll/SubmitBone probe cluster
 
       // NV-DXVK [fanout prev-transform identity]: last frame's position for each
@@ -67581,7 +67577,7 @@ namespace dxvk {
         const bool w2vIdent = isIdentityExact(w2v);
         std::string vsHF = m_currentVsHashCache.empty()
           ? std::string("<novs>") : m_currentVsHashCache.substr(0, 19);
-        const std::vector<Matrix4>* i2o = dcs.transformData.instancesToObject;
+        const std::vector<Matrix4>* i2o = dcs.transformData.instancesToObject.get();
         if (i2o != nullptr && !i2o->empty()) {
           // Per-instance WORLD placement. Find the instance nearest the camera
           // (min |w2vÂ·worldPos|); also report instance 0 raw for reference.

@@ -181,16 +181,11 @@ struct Surface
     set { data2.w = newValue ? packedFlagSet(data2.w, 1 << 29) : packedFlagUnset(data2.w, 1 << 29); }
   }
 
-  property bool ignoreTransparencyLayer
+  // SceneManager preserve path (usePreservePath); not the same as motion-related isStatic.
+  property bool isPreservePath
   {
     get { return packedFlagGet(data2.w, 1 << 30); }
     set { data2.w = newValue ? packedFlagSet(data2.w, 1 << 30) : packedFlagUnset(data2.w, 1 << 30); }
-  }
-
-  property bool isInsideFrustum
-  {
-    get { return packedFlagGet(data2.w, 1 << 31); }
-    set { data2.w = newValue ? packedFlagSet(data2.w, 1 << 31) : packedFlagUnset(data2.w, 1 << 31); }
   }
 
   // Matrices
@@ -634,10 +629,11 @@ struct MinimalSurfaceInteraction
   // Floating-point error of position representation in object space or world space, whichever is larger.
   // Used for calculating ray offsets.
   float positionError = 0.f;
-  // TODO this could just be a `quaternion triangleTBN` 
-  f16vec3 triangleNormal = 0.h;
-  f16vec3 triangleTangent = 0.h;
-  f16vec3 triangleBitangent = 0.h;
+  // TODO this could just be a `quaternion geometryTBN` 
+  vec3 geometryNormal = 0.f;
+  vec3 geometryTangent = 0.f;
+  vec3 geometryBitangent = 0.f;
+  float shadowTerminatorOffset = 0.f;
 
   // Surfaces created from gbuffer may not be valid (i.e. if this pixel was a ray miss)
   property bool isValid
@@ -648,6 +644,13 @@ struct MinimalSurfaceInteraction
 
 struct SurfaceInteraction : MinimalSurfaceInteraction
 {
+#ifdef GBUFFER_FEATURE_DEBUG_VIEW
+#if GBUFFER_FEATURE_DEBUG_VIEW
+  vec3 debugTriangleNormal = 0.f;
+  vec3 debugInterpolatedVertexNormal = 0.f;
+#endif
+#endif
+
   vec3 motion = 0..xxx;
   vec2 textureCoordinates = 0..xx;
   // NV-DXVK: TEXCOORD1 / lightmap UV interpolated to the hit. Only
@@ -680,14 +683,9 @@ struct SurfaceInteraction : MinimalSurfaceInteraction
   vec2 vguiSecondaryQuadPosGradY = 0..xx;
   vec2 textureGradientX = 0..xx;
   vec2 textureGradientY = 0..xx;
-  // Note: All normal, tangent and bitangent vectors are in world space.
-  // TODO this could just be a `quaternion interpolatedTBN`
-  f16vec3 interpolatedNormal = 0.h;
-  f16vec3 interpolatedTangent = 0.h;
-  f16vec3 interpolatedBitangent = 0.h;
-  f16vec3 rawTangent = 0.h;
-  f16vec3 rawBitangent = 0.h;
-  f16vec4 vertexColor = 0.h;
+  vec3 rawTangent = 0.f;
+  vec3 rawBitangent = 0.f;
+  vec4 vertexColor = 0.0f;
   float triangleArea = 0.f;
   // NV-DXVK: debug — gradient-pipeline path code, written by
   // computeAnisotropicEllipseAxes. Used by the material code to

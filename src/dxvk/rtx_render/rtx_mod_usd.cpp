@@ -21,6 +21,11 @@
 */
 #pragma once
 
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+
 #include "rtx_mod_usd.h"
 #include "rtx_asset_replacer.h"
 #include "../../lssusd/curve_utils.h"
@@ -58,8 +63,9 @@
 #include <pxr/base/arch/fileSystem.h>
 #include <pxr/base/plug/registry.h>
 #include <pxr/base/plug/plugin.h>
-#include <src/usd-plugins/RemixParticleSystem/ParticleSystemAPI.h>
+// ParticleSystemAPI accessed via codeless schema (string-based TfToken API)
 #include "../../lssusd/usd_include_end.h"
+#include "../../util/util_string.h"
 #include "../util/util_watchdog.h"
 
 #include "../../lssusd/particle_system_helpers_vec.h"
@@ -70,8 +76,6 @@
 #include "graph/rtx_graph_usd_parser.h"
 
 #include "rtx_lights_data.h"
-#include <filesystem>
-#include <algorithm>
 
 namespace fs = std::filesystem;
 
@@ -533,10 +537,9 @@ std::optional<RtxParticleSystemDesc> UsdMod::Impl::processParticleSystem(Args& a
   using namespace CurveUtils;
   using ColorGradientData = ColorGradientDataT<vec4>;
 
-  if (!sceneDelegate.HasAPI<RemixParticleSystemAPI>()) {
+  if (!sceneDelegate.HasAPI(TfToken("ParticleSystemAPI"))) {
     return std::nullopt;
   }
-  RemixParticleSystemAPI particleSystem(sceneDelegate);
 
   RtxParticleSystemDesc particleInfo;
 
@@ -651,9 +654,8 @@ std::optional<RtxParticleSystemDesc> UsdMod::Impl::processParticleSystem(Args& a
     return combineToVec3(xChannel, hasX, yChannel, hasY, zChannel, hasZ, out, defaultValue, kDefaultAnimationResolution);
   };
 
-  // The assert at the end of this function validates that we account for every schema attribute.
-  // The _SafeGetParticlePrimvar macro increments `counter` automatically. For animated properties
-  // read through our curve/gradient helpers (not the macro), we increment manually here.
+  // The schema registry unit test validates exact property names. This counter also
+  // catches additions or removals in the reader itself.
 
   // Color gradient animated properties: 2 channels (minColor, maxColor) x 2 attrs (times, values) = 4 schema attrs
   bool hasNewMinColor = bakeColorChannel("minColor", particleInfo.minColor, vec4(1.0f));
@@ -696,7 +698,7 @@ std::optional<RtxParticleSystemDesc> UsdMod::Impl::processParticleSystem(Args& a
   _SafeGetParticlePrimvar(float, id, minTargetRotationSpeed, );
   _SafeGetParticlePrimvar(float, id, maxTargetRotationSpeed, );
 
-  // maxSpeed is deprecated (removed from schema); read if present for backward compatibility (do not increment counter).
+  // maxSpeed is deprecated (removed from schema); read if present for backward compatibility.
   {
     float temp {};
     if (_SafeGetPrimvar(sceneDelegate, id, pxr::TfToken("particle:maxSpeed"), temp)) {
@@ -762,7 +764,7 @@ std::optional<RtxParticleSystemDesc> UsdMod::Impl::processParticleSystem(Args& a
   _SafeGetParticlePrimvar(bool, id, restrictVelocityY, particleInfo.);
   _SafeGetParticlePrimvar(bool, id, restrictVelocityZ, particleInfo.);
 
-  assert(RemixParticleSystemAPI::GetSchemaAttributeNames(false).size() == counter);
+  assert(counter == lss::kParticleSystemSchemaPropertyCount);
 
   return particleInfo;
 }
@@ -873,8 +875,8 @@ void UsdMod::Impl::processPointInstancer(Args& args, const pxr::UsdPrim& prim) {
           // Fast Path - this will attach a list of transforms to the replacement, which can be used later to render multiple copies of it.
           
           // Copy the transform vector to this mesh
-          args.meshes[meshInd].instancesToObject = instanceToObjectTransforms;
-          auto& instancesToObject = args.meshes[meshInd].instancesToObject;
+          args.meshes[meshInd].instancesToObject = std::make_shared<std::vector<Matrix4>>(instanceToObjectTransforms);
+          auto& instancesToObject = *args.meshes[meshInd].instancesToObject;
           // Append the meshToProtoRoot transform
           for (size_t instanceInd = 0; instanceInd < instancesToObject.size(); ++instanceInd) {
             instancesToObject[instanceInd] = instancesToObject[instanceInd] * args.meshes[meshInd].replacementToObject;
@@ -1706,4 +1708,51 @@ const ModTypeInfo& UsdMod::getTypeInfo() {
   return s_typeInfo;
 }
 
+static std::string getRemixCategoriesSchemaUsda() {
+  std::stringstream ss;
+  ss << "#usda 1.0\n";
+  ss << "(\n";
+  ss << "    \"\"\"Generated from RTX_OPTION category descriptions. Do not edit directly.\"\"\"\n";
+  ss << ")\n";
+  ss << "\n";
+  ss << "class \"RemixInstanceCategoryAPI\" (\n";
+  ss << "    customData = {\n";
+  ss << "        string userDocBrief = \"Adds Remix instance category flags to a prim.\"\n";
+  ss << "    }\n";
+  ss << ")\n";
+  ss << "{\n";
+  for (const RemixCategoryEntry& entry : kRemixCategoryEntries) {
+    const RtxOptionImpl* option = RtxOptionImpl::getOptionByFullName(entry.optionName);
+    if (option == nullptr || option->getDescription() == nullptr || option->getDescription()[0] == '\0') {
+      return {};
+    }
+
+    ss << "    bool " << entry.attr << " = 0 (\n";
+    ss << "        doc = \"" << str::escapeCStyle(option->getDescription()) << "\"\n";
+    ss << "        displayGroup = \"Remix Categories\"\n";
+    ss << "        displayName = \"" << entry.displayName << "\"\n";
+    ss << "    )\n";
+  }
+  ss << "}\n";
+  return ss.str();
+}
+
 } // namespace dxvk
+
+#ifdef _WIN32
+extern "C" __declspec(dllexport)
+#else
+extern "C" __attribute__((visibility("default")))
+#endif
+bool writeRemixCategoriesSchemaUsda(const char* outputFilePath) {
+  const std::string schema = dxvk::getRemixCategoriesSchemaUsda();
+  if (outputFilePath == nullptr || schema.empty()) {
+    return false;
+  }
+
+  std::ofstream file(outputFilePath);
+  file << schema;
+  file.close();
+  return !file.fail();
+}
+

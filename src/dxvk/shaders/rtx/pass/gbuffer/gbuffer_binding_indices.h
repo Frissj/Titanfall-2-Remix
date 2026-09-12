@@ -73,7 +73,6 @@
 #define GBUFFER_BINDING_SECONDARY_WORLD_POSITION_OUTPUT                         96
 #define GBUFFER_BINDING_SECONDARY_POSITION_ERROR_OUTPUT                         97
 #define GBUFFER_BINDING_PRIMARY_SURFACE_FLAGS_OUTPUT                            98
-#define GBUFFER_BINDING_PRIMARY_WORLD_INTERPOLATED_NORMAL_OUTPUT                99
 #define GBUFFER_BINDING_PRIMARY_DISOCCLUSION_THRESHOLD_MIX_OUTPUT              100
 #define GBUFFER_BINDING_PRIMARY_DEPTH_OUTPUT                                   101
 #define GBUFFER_BINDING_SHARED_BIAS_CURRENT_COLOR_MASK_OUTPUT                  102
@@ -96,11 +95,12 @@
 
 #define GBUFFER_BINDING_REFLECTION_PSR_DATA_STORAGE_1                          115
 
+#define GBUFFER_BINDING_SHARED_SHADOW_TERMINATOR_FIX_OUTPUT                    116
+
 // DLSSRR outputs
 #define GBUFFER_BINDING_PRIMARY_DEPTH_DLSSRR_OUTPUT                             120
 #define GBUFFER_BINDING_PRIMARY_NORMAL_DLSSRR_OUTPUT                            121
 #define GBUFFER_BINDING_PRIMARY_SCREEN_SPACE_MOTION_DLSSRR_OUTPUT               122
-#define GBUFFER_BINDING_PARTICLE_BUFFER_OUTPUT                                  123
 
 #define GBUFFER_BINDING_NRC_QUERY_PATH_INFO_OUTPUT                              130
 #define GBUFFER_BINDING_NRC_TRAINING_PATH_INFO_OUTPUT                           131
@@ -128,4 +128,5 @@
 struct GbufferPushConstants
 {
   uint isTransmissionPSR;
+  uint usePSRPrepare;
 };

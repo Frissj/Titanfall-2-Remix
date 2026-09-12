@@ -172,6 +172,14 @@ namespace dxvk {
 
   RtxGlobalVolumetrics::RtxGlobalVolumetrics(DxvkDevice* device) : CommonDeviceObject(device), RtxPass(device) {}
 
+  void RtxGlobalVolumetrics::onFroxelResourceOptionsChanged(DxvkDevice* device) {
+    if (device == nullptr) {
+      return;
+    }
+
+    device->getCommon()->metaGlobalVolumetrics().m_rebuildFroxels = true;
+  }
+
   // Quality level presets, x component controls the froxelGridResolutionScale and the y component controls the froxelDepthSlices settings.
   static const int2 qualityModes[RtxGlobalVolumetrics::QualityLevel::QualityCount] = {
     int2(32, 48),
@@ -228,9 +236,9 @@ namespace dxvk {
       RemixGui::Checkbox("Show Advanced Options", &showAdvanced);
 
       if (showAdvanced) {
-        m_rebuildFroxels |= RemixGui::DragInt("Froxel Grid Resolution Scale", &froxelGridResolutionScaleObject(), 0.1f, 1);
-        m_rebuildFroxels |= RemixGui::DragInt("Froxel Depth Slices", &froxelDepthSlicesObject(), 0.1f, 1, UINT16_MAX);
-        RemixGui::DragInt("Max Accumulation Frames", &maxAccumulationFramesObject(), 0.1f, 1, UINT8_MAX);
+        RemixGui::DragInt("Froxel Grid Resolution Scale", &froxelGridResolutionScaleObject(), 0.1f, 1, INT_MAX, "%d", ImGuiSliderFlags_AlwaysClamp);
+        RemixGui::DragInt("Froxel Depth Slices", &froxelDepthSlicesObject(), 0.1f, 1, UINT16_MAX, "%d", ImGuiSliderFlags_AlwaysClamp);
+        RemixGui::DragInt("Max Accumulation Frames", &maxAccumulationFramesObject(), 0.1f, 1, UINT8_MAX, "%d", ImGuiSliderFlags_AlwaysClamp);
         RemixGui::DragFloat("Froxel Depth Slice Distribution Exponent", &froxelDepthSliceDistributionExponentObject(), 0.01f, 0.0f, FLT_MAX, "%.3f", ImGuiSliderFlags_AlwaysClamp);
         RemixGui::DragFloat("Froxel Max Distance", &froxelMaxDistanceMetersObject(), 0.25f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
         RemixGui::DragFloat("Froxel Firefly Filtering Luminance Threshold", &froxelFireflyFilteringLuminanceThresholdObject(), 0.1f, 0.0f, FLT_MAX, "%.3f", ImGuiSliderFlags_AlwaysClamp);
@@ -242,11 +250,11 @@ namespace dxvk {
 
         ImGui::BeginDisabled(enableReferenceMode());
 
-        m_rebuildFroxels |= RemixGui::DragInt("Restir Grid Downsample Factor", &restirGridScaleObject(), 0.1f, 1);
-        m_rebuildFroxels |= RemixGui::DragInt("Restir Froxel Depth Slices", &restirFroxelDepthSlicesObject(), 0.1f, 1, UINT16_MAX);
+        RemixGui::DragInt("Restir Grid Downsample Factor", &restirGridScaleObject(), 0.1f, 1, INT_MAX, "%d", ImGuiSliderFlags_AlwaysClamp);
+        RemixGui::DragInt("Restir Froxel Depth Slices", &restirFroxelDepthSlicesObject(), 0.1f, 1, UINT16_MAX, "%d", ImGuiSliderFlags_AlwaysClamp);
         RemixGui::DragFloat("Restir Guard Band Scale Factor", &restirGridGuardBandFactorObject(), 0.1f, 1.0f, FLT_MAX, "%.3f", ImGuiSliderFlags_AlwaysClamp);
 
-        RemixGui::DragInt("Initial RIS Sample Count", &initialRISSampleCountObject(), 0.05f, 1, UINT8_MAX);
+        RemixGui::DragInt("Initial RIS Sample Count", &initialRISSampleCountObject(), 0.05f, 1, UINT8_MAX, "%d", ImGuiSliderFlags_AlwaysClamp);
         RemixGui::Checkbox("Enable Initial Visibility", &enableInitialVisibilityObject());
         ImGui::BeginDisabled(!enableInitialVisibility());
         RemixGui::Checkbox("Enable Visibility Reuse", &visibilityReuseObject());
@@ -254,14 +262,14 @@ namespace dxvk {
 
         RemixGui::Checkbox("Enable Temporal Resampling", &enableTemporalResamplingObject());
         ImGui::BeginDisabled(!enableTemporalResampling());
-        RemixGui::DragInt("Temporal Resampling Max Sample Count", &temporalReuseMaxSampleCountObject(), 1.0f, 1, UINT16_MAX);
+        RemixGui::DragInt("Temporal Resampling Max Sample Count", &temporalReuseMaxSampleCountObject(), 1.0f, 1, UINT16_MAX, "%d", ImGuiSliderFlags_AlwaysClamp);
         ImGui::EndDisabled();
 
         RemixGui::Separator();
 
         RemixGui::Checkbox("Enable Spatial Resampling", &enableSpatialResamplingObject());
         ImGui::BeginDisabled(!enableSpatialResampling());
-        RemixGui::DragInt("Spatial Resampling Max Sample Count", &spatialReuseMaxSampleCountObject(), 1.0f, 1, UINT16_MAX);
+        RemixGui::DragInt("Spatial Resampling Max Sample Count", &spatialReuseMaxSampleCountObject(), 1.0f, 1, UINT16_MAX, "%d", ImGuiSliderFlags_AlwaysClamp);
         RemixGui::DragFloat("Clamped Spatial Resampling Search Radius", &spatialReuseSamplingRadiusObject(), 0.01f, 0.0f, 10.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
         ImGui::EndDisabled();
 
@@ -312,9 +320,10 @@ namespace dxvk {
         RemixGui::Checkbox("Show Advanced Material Options", &showAdvanced);
 
         if (showAdvanced) {
-          RemixGui::DragFloat3("Transmittance Color", &transmittanceColorObject(), 0.01f, 0.0f, MaxTransmittanceValue, "%.3f");
+          RemixGui::Checkbox("Enable Translucent Shadows", &enableTranslucentShadowsObject());
+          RemixGui::DragFloat3("Transmittance Color", &transmittanceColorObject(), 0.01f, 0.0f, MaxTransmittanceValue, "%.3f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::DragFloat("Transmittance Measurement Distance", &transmittanceMeasurementDistanceMetersObject(), 0.25f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-          RemixGui::DragFloat3("Single Scattering Albedo", &singleScatteringAlbedoObject(), 0.01f, 0.0f, 1.0f, "%.3f");
+          RemixGui::DragFloat3("Single Scattering Albedo", &singleScatteringAlbedoObject(), 0.01f, 0.0f, 1.0f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::DragFloat("Anisotropy", &anisotropyObject(), 0.01f, -.99f, .99f, "%.3f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::DragFloat("Depth Offset", &depthOffsetObject(), 0.01f, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
 
@@ -324,7 +333,7 @@ namespace dxvk {
 
           ImGui::BeginDisabled(!enableHeterogeneousFog());
           RemixGui::DragFloat("Noise Field Substep Size", &noiseFieldSubStepSizeMetersObject(), 0.01f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-          RemixGui::DragInt("Noise Field Number of Octaves", &noiseFieldOctavesObject(), 0.05f, 1, 8);
+          RemixGui::DragInt("Noise Field Number of Octaves", &noiseFieldOctavesObject(), 0.05f, 1, 8, "%d", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::DragFloat("Noise Field Time Scale", &noiseFieldTimeScaleObject(), 0.01f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::DragFloat("Noise Field Density Scale", &noiseFieldDensityScaleObject(), 0.01f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::DragFloat("Noise Field Density Exponent", &noiseFieldDensityExponentObject(), 0.01f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
@@ -340,8 +349,8 @@ namespace dxvk {
         ImGui::Indent();
         ImGui::BeginDisabled(!enableAtmosphere());
         {
-          RemixGui::DragFloat("Planet Radius", &atmospherePlanetRadiusMetersObject(), 0.1f, -FLT_MAX, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-          RemixGui::DragFloat("Height", &atmosphereHeightMetersObject(), 0.1f, -FLT_MAX, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+          RemixGui::DragFloat("Planet Radius", &atmospherePlanetRadiusMetersObject(), 0.1f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+          RemixGui::DragFloat("Height", &atmosphereHeightMetersObject(), 0.1f, 0.0f, FLT_MAX, "%.2f", ImGuiSliderFlags_AlwaysClamp);
           RemixGui::Checkbox("Inverted", &atmosphereInvertedObject());
           ImGui::EndDisabled();
         }
@@ -403,24 +412,8 @@ namespace dxvk {
       qualityPreset = qualityModes[desiredQualityLevel];
     }
 
-    // Set new values based on preset values and cache old values
-
-    const auto newFroxelGridResolutionScale = qualityPreset.x;
-    const auto newFroxelDepthSlices = qualityPreset.y;
-    const auto oldFroxelGridResolutionScale = froxelGridResolutionScale();
-    const auto oldFroxelDepthSlices = froxelDepthSlices();
-
-    froxelGridResolutionScale.setDeferred(newFroxelGridResolutionScale);
-    froxelDepthSlices.setDeferred(newFroxelDepthSlices);
-
-    // Indicate that the froxel resources should be rebuilt if any relevant values changed
-
-    if (
-      newFroxelGridResolutionScale != oldFroxelGridResolutionScale ||
-      newFroxelDepthSlices != oldFroxelDepthSlices
-    ) {
-      m_rebuildFroxels = true;
-    }
+    froxelGridResolutionScale.setDeferred(static_cast<uint32_t>(qualityPreset.x));
+    froxelDepthSlices.setDeferred(static_cast<uint16_t>(qualityPreset.y));
   }
 
   void RtxGlobalVolumetrics::setPreset(const PresetType presetType) {
@@ -580,12 +573,14 @@ namespace dxvk {
     volumeArgs.froxelFireflyFilteringLuminanceThreshold = froxelFireflyFilteringLuminanceThreshold();
     volumeArgs.attenuationCoefficient = volumetricAttenuationCoefficient;
     volumeArgs.enable = enable() && canUsePhysicalFog;
+    volumeArgs.enableTranslucentShadows = volumeArgs.enable && enableTranslucentShadows();
     volumeArgs.scatteringCoefficient = volumetricScatteringCoefficient;
     volumeArgs.enableVolumeRISInitialVisibility = enableInitialVisibility();
     volumeArgs.enablevisibilityReuse = visibilityReuse();
+    const bool isViewHistoryInvalidated = mainCamera.isViewHistoryInvalidated(m_device->getCurrentFrameId());
     // Note: We need to invalidate the volumetric reservoir when detecting camera cut to avoid accumulating the history from different scenes
-    volumeArgs.enableVolumeTemporalResampling = enableTemporalResampling() && !cameraManager.getMainCamera().isCameraCut();
-    volumeArgs.enableVolumeSpatialResampling = enableSpatialResampling() && !cameraManager.getMainCamera().isCameraCut();
+    volumeArgs.enableVolumeTemporalResampling = enableTemporalResampling() && !isViewHistoryInvalidated;
+    volumeArgs.enableVolumeSpatialResampling = enableSpatialResampling() && !isViewHistoryInvalidated;
     volumeArgs.numSpatialSamples = spatialReuseMaxSampleCount();
     volumeArgs.spatialSamplingRadius = spatialReuseSamplingRadius();
     volumeArgs.numFroxelVolumes = m_numFroxelVolumes;     
@@ -676,7 +671,7 @@ namespace dxvk {
     }
 
     // Note: We need to invalidate the volumetric history buffers (radiance and age buffers) when detecting camera cut to avoid accumulating the history from different scenes
-    volumeArgs.resetHistory = cameraManager.getMainCamera().isCameraCut();
+    volumeArgs.resetHistory = isViewHistoryInvalidated;
 
     return volumeArgs;
   }
@@ -848,7 +843,6 @@ namespace dxvk {
 
     if (m_rebuildFroxels) {
       createDownscaledResource(ctx, frameBeginCtx.downscaledExtent);
-      m_rebuildFroxels = false;
     }
   }
 
@@ -882,6 +876,8 @@ namespace dxvk {
 
     m_volumeReservoirs[0] = Resources::createImageResource(ctx, "volume reservoir 0", restirFroxelGridFullDimensions, VK_FORMAT_R32G32B32A32_UINT, 1, VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D);
     m_volumeReservoirs[1] = Resources::createImageResource(ctx, "volume reservoir 1", restirFroxelGridFullDimensions, VK_FORMAT_R32G32B32A32_UINT, 1, VK_IMAGE_TYPE_3D, VK_IMAGE_VIEW_TYPE_3D);
+
+    m_rebuildFroxels = false;
   }
 
   void RtxGlobalVolumetrics::releaseDownscaledResource() {

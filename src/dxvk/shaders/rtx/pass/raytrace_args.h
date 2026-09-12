@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2021-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -39,6 +39,7 @@
 #include "rtx/concept/light/light_types.h"
 #include "rtx/concept/surface/surface_shared.h"
 #include "rtx/algorithm/nee_cache_data.h"
+#include "rtx/pass/sparse_rendering/sparse_rendering.h"
 
 struct LightRangeInfo {
   uint offset;
@@ -121,6 +122,14 @@ struct EyeArgs {
   uint  pad1;
 };
 
+struct ShadowTerminatorArgs
+{
+  uint  enableOffset;
+  uint  soften;
+  float maxArea;
+  float maxLength;
+};
+
 #define OBJECT_PICKING_INVALID (cb.clearColorPicking)
 
 // Constant buffer
@@ -155,8 +164,11 @@ struct RaytraceArgs {
   SssArgs sssArgs;
   EyeArgs eyeArgs;
   AtmosphereArgs atmosphereArgs;
+  ShadowTerminatorArgs shadowTerminatorArgs;
 
   Camera renderTargetCamera;
+
+  SparseRenderingArgs sparseRenderingArgs;
 
   // ------------------------- Structs above this line, non structs below this line -----------------------------------
 
@@ -194,7 +206,7 @@ struct RaytraceArgs {
   // The number of active Ray Portals (Used for Ray Portal sampling). Always <= RAY_PORTAL_MAX_COUNT
   uint8_t numActiveRayPortals;
   float secondarySpecularFireflyFilteringThreshold;
-  uint  outputParticleLayer;
+  uint secondarySignalPadding;
 
   // Note: Packed as float16, uses uint16_t due to being shared on C++ side
   uint16_t emissiveBlendOverrideEmissiveIntensity;
@@ -251,6 +263,7 @@ struct RaytraceArgs {
 
   // NOTE: Variables need to be in groups of 4x32 bits above this comment.
 
+  uint invalidateHistoryForAnimatedWater;
   uint uniformRandomNumber;
   uint16_t opaqueDiffuseLobeSamplingProbabilityZeroThreshold;
   uint16_t minOpaqueDiffuseLobeSamplingProbability;
@@ -267,7 +280,7 @@ struct RaytraceArgs {
   uint16_t minTranslucentTransmissionLobeSamplingProbability;
   float roughnessDemodulationOffset;
   float timeSinceStartSeconds;
-  
+
   uint enableCalculateVirtualShadingNormals;
   uint enableDirectLighting;
   uint enableEmissiveBlendEmissiveOverride;
@@ -276,6 +289,7 @@ struct RaytraceArgs {
   uint enableSecondaryBounces;
   uint enableSeparateUnorderedApproximations;
   uint enableStochasticAlphaBlend;
+  uint forceStaticSceneMotionVectors;
   uint16_t enableDirectTranslucentShadows;
   uint16_t enableDirectAlphaBlendShadows;
   uint16_t enableIndirectTranslucentShadows;
@@ -286,6 +300,8 @@ struct RaytraceArgs {
   uint enableUnorderedEmissiveParticlesInIndirectRays;
   uint enableTransmissionApproximationInIndirectRays;
   uint enableDecalMaterialBlending;
+  uint enableLegacyRectLightConeShaping;
+  uint enableRectLightConeShapingRatioScaling;
   uint enableBillboardOrientationCorrection;
   uint enablePlayerModelInPrimarySpace;
   uint enablePlayerModelPrimaryShadows;
@@ -682,7 +698,10 @@ struct RaytraceArgs {
   uint sssTransmissionBsdfSampleCount;
   uint sssTransmissionSingleScatteringSampleCount;
   uint enableTransmissionDiffusionProfileCorrection;
+  float metersToWorldUnitScale;
   float totalMipBias;
+  float hairCardMipBias;
+  float hairCardRoughnessScale;
 
   uint forceFirstHitInGBufferPass;
 
@@ -717,6 +736,12 @@ struct RaytraceArgs {
   // shader skips the TF2 MOD2X detail-texture albedo overlay. Diagnostic for
   // the Ark "red blot" (brown bare sample turned red by detail). uint not bool.
   uint disableDetailOverlay;
+
+  // True only when NRD will actually consume these this frame; the GBuffer skips the writes otherwise.
+  uint writePrimaryDenoisingNormal;
+  // Also gate secondary normal and virtual motion vector, which NRD is the only consumer of.
+  uint writeSecondaryDenoisingGuides;
+  uint writePrimaryVirtualMotionVector;
 
   // NOTE: Add structs to the top section of RaytraceArgs, not the bottom.
   // NOTE: bool does not work in debug builds, use uint instead.

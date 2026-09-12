@@ -37,20 +37,19 @@
 #define TONEMAPPING_TONE_CURVE_HISTOGRAM_INPUT_OUTPUT     0
 #define TONEMAPPING_TONE_CURVE_TONE_CURVE_INPUT_OUTPUT    1
 
-#define TONEMAPPING_APPLY_BLUE_NOISE_TEXTURE_INPUT         0
-#define TONEMAPPING_APPLY_TONEMAPPING_COLOR_INPUT          1
-#define TONEMAPPING_APPLY_TONEMAPPING_TONE_CURVE_INPUT     2
-#define TONEMAPPING_APPLY_TONEMAPPING_EXPOSURE_INPUT       3
-#define TONEMAPPING_APPLY_TONEMAPPING_COLOR_OUTPUT         4
+#define TONEMAPPING_APPLY_TONEMAPPING_COLOR_INPUT          0
+#define TONEMAPPING_APPLY_TONEMAPPING_TONE_CURVE_INPUT     1
+#define TONEMAPPING_APPLY_TONEMAPPING_EXPOSURE_INPUT       2
+#define TONEMAPPING_APPLY_TONEMAPPING_COLOR_OUTPUT         3
 // NV-DXVK [PSDT]: the Perceptual Scene Display Transform needs three inputs no
 // per-pixel operator does - the multi-scale adaptation field, its chroma
 // companion, and the frame's AdaptationState. They are bound unconditionally
 // (the resources are a couple of hundred KiB and always exist) so the apply
 // pipeline layout does not change with the operator selection.
-#define TONEMAPPING_APPLY_PSDT_FIELD_INPUT                 5
-#define TONEMAPPING_APPLY_PSDT_SOURCE_INPUT                6
-#define TONEMAPPING_APPLY_PSDT_ILLUM_INPUT                 7
-#define TONEMAPPING_APPLY_PSDT_STATE_INPUT                 8
+#define TONEMAPPING_APPLY_PSDT_FIELD_INPUT                 4
+#define TONEMAPPING_APPLY_PSDT_SOURCE_INPUT                5
+#define TONEMAPPING_APPLY_PSDT_ILLUM_INPUT                 6
+#define TONEMAPPING_APPLY_PSDT_STATE_INPUT                 7
 
 #define TONEMAPPING_TONE_CURVE_SAMPLE_COUNT               256
 
@@ -137,8 +136,8 @@ struct ToneMappingCurveArgs {
 struct ToneMappingApplyToneMappingArgs {
   uint toneMappingEnabled;
   uint debugMode; // If true shows from left to right: Reinhard (0-0.25), Heji Burgess-Dawson (0.25-0.5), and dynamic tone mappers (0.5-1) along with a tone curve on the same screen.
-  uint performSRGBConversion;
   uint enableAutoExposure;
+  uint colorGradingEnabled;
 
   float shadowContrast;       // See ToneMappingCurveArgs
   float shadowContrastEnd;    // See ToneMappingCurveArgs
@@ -147,15 +146,11 @@ struct ToneMappingApplyToneMappingArgs {
 
   // Color grading
   vec3 colorBalance;
-  uint colorGradingEnabled;
-
   float saturation;
+
   float toneCurveMinStops;
   float toneCurveMaxStops;
   uint finalizeWithACES;
-
-  uint ditherMode;
-  uint frameIndex;
   uint useLegacyACES;
   uint tonemapOperator; // NV-DXVK: one of tonemapOperator* (0 = native dynamic curve)
 };

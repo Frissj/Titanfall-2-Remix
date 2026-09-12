@@ -21,6 +21,7 @@
 */
 
 #include "dxvk_imgui.h"
+#include "dxvk_imgui_first_use_guide.h"
 #include "imgui.h"
 #include "rtx_render/rtx_imgui.h"
 #include "dxvk_device.h"
@@ -234,6 +235,13 @@ namespace dxvk {
           ImGui::EndTabItem();
         }
 
+        if (ImGui::BeginTabItem("Permissions", nullptr, tab_item_flags)) {
+          beginTabChild("##tab_child_permissions");
+          ImGuiFirstUseGuide::showPermissionsUI();
+          endTabChild();
+          ImGui::EndTabItem();
+        }
+
         ImGui::EndTabBar();
       }
 
@@ -288,7 +296,7 @@ namespace dxvk {
       ImGui::SameLine();
       
       // Clear User Settings button
-      if (ImGui::Button("Reset to Default", buttonSize)) {
+      if (ImGui::Button("Delete All User Settings", buttonSize)) {
         if (userLayer) {
           userLayer->removeFromAllOptions();
         }

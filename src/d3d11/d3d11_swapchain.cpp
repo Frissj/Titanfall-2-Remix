@@ -642,7 +642,10 @@ namespace dxvk {
         // skip applyPendingValues entirely, so we must commit here.
         RtxOptionManager::applyPendingValues(m_device.ptr(), false);
         auto& gui = m_device->getCommon()->getImgui();
-        gui.render(m_window, m_context, info.imageExtent, m_vsync);
+        // Upstream's ImGUI::render reads the window from DxvkObjects; publish
+        // this swapchain's window first so the overlay binds to the right HWND.
+        m_context->getCommonObjects()->setWindowHandle(m_window);
+        gui.render(m_context, info.imageExtent);
       }
 
       if (i + 1 >= SyncInterval)

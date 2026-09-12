@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2023-2025, NVIDIA CORPORATION. All rights reserved.
+* Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -62,8 +62,6 @@ namespace dxvk {
       END_PARAMETER()
     };
 
-    PREWARM_SHADER_PIPELINE(HistogramShader);
-
     class ToneCurveShader : public ManagedShader
     {
       SHADER_SOURCE(ToneCurveShader, VK_SHADER_STAGE_COMPUTE_BIT, tonemapping_tone_curve)
@@ -76,8 +74,6 @@ namespace dxvk {
       END_PARAMETER()
     };
 
-    PREWARM_SHADER_PIPELINE(ToneCurveShader);
-
     class ApplyTonemappingShader : public ManagedShader
     {
       SHADER_SOURCE(ApplyTonemappingShader, VK_SHADER_STAGE_COMPUTE_BIT, tonemapping_apply_tonemapping)
@@ -85,7 +81,6 @@ namespace dxvk {
       PUSH_CONSTANTS(ToneMappingApplyToneMappingArgs)
 
       BEGIN_PARAMETER()
-        TEXTURE2DARRAY(TONEMAPPING_APPLY_BLUE_NOISE_TEXTURE_INPUT)
         RW_TEXTURE2D(TONEMAPPING_APPLY_TONEMAPPING_COLOR_INPUT)
         SAMPLER1D(TONEMAPPING_APPLY_TONEMAPPING_TONE_CURVE_INPUT)
         RW_TEXTURE1D_READONLY(TONEMAPPING_APPLY_TONEMAPPING_EXPOSURE_INPUT)
@@ -96,8 +91,6 @@ namespace dxvk {
         RW_TEXTURE1D_READONLY(TONEMAPPING_APPLY_PSDT_STATE_INPUT)
       END_PARAMETER()
     };
-
-    PREWARM_SHADER_PIPELINE(ApplyTonemappingShader);
 
     // NV-DXVK [PSDT]: scene analysis, adaptation pyramid, adaptation state.
     class PsdtAnalysisShader : public ManagedShader
@@ -124,8 +117,6 @@ namespace dxvk {
       END_PARAMETER()
     };
 
-    PREWARM_SHADER_PIPELINE(PsdtAnalysisShader);
-
     class PsdtDownsampleShader : public ManagedShader
     {
       SHADER_SOURCE(PsdtDownsampleShader, VK_SHADER_STAGE_COMPUTE_BIT, psdt_downsample)
@@ -141,8 +132,6 @@ namespace dxvk {
         RW_TEXTURE2D(PSDT_DOWNSAMPLE_ILLUM_OUTPUT)
       END_PARAMETER()
     };
-
-    PREWARM_SHADER_PIPELINE(PsdtDownsampleShader);
 
     class PsdtStateShader : public ManagedShader
     {
@@ -160,7 +149,6 @@ namespace dxvk {
       END_PARAMETER()
     };
 
-    PREWARM_SHADER_PIPELINE(PsdtStateShader);
   }
 
   // NV-DXVK [tonemap operators]: dropdown for rtx.tonemap.tonemapOperator. Uses
@@ -438,8 +426,23 @@ namespace dxvk {
   DxvkToneMapping::DxvkToneMapping(DxvkDevice* device)
   : CommonDeviceObject(device), m_vkd(device->vkd())  {
   }
-  
+
   DxvkToneMapping::~DxvkToneMapping()  {  }
+
+  void DxvkToneMapping::prewarmShaders(DxvkPipelineManager& pipelineManager) const {
+    if (RtxOptions::tonemappingMode() != TonemappingMode::Global) {
+      return;
+    }
+
+    HistogramShader::getShader();
+    ToneCurveShader::getShader();
+    ApplyTonemappingShader::getShader();
+    // NV-DXVK [PSDT]: dispatched from the global tonemapper every frame it is
+    // enabled, so warm them alongside the curve shaders.
+    PsdtAnalysisShader::getShader();
+    PsdtDownsampleShader::getShader();
+    PsdtStateShader::getShader();
+  }
 
   void DxvkToneMapping::showImguiSettings() {
 
@@ -459,8 +462,6 @@ namespace dxvk {
     if (tonemappingEnabled()) {
       ImGui::Indent();
       RemixGui::Checkbox("Finalize With ACES", &finalizeWithACESObject());
-
-      RemixGui::Combo("Dither Mode", &ditherModeObject(), "Disabled\0Spatial\0Spatial + Temporal\0");
 
       RemixGui::Checkbox("Tuning Mode", &tuningModeObject());
       if (tuningMode()) {
@@ -1109,7 +1110,6 @@ namespace dxvk {
     Rc<DxvkImageView> exposureView,
     const Resources::Resource& inputBuffer,
     const Resources::Resource& colorBuffer,
-    bool performSRGBConversion,
     bool autoExposureEnabled,
     bool forceFinalizeWithACES) {
 
@@ -1136,7 +1136,6 @@ namespace dxvk {
     pushArgs.useLegacyACES = RtxOptions::useLegacyACES();
 
     // Tonemap args
-    pushArgs.performSRGBConversion = performSRGBConversion;
     pushArgs.shadowContrast = shadowContrast();
     pushArgs.shadowContrastEnd = shadowContrastEnd();
     pushArgs.exposureFactor = exp2f(exposureBias() + RtxOptions::calcUserEVBias()); // ev100
@@ -1148,14 +1147,6 @@ namespace dxvk {
     pushArgs.colorBalance = colorBalance();
     pushArgs.contrast = contrast();
     pushArgs.saturation = saturation();
-
-    // Dither args
-    switch (ditherMode()) {
-    case DitherMode::None: pushArgs.ditherMode = ditherModeNone; break;
-    case DitherMode::Spatial: pushArgs.ditherMode = ditherModeSpatialOnly; break;
-    case DitherMode::SpatialTemporal: pushArgs.ditherMode = ditherModeSpatialTemporal; break;
-    }
-    pushArgs.frameIndex = ctx->getDevice()->getCurrentFrameId();
 
     // NV-DXVK [tonemap operators]: select the fork operator (0 = native curve).
     pushArgs.tonemapOperator = static_cast<uint32_t>(tonemapOperator());
@@ -1182,7 +1173,6 @@ namespace dxvk {
       }
     }
 
-    ctx->bindResourceView(TONEMAPPING_APPLY_BLUE_NOISE_TEXTURE_INPUT, ctx->getResourceManager().getBlueNoiseTexture(ctx), nullptr);
     ctx->bindResourceView(TONEMAPPING_APPLY_TONEMAPPING_COLOR_INPUT, inputBuffer.view, nullptr);
     ctx->bindResourceView(TONEMAPPING_APPLY_TONEMAPPING_TONE_CURVE_INPUT, m_toneCurve.view, nullptr);
     ctx->bindResourceView(TONEMAPPING_APPLY_TONEMAPPING_EXPOSURE_INPUT, exposureView, nullptr);
@@ -1219,7 +1209,6 @@ namespace dxvk {
     Rc<DxvkImageView> exposureView,
     const Resources::RaytracingOutput& rtOutput,
     const float frameTimeMilliseconds,
-    bool performSRGBConversion,
     bool resetHistory,
     bool autoExposureEnabled,
     bool forceFinalizeWithACES) {
@@ -1230,7 +1219,6 @@ namespace dxvk {
 
     ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
 
-    // TODO : set reset on significant camera changes as well
     if (m_toneHistogram.image.ptr() == nullptr) {
       createResources(ctx);
       m_resetState = true;
@@ -1249,7 +1237,7 @@ namespace dxvk {
       dispatchToneCurve(ctx);
     }
 
-    dispatchApplyToneMapping(ctx, linearSampler, exposureView, inputColorBuffer, rtOutput.m_finalOutput.resource(Resources::AccessType::Write), performSRGBConversion, autoExposureEnabled, forceFinalizeWithACES);
+    dispatchApplyToneMapping(ctx, linearSampler, exposureView, inputColorBuffer, rtOutput.m_finalOutput.resource(Resources::AccessType::Write), autoExposureEnabled, forceFinalizeWithACES);
 
     m_resetState = false;
   }

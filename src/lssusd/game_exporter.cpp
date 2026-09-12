@@ -285,7 +285,9 @@ void GameExporter::setCommonStageMetaData(pxr::UsdStageRefPtr stage, const Expor
     for (auto& pair : exportData.meta.renderingSettingsDict) {
       configs.push_back(pair.first + " = " + pair.second);
     }
-    settings.GetPrim().CreateAttribute(pxr::TfToken("remix_config"), pxr::SdfValueTypeNames->StringArray).Set(configs);
+    // Must be namespaced: Hydra only gathers namespaced attributes from a render settings
+    // prim into the namespacedSettings that HdRemixRenderSettings reads.
+    settings.GetPrim().CreateAttribute(pxr::TfToken("remix:remix_config"), pxr::SdfValueTypeNames->StringArray).Set(configs);
   }
 }
 
@@ -320,7 +322,7 @@ struct AttrDesc {
 { \
   attrEnum, \
   AttrDesc{pxr::TfToken(attrNames[attrEnum]), \
-           pxr::SdfValueTypeNames->##typeName, \
+           pxr::SdfValueTypeNames->typeName, \
            custom, \
            pxr::SdfVariability##sdfVariability} \
 }
@@ -925,7 +927,7 @@ void GameExporter::exportInstances(const Export& exportData, ExportContext& ctx)
       pxr::UsdGeomMesh meshSchema = pxr::UsdGeomMesh::Define(ctx.instanceStage, meshSchemaSdfPath);
       pxr::UsdGeomPrimvarsAPI primvarsAPI(meshSchema.GetPrim());
 
-#define _SetDrawMetadata(name, type)  primvarsAPI.CreatePrimvar(pxr::TfToken("_remix_metadata:" #name), pxr::SdfValueTypeNames->##type).Set(pxr::VtValue(instanceData.metadata.##name))
+#define _SetDrawMetadata(name, type)  primvarsAPI.CreatePrimvar(pxr::TfToken("_remix_metadata:" #name), pxr::SdfValueTypeNames->type).Set(pxr::VtValue(instanceData.metadata.name))
       _SetDrawMetadata(alphaTestEnabled, Bool);
       _SetDrawMetadata(alphaTestReferenceValue, UInt);
       _SetDrawMetadata(alphaTestCompareOp, UInt);

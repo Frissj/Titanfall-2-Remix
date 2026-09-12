@@ -9,6 +9,7 @@ util_src = files([
   'util_job_graph.cpp',
   'util_monitor.cpp',
   'util_window.cpp',
+  'util_sentry.cpp',
 
   'thread.cpp',
   
@@ -37,6 +38,8 @@ util_src = files([
 
   'util_singleton.h',
 
+  'util_struct_hash.h',
+
   'util_fastops.cpp',
   'util_fastops.h',
 
@@ -45,6 +48,13 @@ util_src = files([
 
   'util_filesys.h',
   'util_filesys.cpp',
+
+  'util_local_data.h',
+  'util_local_data.cpp',
+
+  'util_per_game_config.h',
+
+  'util_crash_report.h',
 
   'util_threadpool.h',
   'util_atomic_queue.h',
@@ -55,14 +65,17 @@ util_src = files([
 
   'util_watchdog.h',
 
-  'util_globaltime.h',
+  'util_global_time.cpp',
+  'util_global_time.h',
 
   'util_cond_diag.h',
 ])
 
 util_lib = static_library('util', util_src,
+  dependencies        : [ sentry_dep ],
   include_directories : [ dxvk_include_path ],
   override_options    : ['cpp_std='+dxvk_cpp_std])
 
 util_dep = declare_dependency(
-  link_with           : [ util_lib ])
+  link_with           : [ util_lib ],
+  dependencies        : [ sentry_dep ])

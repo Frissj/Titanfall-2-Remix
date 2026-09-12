@@ -66,11 +66,19 @@ private:
   };
 
   static bool s_bInit;
+  static fspath s_rootPath;
   using PathArray = std::array<fspath, kNumIds>;
   static PathArray s_paths;
 
 public:
   static void init(const std::string rootPath);
+  static bool isInitialized() {
+    return s_bInit;
+  }
+  static inline const fspath& rootPath() {
+    assert(s_bInit && "[RtxFileSys] Not yet init.");
+    return s_rootPath;
+  }
   static inline const fspath path(const Id id) {
     // NV-DXVK: Do not assert here.  Static initializers in this DLL (notably
     // Logger::s_instance) call into this function before D3D11CoreCreateDevice

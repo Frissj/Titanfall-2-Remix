@@ -51,36 +51,36 @@
 
 #define COMMON_MAX_BINDING                       BINDING_SAMPLER_READBACK_BUFFER
 
-// NV-DXVK: per-pixel scene dump (one-shot, ImGui-triggered). Slot 200 is
-// well above every pass-specific binding (max observed ~190 across all
+// NV-DXVK: per-pixel scene dump (one-shot, ImGui-triggered). Slot 400 is
+// above every pass-specific binding (max observed 301 across all
 // passes) so it doesn't clash with hardcoded per-pass slots that start at
 // 20 (e.g. RTXDI_COMPUTE_GRADIENTS_BINDING_RTXDI_RESERVOIR=20). Declared
 // in common_bindings.slangh under `#ifdef RAY_TRACING_PRIMARY_RAY` so only
 // primary-ray pipelines (gbuffer raygen / closesthit) emit the binding,
 // keeping non-primary shaders' descriptor layouts untouched.
-#define BINDING_SCENE_DUMP_BUFFER                200
+#define BINDING_SCENE_DUMP_BUFFER                400
 
 // Atmosphere LUTs use high binding slots to avoid conflicts with pass-specific bindings.
-// Shifted to 201-203 because BINDING_SCENE_DUMP_BUFFER already occupies 200.
-#define BINDING_ATMOSPHERE_TRANSMITTANCE_LUT     201
-#define BINDING_ATMOSPHERE_MULTISCATTERING_LUT   202
-#define BINDING_ATMOSPHERE_SKY_VIEW_LUT          203
+// Shifted to 401-403 because BINDING_SCENE_DUMP_BUFFER already occupies 400.
+#define BINDING_ATMOSPHERE_TRANSMITTANCE_LUT     401
+#define BINDING_ATMOSPHERE_MULTISCATTERING_LUT   402
+#define BINDING_ATMOSPHERE_SKY_VIEW_LUT          403
 // NV-DXVK [AerialPerspective]: 3D LUT (32 x 32 x 32) holding the
 // in-scattered radiance + transmittance for a ray of length D in
 // direction view-relative-to-sun. Sampled per-shading-point in the
 // path tracer to apply atmospheric haze on geometry, decoupled from
 // the visible-sky source. Works in both PhysicalAtmosphere and Hybrid
 // sky modes.
-#define BINDING_ATMOSPHERE_AERIAL_PERSPECTIVE_LUT 204
+#define BINDING_ATMOSPHERE_AERIAL_PERSPECTIVE_LUT 404
 
 // NV-DXVK [Coverage]: per-pass surface-coverage histogram. Two regions
 // (region 0 = geometry-resolver primary surface, region 1 = integrate-pass
 // surface), each kCoverageSurfaceSlots uints, atomically incremented once
-// per pixel that resolves to a given surfaceIndex. Slot 205 keeps it clear
+// per pixel that resolves to a given surfaceIndex. Slot 405 keeps it clear
 // of the pass-specific bindings (which start at 20); ungated in the slang
 // declaration like the atmosphere LUTs above so both the gbuffer and the
 // integrate pipelines can write it.
-#define BINDING_SURFACE_COVERAGE_BUFFER          205
+#define BINDING_SURFACE_COVERAGE_BUFFER          405
 
 // NV-DXVK [Perf.ShaderClock]: dedicated cycle-counter accumulator. Deliberately
 // its OWN buffer and its own binding rather than more SurfaceCoverageBuffer
@@ -92,7 +92,7 @@
 //
 // 64 uint slots, host-visible and coherent, read straight off mapPtr - no
 // compaction pass, no barrier, no dependency on the coverage machinery.
-#define BINDING_SHADER_CLOCK_BUFFER              206
+#define BINDING_SHADER_CLOCK_BUFFER              406
 #define SHADER_CLOCK_SLOT_COUNT                  64u
 
 // Slot layout. Each region uses a (cycles, hits) pair so the log can print a mean
@@ -1032,7 +1032,7 @@
   RW_STRUCTURED_BUFFER(BINDING_SURFACE_COVERAGE_BUFFER)             \
   RW_STRUCTURED_BUFFER(BINDING_SHADER_CLOCK_BUFFER)
 // NV-DXVK: SceneDumpBuffer is in COMMON_RAYTRACING_BINDINGS but uses slot
-// 200 (out-of-the-way) so the C++ descriptor layout for every RT pipeline
+// 400 (out-of-the-way) so the C++ descriptor layout for every RT pipeline
 // includes it; the slang declaration in common_bindings.slangh is gated on
 // RAY_TRACING_PRIMARY_RAY so only primary shaders actually reference it.
 // Non-primary pipelines bind the placeholder buffer but don't read/write
