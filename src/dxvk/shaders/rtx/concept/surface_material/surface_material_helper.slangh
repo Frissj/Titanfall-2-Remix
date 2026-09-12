@@ -99,7 +99,7 @@ bool surfaceMaterialInteractionTextureReadHelper(
   uint16_t textureIndex,
   uint16_t samplerIndex,
   SurfaceInteraction surfaceInteraction,
-  inout f16vec4 textureSample,
+  inout vec4 textureSample,
   float lodBias = 0.0,
   bool drivesControlFlow = false)
 {

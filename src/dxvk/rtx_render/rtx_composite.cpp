@@ -384,7 +384,7 @@ namespace dxvk {
     const DomeLightArgs& domeLightArgs = sceneManager.getLightManager().getDomeLightArgs();
     ctx->bindResourceSampler(COMPOSITE_SKY_LIGHT_TEXTURE, linearSampler);
     Rc<DxvkImageView> skyLightBoundView;
-    if (domeLightArgs.active) {
+    if (domeLightArgs.active && domeLightArgs.textureIndex != BINDING_INDEX_INVALID) {
       RtxTextureManager& texManager = ctx->getCommonObjects()->getTextureManager();
       const TextureRef& domeLightTex = texManager.getTextureTable()[domeLightArgs.textureIndex];
 

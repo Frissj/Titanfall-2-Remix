@@ -122,40 +122,6 @@ namespace dxvk {
     return os << static_cast<uint32_t>(mode);
   }
 
-  ReplacementInstance* PrimInstanceOwner::getOrCreateReplacementInstance(void* owner, PrimInstance::Type type, size_t index,size_t numPrims) {
-    if (m_replacementInstance != nullptr && !isRoot(owner)) {
-      // This Prim is already a non-root member of another replacementInstance, but SceneManager is trying to use it as the root of a new replacement.
-      ONCE(assert(false && "getOrCreateReplacementInstance should only be called on root prims"));
-      // Try to handle it gracefully anyways by removing this from the previous replacement and making it the root of a new replacement.
-      // This will cause m_replacmementInstance to be null, so it will enter the new ReplacementInstance case below.
-      setReplacementInstance(nullptr, ReplacementInstance::kInvalidReplacementIndex, owner, type);
-    }
-
-    if (m_replacementInstance == nullptr) {
-      ReplacementInstance* replacement = new ReplacementInstance();
-      replacement->setup(PrimInstance(owner, type), numPrims);
-      setReplacementInstance(replacement, index, owner, type);
-    } else if (m_replacementInstance->prims.size() != numPrims) {
-      // Number of prims changing generally means a new replacement asset has loaded in.
-      // Need to unlink the old instances, and either re-link them (if they are returned as 
-      // similar by findSimilarInstances) or create new ones.
-      ReplacementInstance* replacement = m_replacementInstance;
-      
-      // Clear the root manually, so that `clear()` doesn't try to delete the replacement.
-      replacement->root = PrimInstance();
-      // Clear the link to this prim so that it doesn't get marked for GC.
-      setReplacementInstance(nullptr, ReplacementInstance::kInvalidReplacementIndex, owner, type);
-
-      // Wipe out all the links in the replacement, which will mark all of the old non-root replacements for cleanup.
-      replacement->clear();
-      
-      // Redo replacement setup.
-      replacement->setup(PrimInstance(owner, type), numPrims);
-      setReplacementInstance(replacement, index, owner, type);
-    }
-    return m_replacementInstance;
-  }
-
   ReplacementInstance::~ReplacementInstance() {
     clear();
   }
@@ -403,7 +369,6 @@ namespace dxvk {
           add(InstanceCategories::IgnoreAntiCulling,    "IgnoreAntiCull");
           add(InstanceCategories::IgnoreMotionBlur,     "IgnoreMotionBlur");
           add(InstanceCategories::IgnoreOpacityMicromap,"IgnoreOMM");
-          add(InstanceCategories::IgnoreTransparencyLayer, "IgnoreXparent");
           if (tags.empty()) tags = "none";
           else tags.pop_back();
           Logger::info(str::format(
@@ -821,6 +786,7 @@ namespace dxvk {
                 && lookupHash(RtxOptions::skyBoxTextures(), textureHash));
 
     setCategory(InstanceCategories::ParticleEmitter, lookupHash(RtxOptions::particleEmitterTextures(), textureHash));
+    setCategory(InstanceCategories::HairCards, lookupHash(RtxOptions::hairCardTextures(), textureHash));
 
     // [SpawnGeomDiag.CatFlags] Log the texture-driven category result
     // ONCE per (textureHash, vsHash) tuple so we can correlate "the
@@ -1128,13 +1094,21 @@ namespace dxvk {
   }
 
   BlasEntry::BlasEntry(const DrawCallState& input_)
-    : input(input_) {
+    : input(input_), m_spatialMap(RtxOptions::uniqueObjectDistance() * 2.f) {
+      if (RtxOptions::uniqueObjectDistance() <= 0.f) {
+        ONCE(Logger::err("rtx.uniqueObjectDistance must be greater than 0."));
+      }
     }
 
   void BlasEntry::unlinkInstance(RtInstance* instance) {
+    instance->removeFromSpatialCache();
     if (m_linkedInstances.erase(instance) == 0) {
       ONCE(Logger::err("Tried to unlink an instance, which was never linked!"));
     }
+  }
+
+  void BlasEntry::rebuildSpatialMap() {
+    m_spatialMap.rebuild(RtxOptions::uniqueObjectDistance() * 2.f);
   }
 
 } // namespace dxvk

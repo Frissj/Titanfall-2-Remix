@@ -86,14 +86,14 @@ void generateIndices(const uint32_t idx, RWStructuredBuffer<uint32_t> dst, Struc
       idx2 = cb.minVertex;
     }
 
-    genTriListStoreIndex(dst, idx * 3 + 0, idx0 - cb.minVertex, cb.useUint32);
-    genTriListStoreIndex(dst, idx * 3 + 1, idx1 - cb.minVertex, cb.useUint32);
-    genTriListStoreIndex(dst, idx * 3 + 2, idx2 - cb.minVertex, cb.useUint32);
+    dst[idx * 3 + 0] = idx0 - cb.minVertex;
+    dst[idx * 3 + 1] = idx1 - cb.minVertex;
+    dst[idx * 3 + 2] = idx2 - cb.minVertex;
   }
   else
   {
-    genTriListStoreIndex(dst, idx * 3 + 0, i0 - cb.minVertex, cb.useUint32);
-    genTriListStoreIndex(dst, idx * 3 + 1, i1 - cb.minVertex, cb.useUint32);
-    genTriListStoreIndex(dst, idx * 3 + 2, i2 - cb.minVertex, cb.useUint32);
+    dst[idx * 3 + 0] = i0 - cb.minVertex;
+    dst[idx * 3 + 1] = i1 - cb.minVertex;
+    dst[idx * 3 + 2] = i2 - cb.minVertex;
   }
 }

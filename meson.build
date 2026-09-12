@@ -219,7 +219,15 @@ test_include_dirs = [
 
 test_include_path = include_directories(test_include_dirs)
 
-dxvk_library_path = join_paths(global_src_root_norm, 'lib')
+if (cpu_family == 'x86_64') or dxvk_is_woa_ec
+  dxvk_library_path = join_paths(global_src_root_norm, 'lib')
+else
+  if dxvk_is_woa
+    dxvk_library_path = join_paths(global_src_root_norm, 'liba64')
+  else
+    dxvk_library_path = join_paths(global_src_root_norm, 'lib32')
+  endif
+endif
 
 dxvk_extradep = [ ]
 

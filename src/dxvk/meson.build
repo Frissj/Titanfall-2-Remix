@@ -468,7 +468,7 @@ endif
 
 # Note: Include directory paths must be relative paths due to a limitation in Meson (currently at least)
 dlss_include_dir = include_directories(join_paths('../../', dlss_root_path, 'include'))
-dlss_lib_path = join_paths(global_src_root_norm, dlss_root_path, 'lib/Windows_x86_64/x64')
+dlss_lib_path = join_paths(global_src_root_norm, dlss_root_path, target_dlss_lib_path)
 dlfg_include_dir = include_directories(join_paths('../../', dlfg_root_path, 'include'))
 cc = meson.get_compiler('c')
 dlss_lib_name = 'nvsdk_ngx_d'

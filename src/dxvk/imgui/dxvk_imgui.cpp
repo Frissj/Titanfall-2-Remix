@@ -2989,6 +2989,7 @@ namespace dxvk {
         RemixGui::Checkbox("Allow Cubemaps", &RtxOptions::allowCubemapsObject());
         RemixGui::Checkbox("Always Calculate AABB (For Instance Matching)", &RtxOptions::enableAlwaysCalculateAABBObject());
         RemixGui::Checkbox("Volumetric Fog Skip Sky", &RtxOptions::volumetricFogSkipSkyObject());
+        RemixGui::Checkbox("Recompute Texture Hash On Write", &RtxOptions::recomputeTextureHashOnWriteObject());
         ImGui::Unindent();
       }
 
@@ -4601,6 +4602,12 @@ namespace dxvk {
   void ImGUI::render(const Rc<DxvkContext>& ctx, VkExtent2D surfaceSize) {
     ScopedGpuProfileZone(ctx, "ImGUI Render");
 
+    const HWND gameHwnd = ctx->getCommonObjects()->getLastKnownWindowHandle();
+    
+    // We need a window to render the GUI and for input to work correctly
+    if (gameHwnd == 0) {
+      return;
+    }
     ONCE(Logger::info(str::format("[ImGUI] render() first call: HWND=", (uintptr_t)gameHwnd,
       " size=", surfaceSize.width, "x", surfaceSize.height,
       " init=", m_init ? 1 : 0)));

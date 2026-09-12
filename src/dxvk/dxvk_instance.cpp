@@ -696,19 +696,17 @@ namespace dxvk {
                                                                                      );
         if (GFSDK_Aftermath_SUCCEED(aftermathResult)) {
           Logger::info("Aftermath enabled");
-          m_aftermathEnabled = true;
+          s_aftermathEnabled = true;
         } else if (aftermathResult == GFSDK_Aftermath_Result_FAIL_AlreadyInitialized) {
-          // Expected on every DxvkInstance construction past the first
-          // (e.g. d3d11.dll constructs a fresh DxvkInstance whose
-          // m_aftermathEnabled defaults to false even though Aftermath
-          // is already active globally from dxgi.dll's earlier
-          // construction). Treat as success: Aftermath is on, just not
-          // owned by this instance's m_aftermathEnabled flag.
-          Logger::info("Aftermath already initialized by an earlier instance; staying enabled");
-          m_aftermathEnabled = true;
+          // Expected when another module's DxvkInstance got there first: dxgi.dll
+          // and d3d11.dll each carry their own copy of s_aftermathEnabled, but
+          // Aftermath itself is process-wide. Treat as success.
+          Logger::info("Aftermath already initialized");
+          s_aftermathEnabled = true;
         } else {
           Logger::warn(str::format("User requested Aftermath enablement, but it failed.  Code: 0x", std::hex, aftermathResult, std::dec));
           m_options.enableAftermath = false;
+          s_aftermathInitFailed = true;
         }
       }
       // NV-DXVK end

@@ -57,6 +57,8 @@ namespace dxvk {
     // dialog at device creation, which deadlocks unattended captures. See
     // dxvk_adapter.cpp for why dropping it is safe.
     bool enablePresentMetering;
+    bool enableGpuCrashState;
+    bool enableGpuCrashStateBufferRetention;
     // NV-DXVK end
 
     // NV-DXVK start: early submit heuristics for memcpy work

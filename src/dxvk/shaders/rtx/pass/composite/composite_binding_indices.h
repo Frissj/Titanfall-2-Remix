@@ -59,10 +59,15 @@
 #define COMPOSITE_BLUE_NOISE_TEXTURE                                24
 #define COMPOSITE_VALUE_NOISE_SAMPLER                               25
 #define COMPOSITE_SKY_LIGHT_TEXTURE                                 26
+#define COMPOSITE_ACTIVE_PIXEL_MASK_INPUT                           27
+#define COMPOSITE_ACTIVE_LOCAL_PIXEL_COORDS_INPUT                   28
+#define COMPOSITE_PIXEL_SAMPLING_RATE_INPUT                         58
 // NV-DXVK [AerialPerspective]: 3D LUT bound here as Sampler3D so the
 // composite pass can apply distance-based haze to the FINAL radiance
 // (covers direct + indirect + bounce, not just primary emissive).
-#define COMPOSITE_AERIAL_PERSPECTIVE_LUT_INPUT                      27
+#define COMPOSITE_AERIAL_PERSPECTIVE_LUT_INPUT                      29
+
+// Inputs/Outputs
 
 #define COMPOSITE_PRIMARY_ALBEDO_INPUT_OUTPUT                       30
 #define COMPOSITE_ACCUMULATED_FINAL_OUTPUT_INPUT_OUTPUT             31

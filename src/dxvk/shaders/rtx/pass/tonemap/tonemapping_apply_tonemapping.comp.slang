@@ -20,7 +20,6 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include "rtx/pass/tonemap/tonemapping.slangh"
-#include "rtx/pass/tonemap/tonemapping_noise.slangh"
 #include "rtx/pass/tonemap/tonemap_operators.slangh"
 #include "rtx/pass/psdt/psdt_transform.slangh"
 #include "rtx/utility/math.slangh"

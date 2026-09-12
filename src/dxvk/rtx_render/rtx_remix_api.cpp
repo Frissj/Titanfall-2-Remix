@@ -63,7 +63,7 @@ namespace dxvk {
 namespace dxvk {
   // Because DrawCallState/LegacyMaterialData hide needed fields as private
   struct RemixAPIPrivateAccessor {
-    static ExternalDrawState toRtDrawState(const remixapi_InstanceInfo& info);
+    static std::unique_ptr<ExternalDrawState> toRtDrawState(const remixapi_InstanceInfo& info);
 
     template<typename Cmd>
     static void EmitCs(D3D11ImmediateContext* ctx, Cmd&& command) {
@@ -841,7 +841,7 @@ std::unique_ptr<dxvk::ExternalDrawState> dxvk::RemixAPIPrivateAccessor::toRtDraw
       extBones->boneTransforms_count : REMIXAPI_INSTANCE_INFO_MAX_BONES_COUNT;
     prototype.skinningData.minBoneIndex = 0;
     prototype.skinningData.numBones = boneCount;
-    prototype.skinningData.numBonesPerVertex = prototype.geometryData.numBonesPerVertex;
+    prototype.skinningData.numBonesPerVertex = prototype.getGeometryData().numBonesPerVertex;
     // NV-DXVK: pBoneMatrices is a COW handle now (see BonePalette in
     // rtx_types.h) — take the mutable vector explicitly to build into it.
     auto& apiBones = prototype.skinningData.pBoneMatrices.mutableVec();
@@ -1087,8 +1087,7 @@ namespace {
     }
     std::lock_guard lock { s_mutex };
     dxvk::RemixAPIPrivateAccessor::EmitCs(remixCtx, [cHandle = handle](dxvk::DxvkContext* ctx) {
-      auto& assets = ctx->getCommonObjects()->getSceneManager().getAssetReplacer();
-      assets->destroyExternalMesh(cHandle);
+      ctx->getCommonObjects()->getSceneManager().destroyExternalMesh(cHandle);
     });
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
@@ -1119,8 +1118,8 @@ namespace {
 
   remixapi_ErrorCode REMIXAPI_CALL remixapi_SetCameraMediumMaterial(
     const remixapi_CameraMediumInfo* info) {
-    dxvk::D3D9DeviceEx* remixDevice = tryAsDxvk();
-    if (!remixDevice) {
+    auto* remixCtx = tryGetContext();
+    if (!remixCtx) {
       return REMIXAPI_ERROR_CODE_REMIX_DEVICE_WAS_NOT_REGISTERED;
     }
     if (!info || info->sType != REMIXAPI_STRUCT_TYPE_CAMERA_MEDIUM_INFO) {
@@ -1130,7 +1129,7 @@ namespace {
     const remixapi_MaterialHandle handle = info->medium;
 
     std::lock_guard lock { s_mutex };
-    remixDevice->EmitCs([handle](dxvk::DxvkContext* ctx) {
+    dxvk::RemixAPIPrivateAccessor::EmitCs(remixCtx, [handle](dxvk::DxvkContext* ctx) {
       auto& sceneManager = ctx->getCommonObjects()->getSceneManager();
       if (handle == nullptr) {
         sceneManager.clearExternalStartInMediumMaterial();
@@ -1164,7 +1163,7 @@ namespace {
     auto drawState = convert::toRtDrawState(*info);
 
     std::lock_guard lock { s_mutex };
-    dxvk::RemixAPIPrivateAccessor::EmitCs(remixCtx, [cRtDrawState = convert::toRtDrawState(*info)](dxvk::DxvkContext* dxvkCtx) mutable {
+    dxvk::RemixAPIPrivateAccessor::EmitCs(remixCtx, [cRtDrawState = std::move(drawState)](dxvk::DxvkContext* dxvkCtx) mutable {
       auto* ctx = static_cast<dxvk::RtxContext*>(dxvkCtx);
       ctx->commitExternalGeometryToRT(std::move(cRtDrawState));
     });
@@ -1360,9 +1359,12 @@ namespace {
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
+  bool g_combineGuiInFinalColor = true;
+
   void applyStartupSettings(const remixapi_StartupInfo& info) {
     dxvk::g_allowSrgbConversionForOutput = !info.disableSrgbConversionForOutput;
     dxvk::g_allowMappingLegacyHashToObjectPickingValue = !info.editorModeEnabled;
+    g_combineGuiInFinalColor = info.combineGuiInFinalColor;
 
     // slightly different initial settings for HdRemix
     if (info.editorModeEnabled) {
@@ -1442,6 +1444,7 @@ namespace {
     }
     s_d3d11Device = dxvkDevice;
     s_d3d11Context = immCtx;
+    dxvk::g_dxvkDeviceNative = dxvkDevice->GetDXVKDevice().ptr();
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 
@@ -1505,10 +1508,9 @@ namespace {
     case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_OBJECT_PICKING:
       break;
     case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_GUI:
-      if (!dxvk::ImGUI::enableExternalPresenter()) {
-        return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
-      }
-      break;
+      // The external-presenter GUI copy renders ImGui into a D3D9 surface view;
+      // the D3D11 path has no equivalent destination view, so it is unsupported.
+      return REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
     default:
       return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
     }
@@ -1523,7 +1525,9 @@ namespace {
       dxvk::Rc<dxvk::DxvkImage> srcImage = nullptr;
       switch (type) {
       case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_FINAL_COLOR:
-        srcImage = cBackbuffer;
+        // m_finalOutput is already sRGB-converted and dithered in place by the
+        // final output pass, so it is the finished frame in the D3D11 path.
+        srcImage = rtOutput.m_finalOutput.resource(dxvk::Resources::AccessType::Read).image;
         break;
       case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_DEPTH:
         srcImage = rtOutput.m_primaryDepth.image;
@@ -1534,15 +1538,9 @@ namespace {
       case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_OBJECT_PICKING:
         srcImage = rtOutput.m_primaryObjectPicking.image;
         break;
-      case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_GUI: {
-        dxvk::DxvkRenderTargets renderTargets;
-        renderTargets.color[0].view = cDestView;
-        renderTargets.color[0].layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        ctx->bindRenderTargets(renderTargets);
-        ctx->getCommonObjects()->getImgui().render(ctx, { cDestView->imageInfo().extent.width, cDestView->imageInfo().extent.height });
-
-        break;
-      }
+      case REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_GUI:
+        // Rejected before recording (see above).
+        return;
       default:
         assert(!"unexpected remixapi_dxvk_CopyRenderingOutputType value");
         return;
@@ -1684,6 +1682,7 @@ namespace {
       s_dxgiSwapChain = nullptr;
     }
     if (s_d3d11Device) {
+      dxvk::g_dxvkDeviceNative = nullptr;
       while (true) {
         ULONG left = s_d3d11Device->Release();
         if (left == 0) {
@@ -1693,6 +1692,10 @@ namespace {
       s_d3d11Device = nullptr;
     }
     s_hwnd = nullptr;
+
+    // Make sure Sentry doesn't keep the process alive when it should be shutting down.
+    dxvk::sentry::shutdown();
+
     return REMIXAPI_ERROR_CODE_SUCCESS;
   }
 

@@ -311,6 +311,10 @@
 
 #define DEBUG_VIEW_PREV_WORLD_POSITION_AND_TBN 860
 
+#define DEBUG_VIEW_SPARSE_RENDERING_ACTIVE_PIXELS_MASK 901
+#define DEBUG_VIEW_SPARSE_RENDERING_PIXEL_SAMPLING_RATE 903
+#define DEBUG_VIEW_SPARSE_RENDERING_ACTIVE_PIXELS_OUTPUT_SCALE 905
+#define DEBUG_VIEW_SPARSE_RENDERING_ACTIVE_THREADS 910
 // NV-DXVK [VsColor]: per-pixel vertex-shader identity. Colours every primary
 // hit by a session-stable small id assigned to its draw's vertexShaderHash
 // (RtSurface::vsDebugId, flags0 bits 5..15). The [VsColor] log emits one line

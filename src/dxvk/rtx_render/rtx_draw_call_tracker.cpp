@@ -208,7 +208,7 @@ namespace dxvk {
     if (spatialMapIter != m_assetSpatialMaps.end()) {
       // Try exact transform + vertex position hash match first
       ReplacementInstance* exactTransformMatch = nullptr;
-      spatialMapIter->second.forEachAtTransform(key.transform, [&](const ReplacementInstance* candidate) {
+      spatialMapIter->second.forEachAtTransform(key.worldPos, key.transform, [&](const ReplacementInstance* candidate) {
         if (candidate->vertexPositionHash == key.vertexPositionHash && l2Filter(candidate)) {
           exactTransformMatch = const_cast<ReplacementInstance*>(candidate);
           return true;

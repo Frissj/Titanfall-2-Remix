@@ -243,7 +243,7 @@ void preprocessInputsForRR(uint2 pixelCoordinate)
 
   if (cb.combineSpecularAlbedo)
   {
-    bool hasPSR = geometryFlags.performPSTR && geometryFlags.performPSRR;
+    bool hasSecondarySurface = geometryFlags.hasSecondarySurface();
 
     vec4 primaryAttenuation = vec4(r11g11b10ToColor(PrimaryAttenuation[pixelCoordinate]), 1.0);
     vec4 secondaryAttenuation = hasSecondarySurface ? vec4(r11g11b10ToColor(SecondaryAttenuation[pixelCoordinate]), 1.0) : vec4(0,0,0,1);

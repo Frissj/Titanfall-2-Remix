@@ -34,6 +34,7 @@
 #include "rtx/algorithm/integrator.slangh"
 #include "rtx/concept/surface_material/opaque_surface_material_interaction.slangh"
 #include "rtx/pass/nrc/nrc_integrator_utilities.slangh"
+#include "rtx/pass/sparse_rendering/sparse_rendering.slangh"
 #include "rtx/pass/atmosphere/atmosphere_common.slangh"
 
 // Evaluate direct sun lighting for secondary bounces (atmosphere mode) with soft shadows

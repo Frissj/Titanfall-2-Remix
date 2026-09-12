@@ -95,7 +95,6 @@ namespace dxvk {
       Rc<DxvkImageView> exposureView,
       const Resources::Resource& inputBuffer,
       const Resources::Resource& colorBuffer,
-      bool performSRGBConversion,
       bool autoExposureEnabled,
       bool forceFinalizeWithACES);
 
@@ -169,12 +168,6 @@ namespace dxvk {
     enum class ExposureAverageMode : uint32_t {
       Mean = 0,
       Median
-    };
-
-    enum class DitherMode : uint32_t {
-      None = 0,
-      Spatial,
-      SpatialTemporal,
     };
 
     // NV-DXVK [PSDT]: the gamut the transform fits colours into. Only meaningful
@@ -475,14 +468,6 @@ namespace dxvk {
                "Replaces the image with one of the transform's own intermediate values. 0 = Off, 1 = Adaptation, 2 = Budget, 3 = Roles, 4 = Source energy, 5 = Illuminant, 6 = Depth, 7 = Gamut demand, 8 = Pressure, 9 = Glare, 10 = Clipping, 11 = Curve slope.\n"
                "Every view shows a value the transform actually read or produced on that pixel on its way past, rather than recomputing its own version of it. A debug view that re-derives the quantity agrees with the shader right up until the moment something is wrong, which is the only moment it was needed.\n"
                "Roles is the one to look at first: it is the classification the whole architecture rests on, in green (surface), red (source) and blue (sky). Depth is the second: its green channel is how much of the coarse adaptation scales survived the depth and luminance agreement tests, so a frame that is dark there is one pooling on the finest scale alone - which is the way the v0.3 pooling terms fail. Clipping is the third, because it shows what the final gamut fit had to hide.");
-
-    // Dithering settings
-    RTX_OPTION("rtx.tonemap", DitherMode, ditherMode, DitherMode::SpatialTemporal,
-               "Tonemap dither mode selection, dithering allows for reduction of banding artifacts in the final rendered output from quantization using a small amount of monochromatic noise. Impact typically most visible in darker regions with smooth lighting gradients.\n"
-               "Enabling dithering will make the rendered image slightly noisier, though usually dither noise is fairly imperceptible in most cases without looking closely. Generally dithered results will also look better than the alternative of banding artifacts due to increasing perceptual precision of the signal.\n"
-               "Note that temporal dithering may increase perceptual precision further but may also introduce more noticeable noise in the final output in some cases due to the noise pattern changing every frame unlike a purely spatial approach.\n"
-               "Supported enum values are 0 = None (Disabled), 1 = Spatial (Enabled, Spatial dithering only), 2 = SpatialTemporal (Enabled, Spatial and temporal dithering).\n"
-               "Generally enabling dithering is recommended, but disabling it may be useful in some niche cases for improving compression ratios in images or videos at the cost of quality (as noise while it may not be very visible may be more difficult to compress), or for capturing \"raw\" post-tonemapped data from the renderer.");
   };
   
 }

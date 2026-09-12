@@ -344,6 +344,9 @@ namespace dxvk {
     friend class OpacityMicromapManager;
   public:
     OpacityMicromapInstanceData();
+    bool isOmmBuildRequested(uint32_t currentGeneration) const {
+      return ommBuildRequested && ommRegistrationGeneration == currentGeneration;
+    }
     void resetCopiedRequestState() {
       ommRegistrationGeneration = 0;
       ommRetryAfterFrame = 0;

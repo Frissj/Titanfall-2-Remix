@@ -106,7 +106,11 @@ GpuParticle respawn(uint particleIdx, uint spawnCtxIdx, const GpuParticleSystem 
       color += unorm4x8ToFloat4x32(colorBits).zyxw * randomBary[i];
     }
     
-    float2 texcoord = 0.f;
+    // Only fetch emitter UVs when a valid texcoord buffer is bound. For a mesh without UVs,
+    // spawnMeshTexcoordsIdx == BINDING_INDEX_INVALID (0xFFFF); reading geometries[0xFFFF] is an
+    // out-of-range bindless descriptor access and faults the GPU (device loss). Mirrors the
+    // existing guards on the color and prev-position reads above.
+    float2 texcoord = float2(0.0f, 0.0f);
     if (spawnCtx.spawnMeshTexcoordsIdx != BINDING_INDEX_INVALID)
     {
       const uint baseSrcTexcoordOffset = (spawnCtx.spawnMeshTexcoordsOffset + index * spawnCtx.spawnMeshTexcoordsStride) / 4;

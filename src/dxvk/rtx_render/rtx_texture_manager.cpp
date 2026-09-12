@@ -998,6 +998,8 @@ namespace dxvk {
       return;
     }
 
+    tex->m_frameLastUsed = m_device->getCurrentFrameId();
+
     if (!async || RtxOptions::TextureManager::neverDowngradeTextures()) {
       tex->m_canDemote = false;
       tex->requestMips(MAX_MIPS);
@@ -1376,6 +1378,7 @@ namespace dxvk {
     ScopedCpuProfileZone();
 
     const auto curframe = m_device->getCurrentFrameId();
+    const auto numFramesToKeepMaterialTextures = RtxOptions::numFramesToKeepMaterialTextures();
 
     uint32_t sfTextureCount = m_sf.fetchNoisyMipCounts(gpuAccessedMips);
     m_sf.accumulateMipCounts(sfTextureCount, curframe, m_wasTextureBudgetPressure);
@@ -1405,8 +1408,15 @@ namespace dxvk {
     // evict once the scene clears (m_refCount > 0 reset in clear()).
     for (ManagedTexture* tex : checkonlyframes) {
       assert(tex && tex->m_canDemote);
-      const bool keep = (tex->m_frameLastUsed != UINT32_MAX)
-                        && (curframe - tex->m_frameLastUsed <= numFramesToKeepMaterialTextures);
+      // Upstream keeps a texture resident for as long as a live instance
+      // references it (m_refCount, maintained by SceneManager's surface
+      // material retain/release). The age window is kept as a second reason to
+      // hold mips so a texture drawn this frame is never demoted before its
+      // owning instance has registered the retain.
+      const bool referenced = tex->m_refCount > 0;
+      const bool recentlyUsed = (tex->m_frameLastUsed != UINT32_MAX)
+                                && (curframe - tex->m_frameLastUsed <= numFramesToKeepMaterialTextures);
+      const bool keep = referenced || recentlyUsed;
 
       // NV-DXVK [TexDemote] reason=age. THE TRANSITION, NOT THE STATE.
       //
@@ -1415,14 +1425,12 @@ namespace dxvk {
       // texture actually LOSES its mips, because that is the frame an object
       // turns untextured on screen.
       //
-      // WHY THIS SITE MATTERS. The keep window is
-      // numFramesToKeepMaterialTextures, which is just numFramesToKeepBLAS, and
-      // m_frameLastUsed is stamped in exactly one place -- addTexture, on the
-      // draw path. So a texture is demoted purely for not having been DRAWN
-      // recently. Before residency an undrawn object left the scene and took its
-      // demoted texture with it; a held instance stays visible, so the demotion
-      // became visible too. reason= separates this from the budget-driven
-      // demote, which needs an entirely different fix.
+      // WHY THIS SITE MATTERS. m_frameLastUsed is stamped in exactly one place
+      // -- addTexture, on the draw path -- so the age window alone demoted a
+      // texture purely for not having been DRAWN recently, which made held
+      // (resident but undrawn) instances turn untextured. The refcount above now
+      // covers those; this log fires only when neither reason holds. reason=
+      // separates this from the budget-driven demote.
       if (!keep && tex->m_requestedMips.load() > 0) {
         Logger::warn(str::format(
           "[TexDemote] f=", curframe,

@@ -827,7 +827,7 @@ extern "C" {
       // firstly, try the default method first, e.g. DLL is already loaded, 
       // DLL-s are around .exe, or an app has called SetDllDirectory
       {
-        HMODULE dll = LoadLibraryW(remixD3D11DllPath);
+        remixapi_HMODULE dll = LoadLibraryW(remixD3D11DllPath);
         if (dll) {
           remixapi_loader_PROC func = GetProcAddress(dll, "remixapi_InitializeLibrary");
           if (func) {
@@ -843,9 +843,9 @@ extern "C" {
       if (!pfn_InitializeLibrary) {
         // set LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR to search 
         // dependency DLLs in the folder of 'remixD3D11DllPath'
-        HMODULE dll = LoadLibraryExW(remixD3D11DllPath, NULL,
-                                     LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
-                                     LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        remixapi_HMODULE dll = LoadLibraryExW(remixD3D11DllPath, NULL,
+                                     REMIX_WINAPI_LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+                                     REMIX_WINAPI_LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
         if (dll) {
           remixapi_loader_PROC func = GetProcAddress(dll, "remixapi_InitializeLibrary");
           if (func) {
@@ -859,9 +859,9 @@ extern "C" {
 
       // at last, try to SetDllDirectory manually
       if (!pfn_InitializeLibrary) {
-        wchar_t absoluteDllPath[MAX_PATH];
+        wchar_t absoluteDllPath[REMIX_WINAPI_MAX_PATH];
         {
-          DWORD ret = GetFullPathNameW(remixD3D11DllPath, MAX_PATH, absoluteDllPath, NULL);
+          unsigned ret = (unsigned)GetFullPathNameW(remixD3D11DllPath, REMIX_WINAPI_MAX_PATH, absoluteDllPath, NULL);
           if (ret == 0) {
             return REMIXAPI_ERROR_CODE_GET_FULL_PATH_NAME_FAILURE;
           }
@@ -869,7 +869,7 @@ extern "C" {
         wchar_t parentDir[REMIX_WINAPI_MAX_PATH];
         {
           int len = 0;
-          for (int i = 0; i < MAX_PATH; i++) {
+          for (int i = 0; i < REMIX_WINAPI_MAX_PATH; i++) {
             if (absoluteDllPath[i] == '\0') {
               break;
             }
@@ -914,7 +914,7 @@ extern "C" {
           }
         }
 
-        HMODULE dll = LoadLibraryW(absoluteDllPath);
+        remixapi_HMODULE dll = LoadLibraryW(absoluteDllPath);
         if (dll) {
           remixapi_loader_PROC func = GetProcAddress(dll, "remixapi_InitializeLibrary");
           if (func) {

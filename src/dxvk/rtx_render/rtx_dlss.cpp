@@ -339,6 +339,8 @@ namespace dxvk {
     // required for initializing DLSS.
     const NVSDK_NGX_PerfQuality_Value perfQuality = profileToQuality(mActualProfile);
 
+    // DLSSPreset enum values match the NGX preset enum, so a direct cast is valid.
+    // Fall back to the default preset for any unexpected/out-of-range value.
     NVSDK_NGX_DLSS_Hint_Render_Preset dlssPreset;
     switch (preset()) {
     case DLSSPreset::J:

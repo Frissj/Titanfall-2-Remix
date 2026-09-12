@@ -516,7 +516,9 @@ namespace dxvk {
 
     struct ViewModel {
       friend class ImGUI;
-      RTX_OPTION("rtx.viewModel", bool, enable, true, "If true, try to resolve view models (e.g. first-person weapons). World geometry doesn't have shadows / reflections / etc from the view models.");
+      public: static void enableOnChange(DxvkDevice* device);
+      RTX_OPTION_ARGS("rtx.viewModel", bool, enable, true, "If true, try to resolve view models (e.g. first-person weapons). World geometry doesn't have shadows / reflections / etc from the view models.",
+                       args.onChangeCallback = &enableOnChange);
       RTX_OPTION("rtx.viewModel", float, rangeMeters, 1.0f, "[meters] Max distance at which to find a portal for view model virtual instances. If rtx.viewModel.separateRays is true, this is also max length of view model rays.");
       RTX_OPTION("rtx.viewModel", float, scale, 1.0f, "Scale for view models. Minimize to prevent clipping.");
       RTX_OPTION("rtx.viewModel", bool, enableVirtualInstances, true, "If true, virtual instances are created to render the view models behind a portal.");
@@ -3515,7 +3517,8 @@ namespace dxvk {
                args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
     RTX_OPTION_ARGS("rtx", bool, useAnisotropicFiltering, true,
                "A flag to indicate if anisotropic filtering should be used on material textures, otherwise typical trilinear filtering will be used.\n"
-               "This should generally be enabled as anisotropic filtering allows for less blurring on textures at grazing angles than typical trilinear filtering with only usually minor performance impact (depending on the max anisotropy samples).");
+               "This should generally be enabled as anisotropic filtering allows for less blurring on textures at grazing angles than typical trilinear filtering with only usually minor performance impact (depending on the max anisotropy samples).",
+               args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
     // NV-DXVK: bumped from 8 → 16 to match the source D3D11 sampler's
     // aniMax. The original 8 default silently halved aniso vs native,
     // which was visible as severe directional smearing ("vertical
@@ -5071,9 +5074,12 @@ namespace dxvk {
 
     struct Eye {
       RTX_OPTION("rtx.eye", bool, showOptions, false, "Show eye options in the developer menu.");
-      RTX_OPTION("rtx.eye", bool, enable, false, "Enable shader code for eye drawing (eyeball normals, iris blending).");
-      RTX_OPTION("rtx.eye", bool, assumeViewTexgenModeAsEye, true, 
-                 "Used to detect eyes and its vectors, by assuming that a draw call with camera-space texcoord generation and a specific texture transform is an eye draw call.");
+      RTX_OPTION_ARGS("rtx.eye", bool, enable, false,
+                      "Enable shader code for eye drawing (eyeball normals, iris blending).",
+                      args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
+      RTX_OPTION_ARGS("rtx.eye", bool, assumeViewTexgenModeAsEye, true,
+                 "Used to detect eyes and its vectors, by assuming that a draw call with camera-space texcoord generation and a specific texture transform is an eye draw call.",
+                 args.flags = RtxOptionFlags::InvalidatesDrawcallTranslation);
       RTX_OPTION("rtx.eye", float, eyeballSphereOffset, 0.18F,
                  "How much to offset a sphere origin when calculating the eye normals on Whites. "
                  "The larger the value, the more pronounced the ambient shadowing is on an eyeball, to better ground the eyes on a face.");

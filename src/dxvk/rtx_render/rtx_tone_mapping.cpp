@@ -92,8 +92,6 @@ namespace dxvk {
       END_PARAMETER()
     };
 
-    PREWARM_SHADER_PIPELINE(ApplyTonemappingShader);
-
     // NV-DXVK [PSDT]: scene analysis, adaptation pyramid, adaptation state.
     class PsdtAnalysisShader : public ManagedShader
     {
@@ -119,8 +117,6 @@ namespace dxvk {
       END_PARAMETER()
     };
 
-    PREWARM_SHADER_PIPELINE(PsdtAnalysisShader);
-
     class PsdtDownsampleShader : public ManagedShader
     {
       SHADER_SOURCE(PsdtDownsampleShader, VK_SHADER_STAGE_COMPUTE_BIT, psdt_downsample)
@@ -136,8 +132,6 @@ namespace dxvk {
         RW_TEXTURE2D(PSDT_DOWNSAMPLE_ILLUM_OUTPUT)
       END_PARAMETER()
     };
-
-    PREWARM_SHADER_PIPELINE(PsdtDownsampleShader);
 
     class PsdtStateShader : public ManagedShader
     {
@@ -155,7 +149,6 @@ namespace dxvk {
       END_PARAMETER()
     };
 
-    PREWARM_SHADER_PIPELINE(PsdtStateShader);
   }
 
   // NV-DXVK [tonemap operators]: dropdown for rtx.tonemap.tonemapOperator. Uses
@@ -444,6 +437,11 @@ namespace dxvk {
     HistogramShader::getShader();
     ToneCurveShader::getShader();
     ApplyTonemappingShader::getShader();
+    // NV-DXVK [PSDT]: dispatched from the global tonemapper every frame it is
+    // enabled, so warm them alongside the curve shaders.
+    PsdtAnalysisShader::getShader();
+    PsdtDownsampleShader::getShader();
+    PsdtStateShader::getShader();
   }
 
   void DxvkToneMapping::showImguiSettings() {
@@ -1112,7 +1110,6 @@ namespace dxvk {
     Rc<DxvkImageView> exposureView,
     const Resources::Resource& inputBuffer,
     const Resources::Resource& colorBuffer,
-    bool performSRGBConversion,
     bool autoExposureEnabled,
     bool forceFinalizeWithACES) {
 
@@ -1151,14 +1148,6 @@ namespace dxvk {
     pushArgs.contrast = contrast();
     pushArgs.saturation = saturation();
 
-    // Dither args
-    switch (ditherMode()) {
-    case DitherMode::None: pushArgs.ditherMode = ditherModeNone; break;
-    case DitherMode::Spatial: pushArgs.ditherMode = ditherModeSpatialOnly; break;
-    case DitherMode::SpatialTemporal: pushArgs.ditherMode = ditherModeSpatialTemporal; break;
-    }
-    pushArgs.frameIndex = ctx->getDevice()->getCurrentFrameId();
-
     // NV-DXVK [tonemap operators]: select the fork operator (0 = native curve).
     pushArgs.tonemapOperator = static_cast<uint32_t>(tonemapOperator());
 
@@ -1184,7 +1173,6 @@ namespace dxvk {
       }
     }
 
-    ctx->bindResourceView(TONEMAPPING_APPLY_BLUE_NOISE_TEXTURE_INPUT, ctx->getResourceManager().getBlueNoiseTexture(ctx), nullptr);
     ctx->bindResourceView(TONEMAPPING_APPLY_TONEMAPPING_COLOR_INPUT, inputBuffer.view, nullptr);
     ctx->bindResourceView(TONEMAPPING_APPLY_TONEMAPPING_TONE_CURVE_INPUT, m_toneCurve.view, nullptr);
     ctx->bindResourceView(TONEMAPPING_APPLY_TONEMAPPING_EXPOSURE_INPUT, exposureView, nullptr);
@@ -1249,7 +1237,7 @@ namespace dxvk {
       dispatchToneCurve(ctx);
     }
 
-    dispatchApplyToneMapping(ctx, linearSampler, exposureView, inputColorBuffer, rtOutput.m_finalOutput.resource(Resources::AccessType::Write), performSRGBConversion, autoExposureEnabled, forceFinalizeWithACES);
+    dispatchApplyToneMapping(ctx, linearSampler, exposureView, inputColorBuffer, rtOutput.m_finalOutput.resource(Resources::AccessType::Write), autoExposureEnabled, forceFinalizeWithACES);
 
     m_resetState = false;
   }

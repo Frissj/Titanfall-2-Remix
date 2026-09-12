@@ -95,6 +95,11 @@ Sampler3D<float4> ValueNoiseSampler;
 layout(binding = COMPOSITE_SKY_LIGHT_TEXTURE)
 Sampler2D<float3> SkyLight;
 
+layout(binding = COMPOSITE_ACTIVE_PIXEL_MASK_INPUT)
+Texture2D<uint> SparseRenderingActivePixelMask;
+
+layout(binding = COMPOSITE_ACTIVE_LOCAL_PIXEL_COORDS_INPUT)
+Texture2D<uint16_t> ActiveLocalPixelCoords;
 // NV-DXVK [AerialPerspective]: 3D LUT (32^3 RGBA16F) bound as a combined
 // image-sampler so the composite pass can apply per-pixel distance haze.
 layout(binding = COMPOSITE_AERIAL_PERSPECTIVE_LUT_INPUT)

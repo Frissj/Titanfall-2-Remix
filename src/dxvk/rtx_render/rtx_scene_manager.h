@@ -528,10 +528,13 @@ private:
   void runShardedDrawTail(ShardedDrawBatchItem& item);
 
   // Consumes a draw call state and updates the scene state accordingly
-  RtInstance* processDrawCallState(const Rc<DxvkContext>& ctx, 
-                                   const DrawCallState& blasInput, 
-                                   const MaterialData& materialData,
-                                   ReplacementInstance& replacementInstance,
+  // replacementInstance is null for a game draw: only asset replacements and
+  // remix API draws are tracked per draw call (see submitDrawState).
+  // materialData is non-const because the instance manager may patch it.
+  RtInstance* processDrawCallState(const Rc<DxvkContext>& ctx,
+                                   const DrawCallState& blasInput,
+                                   MaterialData& materialData,
+                                   ReplacementInstance* replacementInstance,
                                    RtInstance* existingInstance = nullptr,
                                    const RtxParticleSystemDesc* pParticleSystemDesc = nullptr);
 
@@ -567,10 +570,35 @@ private:
   std::unordered_set<XXH64_hash_t> m_dumpedDrawTextureHashes;  // textures written once per image
   std::mutex                       m_dumpDrawMutex;
 
+  // Retain / release all resources associated with the surface material at the given cache index:
+  // texture ref counts (via RtxTextureManager) and scene-wide feature counts (POM, SSS, thin-opaque).
+  // Called when an instance's bound material changes or the instance is destroyed.
+  void retainSurfaceMaterial(uint32_t matIdx);
+  void releaseSurfaceMaterial(uint32_t matIdx);
+
+  RtTranslucentSurfaceMaterial createTranslucentSurfaceMaterial(const TranslucentMaterialData& translucentMaterialData,
+                                                                uint32_t samplerIndex,
+                                                                bool hasTexcoords);
+  Rc<DxvkSampler> getOrCreateExternalSampler();
+
+  // Propagate the BLAS's current geometry buffer indices/strides/formats to all
+  // currently-linked instances.
+  void syncLinkedInstances(BlasEntry* pBlas);
+
+  // Retire a geometry's bindless buffer slots and forget their indices.
+  void unregisterGeometryBuffers(RaytraceGeometry& geo);
+
+  // Retire every BlasEntry's buffer slots and check that no slot is left owned.
+  // Called from clear() to detect registration/retire imbalances before wiping the table.
+  void verifyAndReleaseBufferCache();
+
   // Called whenever a new BLAS scene object is added to the cache
   ObjectCacheState onSceneObjectAdded(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, BlasEntry* pBlas);
   // Called whenever a BLAS scene object is updated
   ObjectCacheState onSceneObjectUpdated(Rc<DxvkContext> ctx, const DrawCallState& drawCallState, BlasEntry* pBlas);
+  // Called whenever a BLAS scene object is destroyed: retires its buffer slots
+  // and marks every linked instance for GC.
+  void onSceneObjectDestroyed(const BlasEntry& pBlas);
   // Called whenever a new instance has been added to the database
   void onInstanceAdded(RtInstance& instance);
   // Called whenever instance metadata is updated
@@ -717,8 +745,8 @@ private:
   mutable std::mutex m_tf2CloudFogMutex;
   Tf2CloudFogParams m_tf2CloudFog;
 
-  bool m_thinOpaqueMaterialExist = false;
-  bool m_sssMaterialExist = false;
+  uint32_t m_thinOpaqueCount = 0;
+  uint32_t m_sssCount = 0;
 
   bool m_isAntiCullingSupported = true;
 
@@ -732,9 +760,6 @@ private:
 
   // Mesh hash tracking for current frame (hash -> count)
   std::unordered_map<XXH64_hash_t, uint32_t> m_currentFrameMeshHashes;
-
-  // Using std::deque for pointer stability: push_back doesn't invalidate existing pointers
-  std::deque<std::vector<Matrix4>> m_externalGpuInstancingTransforms;
 
   // NV-DXVK [MatChurn]: material/texture identity churn, measured per frame.
   //
@@ -883,6 +908,8 @@ private:
   void invalidateSurfaceMaterialMemo();
 
   void logMaterialChurn();
+
+  DrawCallTracker m_drawCallTracker;
 };
 
 // NV-DXVK [Phase2b]: the CS-side consume pointer — non-null only while

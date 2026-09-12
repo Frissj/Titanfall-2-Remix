@@ -76,7 +76,11 @@ if enable_sentry
         user32_lib,
         synchronization_lib
       ],
-      include_directories : sentry_include_path
+      include_directories : sentry_include_path,
+      # The prebuilt Sentry/Crashpad libs ship without their PDBs, so every
+      # linked object raises LNK4099 ("PDB not found"), which werror turns
+      # into a failed link. Missing third-party debug info is not a defect.
+      link_args : [ '/ignore:4099' ]
     )
   add_project_arguments('/DREMIX_SENTRY_ENABLED=1', language : 'cpp')
 else

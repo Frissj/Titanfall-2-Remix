@@ -1072,7 +1072,7 @@ namespace dxvk {
     // f= aligns with [Coverage] FinalGrid f=N (both are device()->getCurrentFrameId()).
     const bool rcTrainDimsChanged = forceReset;                       // incoming arg: max training dims changed
     const bool rcResetHistory     = m_resetHistory;                   // upstream reset (mode change / camera cut / NrcOptions::resetHistory / SDK)
-    const bool rcZeroTrainRecords = (m_numberOfTrainingRecords == 0); // no trainable paths produced last frame
+    const bool rcZeroTrainRecords = (numberOfTrainingRecords == 0);   // no trainable paths produced last frame
     const bool rcNoSmoothing      = (NrcOptions::numFramesToSmoothOutTrainingDimensions() <= 1);
     const bool rcSkippedFrames    = (frameIdx - m_smoothingResetFrameIdx + 1) > (NrcOptions::numFramesToSmoothOutTrainingDimensions() + kMaxFramesInFlight);
 
@@ -1086,7 +1086,7 @@ namespace dxvk {
         " zeroTrainRecords=", (rcZeroTrainRecords ? 1 : 0),
         " noSmoothing=", (rcNoSmoothing ? 1 : 0),
         " skippedFrames=", (rcSkippedFrames ? 1 : 0),
-        " numTrainRecords=", m_numberOfTrainingRecords,
+        " numTrainRecords=", numberOfTrainingRecords,
         " framesSinceSmoothReset=", (frameIdx - m_smoothingResetFrameIdx)));
     }
 

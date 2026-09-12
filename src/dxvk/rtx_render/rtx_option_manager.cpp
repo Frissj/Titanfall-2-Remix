@@ -252,6 +252,12 @@ namespace dxvk {
       lock.unlock();
 
       // Invoke onChange callbacks after promoting all values
+      for (RtxOptionImpl* rtxOption : dirtyOptionsVector) {
+        if ((rtxOption->getFlags() & RtxOptionFlags::InvalidatesDrawcallTranslation) != 0) {
+          s_drawcallTranslationInvalid = true;
+        }
+      }
+
       // Skipped when invokeCallbacks=false: satellite DLLs (e.g. d3d11.dll) need m_resolvedValue
       // populated for their own option statics but must not run callbacks whose side effects
       // (resource allocation, shader recompilation, derived-state propagation) assume they are

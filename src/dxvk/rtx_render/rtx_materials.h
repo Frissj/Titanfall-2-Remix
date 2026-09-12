@@ -24,6 +24,8 @@
 #include <memory>
 #include <atomic>
 #include <cstring>
+#include <variant>
+
 #include "rtx_texture.h"
 #include "rtx_option.h"
 #include "rtx_cb_types.h"
@@ -619,14 +621,10 @@ struct RtSurface {
   uint32_t objectPickingValue = 0; // NOTE: a value to fill GBUFFER_BINDING_PRIMARY_OBJECT_PICKING_OUTPUT
   uint32_t decalSortOrder = 0; // see: InstanceManager::m_decalSortOrderCounter
 
-  // PointInstancer support - this surface may represent multiple instances, one for each transform in instancesToObject
-  const std::vector<Matrix4>* instancesToObject = nullptr;
-  // NV-DXVK: Lifetime owner for instancesToObject when the pointer references
-  // storage whose lifetime is tied to the frame that created it (e.g. the d3d11
-  // bone-fanout path). Without this, the raw pointer above could dangle once
-  // the originating frame's transform buffer is recycled. Sources with external
-  // ownership leave this null.
-  std::shared_ptr<const std::vector<Matrix4>> instancesToObjectOwner;
+  // PointInstancer support - this surface may represent multiple instances, one for each transform in instancesToObject.
+  // Some API-provided instance transform arrays are not owned by an AssetReplacement and may be destroyed before the
+  // next full scene clear, so surfaces retain shared ownership of the transform data they reference.
+  std::shared_ptr<const std::vector<Matrix4>> instancesToObject;
   // on the GPU, multiple copies of this surface with different transforms will exist.  They will be in a continuous block, starting at surfaceIndexOfFirstInstance.
   size_t surfaceIndexOfFirstInstance = SIZE_MAX;
 };
@@ -800,7 +798,7 @@ struct RtOpaqueSurfaceMaterial {
     m_ignoreAlphaChannel { ignoreAlphaChannel }, m_enableThinFilm { enableThinFilm }, m_alphaIsThinFilmThickness { alphaIsThinFilmThickness },
     m_thinFilmThicknessConstant { thinFilmThicknessConstant }, m_samplerIndex{ samplerIndex }, m_displaceIn{ displaceIn },
     m_displaceOut{ displaceOut }, m_subsurfaceMaterialIndex(subsurfaceMaterialIndex), m_isRaytracedRenderTarget(isRaytracedRenderTarget),
-    m_samplerFeedbackStamp{ samplerFeedbackStamp },
+    m_isHairCard(isHairCard), m_samplerFeedbackStamp{ samplerFeedbackStamp },
     m_alphaModulateEmissive{ alphaModulateEmissive },
     m_emissiveTintFromConstant{ emissiveTintFromConstant },
     m_hasScreenSpaceEmissive{ hasScreenSpaceEmissive },
@@ -985,7 +983,7 @@ struct RtOpaqueSurfaceMaterial {
     //   data[36] = T.x       (packHalf)
     //   data[37] = T.y       (packHalf)
     //   data[38] = screenSpaceEmissiveMaskTextureIndex (uint16)
-    //   data[39] = padding   (0)
+    //   data[39] = isHairCard (uint16, 0/1)
     // Slang reads the matrix + translate as float2 pairs and decodes the
     // mask texture index as a bindless uint16. Default-initialised values
     // for non-screen-space materials produce identity matrix + zero
@@ -997,7 +995,9 @@ struct RtOpaqueSurfaceMaterial {
     writeGPUHelper(data, offset, glm::packHalf1x16(m_screenSpaceEmissiveTranslate.x));
     writeGPUHelper(data, offset, glm::packHalf1x16(m_screenSpaceEmissiveTranslate.y));
     writeGPUHelperExplicit<2>(data, offset, m_screenSpaceEmissiveMaskTextureIndex);
-    writeGPUHelperExplicit<2>(data, offset, uint16_t(0));  // padding to fill 16 bytes
+    // The 16-bit flags word is full in this fork (TF2 flags occupy every bit
+    // after the type bits), so upstream's hair-card flag lives in this word.
+    writeGPUHelperExplicit<2>(data, offset, uint16_t(m_isHairCard ? 1u : 0u));
     assert(offset - oldOffset == kSurfaceMaterialGPUSize);
   }
 
@@ -1065,6 +1065,11 @@ struct RtOpaqueSurfaceMaterial {
   uint32_t getLightmap2TextureIndex() const { return m_lightmap2TextureIndex; }
   uint32_t getDetailTextureIndex() const { return m_detailTextureIndex; }
   uint32_t getCloudMaskTextureIndex() const { return m_cloudMaskTextureIndex; }
+
+  // Albedo ManagedTexture stamp; used to associate textures for streaming priority.
+  uint16_t getSamplerFeedbackStamp() const {
+    return m_samplerFeedbackStamp;
+  }
 
   float getAnisotropy() const {
     return m_anisotropy;

@@ -609,7 +609,8 @@ namespace dxvk {
     checkNeuralRadianceCacheSupport();
     reportCpuSimdSupport();
 
-    GlobalTime::get().init(RtxOptions::timeDeltaBetweenFrames());
+    GlobalTime::get().init(RtxOptions::timeDeltaBetweenFrames() * 0.001f);
+    GlobalTime::get().setAdvanceTime(RtxOptions::advanceTime());
 
     // Initialize atmosphere system
     m_atmosphere = std::make_unique<RtxAtmosphere>(m_device.ptr());
@@ -2252,7 +2253,7 @@ namespace dxvk {
     }));
   }
 
-  VkExtent3D RtxContext::onFrameBegin(const VkExtent3D& upscaledExtent) {
+  VkExtent3D RtxContext::onInjectRtxFrameBegin(const VkExtent3D& upscaledExtent) {
     auto logRenderPassRaytraceModeRayQuery = [=](const char* renderPassName, auto mode) {
       switch (mode) {
       case decltype(mode)::RayQuery:
@@ -2386,6 +2387,49 @@ namespace dxvk {
 
     return downscaledExtent;
   }
+
+  void RtxContext::onInjectRtxFrameEnd(bool rayTracedThisFrame) {
+    if (rayTracedThisFrame) {
+      Resources::RaytracingOutput& rtOutput = getResourceManager().getRaytracingOutput();
+
+      m_common->metaNeuralRadianceCache().onFrameEnd(rtOutput);
+      rtOutput.onFrameEnd();
+    }
+
+    getSceneManager().onFrameEnd(this, rayTracedThisFrame);
+  }
+  
+#ifdef REMIX_DEVELOPMENT
+  bool RtxContext::handleCrashHotkeys() {
+    // Crash Hotkey Feature: When armed via the Development tab checkbox, pressing the crash hotkey
+    // triggers a deliberate null pointer dereference crash. This is useful for testing crash handling,
+    // crash dumps, and crash reporting systems.
+    static bool crashHotkeyStartupLogged = false;
+    if (!crashHotkeyStartupLogged && RtxOptions::enableCrashHotkey()) {
+      const auto crashHotkeyStr = buildKeyBindDescriptorStringForDisplay(RtxOptions::crashHotkey());
+      const auto gpuCrashHotkeyStr = buildKeyBindDescriptorStringForDisplay(RtxOptions::gpuCrashHotkey());
+      Logger::warn(str::format("Crash hotkeys ARMED at startup - ", crashHotkeyStr, " = CPU crash, ", gpuCrashHotkeyStr, " = GPU crash"));
+      crashHotkeyStartupLogged = true;
+    }
+
+    if (RtxOptions::enableCrashHotkey() && ImGUI::checkHotkeyState(RtxOptions::crashHotkey(), false)) {
+      const auto crashHotkeyStr = buildKeyBindDescriptorStringForDisplay(RtxOptions::crashHotkey());
+      Logger::err(str::format("Deliberate crash triggered via crash hotkey (", crashHotkeyStr, ")"));
+      // Trigger a null pointer dereference to cause a crash
+      volatile int* nullPtr = nullptr;
+      *nullPtr = 0xDEAD;
+    }
+
+    if (RtxOptions::enableCrashHotkey() && ImGUI::checkHotkeyState(RtxOptions::gpuCrashHotkey(), false)) {
+      const auto gpuCrashHotkeyStr = buildKeyBindDescriptorStringForDisplay(RtxOptions::gpuCrashHotkey());
+      Logger::warn(str::format("GPU crash triggered via hotkey (", gpuCrashHotkeyStr, ")"));
+      commitGraphicsState<true, false>();
+      getCommonObjects()->metaGpuCrash().dispatch(this);
+      return true;
+    }
+    return false;
+  }
+#endif
 
   void RtxContext::blitPostTonemapScratchToCompositeOut(Rc<DxvkImage> compositeOut) {
     static uint64_t sBlitCount = 0;
@@ -2642,6 +2686,22 @@ namespace dxvk {
     const float gpuIdleTimeMilliseconds = getGpuIdleTimeSinceLastCall();
     perfFrame.gpuIdleMs = gpuIdleTimeMilliseconds;
     markTail(tTail, perfFrame.tail_gpuIdleUs);
+    Metrics::TestTraceSample testTraceSample;
+    testTraceSample.frameId = m_device->getCurrentFrameId();
+    testTraceSample.effectiveDeltaMs = GlobalTime::get().deltaTimeMs();
+    testTraceSample.realWallDeltaMs = GlobalTime::get().realDeltaTimeMs();
+    testTraceSample.gpuIdleTimeMs = gpuIdleTimeMilliseconds;
+    testTraceSample.surfaceCount = getSceneManager().getAccelManager().getSurfaceCount();
+    testTraceSample.shaderCompileInflightCount = getCommonObjects()->pipelineManager().remixShaderCompilationCount();
+    testTraceSample.debugViewMode = m_common->metaDebugView().getDebugViewIndex();
+    testTraceSample.compositeDebugViewMode = m_common->metaDebugView().getCompositeDebugViewIndex();
+    testTraceSample.raytracingEnabled = isRaytracingEnabled;
+    testTraceSample.cameraValid = isCameraValid;
+    testTraceSample.asyncShaderPrewarming = RtxInitializer::asyncShaderPrewarming();
+    testTraceSample.asyncCompilationEnabled = RtxOptions::Shader::enableAsyncCompilation();
+    testTraceSample.asyncCompilationActive = asyncShaderCompilationActive;
+    testTraceSample.surfaceBufferAvailable = getSceneManager().getSurfaceBuffer() != nullptr;
+    Metrics::recordTestTrace(testTraceSample);
 
     bool raytracedThisFrame = false;
 
@@ -2957,7 +3017,7 @@ namespace dxvk {
         //     91 ms of GPU work, and the next split goes inside it.
         markGpuStage();  // gpuDrain — GPU catch-up before onFrameBegin records anything
 
-        VkExtent3D downscaledExtent = onFrameBegin(targetImage->info().extent);
+        VkExtent3D downscaledExtent = onInjectRtxFrameBegin(targetImage->info().extent);
         markStage(tStage, perfFrame.onFrameBeginUs);
         markGpuStage();
 
@@ -8492,28 +8552,21 @@ namespace dxvk {
       toneMapper.dispatch(this,
         getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER),
         autoExposure.getExposureTexture().view,
-        rtOutput, GlobalTime::get().deltaTimeMs(), performSRGBConversion,
-        // NV-DXVK [auto exposure plus]: `autoExposure.enabled()` used to be passed here, where
-        // it lands in `resetHistory`, not `autoExposureEnabled`. With auto exposure on (the
-        // default) that set m_resetState every single frame, so the tone curve pass took its
-        // `needsReset` branch every frame and skipped its own temporal filter - the adaptive
-        // curve was rebuilt from one frame's histogram instead of easing towards it, which
-        // renders flat and unstable. Harmless while the default tonemappingMode kept the global
-        // path dormant; not harmless now that Plus routes through it. `false` is what the
-        // comment above this block already asks for, and the enable flag now reaches the
-        // parameter it was meant for.
-        false, autoExposure.enabled(), forceACES);
+        rtOutput, GlobalTime::get().deltaTimeMs(),
+        // NV-DXVK [auto exposure plus]: resetHistory used to receive autoExposure.enabled(),
+        // which reset the tone curve every frame (flat, unstable adaptive curve). Upstream
+        // now passes a real reset (history reset / camera cut); the enable flag reaches
+        // autoExposureEnabled, and Plus may force the ACES finalize.
+        resetToneMapperHistory, autoExposure.enabled(), forceACES);
     }
     DxvkLocalToneMapping& localTonemapper = m_common->metaLocalToneMapping();
     if (localTonemapper.isActive() && !operatorSelected && !plusForcesGlobal) {
       localTonemapper.dispatch(this,
         getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE),
         autoExposure.getExposureTexture().view,
-        // NV-DXVK [auto exposure plus]: same misplaced argument as the global path above. This
-        // one is inert - DxvkLocalToneMapping accepts `resetHistory` and never reads it - so
-        // straightening it out cannot change how Base looks, which keeps it valid as the
-        // reference to compare Plus against. Corrected so the two call sites read alike.
-        rtOutput, GlobalTime::get().deltaTimeMs(), performSRGBConversion, false, autoExposure.enabled());
+        rtOutput,
+        GlobalTime::get().deltaTimeMs(),
+        autoExposure.enabled());
     }
 
     // NV-DXVK [TonemapProbe]: capture tonemap in->out now, before bloom/post-fx

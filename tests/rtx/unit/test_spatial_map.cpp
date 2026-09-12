@@ -158,7 +158,7 @@ namespace dxvk {
         const int* found = map.getDataAtTransform(extra.transform, 0x1234ull, &queryHash);
         expect(found != nullptr && *found == 999, "override-keyed lookup");
         expect(queryHash == 0, "override-keyed lookup reports no reusable matrix hash");
-        map.erase(propKey);
+        map.erase(propKey, &extra.data);
       }
 
       // A real move to a new transform re-files the entry and retires the old key.
@@ -178,7 +178,7 @@ namespace dxvk {
       // This is what breaks first if the probe-run repair after a deletion is
       // wrong -- an entry stays in the table but stops being findable.
       for (int i = 0; i < kCount; i += 3) {
-        map.erase(keys[i]);
+        map.erase(keys[i], &data[i].data);
       }
       for (int i = 0; i < kCount; ++i) {
         const int* found = map.getDataAtTransform(data[i].transform);
@@ -202,6 +202,36 @@ namespace dxvk {
 
       // m_cells must not have drifted from m_cache through all of that.
       expect(map.debugCellEntryCount() == map.size(), "cell grid agrees with cache");
+
+      // Distinct objects may have identical transforms. The flat cache stores
+      // them under collision-bumped physical keys, but exact-transform lookup
+      // must still visit every logical match and honour early-out.
+      {
+        TestData first(Vector3(2000.f), 1001);
+        TestData second(Vector3(2000.f), 1002);
+        const XXH64_hash_t firstKey = map.insert(first.pos, first.transform, &first.data);
+        map.insert(second.pos, second.transform, &second.data);
+
+        int visits = 0;
+        int found = 0;
+        map.forEachAtTransform(first.pos, first.transform, [&](const int* value) {
+          ++visits;
+          if (*value == second.data) {
+            found = *value;
+            return true;
+          }
+          return false;
+        });
+        expect(found == second.data && visits == 2, "duplicate transform visitor reaches the collision-bumped entry");
+
+        map.erase(firstKey, &first.data);
+        found = 0;
+        map.forEachAtTransform(second.pos, second.transform, [&](const int* value) {
+          found = *value;
+          return true;
+        });
+        expect(found == second.data, "duplicate transform remains reachable after the original key is erased");
+      }
     }
 
 

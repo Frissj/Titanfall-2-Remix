@@ -835,9 +835,8 @@ float oitDepthWeight(float hitT, float tMax)
   return exp(-cb.wboitDepthWeightTuning * z);
 }
 
-// Handles unordered Resolve operations within the resolve loop which do not depend on the typical ordered execution
-// for the resolve logic.
-void resolveVertexUnordered<let RAY_FLAGS : uint>(
+void resolveVertexUnorderedParticles<
+  let RAY_FLAGS : uint>(
   uint8_t resolveMode, Ray ray, uint rayMask,
   PortalSpace2BitsType portalSpace,
   bool useIntersectionBillboards,
@@ -1048,7 +1047,7 @@ void resolveVertexUnordered<let RAY_FLAGS : uint>(
       const OpaqueSurfaceMaterial opaqueSurfaceMaterial = opaqueSurfaceMaterialCreate(memoryPolymorphicSurfaceMaterial);
 
       const OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteraction =
-        opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteraction);
+        opaqueSurfaceMaterialInteractionCreate(opaqueSurfaceMaterial, surface, surfaceInteraction, rayInteraction, rayInteraction.surfaceIndex, 1u);
 
       evaluateOpaqueApproximations(
         resolveMode | resolveModeForceOpacityLightingApprox,
@@ -1716,7 +1715,7 @@ void resolveVertexUnordered<
     }
 #endif
 
-    if (!surfaceIsDecal(surface))
+    if (ENABLE_PARTICLES && !isDecal && handledInteraction)
     {
       // Calculate a blend softening factor
       // Note: This is done to avoid raster particles handled by this seprated logic from clipping in ugly ways against geometry by

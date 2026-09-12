@@ -466,7 +466,10 @@ uint32_t addGeometry(
   record.frontFace = static_cast<uint32_t>(source.frontFace);
   record.boneHash = skinning.boneHash;
   record.modifiedLastBoneHash = modified.lastBoneHash;
-  record.boneMatrices = skinning.pBoneMatrices;
+  // The live TF2 palette is copy-on-write, but a crash record is an immutable
+  // snapshot that can outlive the draw. Deep-copy its current contents rather
+  // than retaining the shared palette or exposing an implicit conversion.
+  record.boneMatrices = skinning.pBoneMatrices.vec();
 
   if (modified.positionBuffer.defined()) {
     record.modifiedPositionAddress = modified.positionBuffer.getDeviceAddress()

@@ -125,11 +125,6 @@ struct DebugViewArgs {
   // NV-DXVK [Coverage PickRegion2]: second independent pick rect (same format).
   vec4 surfaceCoveragePickRegion2;
 
-  NrdArgs nrd;
-  NrcArgs nrcArgs;
-
-  AccumulationArgs accumulationArgs;
-
   // Common Display enable flags
   uint enableInfNanViewFlag;
   // Standard Display enable flags

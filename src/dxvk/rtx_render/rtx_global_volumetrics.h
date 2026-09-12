@@ -207,10 +207,11 @@ namespace dxvk {
                "A flag to enable or disable remapping legacy fog's max distance. Only takes effect when fog remapping in general is enabled.\n"
                "Enables or disables remapping functionality relating to the max distance parameter of legacy fog.\n"
                "This allows dynamic changes to the game's fog max distance to be reflected somewhat in the volumetrics system. Overrides the specified volumetric transmittance measurement distance.");
-    RTX_OPTION("rtx.volumetrics", float, waterFogDensityThreshold, 0.065f,
+    RTX_OPTION_ARGS("rtx.volumetrics", float, waterFogDensityThreshold, 0.065f,
                "The fog density threshold for determining when to use physical volumetrics vs legacy fog.\n"
                "Values below this threshold will use physical volumetrics, while values above will fall back to legacy fog.\n"
-               "This threshold was created specifically for Portal RTX's underwater legacy fog.");
+               "This threshold was created specifically for Portal RTX's underwater legacy fog.",
+               args.minValue = 0.0f);
     RTX_OPTION_ARGS("rtx.volumetrics", float, fogRemapMaxDistanceMinMeters, 1.0f,
                "A value controlling the \"max distance\" legacy fog parameter's minimum remapping bound.\n"
                "Note that fog remapping and fog max distance remapping must be enabled for this setting to have any effect.  In meters.",

@@ -822,6 +822,12 @@ namespace dxvk {
         break;
     }
 
+    if (m_outputStatisticsMode == DebugViewOutputStatisticsMode::Mean) {
+      const VkExtent3D& debugViewExtent = m_debugView.view->imageInfo().extent;
+      outputStatistics *=
+        1.f / static_cast<float>(debugViewExtent.width * debugViewExtent.height);
+    }
+
     // NV-DXVK [Perf.Resolve]: report the reduced mean once per second.
     //
     // The interaction debug views are written by accumulateInDebugViewAdd in

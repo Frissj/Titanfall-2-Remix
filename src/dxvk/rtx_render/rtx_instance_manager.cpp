@@ -23,17 +23,14 @@
 #include <atomic>
 #include <cstring>
 #include <mutex>
-#include <atomic>
 #include <vector>
 #include <unordered_set>
 #include <unordered_map>
 #include <algorithm>
-#include <cstring>
 // NV-DXVK [Perf.Report]: [Perf.SceneObj]'s four estMsPerFrame values feed the
 // dxvk-cs half of the assembled breakdown.
 #include "rtx_perf_report.h"
 #include <chrono>
-#include <assert.h>
 
 #include "rtx_context.h"
 #include "rtx_scene_manager.h"
@@ -58,6 +55,18 @@
 
 namespace dxvk {
 
+  namespace {
+    std::atomic<uint64_t> s_nextRtInstanceCacheIdentity { 1 };
+
+    uint64_t nextRtInstanceCacheIdentity() {
+      return s_nextRtInstanceCacheIdentity.fetch_add(1, std::memory_order_relaxed);
+    }
+
+#ifndef NDEBUG
+    constexpr int kDestroyedRtInstanceMemoryPattern = 0xDD;
+#endif
+  }
+  
   // NV-DXVK [Phase2b]: the sharded-instance-phase context — see the declaration
   // comment in rtx_instance_manager.h and PHASE2B_IMPLEMENTATION_SPEC.md.
   thread_local ShardedInstancePhase t_shardPhase;
@@ -418,6 +427,10 @@ namespace dxvk {
     if (!RtxOptions::enableCulling())
       flags |= VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
 
+    if (drawCall.testCategoryFlags(InstanceCategories::HairCards)) {
+      flags |= VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+    }
+
     // [SpawnGeomDiag] Capture the inputs determineInstanceFlags decided on, per-draw,
     // to diagnose the TF2 BSP backface-cull issue. Logs both the OLD basis
     // (worldToProjection mirror) and the NEW basis (objectToWorld mirror) so
@@ -520,7 +533,7 @@ namespace dxvk {
       flags ^= VK_GEOMETRY_INSTANCE_TRIANGLE_FLIP_FACING_BIT_KHR;
     }
 
-    switch (drawCall.getGeometryData().cullMode) {
+    switch (drawCall.getCullMode()) {
     case VkCullModeFlagBits::VK_CULL_MODE_NONE:
       flags |= VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
       break;
@@ -551,102 +564,10 @@ namespace dxvk {
   RtInstance::RtInstance(const RtInstance& src, uint64_t id, uint32_t instanceVectorId)
     : m_id(id)
     , m_instanceVectorId(instanceVectorId)
-    , m_seenCameraTypes(src.m_seenCameraTypes)
-    , m_materialType(src.m_materialType)
-    , m_albedoOpacityTextureIndex(src.m_albedoOpacityTextureIndex)
-    , m_samplerIndex(src.m_samplerIndex)
-    , m_secondaryOpacityTextureIndex(src.m_secondaryOpacityTextureIndex)
-    , m_secondarySamplerIndex(src.m_secondarySamplerIndex)
-    , m_isAnimated(src.m_isAnimated)
-    , m_opacityMicromapInstanceData(src.m_opacityMicromapInstanceData)
-    , m_surfaceIndex(src.m_surfaceIndex)
-    , m_previousSurfaceIndex(src.m_previousSurfaceIndex)
-    // NV-DXVK: must travel WITH m_previousSurfaceIndex — the two are one
-    // value (base + length of the surface-slot range owned last frame). A copy
-    // that inherited the base but reset the length to its default would map
-    // only the first slot of a PointInstancer range for a frame, which is the
-    // exact bug the range mapping in AccelManager was added to fix.
-    , m_previousSurfaceCount(src.m_previousSurfaceCount)
-    , m_isHidden(src.m_isHidden)
-    , m_isPlayerModel(src.m_isPlayerModel)
-    , m_isWorldSpaceUI(src.m_isWorldSpaceUI)
-    , m_isUnordered(src.m_isUnordered)
-    , m_isObjectToWorldMirrored(src.m_isObjectToWorldMirrored)
-    , m_linkedBlas(src.m_linkedBlas)
-    , m_materialHash(src.m_materialHash)
-    , m_materialDataHash(src.m_materialDataHash)
-    , m_texcoordHash(src.m_texcoordHash)
-    , m_indexHash(src.m_indexHash)
-    , m_vkInstance(src.m_vkInstance)
-    , m_geometryFlags(src.m_geometryFlags)
-    , m_firstBillboard(src.m_firstBillboard)
-    , m_billboardCount(src.m_billboardCount)
-    , m_categoryFlags(src.m_categoryFlags)
-    // NV-DXVK: was missing. m_stablePropId is the SpatialMap dedup key (see its
-    // declaration). Left at 0 the clone falls back to XXH64(matrix), which is
-    // exactly the drift-prone path the stable-prop ID was added to replace, and
-    // clones are sub-view-reprojected content - the case it was added FOR.
-    , m_stablePropId(src.m_stablePropId)
-    // NV-DXVK: was missing. This mirrors the FLIP_FACING bit of m_vkInstance.flags
-    // (set from it at updateInstance), and m_vkInstance IS copied - so leaving
-    // this false made the clone internally inconsistent with its own flags.
-    // Currently only read by diagnostics and the game capturer, so copying it is
-    // low risk and removes the contradiction.
-    , isFrontFaceFlipped(src.isFrontFaceFlipped)
-    // NV-DXVK [FirstBakeHold]: clones inherit the hold. m_linkedBlas is copied
-    // above, so the clone renders from the same (possibly still source-pending)
-    // entry as its source — without the stash it would show the collapsed
-    // first bake for a frame, the exact artifact the hold exists to prevent.
-    // Rc copy just addrefs; the stamp site releases it per-instance once the
-    // bake lands.
-    , m_prevBlasKeepAlive(src.m_prevBlasKeepAlive) {
-    m_opacityMicromapInstanceData.resetCopiedRequestState();
-    // NV-DXVK [2026-07-26]: m_isSubsurface is skipped DELIBERATELY, and not
-    // because it is harmless. It is a genuine divergence: createInstanceCopy
-    // never calls updateInstance, so a clone of a subsurface instance reports
-    // isSubsurface()==false and is routed as non-subsurface.
-    //
-    // Copying it was tried and FROZE THE GAME (hard GPU hang during load).
-    // Reason: isSubsurface() does not merely report. It
-    //   - gates BLAS bucket compatibility          (rtx_accel_manager.cpp:209)
-    //   - ALSO pushes the instance into m_mergedInstances[Tlas::SSS]   (:2184)
-    //   - reserves an EXTRA PointInstancerBatch with tlasType=Tlas::SSS,
-    //     bumping m_pointInstancerSlotsPerType[Tlas::SSS]              (:6193)
-    // That last one shifts every per-type byte offset that
-    // dispatchPointInstancerCulling writes into m_vkInstanceBuffer, so turning
-    // it on for clones corrupts AS instance data unless the SSS slot accounting
-    // and TLAS build are verified to cover them - cf. the null-AS ->
-    // VK_ERROR_DEVICE_LOST warning in rtx_context.cpp:2431.
-    //
-    // So this is a KNOWN latent bug, not an oversight. Fixing it properly means
-    // auditing the SSS region sizing in dispatchPointInstancerCulling FIRST and
-    // confirming Tlas::SSS is actually built when clones land in it. Do not
-    // simply add it to the init list above.
-    //
-    // Members for which state carry over is intentionally skipped
-    /*
-       m_isSubsurface  (see the note above - deliberate, and load-bearing)
-       m_isMarkedForGC
-       m_isUnlinkedForGC
-       m_isInsideFrustum
-       m_frameLastUpdated
-       m_frameCreated
-       m_isCreatedByRenderer
-       m_spatialCacheHash
-       m_spatialOpPendingFrame  (one value with m_spatialCacheHash - see the size note)
-       m_batchRecordKey    (record back-pointer; a clone is in no batch)
-       m_residentKey       (record back-pointer; a clone is in no resident record.
-                            NOT optional and not merely a "first use runs the full
-                            path" convention - see the 952 -> 960 size note for why
-                            an inherited key invalidates a record the clone was
-                            never in, and why that costs an UNBOUNDED skip window
-                            here where the batch equivalent costs one frame.)
-       m_primInstanceOwner
-       buildGeometries
-       buildRanges
-       billboardIndices
-       indexOffsets
-     */
+    , m_cacheIdentity(nextRtInstanceCacheIdentity())
+    , m_surfaceIndex(SURFACE_INDEX_INVALID)
+    , m_previousSurfaceIndex(SURFACE_INDEX_INVALID) {
+    copyInstanceDataFrom(src);
   }
 
 #ifndef NDEBUG
@@ -817,7 +738,14 @@ namespace dxvk {
       // stage of findSimilarInstance ran for, so None/kInvalidFrameIndex is
       // simply true. Inheriting the source's stage would report the clone as
       // having blocked a search it never took part in.
-      static_assert(RtInstanceSize == 968, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
+      //
+      // 968 -> 984 on 2026-09-12, upstream merge: + m_cacheIdentity,
+      // m_emitterMotionState, m_blasDirty, m_billboardGeometryDirty (all
+      // identity / lifecycle, deliberately not synced -- see the skip list in
+      // copyInstanceDataFrom, which the copy ctor now uses); RtSurface lost
+      // isInsideFrustum / ignoreTransparencyLayer, gained isPreservePath, and
+      // instancesToObject + its owner collapsed into one shared_ptr.
+      static_assert(RtInstanceSize == 984, "RtInstance size has changed.  Fix the copy constructor above this message, then update the expected size.");
     };
     CheckRtInstanceSize<sizeof(RtInstance)> _rtInstanceSizeTest;
   }
@@ -865,12 +793,17 @@ namespace dxvk {
     m_opacityMicromapInstanceData.resetCopiedRequestState();
     m_surfaceIndex = src.m_surfaceIndex;
     m_previousSurfaceIndex = src.m_previousSurfaceIndex;
+    // NV-DXVK: must travel WITH m_previousSurfaceIndex — the two are one
+    // value (base + length of the surface-slot range owned last frame). A copy
+    // that inherited the base but reset the length to its default would map
+    // only the first slot of a PointInstancer range for a frame, which is the
+    // exact bug the range mapping in AccelManager was added to fix.
+    m_previousSurfaceCount = src.m_previousSurfaceCount;
     m_isHidden = src.m_isHidden;
     m_isPlayerModel = src.m_isPlayerModel;
     m_isWorldSpaceUI = src.m_isWorldSpaceUI;
     m_isUnordered = src.m_isUnordered;
     m_isObjectToWorldMirrored = src.m_isObjectToWorldMirrored;
-    m_isSubsurface = src.m_isSubsurface;
     m_linkedBlas = src.m_linkedBlas;
     m_materialHash = src.m_materialHash;
     m_materialDataHash = src.m_materialDataHash;
@@ -881,6 +814,40 @@ namespace dxvk {
     m_firstBillboard = src.m_firstBillboard;
     m_billboardCount = src.m_billboardCount;
     m_categoryFlags = src.m_categoryFlags;
+    // NV-DXVK: m_stablePropId is the SpatialMap dedup key (see its declaration).
+    // Left at 0 the clone falls back to XXH64(matrix), which is exactly the
+    // drift-prone path the stable-prop ID was added to replace, and clones are
+    // sub-view-reprojected content - the case it was added FOR.
+    m_stablePropId = src.m_stablePropId;
+    // NV-DXVK: mirrors the FLIP_FACING bit of m_vkInstance.flags (set from it at
+    // updateInstance), and m_vkInstance IS copied - so leaving it behind would
+    // make the clone internally inconsistent with its own flags.
+    isFrontFaceFlipped = src.isFrontFaceFlipped;
+    // NV-DXVK [FirstBakeHold]: clones inherit the hold. m_linkedBlas is copied
+    // above, so the clone renders from the same (possibly still source-pending)
+    // entry as its source — without the stash it would show the collapsed
+    // first bake for a frame, the exact artifact the hold exists to prevent.
+    // Rc copy just addrefs; the stamp site releases it per-instance once the
+    // bake lands.
+    m_prevBlasKeepAlive = src.m_prevBlasKeepAlive;
+
+    // NV-DXVK [2026-07-26]: m_isSubsurface is skipped DELIBERATELY, and not
+    // because it is harmless. It is a genuine divergence: createInstanceCopy
+    // never calls updateInstance, so a clone of a subsurface instance reports
+    // isSubsurface()==false and is routed as non-subsurface.
+    //
+    // Copying it was tried and FROZE THE GAME (hard GPU hang during load).
+    // isSubsurface() does not merely report. It gates BLAS bucket
+    // compatibility, pushes the instance into m_mergedInstances[Tlas::SSS], and
+    // reserves an EXTRA PointInstancerBatch with tlasType=Tlas::SSS, bumping
+    // m_pointInstancerSlotsPerType[Tlas::SSS]. That last one shifts every
+    // per-type byte offset that dispatchPointInstancerCulling writes into
+    // m_vkInstanceBuffer, so turning it on for clones corrupts AS instance data
+    // unless the SSS slot accounting and TLAS build are verified to cover them.
+    //
+    // A KNOWN latent bug, not an oversight. Fixing it properly means auditing
+    // the SSS region sizing in dispatchPointInstancerCulling FIRST and
+    // confirming Tlas::SSS is actually built when clones land in it.
 
     // Intentionally NOT synced (identity / lifecycle / per-build state):
     //   m_id, m_instanceVectorId, m_cacheIdentity, m_isMarkedForGC, m_isUnlinkedForGC,
@@ -889,7 +856,13 @@ namespace dxvk {
     //   OMM request registration state,
     //   m_primInstanceOwner, buildGeometries, buildRanges,
     //   billboardIndices, indexOffsets, m_blasDirty,
-    //   m_billboardGeometryDirty, m_emitterMotionState
+    //   m_billboardGeometryDirty, m_emitterMotionState,
+    //   m_isSubsurface (see above),
+    //   m_spatialOpPendingFrame (one value with m_spatialCacheHash),
+    //   m_batchRecordKey, m_residentKey (record back-pointers; a copy is in no
+    //     batch or resident record, and an inherited key would invalidate a
+    //     record the copy was never in -- see the size notes above),
+    //   m_claimStage/m_claimFrame, m_instStateKey, m_fastDrawBits, cullAabbCache
   }
 
   void RtInstance::updateFromReference(const RtInstance& src, const bool preserveTransforms) {
@@ -1650,7 +1623,8 @@ namespace dxvk {
     // NOTE: VkTransformMatrixKHR is 4x3 matrix, and Matrix4 is 4x4
     const auto t = transpose(surface.objectToWorld);
     memcpy(&m_vkInstance.transform, &t, sizeof(VkTransformMatrixKHR));
-
+    
+    m_blasDirty = true;
     return false; // freshly teleported instances are always treated as still.
   }
 
@@ -1779,6 +1753,18 @@ namespace dxvk {
 
   void RtInstance::markForGarbageCollection() const {
     m_isMarkedForGC = true;
+  }
+
+  void RtInstance::markAsUnlinkedFromBlasEntryForGarbageCollection() const {
+    m_isUnlinkedForGC = true;
+  }
+
+  void RtInstance::markAsInsideFrustum() const {
+    m_isInsideFrustum = true;
+  }
+
+  void RtInstance::markAsOutsideFrustum() const {
+    m_isInsideFrustum = false;
   }
 
 
@@ -1970,6 +1956,7 @@ namespace dxvk {
   }
 
   void InstanceManager::clear() {
+    notifySceneChanged();
     // NV-DXVK [InstClearProbe]: gameplay-only. SceneManager::clear() is the
     // only known external caller and has its own [SceneClearProbe], but
     // 109 instances vanished between f=1176 and f=1178 with no probe
@@ -2017,6 +2004,69 @@ namespace dxvk {
     m_renderableEnum.clear();
     m_viewModelCandidates.clear();
     m_playerModelInstances.clear();
+
+    // Persistent maps contain pointers into m_instances which are now deleted.
+    m_persistentViewModelInstances.clear();
+    m_persistentVirtualViewModelInstances.clear();
+    m_persistentPlayerModelClones.clear();
+  }  
+
+  void InstanceManager::cleanupPersistentMap(
+      std::unordered_map<RtInstance*, RtInstance*>& map,
+      const std::unordered_set<RtInstance*>& activeReferences) {
+    for (auto it = map.begin(); it != map.end(); ) {
+      if (activeReferences.find(it->first) == activeReferences.end()) {
+        // Reference is gone — mark the derived instance for GC.
+        it->second->markForGarbageCollection();
+        it = map.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  void InstanceManager::erasePersistentMapEntries(RtInstance* dying) {
+    auto eraseFromMap = [dying](std::unordered_map<RtInstance*, RtInstance*>& map) {
+      // Fast O(1) check: is the dying instance a key (reference) in the map?
+      auto it = map.find(dying);
+      if (it != map.end()) {
+        // The reference is being GC'd — mark the derived instance for GC
+        // so it doesn't survive with a dangling m_linkedBlas pointer.
+        // (m_isCreatedByRenderer prevents timeout-based GC, so we must mark explicitly.)
+        it->second->markForGarbageCollection();
+        map.erase(it);
+        return;
+      }
+      // Slower O(n) check: is the dying instance a value (derived) in the map?
+      for (it = map.begin(); it != map.end(); ++it) {
+        if (it->second == dying) {
+          map.erase(it);
+          return;
+        }
+      }
+    };
+    eraseFromMap(m_persistentViewModelInstances);
+    eraseFromMap(m_persistentVirtualViewModelInstances);
+    eraseFromMap(m_persistentPlayerModelClones);
+  }
+
+#ifndef NDEBUG
+  void InstanceManager::releaseDestroyedInstanceQuarantine() {
+    while (!m_destroyedInstanceQuarantine.empty()) {
+      ::operator delete(m_destroyedInstanceQuarantine.front());
+      m_destroyedInstanceQuarantine.pop_front();
+    }
+  }
+#endif
+
+  void InstanceManager::destroyInstanceAllocation(RtInstance* instance) {
+#ifndef NDEBUG
+    instance->~RtInstance();
+    std::memset(instance, kDestroyedRtInstanceMemoryPattern, sizeof(RtInstance));
+    m_destroyedInstanceQuarantine.push_back(instance);
+#else
+    delete instance;
+#endif
   }
 
   void InstanceManager::garbageCollection() {
@@ -2861,15 +2911,6 @@ namespace dxvk {
         }
       }
     }
-
-    // Need to release all instances when ViewModel enablement changes
-    // This is a big hammer but it's fine, it's a debugging feature
-    const bool isViewModelEnabled = RtxOptions::ViewModel::enable();
-    if (isViewModelEnabled != m_previousViewModelState) {
-      clear();
-      m_previousViewModelState = isViewModelEnabled;
-    }
-  }
 
     // NV-DXVK [SubViewVsCensus]: per-VS bucket counts across ALL
     // sub-view RtInstances (every instance with IgnoreAntiCulling set
@@ -4843,7 +4884,7 @@ namespace dxvk {
     // that pointer-chases five draw-scoped objects. See DrawScopedState.
     const DrawScopedState drawState = computeDrawScopedState(blas, drawCall, materialData);
 
-    const std::vector<Matrix4>* transforms = drawCall.getTransformData().instancesToObject;
+    const std::vector<Matrix4>* transforms = drawCall.getTransformData().instancesToObject.get();
     if (transforms == nullptr || transforms->empty()) {
       // Not actually a batch — fall back to the ordinary single-instance path so
       // this entry point is safe to call unconditionally.
@@ -5842,7 +5883,7 @@ namespace dxvk {
     BlasEntry& blas, const DrawCallState& drawCall, MaterialData& materialData,
     DrawCallCache* drawCallCache, const std::vector<uint32_t>& placements,
     std::vector<RtInstance*>& out_instances) {
-    const std::vector<Matrix4>* transforms = drawCall.getTransformData().instancesToObject;
+    const std::vector<Matrix4>* transforms = drawCall.getTransformData().instancesToObject.get();
     if (transforms == nullptr || transforms->empty()) {
       return;
     }
@@ -6539,6 +6580,28 @@ namespace dxvk {
       // No existing match - so need to create one
       currentInstance = addInstance(blas);
       psoSplit.noteAdded();
+    } else if (currentInstance->getBlas() != &blas) {
+      // The BlasEntry changed — re-link the instance to the current one.
+      // NV-DXVK [Phase2b]: re-linking mutates both BlasEntries' link sets, which
+      // no worker may do; the ordered tail replays this draw with allowMiss set.
+      if (inShardedInstancePhase() && !t_shardPhase.allowMiss) {
+        t_shardPhase.deferredThisDraw = true;
+        return nullptr;
+      }
+      // NV-DXVK: an instance unlinked for GC has already left its old BlasEntry,
+      // which may be freed, so only a still-linked one is unlinked from it.
+      // Re-linking makes the instance live again, so the unlink mark is cleared.
+      if (!currentInstance->isUnlinkedForGC()) {
+        BlasEntry* oldBlas = currentInstance->getBlas();
+        if (oldBlas != nullptr) {
+          oldBlas->unlinkInstance(currentInstance);
+        }
+      }
+      currentInstance->m_isUnlinkedForGC = false;
+      currentInstance->setBlas(blas);
+      blas.linkInstance(currentInstance);
+      currentInstance->m_blasDirty = true;
+      notifySceneChanged();
     }
 
     psoSplit.markAdd();   // NV-DXVK [Perf.SceneObj]: end of `add`
@@ -8994,7 +9057,7 @@ namespace dxvk {
       if (!event.skippableWhenNoPendingOmmWork) {
         continue;
       }
-      event.onInstanceUpdatedCallback(instance, drawCall, materialData, hasTransformChanged,
+      event.onInstanceUpdatedCallback(instance, drawCall, &materialData, hasTransformChanged,
                                       hasPreviousPositions, isFirstUpdateThisFrame);
     }
   }
@@ -9576,15 +9639,12 @@ namespace dxvk {
     // slot; writeGPUData's PI branch needs BOTH to be set.
     if (split != nullptr) {
       currentInstance.surface.instancesToObject = nullptr;
-      currentInstance.surface.instancesToObjectOwner = nullptr;
       currentInstance.surface.surfaceIndexOfFirstInstance = SIZE_MAX;
-    } else {
+    } else if (currentInstance.surface.instancesToObject != drawCall.getTransformData().instancesToObject) {
+      // shared_ptr: the RtInstance co-owns the transform vector, so it cannot
+      // dangle once the draw-call source releases its reference. Compared first
+      // so a steady-state draw does not pay the refcount round trip.
       currentInstance.surface.instancesToObject = drawCall.getTransformData().instancesToObject;
-      // NV-DXVK: Couple lifetime of the transform vector to this RtInstance so the
-      // raw pointer above cannot dangle once the draw-call source's own ring-buffer
-      // releases its reference. Null for sources with externally-owned storage
-      // (USD replacements, etc.) — that's fine, they already manage lifetime.
-      currentInstance.surface.instancesToObjectOwner = drawCall.getTransformData().instancesToObjectOwner;
     }
 
     // NV-DXVK: flag sub-view (3D-skybox) geometry so WriteGPUData negates its
@@ -9699,10 +9759,8 @@ namespace dxvk {
       currentInstance.m_isHidden = true;
     }
 
-    // Snapshot whether this is a brand-new camera before the call to preserveInstance() at the
-    // bottom (which always re-registers via RtInstance::registerCamera) so the override logic
-    // below sees the "is this the first time we've seen this camera type?" state.
-    const bool isNewCameraSet = !currentInstance.isCameraRegistered(drawCall.cameraType);
+    // Register camera
+    bool isNewCameraSet = currentInstance.registerCamera(drawCall.cameraType, m_device->getCurrentFrameId());
 
     const bool overridePreviousCameraUpdate = isNewCameraSet &&
       (drawCall.cameraType == CameraType::Main ||
@@ -9923,8 +9981,6 @@ namespace dxvk {
               processInstanceBuffers(blas, drawState, currentInstance);
             }
             currentInstance.surface.hasMaterialChanged = false;
-            currentInstance.surface.isInsideFrustum =
-              RtxOptions::AntiCulling::isObjectAntiCullingEnabled() ? currentInstance.m_isInsideFrustum : true;
             currentInstance.surface.objectPickingValue = drawCall.drawCallID;
             // Advance transform history: cur is byte-identical to the incoming
             // matrix, so prev := cur is what move() would have produced, and the
@@ -9973,7 +10029,7 @@ namespace dxvk {
                   s_fastInstOmmSkips.fetch_add(1, std::memory_order_relaxed);
                   continue;
                 }
-                event.onInstanceUpdatedCallback(currentInstance, drawCall, materialData,
+                event.onInstanceUpdatedCallback(currentInstance, drawCall, &materialData,
                                                 /*hasTransformChanged*/ false,
                                                 /*hasPreviousPositions*/ false,
                                                 /*isFirstUpdateThisFrame*/ true);
@@ -10189,10 +10245,9 @@ namespace dxvk {
         // NV-DXVK [perf] sec 4c: PER-FRAME, NEVER SKIPPED. Hoisted out of the
         // guard because their sources change every frame and a skip would freeze
         // them -- drawCallID is a per-frame draw counter (D3D11Rtx::m_drawCallID,
-        // reset each frame) and m_isInsideFrustum tracks the camera. Neither is in
-        // computeSurfStateKey by construction: keying on drawCallID would make the
-        // key differ every frame and the guard would never fire.
-        currentInstance.surface.isInsideFrustum = RtxOptions::AntiCulling::isObjectAntiCullingEnabled() ? currentInstance.m_isInsideFrustum : true;
+        // reset each frame). It is not in computeSurfStateKey by construction:
+        // keying on it would make the key differ every frame and the guard would
+        // never fire.
         currentInstance.surface.objectPickingValue = drawCall.drawCallID;
 
         // Note: Extract spritesheet information from the associated material data as it ends up stored in the Surface
@@ -10451,7 +10506,14 @@ namespace dxvk {
         // already made: kUpdateBVH always produces a previous-position buffer,
         // KBuildBVH always resets it, kUpdateInstance leaves it as-is. This is
         // exactly what processGeometryInfo's bake switch does to the field.
-        bool prevPosDefinedAfterBake = blas.modifiedGeometryData.previousPositionBuffer.defined();
+        //
+        // previousPositionBuffer is only re-pointed at historyBuffer[1] on a
+        // kUpdateBVH frame. On any later frame it still holds that older slice
+        // (a kUpdateInstance frame, or a sibling draw's early-out), so it only
+        // counts when the BlasEntry was updated THIS frame -- otherwise stale
+        // vertices feed motion vectors (upstream fix).
+        bool prevPosDefinedAfterBake = blas.modifiedGeometryData.previousPositionBuffer.defined()
+                                    && blas.frameLastUpdated == m_device->getCurrentFrameId();
         if (inShardedInstancePhase() && t_shardPhase.info->geomResult >= 0) {
           const auto r = static_cast<SceneManager::ObjectCacheState>(t_shardPhase.info->geomResult);
           if (r == SceneManager::ObjectCacheState::kUpdateBVH) {
@@ -10692,11 +10754,6 @@ namespace dxvk {
               " curT=(", float(cT.x), ",", float(cT.y), ",", float(cT.z), ")",
               " prevDelta=", dT));
           }
-        }
-
-        if (hasTransformChanged) {
-          notifySceneChanged();
-          currentInstance.m_blasDirty = true;
         }
 
         currentInstance.surface.textureTransform = drawCall.getTransformData().textureTransform;
@@ -11074,20 +11131,11 @@ namespace dxvk {
 
     uiSplit.mark(4);   // NV-DXVK [Perf.UpdInst]: end of `viewmodel`
 
-    const auto currentInstancesToObject = currentInstance.surface.instancesToObject;
-    const size_t currentInstancesToObjectSize = currentInstancesToObject ? currentInstancesToObject->size() : 0;
-    const uint32_t currentCustomIndexFlags = currentInstance.m_vkInstance.instanceCustomIndex & ~uint32_t(CUSTOM_INDEX_SURFACE_MASK);
-    const bool accelerationStructureKeyChanged =
-      previousCategoryFlags.raw() != currentInstance.m_categoryFlags.raw() ||
-      previousInstanceMask != currentInstance.m_vkInstance.mask ||
-      previousCustomIndexFlags != currentCustomIndexFlags ||
-      previousInstanceShaderBindingTableRecordOffset != currentInstance.m_vkInstance.instanceShaderBindingTableRecordOffset ||
-      previousInstanceFlags != currentInstance.m_vkInstance.flags ||
-      previousUsesUnorderedApproximations != currentInstance.m_isUnordered ||
-      previousIsSubsurface != currentInstance.m_isSubsurface ||
-      previousGeometryFlags != currentInstance.m_geometryFlags ||
-      previousInstancesToObject.get() != currentInstancesToObject.get() ||
-      previousInstancesToObjectSize != currentInstancesToObjectSize;
+    if (RtxOptions::enableSeparateUnorderedApproximations() &&
+        (drawCall.cameraType == CameraType::Main || drawCall.cameraType == CameraType::ViewModel) &&
+        currentInstance.m_isUnordered &&
+        !currentInstance.m_isHidden &&
+        currentInstance.getVkInstance().mask != 0) {
 
       // NV-DXVK [Phase2b]: createBillboards reads MAPPED BUFFER CONTENTS (a
       // positional read — the physical slice a logical buffer resolves to is a
@@ -11455,7 +11503,7 @@ namespace dxvk {
           t_shardPhase.currentOps->evIsFirstUpdateThisFrame = isFirstUpdateThisFrame;
           continue;
         }
-        event.onInstanceUpdatedCallback(currentInstance, drawCall, materialData, hasTransformChanged, hasPreviousPositions, isFirstUpdateThisFrame);
+        event.onInstanceUpdatedCallback(currentInstance, drawCall, &materialData, hasTransformChanged, hasPreviousPositions, isFirstUpdateThisFrame);
       }
     }
 
@@ -11476,6 +11524,69 @@ namespace dxvk {
                    currentInstance.surface.hasMaterialChanged,
                    hasPreviousPositions,
                    currentInstance.surface.isStatic);
+  }
+
+  void InstanceManager::registerViewModelCandidate(RtInstance& instance) {
+    // Lazy-clear stale candidates if onFrameEnd() was skipped last frame (e.g. device loss on alt+tab).
+    const uint32_t currentFrameId = m_device->getCurrentFrameId();
+    if (m_viewModelCandidatesFrameId != currentFrameId) {
+      m_viewModelCandidates.clear();
+      m_viewModelCandidatesFrameId = currentFrameId;
+    }
+    m_viewModelCandidates.push_back(&instance);
+  }
+
+  void InstanceManager::registerPlayerModelInstance(RtInstance& instance) {
+    // Lazy-clear stale instances if onFrameEnd() was skipped last frame (e.g. device loss on alt+tab).
+    const uint32_t currentFrameId = m_device->getCurrentFrameId();
+    if (m_playerModelInstancesFrameId != currentFrameId) {
+      m_playerModelInstances.clear();
+      m_playerModelInstancesFrameId = currentFrameId;
+    }
+    m_playerModelInstances.push_back(&instance);
+  }
+
+  void InstanceManager::preserveInstance(
+      RtInstance& instance,
+      const DrawCallState& drawCall,
+      const MaterialData* materialData,
+      bool hasTransformChanged,
+      bool hasPreviousPositions,
+      bool isFirstUpdateThisFrame,
+      bool fireEvents) {
+    // Camera registration. This is per-instance, so this detects the first time an instance
+    // is drawn with a given camera each frame.
+    const bool isNewCameraTypeThisFrame =
+        instance.registerCamera(drawCall.cameraType, m_device->getCurrentFrameId());
+
+    // Re-register view-model candidates every frame; m_viewModelCandidates is cleared in
+    // onFrameEnd, and createViewModelInstances() iterates the list later in the frame.
+    if (drawCall.cameraType == CameraType::ViewModel && !instance.isHidden() && isNewCameraTypeThisFrame) {
+      registerViewModelCandidate(instance);
+    }
+
+    // Re-register player-model instances every frame. m_playerModelInstances is cleared
+    // in onFrameEnd(), and filterPlayerModelInstances() / createPlayerModelVirtualInstances()
+    // (run from SceneManager later in the frame) iterate this list to mask the geometric
+    // instance and produce billboard intersection primitives + portal-space virtual clones.
+    // Without this re-registration, the preserve path's player-model particles would lose
+    // their billboard mask and never bind their cached OMM.
+    if (instance.m_isPlayerModel && drawCall.cameraType != CameraType::ViewModel) {
+      registerPlayerModelInstance(instance);
+    }
+
+    // Fire onInstanceUpdated so listeners with delayed per-instance work get a chance to run.
+    // The OMM manager's needsToCalculateNumTexelsPerMicroTriangle path is only driven from
+    // this callback, so without this dispatch instances that settle into the preserve path
+    // before their OMM finishes baking would stall the OMM pipeline indefinitely.
+    // hasTransformChanged / hasPreviousPositions default to false because on the preserve path
+    // the RtInstance's transform and vertex buffers are reused as-is from the last dynamic update.
+    if (fireEvents) {
+      for (auto& event : m_eventHandlers) {
+        event.onInstanceUpdatedCallback(instance, drawCall, materialData,
+                                        hasTransformChanged, hasPreviousPositions, isFirstUpdateThisFrame);
+      }
+    }
   }
 
   void InstanceManager::removeInstance(RtInstance* instance) {
@@ -11568,7 +11679,12 @@ namespace dxvk {
       // Existing persistent instance — sync surface/material data from the
       // reference while preserving the corrected transform for change detection.
       viewModelInstance = it->second;
-      viewModelInstance->updateFromReference(reference);
+      // NV-DXVK: take the reference's transforms too, exactly as a fresh copy
+      // would. Every path below that corrects the transform sets both current
+      // and previous explicitly (teleport); the ones that do not (geometry
+      // fallback, perspective correction off) must see the reference's, not
+      // whatever this instance was left with last frame.
+      viewModelInstance->updateFromReference(reference, /* preserveTransforms = */ false);
       notifySceneChanged();
     } else {
       // First time seeing this reference — create a new persistent instance.
@@ -11583,9 +11699,6 @@ namespace dxvk {
     viewModelInstance->setFrameLastUpdated(frameId);
     viewModelInstance->m_vkInstance.mask = OBJECT_MASK_VIEWMODEL;
     viewModelInstance->setCustomIndexBit(CUSTOM_INDEX_IS_VIEW_MODEL, true);
-
-    // View model instances are recreated every frame
-    viewModelInstance->markForGarbageCollection();
 
     // NV-DXVK [zig-zag ROOT FIX]: for the TF2 engine-hook viewmodel the per-draw
     // o2w (reference.getTransform()) was sampled from the camera-manager Main on
@@ -11796,6 +11909,12 @@ namespace dxvk {
                                                  const RayPortalManager& rayPortalManager) {
     ScopedGpuProfileZone(ctx, "ViewModel");
 
+    auto cleanupAllPersistentViewModelInstances = [this]() {
+      for (auto& [ref, inst] : m_persistentViewModelInstances) {
+        inst->markForGarbageCollection();
+      }
+      m_persistentViewModelInstances.clear();
+    };
     const uint32_t fid = m_device->getCurrentFrameId();
     const bool vmEnable = RtxOptions::ViewModel::enable();
     const bool vmCamValid = cameraManager.isCameraValid(CameraType::ViewModel);
@@ -11930,10 +12049,9 @@ namespace dxvk {
       }
     }
 
-    if (!vmEnable)
-      return;
 
-    if (!vmCamValid)
+    if (!vmEnable) {
+      cleanupAllPersistentViewModelInstances();
       return;
     }
 
@@ -12019,6 +12137,7 @@ namespace dxvk {
 
     // Create any valid view model instances from the list of candidates
     std::vector<RtInstance*> viewModelInstances;
+    std::unordered_set<RtInstance*> activeViewModelReferences;
     uint32_t vmSkippedMulticam = 0, vmSkippedNoCam = 0, vmCreated = 0;
     for (auto* candidateInstance : m_viewModelCandidates) {
 

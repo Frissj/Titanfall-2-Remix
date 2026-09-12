@@ -45,10 +45,15 @@ namespace dxvk {
     struct Entry {
       const T* data;
       Vector3 centroid;
+      // Hash requested by the caller before collision bumping. Multiple entries
+      // at one transform share this value even though transformHash is unique.
+      XXH64_hash_t lookupTransformHash;
       XXH64_hash_t transformHash;
-      Entry() : data(nullptr), centroid(0.f), transformHash(0) { }
-      Entry(const T* data, const Vector3& centroid, XXH64_hash_t transformHash) : data(data), centroid(centroid), transformHash(transformHash) { }
-      Entry(const Entry& other) : data(other.data), centroid(other.centroid), transformHash(other.transformHash) { }
+      Entry() : data(nullptr), centroid(0.f), lookupTransformHash(0), transformHash(0) { }
+      Entry(const T* data, const Vector3& centroid, XXH64_hash_t lookupTransformHash, XXH64_hash_t transformHash)
+        : data(data), centroid(centroid), lookupTransformHash(lookupTransformHash), transformHash(transformHash) { }
+      Entry(const Entry& other)
+        : data(other.data), centroid(other.centroid), lookupTransformHash(other.lookupTransformHash), transformHash(other.transformHash) { }
       // Declaring the copy constructor above suppresses the implicit MOVE
       // assignment and deprecates the implicit copy assignment. The flat cache
       // below assigns entries when it back-shifts a probe run and when it
@@ -175,6 +180,24 @@ namespace dxvk {
       if (slot != Cache::kInvalidSlot) {
         return m_cache.valueAt(slot).data;
       }
+      return nullptr;
+    }
+
+    // Visits every entry with this exact transform. The flat cache collision-
+    // bumps duplicate physical keys, so match the retained pre-bump hash inside
+    // the query's spatial cell instead of assuming one key maps to one object.
+    template<typename Visitor>
+    void forEachAtTransform(const Vector3& centroid, const Matrix4& transform, Visitor&& visitor) const {
+      const XXH64_hash_t lookupHash = XXH64(&transform, sizeof(transform), 0);
+      const auto cell = m_cells.find(getCellPos(centroid));
+      if (cell == m_cells.end()) {
+        return;
+      }
+      for (const Entry& entry : cell->second) {
+        if (entry.lookupTransformHash == lookupHash && visitor(entry.data)) {
+          return;
+        }
+      }
     }
 
     // Returns the entry closest to `centroid` that passes the `filter` and is less than `sqrt(maxDistSqr)` units from `centroid`.
@@ -261,13 +284,13 @@ namespace dxvk {
           ledgerBumped = true;
         }
       }
-      const bool success = m_cache.insert(transformHash, Entry(data, centroid, transformHash));
+      const bool success = m_cache.insert(transformHash, Entry(data, centroid, ledgerKey, transformHash));
       if (!success) {
         ONCE(Logger::err("Failed to add entry in SpatialMap::insert()."));
         assert(false);
         return transformHash;
       }
-      m_cells[getCellPos(centroid)].emplace_back(data, centroid, transformHash);
+      m_cells[getCellPos(centroid)].emplace_back(data, centroid, ledgerKey, transformHash);
       ++m_dbgInserts;
       ledgerRecord(ledgerKey, LedgerOp::Inserted, frame, data, /*otherKey*/ 0, ledgerBumped);
       return transformHash;
@@ -340,7 +363,7 @@ namespace dxvk {
         // ledger while the slot is still valid, and it is only ever compared and
         // printed as an address afterwards.
         const T* const owner = m_cache.valueAt(slot).data;
-        eraseFromCell(centroid, actualHash);
+        eraseFromCell(centroid, actualHash, owner);
         m_cache.eraseAt(slot);
         ++m_dbgErases;
         ledgerRecord(actualHash,
@@ -352,7 +375,6 @@ namespace dxvk {
         ONCE(Logger::warn("Specified hash was missing in SpatialMap::erase()."));
         // assert(false);
       }
-      ONCE(Logger::warn("Specified entry was missing in SpatialMap::erase()."));
     }
 
   public:

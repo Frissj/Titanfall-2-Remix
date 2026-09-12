@@ -26,6 +26,7 @@
 // once-per-frame chunk on dxvk-cs.
 #include "rtx_perf_report.h"
 #include <cmath>
+#include <cstring>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -159,6 +160,33 @@ namespace dxvk {
     m_persistBuckets.clear();
     m_persistMembers.clear();
     m_persistValid = false;
+
+    // Invalidate incremental rebuild cache
+    m_cachedBuckets.clear();
+    m_instanceBucketIndex.clear();
+    m_cachedDynamicBlasEntries.clear();
+    resetUniqueDynamicBlasGroups();
+    m_lastProcessedGeneration = UINT64_MAX;
+    m_ommBindPending = false;
+  }
+
+  void AccelManager::resetUniqueDynamicBlasGroups() {
+    for (uint32_t i = 0; i < m_uniqueDynamicBlasCount; ++i) {
+      m_uniqueDynamicBlas[i].blasEntry = nullptr;
+      m_uniqueDynamicBlas[i].instances.clear();
+    }
+    m_uniqueDynamicBlasCount = 0;
+    m_uniqueDynamicBlasIndex.clear();
+  }
+
+  void AccelManager::removeInstanceFromBucketCache(RtInstance* instance) {
+    if (m_instanceBucketIndex.erase(instance) == 0) {
+      return;
+    }
+
+    m_cachedBuckets.clear();
+    m_instanceBucketIndex.clear();
+    m_lastProcessedGeneration = UINT64_MAX;
   }
 
   void AccelManager::garbageCollection() {
@@ -828,6 +856,8 @@ namespace dxvk {
         " idxSize=", std::dec, (ib.buffer() != nullptr ? ib.buffer()->info().size : 0)));
     }
 
+    auto& positionBuffer = blasEntry->modifiedGeometryData.positionBuffer.buffer();
+
     execBarriers.accessBuffer(
       positionBuffer->getSliceHandle(),
       positionBuffer->info().stages,
@@ -906,140 +936,21 @@ namespace dxvk {
     auto& instances = instanceManager.getInstanceTable();
     const uint32_t currentFrame = m_device->getCurrentFrameId();
 
-    // --- Full-skip fast path ---
-    // If no scene changes occurred since the last build, we can reuse all cached
-    // BLAS/TLAS data and skip the expensive per-instance iteration, bucket merging,
-    // and GPU BLAS builds.  Per-surface GPU data (transforms, previous-frame buffer
-    // indices, surface mapping) still needs uploading because fields like
-    // previousPositionBufferIndex and prevObjectToWorld are updated by draw-call
-    // processing every frame without bumping m_sceneGeneration.
-    {
-      const uint64_t currentGeneration = instanceManager.getSceneGeneration();
-      const bool sceneUnchanged = (currentGeneration == m_lastProcessedGeneration);
-
-      if (sceneUnchanged && !m_ommBindPending && !m_reorderedSurfaces.empty()) {
-        m_sceneUnchangedThisFrame = true;
-        // Touch pooled (merged) BLAS
-        for (auto& blas : m_blasPool) {
-          blas->frameLastTouched = currentFrame;
-        }
-        // Touch dynamic BLAS
-        for (auto& dynBlas : m_activeDynamicBlases) {
-          dynBlas->frameLastTouched = currentFrame;
-        }
-        // Reassign surface indices (cleared by InstanceManager::resetSurfaceIndices at frame end)
-        for (uint32_t i = 0; i < m_reorderedSurfaces.size(); ++i) {
-          m_reorderedSurfaces[i]->setSurfaceIndex(i);
-        }
-        // OMM still needs per-frame management
-        if (opacityMicromapManager) {
-          opacityMicromapManager->onFrameStart(ctx);
-          // If OMM options changed, force a full BLAS rebuild
-          if (opacityMicromapManager->consumeNeedsBlasRebuild()) {
-            m_ommBindPending = true;
-            instanceManager.notifySceneChanged();
-          }
-          // Process deferred OMM candidates even when the scene is static
-          opacityMicromapManager->processOmmCandidates(instanceManager, textures);
-        }
-        // Advance the prefix-sum last-frame snapshot so temporal lookups stay current
-        m_reorderedSurfacesPrimitiveIDPrefixSumLastFrame = m_reorderedSurfacesPrimitiveIDPrefixSum;
-        // Upload per-surface GPU data (surface buffer, mapping buffer, prefix sums)
-        uploadSurfaceData(ctx);
-        // Continue building OMMs even when the scene is static — surface data must be
-        // uploaded first since the GPU baking pass reads it.
-        if (opacityMicromapManager && opacityMicromapManager->isActive()) {
-          opacityMicromapManager->buildOpacityMicromaps(ctx, textures, cameraManager.getLastCameraCutFrameId());
-          opacityMicromapManager->onBlasBuild(ctx);
-          opacityMicromapManager->onFinishedBuilding();
-        }
-        // If new OMMs were built this frame, force a full scene rebuild next frame
-        // so tryBindOpacityMicromap runs on all instances and the BLASes pick up the new OMMs.
-        if (opacityMicromapManager && opacityMicromapManager->hasNewlyBuiltOmms()) {
-          m_ommBindPending = true;
-          instanceManager.notifySceneChanged();
-        }
-        return;
-      }
-
-      // Scene has changed — record state and proceed to incremental rebuild
-      m_lastProcessedGeneration = currentGeneration;
-      m_sceneUnchangedThisFrame = false;
-    }
-
-    // --- Per-bucket dirty detection ---
-    // Build a validity set of current instances for removal detection, then scan
-    // each cached bucket.  A bucket is dirty if any of its instances was removed,
-    // had a transform / material / geometry change, or if the BlasEntry was updated
-    // this frame.  Otherwise the bucket is clean and can be fully restored from cache.
-    const bool hasValidBucketCache = !m_cachedBuckets.empty();
-    std::vector<bool> bucketDirty;
-    bool anyBucketDirty = false;
-
-    if (hasValidBucketCache) {
-      // When newly built OMMs need binding, force all buckets dirty so that
-      // tryBindOpacityMicromap runs on every instance's BLAS rebuild.
-      if (m_ommBindPending) {
-        bucketDirty.resize(m_cachedBuckets.size(), true);
-        anyBucketDirty = true;
-        m_ommBindPending = false;
-      } else {
-        std::unordered_set<RtInstance*> currentInstanceSet(instances.begin(), instances.end());
-        bucketDirty.resize(m_cachedBuckets.size(), false);
-
-        for (uint32_t bi = 0; bi < m_cachedBuckets.size(); ++bi) {
-          const auto& cachedBucket = m_cachedBuckets[bi];
-
-          if (cachedBucket.instances.size() != cachedBucket.instanceCacheIdentities.size()) {
-            bucketDirty[bi] = true;
-            anyBucketDirty = true;
-            continue;
-          }
-
-          for (size_t ii = 0; ii < cachedBucket.instances.size(); ++ii) {
-            RtInstance* inst = cachedBucket.instances[ii];
-
-            // Validity check MUST come first: if the cached instance is no longer
-            // in the live set (per-instance GC, or any path that bypasses the
-            // bucket-vector cleanup), the pointer is dangling and must not be
-            // dereferenced. Mark the bucket dirty so it gets rebuilt without
-            // touching the stale entry.
-            if (currentInstanceSet.find(inst) == currentInstanceSet.end()) {
-              bucketDirty[bi] = true;
-              anyBucketDirty = true;
-              break;
-            }
-
-            if (inst->getCacheIdentity() != cachedBucket.instanceCacheIdentities[ii]) {
-              bucketDirty[bi] = true;
-              anyBucketDirty = true;
-              break;
-            }
-
-            const uint32_t customIndexFlags = inst->getVkInstance().instanceCustomIndex & ~uint32_t(CUSTOM_INDEX_SURFACE_MASK);
-            const bool bucketKeyChanged =
-              inst->getVkInstance().mask != cachedBucket.tlasInstance.mask ||
-              inst->getVkInstance().instanceShaderBindingTableRecordOffset != cachedBucket.tlasInstance.instanceShaderBindingTableRecordOffset ||
-              inst->getVkInstance().flags != cachedBucket.tlasInstance.flags ||
-              customIndexFlags != cachedBucket.tlasInstance.instanceCustomIndex ||
-              inst->usesUnorderedApproximations() != cachedBucket.isUnordered ||
-              inst->isSubsurface() != cachedBucket.hasSssInstances;
-
-            if (inst->isBlasDirty() ||
-                inst->getBlas()->frameLastUpdated == currentFrame ||
-                bucketKeyChanged) {
-              bucketDirty[bi] = true;
-              anyBucketDirty = true;
-              break;
-            }
-          }
-        }
-      }
-    } else {
-      // With no cached buckets, every bucket is built from scratch below, so
-      // pending OMM binding invalidation is naturally consumed by the full pass.
-      m_ommBindPending = false;
-    }
+    // NV-DXVK: upstream's scene-generation fast path (skip the whole merge when
+    // InstanceManager::getSceneGeneration() is unchanged) and its per-bucket
+    // incremental cache are deliberately NOT used in this fork. Both are only
+    // correct if every instance mutation calls notifySceneChanged(), and this
+    // fork's instance layer mutates instances on paths upstream does not have
+    // (fastInstanceUpdate, the sharded Phase2b apply, resident/held instances,
+    // fanout splits). A missed bump there would reuse a stale BLAS/TLAS. The
+    // equivalent saving comes from [Perf.MergeP] persistent buckets below, which
+    // validate by content fingerprint instead of by a change counter, plus the
+    // per-BLAS content-hash build skip in createBlasBuffersAndInstances.
+    m_sceneUnchangedThisFrame = false;
+    m_ommBindPending = false;
+    // The GPU crash recorder reuses its last scene snapshot while this value is
+    // unchanged. With no reliable change counter, every frame is a new scene.
+    m_lastProcessedGeneration = m_device->getCurrentFrameId();
 
     // [SpawnGeomDiag.merge] Unconditional entry log so we can confirm the
     // running binary reaches this function. Past runs showed 0 [PI-route]
@@ -1721,6 +1632,12 @@ namespace dxvk {
       if (instance->isHidden()) {
         ++s.hidden;
         logDrop("hidden");
+        continue;
+      }
+
+      // Skip instances that are pending GC — their m_linkedBlas may be dangling
+      // (e.g. persistent renderer-created clones whose source BLAS was freed).
+      if (instance->isMarkedForGC()) {
         continue;
       }
 
@@ -2828,9 +2745,9 @@ namespace dxvk {
             // Expand PI transforms into N CPU-side addBlas entries. We permanently
             // null instancesToObject on this RtInstance so ALL downstream passes
             // (uploadSurfaceData, surface-index mapping) treat each slot as a normal
-            // non-PI surface. The shared_ptr owner still keeps storage alive; the
-            // raw pointer is re-set next frame when the draw is resubmitted.
-            const auto* xformsPtr = rtInstance->surface.instancesToObject;
+            // non-PI surface. The local shared_ptr keeps storage alive for the
+            // loop; the field is re-set next frame when the draw is resubmitted.
+            const auto xformsPtr = rtInstance->surface.instancesToObject;
             rtInstance->surface.instancesToObject = nullptr;
             rtInstance->surface.surfaceIndexOfFirstInstance = SIZE_MAX;
             for (uint32_t i = 0; i < xformsPtr->size(); ++i) {
@@ -2890,45 +2807,7 @@ namespace dxvk {
         VK_ACCESS_SHADER_READ_BIT);
     }
 
-    // --- Restore clean cached buckets and collect surfaces ---
-    // Clean cached buckets: restore surfaces + TLAS instances directly, touch BLAS.
-    // Dirty/new buckets: their surfaces were already added by the main loop via
-    // the bucket pipeline; their TLAS instances will be emitted by createBlasBuffersAndInstances.
-    if (hasValidBucketCache) {
-      for (uint32_t bi = 0; bi < m_cachedBuckets.size(); ++bi) {
-        if (bucketDirty[bi]) {
-          continue; // Dirty bucket — its instances went through the normal pipeline above
-        }
-        auto& cached = m_cachedBuckets[bi];
-
-        // Restore surfaces from this clean bucket
-        const uint32_t surfaceOffset = static_cast<uint32_t>(m_reorderedSurfaces.size());
-        m_reorderedSurfaces.insert(m_reorderedSurfaces.end(),
-                                   cached.surfaces.begin(), cached.surfaces.end());
-        m_reorderedSurfacesFirstIndexOffset.insert(m_reorderedSurfacesFirstIndexOffset.end(),
-                                                   cached.indexOffsets.begin(), cached.indexOffsets.end());
-
-        // Touch the BLAS so GC doesn't collect it
-        cached.assignedBlas->frameLastTouched = currentFrame;
-
-        // Emit TLAS instance with updated surface offset
-        auto tlasInst = cached.tlasInstance;
-        tlasInst.instanceCustomIndex =
-          (tlasInst.instanceCustomIndex & ~uint32_t(CUSTOM_INDEX_SURFACE_MASK)) |
-          (surfaceOffset & uint32_t(CUSTOM_INDEX_SURFACE_MASK));
-
-        if (cached.isUnordered && RtxOptions::enableSeparateUnorderedApproximations()) {
-          m_mergedInstances[Tlas::Unordered].push_back(tlasInst);
-        } else {
-          m_mergedInstances[Tlas::Opaque].push_back(tlasInst);
-          if (cached.hasSssInstances) {
-            m_mergedInstances[Tlas::SSS].push_back(tlasInst);
-          }
-        }
-      }
-    }
-
-    // Collect surfaces from newly-built (dirty) buckets
+    // Collect surfaces from this frame's buckets
     for (const auto& blasBucket : blasBuckets) {
       blasBucket->reorderedSurfacesOffset = static_cast<uint32_t>(m_reorderedSurfaces.size());
 
@@ -3018,8 +2897,15 @@ namespace dxvk {
 
     markMrg(mrg_tail);
     buildBlases(ctx, execBarriers, cameraManager, opacityMicromapManager, instanceManager,
-                textures, instances, blasBuckets, blasToBuild, blasRangesToBuild, totalScratchMemory);
+                textures, instances, blasBuckets, blasToBuild, blasRangesToBuild,
+                instanceTransforms, totalScratchMemory);
     markMrg(mrg_buildBlases);
+
+    // Save baseline counts (before billboards are appended in prepareSceneData),
+    // which truncates back to them so billboard entries never accumulate.
+    for (int t = 0; t < Tlas::Count; ++t) {
+      m_mergedInstancesBaselineCount[t] = static_cast<uint32_t>(m_mergedInstances[t].size());
+    }
 
     // [Perf.Merge] CPU sub-split (us). Gate and throttle are DELIBERATELY
     // identical to [Perf.PrepScene] in rtx_scene_manager.cpp, not offset from
@@ -3263,6 +3149,7 @@ namespace dxvk {
         uint32_t primitiveOffset;
         uint32_t firstVertex;
       };
+
       XXH64_hash_t newTopologyHash = kEmptyHash;
       for (uint32_t geometryIndex = 0; geometryIndex < bucket->geometries.size(); ++geometryIndex) {
         const BlasEntry* blasEntry = bucket->originalInstances[geometryIndex]->getBlas();
@@ -3272,7 +3159,11 @@ namespace dxvk {
           bucket->ranges[geometryIndex].primitiveOffset,
           bucket->ranges[geometryIndex].firstVertex,
         };
-        newTopologyHash = hashStructByMemory<TopologyHashData, false>(topologyHashData);
+        newTopologyHash = hashStructByMemory<TopologyHashData,
+            &TopologyHashData::previousHash,
+            &TopologyHashData::indexHash,
+            &TopologyHashData::primitiveOffset,
+            &TopologyHashData::firstVertex>(topologyHashData);
       }
 
       // Must ensure that if we are updating an existing blas, rather than rebuilding, the blas is compatible with our new build info
@@ -3345,8 +3236,10 @@ namespace dxvk {
         }
       }
 
-      copyAccelerationStructureBuildGeometryInfo(buildInfo, selectedBlas->buildInfo);
-      selectedBlas->primitiveCounts = bucket->primitiveCounts;
+      const bool canSkipBuild = (buildInfo.mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR) &&
+                                 (selectedBlas->contentHash == newContentHash) &&
+                                 (newContentHash != kEmptyHash);
+      selectedBlas->contentHash = newContentHash;
 
       if (!canSkipBuild) {
         // Use the selected BLAS for the build
@@ -3630,6 +3523,16 @@ namespace dxvk {
       sink = std::chrono::duration_cast<std::chrono::microseconds>(now - tAcc).count();
       tAcc = now;
     };
+
+    // Truncate merged instances back to the baseline (removing any billboard
+    // instances that were appended in a previous frame's prepareSceneData call).
+    // This is necessary so that billboard entries are not accumulated
+    // across frames; fresh billboards are appended below.
+    for (int t = 0; t < Tlas::Count; ++t) {
+      if (m_mergedInstances[t].size() > m_mergedInstancesBaselineCount[t]) {
+        m_mergedInstances[t].resize(m_mergedInstancesBaselineCount[t]);
+      }
+    }
 
     bool haveInstances = false;
     for (const auto& instances : m_mergedInstances) {
@@ -4702,7 +4605,7 @@ namespace dxvk {
         c.x0         = b.debugFirstXform[0];
         c.y0         = b.debugFirstXform[1];
         c.z0         = b.debugFirstXform[2];
-        c.xformPtr   = static_cast<const void*>(b.transforms);
+        c.xformPtr   = static_cast<const void*>(b.transforms.get());
         c.lastFrame  = curFrame;
 
         if (b.debugBlasRef != nullptr) {
@@ -9191,6 +9094,12 @@ namespace dxvk {
         }
       }
 
+      m_gpuCrashRecorder.recordBlasBuilds(
+        m_device->getCurrentFrameId(),
+        blasToBuild,
+        blasRangesToBuild,
+        m_transformBuffer != nullptr ? m_transformBuffer->getDeviceAddress() : 0,
+        instanceTransforms);
       ctx->vkCmdBuildAccelerationStructuresKHR(blasToBuild.size(), blasToBuild.data(), blasRangesToBuild.data());
 
       execBarriers.accessBuffer(
@@ -10029,7 +9938,7 @@ namespace dxvk {
       if (first) {
         const uint32_t primCount = blasEntry->buildRanges.empty() ? 0u
           : blasEntry->buildRanges[0].primitiveCount;
-        const auto* xforms = rtInstance->surface.instancesToObject;
+        const auto* xforms = rtInstance->surface.instancesToObject.get();
         const uint32_t instCount = (xforms != nullptr)
           ? static_cast<uint32_t>(xforms->size()) : 0u;
         Logger::info(str::format(

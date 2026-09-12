@@ -50,6 +50,8 @@ struct RtLight;
 class GraphInstance;
 struct RtxVSConstants;
 struct RtxPSConstants;
+struct DrawCallState;
+struct AssetReplacement;
 struct ReplacementInstance;
 
 struct ShaderProgramInfo {
@@ -981,12 +983,10 @@ struct DrawCallTransforms {
   // ISGN componentType=uint on TEXCOORD0). Set in d3d11_rtx.cpp at
   // SubmitDraw time from D3D11CommonShader::GetInputSemanticComponentType.
   RtSurface::TexcoordEncoding texcoordEncoding = RtSurface::TexcoordEncoding::Float;
-  const std::vector<Matrix4>* instancesToObject = nullptr;
-  // NV-DXVK: Optional lifetime owner for instancesToObject. When set, keeps the
-  // backing storage alive as long as this DrawCallState / the RtInstance it feeds
-  // exists. Sources whose storage has external lifetime (e.g. USD replacements)
-  // can leave this null and only fill instancesToObject.
-  std::shared_ptr<const std::vector<Matrix4>> instancesToObjectOwner;
+  // Shared ownership (upstream): some sources (d3d11 bone fanout, API-provided
+  // instance arrays) are not owned by an AssetReplacement and may be recycled
+  // before the next full scene clear, so the draw keeps its transforms alive.
+  std::shared_ptr<const std::vector<Matrix4>> instancesToObject;
 
   // NV-DXVK [fanout split]: true when instancesToObject holds one transform per
   // GAME-submitted prop of a bone-instanced fanout batch (d3d11_rtx path 10),
@@ -1706,6 +1706,12 @@ private:
 
   CategoryFlags categories = 0;
 
+  // Overridden geometry (replaced or external) and states
+  struct {
+    const RasterGeometry* geometryData = nullptr; // TBD: use a shared ptr?
+    VkCullModeFlags cullMode = VK_CULL_MODE_FLAG_BITS_MAX_ENUM;
+  } overrides;
+
   // NV-DXVK [SkyProbe.cubeRender] Snapshot taken at the d3d11 frontend when
   // a sky-classified draw is detected. The frontend reads c_cameraRelativeToClip
   // (slot+offset via FindCBField) plus the full cb2 byte contents at the moment
@@ -1909,6 +1915,11 @@ struct BlasEntry {
 
   const std::unordered_set<RtInstance*>& getLinkedInstances() const { return m_linkedInstances; }
 
+  InstanceMap& getSpatialMap() { return m_spatialMap; }
+  const InstanceMap& getSpatialMap() const { return m_spatialMap; }
+
+  void rebuildSpatialMap();
+
   void printDebugInfo(const char* name = "") const {
 #ifdef REMIX_DEVELOPMENT
     Logger::warn(str::format(
@@ -1948,6 +1959,7 @@ private:
   // ordering doesn't matter for any current consumer (size / empty are the
   // only read operations on this container).
   std::unordered_set<RtInstance*> m_linkedInstances;
+  InstanceMap m_spatialMap;
   std::unordered_map<XXH64_hash_t, LegacyMaterialData> m_materials;
 };
 

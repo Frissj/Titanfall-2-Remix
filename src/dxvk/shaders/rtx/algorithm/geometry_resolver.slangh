@@ -153,6 +153,38 @@
 #define REMIX_GBSTOP 0
 #endif
 
+#ifndef GBUFFER_FEATURE_DLSSRR
+#define GBUFFER_FEATURE_DLSSRR 1
+#endif
+
+#ifndef GBUFFER_FEATURE_OBJECT_PICKING
+#define GBUFFER_FEATURE_OBJECT_PICKING 1
+#endif
+
+#ifndef GBUFFER_FEATURE_RAYTRACED_RENDER_TARGET
+#define GBUFFER_FEATURE_RAYTRACED_RENDER_TARGET 1
+#endif
+
+#ifndef GBUFFER_FEATURE_STOCHASTIC_ALPHA
+#define GBUFFER_FEATURE_STOCHASTIC_ALPHA 1
+#endif
+
+#ifndef GBUFFER_FEATURE_PSR_REPLACEMENT
+#define GBUFFER_FEATURE_PSR_REPLACEMENT 1
+#endif
+
+#ifndef GBUFFER_FEATURE_INLINE_PSR_SAMPLING
+#define GBUFFER_FEATURE_INLINE_PSR_SAMPLING 1
+#endif
+
+#ifndef GBUFFER_FEATURE_DEBUG_VIEW
+#define GBUFFER_FEATURE_DEBUG_VIEW 0
+#endif
+
+#ifndef GBUFFER_FEATURE_INLINE_UNORDERED_DECALS
+#define GBUFFER_FEATURE_INLINE_UNORDERED_DECALS false
+#endif
+
 // Geometry Resolver Helper Constants
 
 static const uint8_t psrTypeReflection = uint8_t(0);
@@ -343,6 +375,7 @@ void geometryResolverOutputSurface<
   {
     linearViewZ = (linearViewZ < 0.0f) ? -200000.0f : 200000.0f;
   }
+  float primaryDepth = 0.0f;
 
   if (PRIMARY_SURFACE)
   {
@@ -685,6 +718,13 @@ void geometryResolverOutputSurfaceDebugView<
      accumulateInDebugViewAnd(pixelCoordinate, isValid);
      break;
    }
+  }
+
+  // Primary-material debug views are factored into a separate helper because the unordered-decals
+  // pass re-invokes it after blending updates the GBuffer; calling it here covers the initial write.
+  if (PRIMARY_SURFACE)
+  {
+    geometryResolverOutputPrimaryMaterialDebugView(pixelCoordinate, polymorphicSurfaceMaterialInteraction);
   }
 #endif // REMIX_ENABLE_GBUFFER_DEBUG_VIEWS
 }
@@ -2032,21 +2072,12 @@ void geometryResolverVertex(
     radianceAttenuation, emissiveRadiance,
     numUnorderedInteractions, surfaceIndex);
 
-  bool ignoreTransparencyLayer = false;
-  if (surfaceIndex >= 0)
-  {
-    const Surface surface = surfaces[uint(surfaceIndex)];
-    ignoreTransparencyLayer = surface.ignoreTransparencyLayer;
-  }
-
-  vec3 particleEmissive = emissiveRadiance;
-
 #if REMIX_ENABLE_GBUFFER_DEBUG_VIEWS
-  if (cb.debugView == DEBUG_VIEW_PRIMARY_DECAL_ALBEDO)
+  if (GBUFFER_FEATURE_DEBUG_VIEW && cb.debugView == DEBUG_VIEW_PRIMARY_DECAL_ALBEDO)
   {
     MemoryDecalMaterialInteraction memory;
-    memory.packed = decalMemory;
-    memory.emissiveRadiance = decalEmissiveRadiance;
+    memory.packed = decalMemory; 
+    memory.emissiveRadiance = f16vec3(decalEmissiveRadiance);
     DecalMaterialInteraction decalMaterialInteraction = decalMaterialInteractionUnpack(memory);
     storeInDebugView(geometryResolverState.pixelCoordinate, decalMaterialInteraction.albedo);
   }
@@ -2104,8 +2135,8 @@ void geometryResolverVertex(
     surface, surfaceInteraction,
     polymorphicSurfaceMaterialInteraction,
     radianceAttenuation, emissiveRadiance,
-    decalMemory, decalEmissiveRadiance,
-    float16_t(cb.screenSpacePixelSpreadHalfAngle),
+    decalMemory, decalEmissiveRadiance, 
+    cb.screenSpacePixelSpreadHalfAngle,
     isStochasticAlphaBlend, firstRayPortal,
     geometryResolverState.pomOpaqueSurfaceEncountered,
     isRaytracedRenderTarget,
@@ -2379,7 +2410,7 @@ void geometryResolverVertex(
 
     geometryResolverState.radiance += skyRadiance * vec3(geometryResolverState.attenuation);
     
-    updateNrcOnGBufferMiss(geometryResolverState.pixelCoordinate, cb.nrcArgs);
+    updateNrcOnGBufferMiss(geometryResolverState.pixelCoordinate);
 
     // Note: Always write to primary surface for initial misses,
     // it always will be the selected integrated surface in this case as well.
@@ -2434,7 +2465,6 @@ void geometryResolverVertex(
   //   return;
   // }
   
-  // Construct RNG
 
   // Construct RNG
   RNG randomState = createRNG(geometryResolverState.pixelCoordinate, cb.frameIdx);
@@ -2951,7 +2981,7 @@ void geometryPSRResolverVertex(
 
   // Note: Add to the number of unordered interactions in the debug view based on the number of unordered interactions in resolving.
 #if REMIX_ENABLE_GBUFFER_DEBUG_VIEWS
-  if (cb.debugView == DEBUG_VIEW_PRIMARY_UNORDERED_INTERACTIONS || cb.debugView == DEBUG_VIEW_PRIMARY_RAY_AND_UNORDERED_INTERACTIONS)
+  if (GBUFFER_FEATURE_DEBUG_VIEW && (cb.debugView == DEBUG_VIEW_PRIMARY_UNORDERED_INTERACTIONS || cb.debugView == DEBUG_VIEW_PRIMARY_RAY_AND_UNORDERED_INTERACTIONS))
   {
     accumulateInDebugViewAdd(geometryPSRResolverState.pixelCoordinate, numUnorderedInteractions);
   }
@@ -3471,7 +3501,7 @@ void geometryPSRResolver(inout GeometryPSRResolverState psrResolverState) {
   // Add to the number of primary ray bounces in the debug view based on the number of PSR iterations
 
 #if REMIX_ENABLE_GBUFFER_DEBUG_VIEWS
-  if (cb.debugView == DEBUG_VIEW_PRIMARY_RAY_BOUNCES)
+  if (GBUFFER_FEATURE_DEBUG_VIEW && cb.debugView == DEBUG_VIEW_PRIMARY_RAY_BOUNCES)
   {
     accumulateInDebugViewAdd(psrResolverState.pixelCoordinate, psrResolverState.bounceIteration);
   }
@@ -3536,12 +3566,12 @@ void geometryResolver(ivec2 pixelCoordinate) {
         geometryResolverVertex,
         cb.primaryRayMaxInteractions, geometryResolverState,
         geometryResolverState.segmentHitDistance,
-        DEBUG_VIEW_PRIMARY_RAY_INTERACTIONS, DEBUG_VIEW_PRIMARY_RAY_AND_UNORDERED_INTERACTIONS, true);
+        DEBUG_VIEW_PRIMARY_RAY_INTERACTIONS, DEBUG_VIEW_PRIMARY_RAY_AND_UNORDERED_INTERACTIONS, GBUFFER_FEATURE_DEBUG_VIEW);
     }
 #endif
 
 #if REMIX_ENABLE_GBUFFER_DEBUG_VIEWS
-    if (cb.debugView == DEBUG_VIEW_PRIMARY_RAY_BOUNCES)
+    if (GBUFFER_FEATURE_DEBUG_VIEW && cb.debugView == DEBUG_VIEW_PRIMARY_RAY_BOUNCES)
     {
       accumulateInDebugViewAdd(geometryResolverState.pixelCoordinate, 1);
     }

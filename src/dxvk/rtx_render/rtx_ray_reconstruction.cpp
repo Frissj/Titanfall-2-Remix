@@ -82,6 +82,7 @@ namespace dxvk {
     };
   }
 
+  // Combo box shared with dxvk_imgui.cpp
   extern RemixGui::ComboWithKey<DxvkRayReconstruction::RayReconstructionPreset> rayReconstructionPresetCombo;
 
   DxvkRayReconstruction::DxvkRayReconstruction(DxvkDevice* device)
@@ -364,7 +365,6 @@ namespace dxvk {
       RemixGui::Checkbox("DLSS-RR Demodulate Roughness", &demodulateRoughnessObject());
       RemixGui::DragFloat("DLSS-RR Roughness Sensitivity", &upscalerRoughnessDemodulationOffsetObject(), 0.01f, 0.0f, 2.0f, "%.3f");
       RemixGui::DragFloat("DLSS-RR Roughness Multiplier", &upscalerRoughnessDemodulationMultiplierObject(), 0.01f, 0.0f, 20.0f, "%.3f");
-      RemixGui::Checkbox("Composite Volumetric Light", &compositeVolumetricLightObject());      
       rayReconstructionPresetCombo.getKey(&presetObject());
 
       if (RemixGui::CollapsingHeader("Disocclusion Mask")) {
@@ -431,6 +431,8 @@ namespace dxvk {
 
     if (m_rayReconstructionContext) {
 
+      // RayReconstructionPreset enum values match the NGX preset enum, so a direct cast is valid.
+      // Fall back to the default preset for any unexpected/out-of-range value.
       NVSDK_NGX_RayReconstruction_Hint_Render_Preset dlssdModel;
       switch (preset()) {
       case RayReconstructionPreset::D:

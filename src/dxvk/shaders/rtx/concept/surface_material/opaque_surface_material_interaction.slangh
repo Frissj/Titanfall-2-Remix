@@ -699,13 +699,13 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
 #if REMIX_ENABLE_PERF_LADDERS
   if (cb.perfMaterialStopAfter != 0)
   {
-    opaqueSurfaceMaterialInteraction.albedo = f16vec3(0.0h);
-    opaqueSurfaceMaterialInteraction.opacity = float16_t(1.0h);
-    opaqueSurfaceMaterialInteraction.emissiveRadiance = f16vec3(0.0h);
-    opaqueSurfaceMaterialInteraction.shadingNormal = surfaceInteraction.interpolatedNormal;
-    opaqueSurfaceMaterialInteraction.baseReflectivity = f16vec3(0.0h);
-    opaqueSurfaceMaterialInteraction.isotropicRoughness = float16_t(1.0h);
-    opaqueSurfaceMaterialInteraction.anisotropicRoughness = f16vec2(1.0h, 1.0h);
+    opaqueSurfaceMaterialInteraction.albedo = vec3(0.0f);
+    opaqueSurfaceMaterialInteraction.opacity = 1.0f;
+    opaqueSurfaceMaterialInteraction.emissiveRadiance = vec3(0.0f);
+    opaqueSurfaceMaterialInteraction.shadingNormal = surfaceInteraction.geometryNormal;
+    opaqueSurfaceMaterialInteraction.baseReflectivity = vec3(0.0f);
+    opaqueSurfaceMaterialInteraction.isotropicRoughness = 1.0f;
+    opaqueSurfaceMaterialInteraction.anisotropicRoughness = vec2(1.0f, 1.0f);
   }
 #endif
 
@@ -746,6 +746,8 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     (cb.perfSkipThinFilm == 0) &&
 #endif
     ((opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_USE_THIN_FILM_LAYER) != 0);
+  const bool isHairCardMaterial = opaqueSurfaceMaterial.isHairCard != 0;
+  const float materialLodBias = isHairCardMaterial ? cb.hairCardMipBias : 0.0f;
 
   opaqueSurfaceMaterialInteraction.flags |= thinFilmEnabled ? OPAQUE_SURFACE_MATERIAL_INTERACTION_FLAG_USE_THIN_FILM_LAYER : 0;
 
@@ -795,8 +797,8 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // decides continueResolving, so rtx.perfSkipMaterialTextures must NOT suppress
   // it - otherwise the probe changes how many resolve iterations run and stops
   // measuring texture cost. Every other read below is suppressible.
-  const bool albedoOpacityLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.albedoOpacityTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, albedoOpacitySample, 0.0, true);
-  bool normalLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.normalTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, normalSample);
+  const bool albedoOpacityLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.albedoOpacityTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, albedoOpacitySample, materialLodBias, true);
+  bool normalLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.normalTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, normalSample, materialLodBias);
 
   bool secondNormalLoaded = false;
   if (cb.opaqueMaterialArgs.layeredWaterNormalEnable && surface.isAnimatedWater)
@@ -815,9 +817,9 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     surfaceInteraction.textureCoordinates = savedCoordinates;
   }
 
-  const bool tangentLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.tangentTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, tangentSample);
-  const bool roughnessLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.roughnessTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, roughnessSample);
-  const bool metallicLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.metallicTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, metallicSample);
+  const bool tangentLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.tangentTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, tangentSample, materialLodBias);
+  const bool roughnessLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.roughnessTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, roughnessSample, materialLodBias);
+  const bool metallicLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.metallicTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, metallicSample, materialLodBias);
 
   // NV-DXVK [Perf.MatLadder] rung 1: POM plus the main material texture reads
   // have run; nothing has been decoded or composited. rtx.perfSkipMaterialTextures
@@ -917,7 +919,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
     if (emissiveColorLoaded
         && opaqueSurfaceMaterial.screenSpaceEmissiveMaskTextureIndex != BINDING_INDEX_INVALID)
     {
-      f16vec4 maskSample;
+      vec4 maskSample;
       const bool maskLoaded = surfaceMaterialInteractionTextureReadHelper(
         opaqueSurfaceMaterial.screenSpaceEmissiveMaskTextureIndex,
         opaqueSurfaceMaterial.samplerIndex,
@@ -931,7 +933,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   }
   else
   {
-    emissiveColorLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.emissiveColorTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, emissiveColorSample);
+    emissiveColorLoaded = surfaceMaterialInteractionTextureReadHelper(opaqueSurfaceMaterial.emissiveColorTextureIndex, opaqueSurfaceMaterial.samplerIndex, surfaceInteraction, emissiveColorSample, materialLodBias);
   }
   
   // NV-DXVK: TF2 aux textures.
@@ -952,17 +954,17 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // a future refinement could compute a lightmap-specific Jacobian.
   SurfaceInteraction lightmapSurfaceInteraction = surfaceInteraction;
   lightmapSurfaceInteraction.textureCoordinates = surfaceInteraction.lightmapTextureCoordinates;
-  f16vec4 lightmapSample;
+  vec4 lightmapSample;
   const bool lightmapLoaded = surfaceMaterialInteractionTextureReadHelper(
     opaqueSurfaceMaterial.lightmapTextureIndex,
     opaqueSurfaceMaterial.samplerIndex,
     lightmapSurfaceInteraction, lightmapSample);
-  f16vec4 lightmap2Sample;
+  vec4 lightmap2Sample;
   const bool lightmap2Loaded = surfaceMaterialInteractionTextureReadHelper(
     opaqueSurfaceMaterial.lightmap2TextureIndex,
     opaqueSurfaceMaterial.samplerIndex,
     lightmapSurfaceInteraction, lightmap2Sample);
-  f16vec4 detailSample;
+  vec4 detailSample;
   const bool detailLoaded = surfaceMaterialInteractionTextureReadHelper(
     opaqueSurfaceMaterial.detailTextureIndex,
     opaqueSurfaceMaterial.samplerIndex,
@@ -999,7 +1001,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   const bool emissiveSampleIsSrgb = emissiveColorLoaded
     && (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_EMISSIVE_IS_SRGB) != 0;
 
-  f16vec3 emissiveColor;
+  vec3 emissiveColor;
 
   if (emissiveColorLoaded)
   {
@@ -1058,7 +1060,7 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // `color *= cavity.r`) and any other material whose PS RDEF names a
   // cavityTexture / aoTexture / ambientOcclusionTexture. No-op when the
   // texture index is invalid.
-  f16vec4 ambientOcclusionSample;
+  vec4 ambientOcclusionSample;
   const bool ambientOcclusionLoaded = surfaceMaterialInteractionTextureReadHelper(
     opaqueSurfaceMaterial.ambientOcclusionTextureIndex,
     opaqueSurfaceMaterial.samplerIndex,
@@ -1944,9 +1946,9 @@ OpaqueSurfaceMaterialInteraction opaqueSurfaceMaterialInteractionCreate(
   // base reflectivity path mirrors the same bypass.
   const bool isPremultSource =
     (opaqueSurfaceMaterial.flags & OPAQUE_SURFACE_MATERIAL_FLAG_ALBEDO_IS_PREMULTIPLIED) != 0u;
-  opaqueSurfaceMaterialInteraction.albedo = surface.isMatte ? f16vec3(0)
+  opaqueSurfaceMaterialInteraction.albedo = surface.isMatte ? vec3(0)
     : (isPremultSource ? albedo : albedoToAdjustedAlbedo(albedo, metallic, opacity));
-  opaqueSurfaceMaterialInteraction.baseReflectivity = surface.isMatte ? f16vec3(0)
+  opaqueSurfaceMaterialInteraction.baseReflectivity = surface.isMatte ? vec3(0)
     : (isPremultSource ? mix(materialBaseReflectivityDielectric, albedo, metallic)
                        : calcBaseReflectivity(albedo, metallic, opacity));
    

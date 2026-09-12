@@ -126,6 +126,7 @@ namespace dxvk {
     // the latched Main. Reset on agreement. Once it exceeds kCutStreakThreshold
     // the classifier accepts a re-latch (assumed camera cut).
     uint32_t m_disagreeStreak = 0;
+    uint32_t m_lastCameraViewHistoryInvalidationFrameId = -1;
     fast_unordered_cache<DecomposeProjectionParams> m_decompositionCache;
 
     DecomposeProjectionParams getOrDecomposeProjection(const Matrix4& viewToProjection);

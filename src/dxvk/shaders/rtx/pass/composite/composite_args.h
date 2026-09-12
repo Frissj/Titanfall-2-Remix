@@ -104,9 +104,9 @@ struct CompositeArgs {
   float skyBrightness;
 
   float alphaBlendSurfacePackMult; // for packing/unpacking hitT into Float16 in AlphaBlendSurface
-  float pad1;
-  float pad2;
-  float pad3;
+  float postFilterThreshold;
+  uint writeRayReconstructionHitDistance;
+  uint timeSinceStartMS;
 
   // NV-DXVK [AerialPerspective]: atmosphere args + sky mode plumbed into
   // composite so the final radiance output gets distance-based haze.

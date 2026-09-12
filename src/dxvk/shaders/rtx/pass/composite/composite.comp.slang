@@ -645,23 +645,13 @@ vec4 compositeResult(
   // Note: The primary hit accumulated radiance value is not affected by the throughput (rather takes attenuation into account
   // while accumulating already), so it can be added in here without issue.
   radianceOutput += remodulatedTotalPrimaryRadiance * volumeAttenuation;
+
   // Note: Shared radiance should always be pre-attenuated so no need to factor that in here - it contains multiple layers of signal so each contribution must be attenuated inline.
   radianceOutput += sharedRadiance;
 
   // Add sky radiance
-  if (primaryMiss)
-  {
-    if (cb.domeLightArgs.active)
-    {
-      radianceOutput += cb.domeLightArgs.radiance * sampleDomeLightTexture(SkyLight, primaryRayDirections.worldDirection, cb.domeLightArgs.worldToLightTransform) * volumeAttenuation;
-    }
-    else
-    {
-      vec2 screenUV = cameraPixelCoordinateToScreenUV(cb.camera, thread_id);
-      radianceOutput += cb.skyBrightness * SkyLight.SampleLevel(screenUV, 0) * volumeAttenuation;
-    }
-  }
-  
+  applySkyContribution(pixelCoordinate, primaryRayDirections, primaryMiss, radianceScale, volumeAttenuation, radianceOutput);
+
   // NV-DXVK [AerialPerspective]: apply atmospheric haze BEFORE fog. This
   // catches the FULL aggregated radiance (direct + indirect + bounce +
   // sky), not just the gbuffer's primary emissive contribution. Skipped
@@ -675,9 +665,6 @@ vec4 compositeResult(
       && cb.atmosphereArgs.aerialPerspectiveStrength > 0.0f
       && !primaryMiss
       && viewDistance > 0.0f) {
-    // Recompute view direction from screen UV. cameraPixelCoordinateToScreenUV
-    // and the inverse projection give us a normalised world-space dir.
-    vec2 screenUV = cameraPixelCoordinateToScreenUV(cb.camera, thread_id);
     vec3 viewDirWS = primaryRayDirections.worldDirection;
 
     // Convert worldDistance to LUT params and sample.
@@ -717,12 +704,6 @@ vec4 compositeResult(
     radianceOutput = radianceOutput * trgb + inscatter;
   }
 
-  vec3 attenuatedOutput = radianceOutput;
-  if (!volumeArgs.enable)
-  {
-    // Todo: Using view distance is a bit of a hack here, the primary emissive contribution will not be fully weighted correctly
-    // as emissive hits will be over-attenuated.
-    const vec4 fogColor = calculateFog(viewDistance);
 
   // Apply fog 
   applyFog(viewDistance, radianceScale, radianceOutput);
@@ -772,7 +753,7 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 localIndex : SV_GroupTh
 
   vec4 finalOutput = compositeResult(pixelCoordinate, pixelIsActive, geometryFlags, primaryLinearViewZ, primaryMiss);
 
-  finalOutput = accumulate(thread_id.xy, finalOutput, cb.accumulationArgs, true, AccumulatedFinalOutput);
+  finalOutput = accumulate(pixelCoordinate, finalOutput, cb.accumulationArgs, true, AccumulatedFinalOutput);
 
   // NV-DXVK [SkyMissMagentaProbe]: paint primary-miss pixels bright
   // magenta when the diagnostic option is on. Placed AFTER accumulate
@@ -786,7 +767,7 @@ void main(uint2 threadIndex : SV_DispatchThreadID, uint2 localIndex : SV_GroupTh
     finalOutput = vec4(1.0, 0.0, 1.0, finalOutput.w);
   }
 
-  imageStore(FinalOutput, thread_id.xy, finalOutput);
+  FinalOutput[pixelCoordinate] = finalOutput;
 
   // Note: we only debug output for active pixels
   postCompositeDebugView(pixelCoordinate, geometryFlags, pixelIsActive);

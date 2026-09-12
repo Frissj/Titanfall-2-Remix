@@ -683,14 +683,9 @@ struct SurfaceInteraction : MinimalSurfaceInteraction
   vec2 vguiSecondaryQuadPosGradY = 0..xx;
   vec2 textureGradientX = 0..xx;
   vec2 textureGradientY = 0..xx;
-  // Note: All normal, tangent and bitangent vectors are in world space.
-  // TODO this could just be a `quaternion interpolatedTBN`
-  f16vec3 interpolatedNormal = 0.h;
-  f16vec3 interpolatedTangent = 0.h;
-  f16vec3 interpolatedBitangent = 0.h;
-  f16vec3 rawTangent = 0.h;
-  f16vec3 rawBitangent = 0.h;
-  f16vec4 vertexColor = 0.h;
+  vec3 rawTangent = 0.f;
+  vec3 rawBitangent = 0.f;
+  vec4 vertexColor = 0.0f;
   float triangleArea = 0.f;
   // NV-DXVK: debug — gradient-pipeline path code, written by
   // computeAnisotropicEllipseAxes. Used by the material code to

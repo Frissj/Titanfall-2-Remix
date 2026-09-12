@@ -119,12 +119,15 @@ struct OpaqueSurfaceMaterial
   // EMISSIVE is set in `flags`. The 2x2 matrix + translate transform a
   // SV_Position-derived (screen) UV into the emissive texture's atlas UV;
   // mask texture (if valid) is sampled at mesh UV and multiplied in.
-  // Storage: 6 packed-half floats + 1 uint16 + 1 uint16 padding = 16 bytes.
+  // Storage: 6 packed-half floats + 1 uint16 + 1 uint16 hair-card word = 16 bytes.
   f16vec2 screenSpaceEmissiveMatRow0;
   f16vec2 screenSpaceEmissiveMatRow1;
   f16vec2 screenSpaceEmissiveTranslate;
   uint16_t screenSpaceEmissiveMaskTextureIndex;
-  uint16_t screenSpaceEmissivePadding;
+  // Dedicated hair-card state. The 16-bit flags word is full in this fork,
+  // so upstream's hair-card bit uses the trailing word without changing the
+  // 80-byte ABI.
+  uint16_t isHairCard;
 
   // Todo: Legacy blend state info here in the future (Actually this should go on a Legacy Material, or some sort of non-PBR Legacy Surface)
 

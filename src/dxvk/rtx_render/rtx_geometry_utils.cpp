@@ -1201,16 +1201,6 @@ namespace dxvk {
     return true;
   }
 
-  // CPU path only writes uint16 indices; meshes needing uint32 output (vertexCount >= 64K) use the compute shader.
-  template<typename SrcType>
-  static void dispatchGenTriListCpu(const Rc<DxvkContext>& ctx, const GenTriListArgs& cb, const DxvkBufferSlice& dstSlice, uint16_t* dst, const RasterBuffer* srcBuffer) {
-    const SrcType* src = (cb.useIndexBuffer != 0) ? reinterpret_cast<SrcType*>(srcBuffer->mapPtr()) : nullptr;
-    for (uint32_t idx = 0; idx < cb.primCount; idx++) {
-      generateIndices(idx, dst, src, cb);
-    }
-    ctx->writeToBuffer(dstSlice.buffer(), 0, cb.primCount * 3 * sizeof(uint16_t), dst);
-  }
-
   void RtxGeometryUtils::dispatchGenTriList(const Rc<DxvkContext>& ctx, const GenTriListArgs& cb, const DxvkBufferSlice& dstSlice, const RasterBuffer* srcBuffer) const {
     ScopedGpuProfileZone(ctx, "generateTriangleList");
     const uint32_t kNumTrianglesToProcessOnCPU = 512;

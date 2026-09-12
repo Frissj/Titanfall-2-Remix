@@ -26,8 +26,6 @@
 
 #include "rtx_option.h"
 #include "rtx_resources.h"
-#include <random>
-#include <atomic>
 
 namespace nrc {
   struct ContextSettings;

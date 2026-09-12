@@ -769,6 +769,7 @@ namespace dxvk
       return false;
     }
 
+    m_isFreeCameraEnabled = enableFreeCamera();
     // [NaNGuard] RtCamera::update is the SINGLE entry point that mutates
     // m_context.{worldToView,viewToProjection}. Every downstream consumer
     // (getVolumeShaderConstants → SetupByAngles + MvpToPlanes,

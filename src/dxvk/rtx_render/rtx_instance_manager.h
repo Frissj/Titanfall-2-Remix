@@ -221,6 +221,9 @@ public:
   uint32_t getFrameAge() const { return m_frameLastUpdated - m_frameCreated; }
   // Signal this object should be collected on the next GC pass
   void markForGarbageCollection() const;
+  void markAsUnlinkedFromBlasEntryForGarbageCollection() const;
+  void markAsInsideFrustum() const;
+  void markAsOutsideFrustum() const;
   // Returns true if a new camera type was registered
   bool registerCamera(CameraType::Enum cameraType, uint32_t frameIndex);
   bool isCameraRegistered(CameraType::Enum cameraType) const;
@@ -353,6 +356,7 @@ uint32_t getFirstBillboardIndex() const { return m_firstBillboard; }
   void clearBillboardGeometryDirty() { m_billboardGeometryDirty = false; }
 
   bool isMarkedForGC() const { return m_isMarkedForGC; }
+  bool isUnlinkedForGC() const { return m_isUnlinkedForGC; }
 
   PrimInstanceOwner& getPrimInstanceOwner() { return m_primInstanceOwner; }
   // Const overload: the match-eligibility predicate shared by findSimilarInstance's
@@ -373,6 +377,7 @@ private:
     }
     return surface.objectToWorld;
   }
+  void copyInstanceDataFrom(const RtInstance& src);
   // NV-DXVK [perf] handoff v5 sec 4b(a): objectToWorldChanged lets a caller that
   // has already proven surface.objectToWorld is byte-identical skip the
   // transpose + 48-byte memcpy into m_vkInstance.transform. move()/moveAgain()
@@ -395,6 +400,12 @@ private:
 
   mutable uint32_t m_frameLastUpdated = kInvalidFrameIndex;
   mutable uint32_t m_frameCreated = kInvalidFrameIndex;
+
+  // NV-DXVK: instance-level GC/anti-culling lifecycle. Upstream moved anti-culling
+  // to draw calls (DrawCallTracker); this fork still culls, holds and reaps at
+  // the RtInstance level, so it keeps these flags.
+  mutable bool m_isUnlinkedForGC = false;
+  mutable bool m_isInsideFrustum = true;
 
   // NV-DXVK [Perf.PushInst] PHASE 2: which fanout batch record, if any, is
   // currently holding a raw pointer to this instance. 0 means none.
@@ -462,6 +473,10 @@ private:
   mutable ClaimStage m_claimStage = ClaimStage::None;
   mutable uint32_t m_claimFrame = kInvalidFrameIndex;
 
+  // Particle-emitter spawn-discontinuity guard state, lazily allocated (null for non-emitter instances).
+  // Persistent lifecycle state, intentionally not synced in copyInstanceDataFrom.
+  mutable std::unique_ptr<EmitterMotionState> m_emitterMotionState;
+
   Flags<CameraType::Enum> m_seenCameraTypes;  // Camera types with which the instance has been originally rendered with
 
   MaterialDataType m_materialType = MaterialDataType::Invalid;
@@ -477,11 +492,16 @@ private:
   // Stored in instance object to avoid indirection of looking it up for an instance
   OpacityMicromapInstanceData m_opacityMicromapInstanceData;
 
-  uint32_t m_surfaceIndex;        // Material surface index for reordered surfaces by AccelManager
-  uint32_t m_previousSurfaceIndex;
   // Consecutive slots owned last frame; 1 for everything except PointInstancer
   // instances, which own instanceCount. See setPreviousSurfaceCount.
   uint32_t m_previousSurfaceCount = 1;
+
+  // Extra instance meta data needed for Opacity Micromap Manager, generally describes if animated spritesheets are in use
+// on a given instance (though the applicability to OMMs are only relevant for Opaque and Ray Portal materials currently
+// where cutout opacity can be animated, translucent materials do not have any relation right now to OMMs).
+  bool m_isAnimated = false;
+
+  mutable bool m_isMarkedForGC = false;
 
   bool m_isHidden = false;
   bool m_isPlayerModel = false;
@@ -530,6 +550,8 @@ private:
 
   CategoryFlags m_categoryFlags;
 
+  // Key this instance is filed under in its BlasEntry's SpatialMap.
+  XXH64_hash_t m_spatialCacheHash = kEmptyHash;
 
   // NV-DXVK [Phase2b]: frame id of the last DEFERRED spatial-map op recorded for
   // this instance (sharded instance phase only). Lets onTransformChanged detect
@@ -1157,6 +1179,7 @@ private:
   // called out of any hold scope except allocator/logging, so it cannot deadlock
   // with the probe mutexes on the same paths.
   std::mutex m_shardEscapeMutex;
+  uint64_t m_sceneGeneration = 0;
   std::vector<RtInstance*> m_viewModelCandidates;
   uint32_t m_viewModelCandidatesFrameId = kInvalidFrameIndex;
   std::vector<RtInstance*> m_playerModelInstances;
@@ -1319,6 +1342,13 @@ private:
     const CameraManager& cameraManager, const RayPortalManager& rayPortalManager,
     BlasEntry& blas, const DrawCallState& drawCall, MaterialData& materialData, RtInstance* existingInstance,
     DrawCallCache* drawCallCache, const FanoutSplit* split, const DrawScopedState& drawState);
+
+  void registerViewModelCandidate(RtInstance& instance);
+
+  // Adds an instance to the per-frame player-model worklist consumed by
+  // filterPlayerModelInstances() / createPlayerModelVirtualInstances().
+  // Mirrors registerViewModelCandidate's lazy-clear pattern.
+  void registerPlayerModelInstance(RtInstance& instance);
 
   RtInstance* addInstance(BlasEntry& blas);
   // Binds currentInstance.surface to blas's buffers. blas is still passed
