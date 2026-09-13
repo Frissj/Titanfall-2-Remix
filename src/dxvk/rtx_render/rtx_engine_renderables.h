@@ -143,7 +143,34 @@ namespace dxvk {
   private:
     // Resolves the registry base and validates the header. Returns 0 when the
     // symbol is unresolved or the structure fails its plausibility checks.
-    uintptr_t registryBase(uint32_t& capacityOut) const;
+    // resolveNsOut: time spent in EngineSymbols::resolve alone (see Cost).
+    // Non-const: the readable() probes are cached per resolved address.
+    uintptr_t registryBase(uint32_t& capacityOut, uint64_t& resolveNsOut);
+
+    // The address and word count the readable() probes last passed for; 0 =
+    // nothing proven. See registryBase for why this may be reused.
+    uintptr_t m_probedBase  = 0;
+    uint32_t  m_probedWords = 0u;
+
+    // NV-DXVK [perf] 2026-09-12: WHERE update() SPENDS ITS TIME. Replacing the
+    // per-frame unordered_set with a reused vector did not move [Perf.GcInst]
+    // enum= (1164-1244 us before, 1156-1711 us after), so allocation was not the
+    // cost. Summed over the log window, printed as per-frame averages. If the
+    // phases sum far below enum=, the time is outside update() entirely.
+    struct Cost {
+      uint64_t resolveNs = 0ull;   // EngineSymbols::resolve, the three-link chain
+      uint64_t probeNs   = 0ull;   // header check + the readable() probes
+      uint64_t walkNs    = 0ull;   // bitmask walk + note()
+      uint64_t closeNs   = 0ull;   // endFrame(): sort + dedupe, both lists
+      uint64_t totalNs   = 0ull;   // whole update() on the read path
+      uint64_t maxNs     = 0ull;   // worst single update() in the window
+      uint32_t frames    = 0u;
+      // Full readable() probe passes this window. 1 after a (re)resolve, 0 in
+      // steady state; climbing every window = the registry address or size is
+      // moving and the cache never hits.
+      uint32_t probes    = 0u;
+    };
+    Cost m_cost;
 
     VisibilitySource         m_visible { "client.RenderableRegistry" };
     ExistenceSourcePromotion m_promotion;

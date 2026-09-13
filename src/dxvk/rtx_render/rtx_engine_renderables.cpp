@@ -21,6 +21,8 @@
 */
 #include "rtx_engine_renderables.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 
@@ -72,18 +74,43 @@ namespace dxvk {
     }
   }
 
-  uintptr_t RenderableEnum::registryBase(uint32_t& capacityOut) const {
+  uintptr_t RenderableEnum::registryBase(uint32_t& capacityOut, uint64_t& resolveNsOut) {
     capacityOut = 0u;
 
+    const auto tResolve = std::chrono::steady_clock::now();
     const uintptr_t base = EngineSymbols::resolve(tf2sym::kRenderableRegistry);
-    if (base == 0)
+    resolveNsOut = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - tResolve).count());
+    if (base == 0) {
+      // Unresolved, or client.dll went away: whatever comes back next is a new
+      // mapping and must be probed from scratch.
+      m_probedBase  = 0;
+      m_probedWords = 0u;
       return 0;   // unresolved; the resolver has already logged it once
+    }
+
+    // NV-DXVK [perf] 2026-09-12: THE PROBES ARE PAID ONCE PER MAPPING, NOT PER
+    // FRAME. cost{} billed the three readable() calls at probe=1699-1807 us of
+    // total=1813-1923 us per frame: VirtualQuery is not a cheap call on an
+    // image section, and the walk it guards costs 42 us. What the probes prove
+    // cannot change between frames while the address does not: the registry
+    // is a static object inside client.dll's image (the resolver finds it
+    // through a lea), so its page protection is the module mapping's, and the
+    // mapping's lifetime is exactly what resolve() re-checks every frame -- it
+    // returns 0 on unload and a new address on a new generation, and either
+    // one drops this cache. A changed nWords re-probes the spans it sizes.
+    const bool known = (base == m_probedBase);
 
     // Header first. If this is not readable, the address is not what we think
     // it is and every offset below would be a guess on top of a guess.
-    if (!EngineSymbols::readable(reinterpret_cast<const void*>(base + kOffNWords),
-                                sizeof(uint32_t)))
-      return 0;
+    if (!known) {
+      m_probedBase  = 0;
+      m_probedWords = 0u;
+      m_cost.probes += 1u;
+      if (!EngineSymbols::readable(reinterpret_cast<const void*>(base + kOffNWords),
+                                  sizeof(uint32_t)))
+        return 0;
+    }
 
     const uint32_t nWords = *reinterpret_cast<const uint32_t*>(base + kOffNWords);
     if (nWords == 0u || nWords > kMaxWords)
@@ -92,12 +119,21 @@ namespace dxvk {
     const uint32_t capacity = nWords * 64u;
 
     // Both spans probed before either is walked.
-    if (!EngineSymbols::readable(reinterpret_cast<const void*>(base + kOffAllocMask),
-                                static_cast<size_t>(nWords) * sizeof(uint64_t)))
-      return 0;
-    if (!EngineSymbols::readable(reinterpret_cast<const void*>(base + kOffEntries),
-                                static_cast<size_t>(capacity) * kEntryStride))
-      return 0;
+    if (!known || nWords != m_probedWords) {
+      if (known) {
+        m_cost.probes += 1u;
+      }
+      m_probedBase  = 0;
+      m_probedWords = 0u;
+      if (!EngineSymbols::readable(reinterpret_cast<const void*>(base + kOffAllocMask),
+                                  static_cast<size_t>(nWords) * sizeof(uint64_t)))
+        return 0;
+      if (!EngineSymbols::readable(reinterpret_cast<const void*>(base + kOffEntries),
+                                  static_cast<size_t>(capacity) * kEntryStride))
+        return 0;
+      m_probedBase  = base;
+      m_probedWords = nWords;
+    }
 
     capacityOut = capacity;
     return base;
@@ -111,8 +147,16 @@ namespace dxvk {
       return;
     }
 
+    using Clock = std::chrono::steady_clock;
+    auto ns = [](Clock::time_point a, Clock::time_point b) {
+      return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+    };
+
+    const Clock::time_point tBegin = Clock::now();
     uint32_t capacity = 0u;
-    const uintptr_t base = registryBase(capacity);
+    uint64_t resolveNs = 0ull;
+    const uintptr_t base = registryBase(capacity, resolveNs);
+    const Clock::time_point tBase = Clock::now();
 
     m_stats.resolved = (base != 0);
     if (base == 0) {
@@ -179,10 +223,12 @@ namespace dxvk {
       }
     }
 
+    const Clock::time_point tWalk = Clock::now();
     m_visible.endFrame();
     if (existence != nullptr) {
       existence->endFrame();
     }
+    const Clock::time_point tClose = Clock::now();
 
     m_stats.listed  = listed;
     m_stats.maxSlot = maxSlot;
@@ -231,8 +277,18 @@ namespace dxvk {
       m_existence = m_promotion.promote(m_visible.name());
     }
 
+    const uint64_t totalNs = ns(tBegin, Clock::now());
+    m_cost.resolveNs += resolveNs;
+    m_cost.probeNs   += ns(tBegin, tBase) - std::min(resolveNs, ns(tBegin, tBase));
+    m_cost.walkNs    += ns(tBase, tWalk);
+    m_cost.closeNs   += ns(tWalk, tClose);
+    m_cost.totalNs   += totalNs;
+    m_cost.maxNs      = std::max(m_cost.maxNs, totalNs);
+    m_cost.frames    += 1u;
+
     if (RtxOptions::RenderableEnum::logStats() && frame - m_lastLogFrame >= 60u) {
       m_lastLogFrame = frame;
+      const uint64_t perFrame = 1000ull * std::max<uint64_t>(m_cost.frames, 1ull);
       Logger::warn(str::format(
         "[RenderableEnum] f=", frame,
         " listed=", listed,
@@ -248,12 +304,22 @@ namespace dxvk {
         " promotable=", m_promotion.flat() ? 1u : 0u,
         // Slice 2: promoted and trusted this frame -- absence is death for
         // records that carry a handle. collapseSkips: frames the guard refused.
-        " existence=", existence() != nullptr ? 1u : 0u,
+        " existence=", (m_existence != nullptr && m_existenceUsable) ? 1u : 0u,
         " collapseSkips=", m_collapseSkips,
         " reads=", m_stats.reads,
         " readFail=", m_stats.readFailures,
+        // us/frame averaged over the window. total << [Perf.GcInst] enum= means
+        // the time is outside update(); otherwise the largest phase is the cost.
+        " cost{resolve=", m_cost.resolveNs / perFrame,
+        " probe=", m_cost.probeNs / perFrame,
+        " walk=", m_cost.walkNs / perFrame,
+        " close=", m_cost.closeNs / perFrame,
+        " total=", m_cost.totalNs / perFrame,
+        " max=", m_cost.maxNs / 1000ull,
+        " probes=", m_cost.probes, "}",
         " | listed FLAT under a fixed-position sweep = pre-cull;"
         " listed moving = culling is leaking into the list"));
+      m_cost = Cost();
     }
   }
 
@@ -266,6 +332,9 @@ namespace dxvk {
     m_existence.reset();
     m_existenceUsable = false;
     m_lastListed = 0u;
+    m_cost = Cost();
+    m_probedBase  = 0;
+    m_probedWords = 0u;
   }
 
 } // namespace dxvk

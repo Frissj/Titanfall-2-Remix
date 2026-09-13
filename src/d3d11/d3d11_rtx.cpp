@@ -18954,6 +18954,64 @@ namespace dxvk {
   // before, behind one thread_local load.
   // ==================================================================
   static thread_local bool s_xfDeferExecuting = false;
+  // ==================================================================
+  // NV-DXVK [XfDefer] slice 4: THE REPLAY SCOPE.
+  //
+  // xfChainJoin re-runs every aborted draw's deferred half on the frame thread
+  // -- but at flushGeometryBatch, i.e. at END OF FRAME, not at the draw. The
+  // old contract ("not inside a deferred scope, so xfLiveState() hands back the
+  // real context") assumed the real context was still the draw's. It is the
+  // frame's LAST draw's. Every live read a replay performed -- PS stage, VS
+  // cbuffers, cb2 contents, drawCbSpan's live section -- read another draw's
+  // state, and the geometry-capture EmitCs landed at the end-of-frame stream
+  // position, after the very uploads it exists to order against. With the
+  // chain on that was 35,284 of 78,212 draws (45%).
+  //
+  // So during a replay: record-served reads stay (the record is installed),
+  // the PS stage comes from the seam snapshot (xfPsSource), and anything that
+  // would read LIVE state or perform an instant-sensitive shared write is
+  // refused -- without marking the record, because a replay cannot abort
+  // again. The refusals are counted (xfReplayRef{}) so a site that still
+  // needs converting is visible rather than silently skipped.
+  // ==================================================================
+  static thread_local bool s_xfReplaying = false;
+  static std::atomic<uint32_t> s_xfReplayRefuseLive;
+  static std::atomic<uint32_t> s_xfReplayRefuseShared;
+
+  // NV-DXVK [XfDefer] slice 4: VSes whose routed draws asked
+  // CaptureSkyProbeCubeFromCb for a cb2 snapshot the dispatch had not pinned.
+  // Learned on whichever thread the tail ran on, read at the dispatch on the
+  // frame thread -- hence the mutex. The frame thread consults it once per
+  // routed draw, so the lookup goes through a thread_local single-entry memo
+  // keyed on (vs, generation): draws batch by VS, and a learn bumps the
+  // generation so a memoised "not known" cannot outlive the learn.
+  static std::mutex                        s_skyCb2LearnMu;
+  static std::unordered_set<XXH64_hash_t>  s_skyCb2LearnedVs;
+  static std::atomic<uint32_t>             s_skyCb2LearnGen { 0u };
+
+  static void xfSkyCb2Learn(XXH64_hash_t vs) {
+    std::lock_guard<std::mutex> lk(s_skyCb2LearnMu);
+    if (s_skyCb2LearnedVs.insert(vs).second)
+      s_skyCb2LearnGen.fetch_add(1u, std::memory_order_release);
+  }
+
+  static bool xfSkyCb2Known(XXH64_hash_t vs) {
+    static thread_local XXH64_hash_t s_memoVs  = 0;
+    static thread_local uint32_t     s_memoGen = UINT32_MAX;
+    static thread_local bool         s_memoVal = false;
+    const uint32_t gen = s_skyCb2LearnGen.load(std::memory_order_acquire);
+    if (s_memoGen == gen && s_memoVs == vs)
+      return s_memoVal;
+    bool known = false;
+    {
+      std::lock_guard<std::mutex> lk(s_skyCb2LearnMu);
+      known = s_skyCb2LearnedVs.find(vs) != s_skyCb2LearnedVs.end();
+    }
+    s_memoVs  = vs;
+    s_memoGen = gen;
+    s_memoVal = known;
+    return known;
+  }
   // Per-site escape tally, zeroes omitted at emit -- same idiom as
   // s_drawSnapWcMissBySlot, and for the same reason: one dominant site has to
   // be visible at a glance, and a site that never fires is a site that is
@@ -19042,7 +19100,7 @@ namespace dxvk {
     s_xfSharedRefuseBySite[size_t(XfSharedSite::Count)];
   static const char* const kXfSharedSiteNames[] = {
     "phase2Arena", "geoCapWanted", "geoCapStable", "vmHunt", "hudClass",
-    "boneMirror", "engineSun", "engineLights", "geomCapEmit"
+    "boneMirror", "engineSun", "engineLights", "geomCapEmit", "engineLightsSubmit"
   };
   static_assert(sizeof(kXfSharedSiteNames) / sizeof(kXfSharedSiteNames[0])
                     == size_t(XfSharedSite::Count),
@@ -19088,8 +19146,13 @@ namespace dxvk {
   // minus the substitute value -- callers that reach this have nothing to
   // stand in for the read, so the draw has to be re-derived.
   bool D3D11Rtx::xfMayReadLive(XfLiveSite site) {
-    if (!s_xfDeferExecuting)
-      return true;
+    if (!s_xfDeferExecuting) {
+      if (!s_xfReplaying)
+        return true;
+      // Replay: the live state is a later draw's. Refuse; cannot abort again.
+      s_xfReplayRefuseLive.fetch_add(1u, std::memory_order_relaxed);
+      return false;
+    }
     s_xfLiveEscapeBySite[size_t(site)].fetch_add(1u, std::memory_order_relaxed);
     if (m_drawSnapCur != nullptr && m_drawSnapValid
         && m_drawSnapCur->liveStateEscapes != UINT16_MAX)
@@ -19098,8 +19161,20 @@ namespace dxvk {
   }
 
   bool D3D11Rtx::xfMayWriteShared(XfSharedSite site) {
-    if (!s_xfDeferExecuting)
-      return true;
+    if (!s_xfDeferExecuting) {
+      if (!s_xfReplaying)
+        return true;
+      // Replay, frame thread: no data race, but most of these writes are tied
+      // to the DRAW'S instant -- the capture EmitCs to its stream position, the
+      // sun and light publishes and the VM-hunt / HUD-class latches to its live
+      // state and to the draws around it. Only the two capture-set snapshot
+      // refreshes are frame-scoped caches that are correct at any point.
+      if (site == XfSharedSite::GeomCaptureWantedSet
+       || site == XfSharedSite::GeomCaptureStableSet)
+        return true;
+      s_xfReplayRefuseShared.fetch_add(1u, std::memory_order_relaxed);
+      return false;
+    }
     s_xfSharedRefuseBySite[size_t(site)].fetch_add(1u, std::memory_order_relaxed);
     if (m_drawSnapCur != nullptr && m_drawSnapValid)
       m_drawSnapCur->carrierMask |= static_cast<uint8_t>(1u << kSdepStatic);
@@ -19116,7 +19191,7 @@ namespace dxvk {
   }
 
   const D3D11ContextState& D3D11Rtx::xfLiveState(XfLiveSite site) {
-    if (!s_xfDeferExecuting)
+    if (!s_xfDeferExecuting && !s_xfReplaying)
       return m_context->m_state;
     // One shared instance is enough because nothing may write it, and `const`
     // is what enforces that: a site that tried would fail to compile rather
@@ -19124,6 +19199,11 @@ namespace dxvk {
     // null for the life of the process, so handing it out releases nothing and
     // keeps no resource alive.
     static const D3D11ContextState s_emptyState { };
+    if (!s_xfDeferExecuting) {
+      // Replay: see s_xfReplaying. Every site already skips on the empty state.
+      s_xfReplayRefuseLive.fetch_add(1u, std::memory_order_relaxed);
+      return s_emptyState;
+    }
     s_xfLiveEscapeBySite[size_t(site)].fetch_add(1u, std::memory_order_relaxed);
     // Saturating: the record's counter is 16-bit and the only question asked of
     // it is != 0, so wrapping to zero on a pathological draw would turn an
@@ -25453,7 +25533,24 @@ namespace dxvk {
                 } else if (bonePtrRp == nullptr) {
                   // Site's path-3 read order: mapped slice, then direct map,
                   // then the full-bone cache. Bone 0 is at offset 0.
-                  if (boneBufRp != nullptr) {
+                  //
+                  // NV-DXVK [Perf.Replay] slice 5: ...AND THE CAPTURE BEFORE ALL
+                  // THREE. The site has served bone 0 from m_drawSnapCur->bone0
+                  // since [Bone0Cmp] bit 20 (~:28542); this mirror still read it
+                  // live, so with rtx.useDrawSnapshot on, full and replay read
+                  // bone 0 at two different instants. MEASURED 2026-09-13: the
+                  // only VERIFY-FAILs left, 4 per session on sky/sub-view VSes,
+                  // all o2wPathFull=3 o2wPathReplay=3, with the chain off and
+                  // verifyCov=1000/1000 -- and 0 with the snapshot off, where the
+                  // site falls through to the same live reads. Same gate, same
+                  // order as the site.
+                  if ((RtxOptions::splitTransformObjKeyMask() & 1048576u) != 0u
+                      && m_drawSnapCur != nullptr && m_drawSnapCur->bone0Valid) {
+                    bmRp = m_drawSnapCur->bone0;
+                  }
+                  // `bmRp == nullptr` guard for the same reason the site added
+                  // `!bm`: unguarded, the live read overwrites the capture.
+                  if (bmRp == nullptr && boneBufRp != nullptr) {
                     const auto mappedRp = boneBufRp->GetMappedSlice();
                     if (mappedRp.mapPtr && mappedRp.length >= 48) {
                       bmRp = reinterpret_cast<const float*>(mappedRp.mapPtr);
@@ -32902,6 +32999,46 @@ namespace dxvk {
     };
     BoneSrcCap bone;  bool hasBone = false;
 
+    // ==================================================================
+    // NV-DXVK [XfDefer] slice 4: THE SKY-PROBE cb2, PINNED AT THE SEAM.
+    //
+    // CaptureSkyProbeCubeFromCb snapshots up to 1 KB of CBufCommonPerCamera out
+    // of the cb2 LIVE mapping. On the chain worker that was refused
+    // (xfEsc{ skyProbeCb2=832 } per window, every one an abort), and the abort's
+    // replay then ran at the join -- flushGeometryBatch, end of frame -- where
+    // the live cb2 is the frame's LAST draw's, not this one's. So the refusal
+    // did not even buy correctness.
+    //
+    // Same shape as BoneSrcCap: resolved and pinned on the frame thread at the
+    // dispatch, handed over, read by the tail wherever it runs. Taken only for
+    // draws that can reach the capture -- sub-view draws (known from
+    // ExtractTransforms by the dispatch) and draws of a VS the tail has
+    // already asked for this capture (learned; see xfSkyCb2Known) -- so the pin
+    // is paid by the sky population, not by every routed draw.
+    // ==================================================================
+    struct SkyCb2Cap {
+      const uint8_t* base           = nullptr;   // mapped slice at the dispatch
+      size_t         byteWidth      = 0;         // D3D11 ByteWidth at the dispatch
+      uint32_t       constantOffset = 0;         // in 16-byte constants, as bound
+      uint32_t       slot           = UINT32_MAX;
+      DxvkBuffer*    pinned         = nullptr;
+    };
+    SkyCb2Cap skyCb2;  bool hasSkyCb2 = false;
+
+    // NV-DXVK [XfDefer] slice 4: WORK THE DISPATCH ALREADY DID ON THE FRAME
+    // THREAD, so the tail must not do it again wherever it runs. Both are
+    // captured before the seam and survive a replay (releaseDeferredCaptures
+    // keeps them), exactly like hash/matSnap/bone.
+    //   seamSrcGeo -- captureSourceGeometry ran at the dispatch: its EmitCs is
+    //                 at THIS draw's CS stream position, the only one that
+    //                 orders the copy against the engine's next upload.
+    //   seamPublish -- the frame-scoped publishers ran at the dispatch, against
+    //                 this draw's live state and on the one thread allowed to
+    //                 EmitCs: CaptureEngineSunFromCb and the three engine-light
+    //                 calls (dump, field stats, SubmitEngineLights).
+    bool seamSrcGeo  = false;
+    bool seamPublish = false;
+
     void releaseBone() {
       if (bone.pinned) {
         bone.pinned->release(DxvkAccess::Read);
@@ -32914,8 +33051,21 @@ namespace dxvk {
       hasBone        = false;
     }
 
+    void releaseSkyCb2() {
+      if (skyCb2.pinned) {
+        skyCb2.pinned->release(DxvkAccess::Read);
+        skyCb2.pinned->decRef();
+        skyCb2.pinned = nullptr;
+      }
+      skyCb2    = SkyCb2Cap();
+      hasSkyCb2 = false;
+    }
+
     void release() {
       releaseBone();
+      releaseSkyCb2();
+      seamSrcGeo  = false;
+      seamPublish = false;
       if (hasHash) { hash.releasePins(); hasHash = false; }
       if (hasBbox) { bbox.releasePins(); hasBbox = false; }
       hasSkin = false;   // skin job holds a byte copy, no pins to release
@@ -32937,7 +33087,8 @@ namespace dxvk {
     // and the aborted run returned above the append without moving them out.
     // Releasing them here would leave the replay's append with nothing to hand
     // the item -- and for `bone` specifically it would drop the pin the replay
-    // is about to read through.
+    // is about to read through. skyCb2 and the two seam flags (slice 4) are
+    // kept for the same reason: the dispatch took them, the replay reads them.
     void releaseDeferredCaptures() {
       if (hasBbox) { bbox.releasePins(); hasBbox = false; }
       hasSkin = false;
@@ -32973,6 +33124,11 @@ namespace dxvk {
       // owns the pin or its destructor releases one the destination is using.
       bone    = o.bone;               hasBone    = o.hasBone;
       o.bone.pinned = nullptr;        o.hasBone  = false;
+      // Same rule for the sky cb2 pin.
+      skyCb2  = o.skyCb2;             hasSkyCb2  = o.hasSkyCb2;
+      o.skyCb2.pinned = nullptr;      o.hasSkyCb2 = false;
+      seamSrcGeo = o.seamSrcGeo;      o.seamSrcGeo = false;
+      seamPublish = o.seamPublish;    o.seamPublish = false;
     }
   };
 
@@ -33042,13 +33198,21 @@ namespace dxvk {
   D3D11Rtx::XfPsSource D3D11Rtx::xfPsSource(XfLiveSite site,
                                             const PendingDrawSlot& pend) {
     XfPsSource src;
-    if (!s_xfDeferExecuting) {
-      src.ps = &m_context->m_state.ps;
-      return src;
-    }
+    // NV-DXVK [XfDefer] slice 4: THE SNAPSHOT FIRST, ON EVERY THREAD. A draw
+    // with a seam capture is a routed draw, and the live PS stage belongs to it
+    // only at the dispatch. The join replay (flushGeometryBatch, end of frame)
+    // runs on the frame thread with s_xfDeferExecuting false, and used to take
+    // the live branch below -- reading the frame's LAST draw's PS cbuffers and
+    // SRVs for the UV transform and the TSP scan of every aborted draw. Inline
+    // draws never have hasMatSnap (the seam capture is chain-only), so their
+    // path is unchanged.
     if (pend.hasMatSnap) {
       src.ps   = &pend.matSnap.ps;
       src.snap = &pend.matSnap;
+      return src;
+    }
+    if (!s_xfDeferExecuting) {
+      src.ps = &m_context->m_state.ps;
       return src;
     }
     // UNREACHABLE BY CONSTRUCTION, and refused rather than asserted. The seam
@@ -33498,6 +33662,102 @@ namespace dxvk {
       m_xfChain = std::make_unique<XfChain>(this);
   }
 
+  // ==================================================================
+  // NV-DXVK [XfDefer] slice 4: THE OBSERVE HALF OF A ROUTED DRAW'S TAIL.
+  //
+  // ARCHITECTURE_OVERHAUL slice 4: SubmitDraw captures and enqueues, derives
+  // nothing. The census named what still broke that for routed draws:
+  //   xfEsc{ skyProbeCb2=832 } xfShared{ geomCapEmit=2320 engineSun=104 }
+  // per window against xfRouted=8318 -- 39% of routed draws aborted, and every
+  // abort was re-run at the join against the frame's LAST draw's state.
+  //
+  // All three are bound to the draw's INSTANT, not to data the record can
+  // carry, so they run here: frame thread, at the dispatch, while the live
+  // context and the CS stream position are still this draw's. The tail sees
+  // the pend flags and does not repeat them, wherever it runs. The inline
+  // path never comes here and is unchanged.
+  // ==================================================================
+  void D3D11Rtx::xfSeamCaptures(SubmitDrawTailCtx& c) {
+    DrawCallState&   dcs  = *c.dcs;
+    PendingDrawSlot& pend = *c.pend;
+
+    // (1) SKY-PROBE cb2 -- pinned, BoneSrcCap-style. Candidates are the draws
+    // that can reach CaptureSkyProbeCubeFromCb: sub-view draws (isSubView is
+    // final once ExtractTransforms has run, which it has) and draws of a VS the
+    // tail has asked before (Sky tagging happens in the tail, so it is learned
+    // rather than predicted). Resolved exactly as the inline read resolves it.
+    const XXH64_hash_t skyVs = dcs.transformData.vertexShaderHash;
+    if (dcs.transformData.isSubView || xfSkyCb2Known(skyVs)) {
+      const auto& vsComSeam = drawVertexShaderCom();
+      const auto* vsCommonSeam =
+        (vsComSeam != nullptr) ? vsComSeam->GetCommonShader() : nullptr;
+      if (vsCommonSeam != nullptr) {
+        auto matLoc = memoCBFieldLoc(vsCommonSeam, "CBufCommonPerCamera",
+                                     "c_cameraRelativeToClip");
+        auto orgLoc = memoCBFieldLoc(vsCommonSeam, "CBufCommonPerCamera",
+                                     "c_cameraOrigin");
+        if (matLoc.has_value() && matLoc->size >= 64
+            && matLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
+            && orgLoc.has_value() && orgLoc->size >= 12
+            && orgLoc->slot == matLoc->slot) {
+          const auto& cbSeam = m_context->m_state.vs.constantBuffers[matLoc->slot];
+          if (cbSeam.buffer != nullptr) {
+            const uint8_t* pSeam = reinterpret_cast<const uint8_t*>(
+              cbSeam.buffer->GetMappedSlice().mapPtr);
+            Rc<DxvkBuffer> dbSeam = cbSeam.buffer->GetBuffer();
+            if (pSeam != nullptr && dbSeam != nullptr) {
+              pend.releaseSkyCb2();
+              // The pin holds THIS slice alive across a WRITE_DISCARD rename,
+              // so pSeam still addresses the bytes the draw was issued with.
+              dbSeam->incRef();
+              dbSeam->acquire(DxvkAccess::Read);
+              pend.skyCb2.base           = pSeam;
+              pend.skyCb2.byteWidth      = cbSeam.buffer->Desc()->ByteWidth;
+              pend.skyCb2.constantOffset = cbSeam.constantOffset;
+              pend.skyCb2.slot           = matLoc->slot;
+              pend.skyCb2.pinned         = dbSeam.ptr();
+              pend.hasSkyCb2             = true;
+            }
+          }
+        }
+      }
+    }
+
+    // (2) SOURCE-GEOMETRY CAPTURE -- the EmitCs, at this draw's stream
+    // position. The block excludes skinned draws, and "skinned" is decided by
+    // the tail's skinning block, which has not run yet. Predict it from the
+    // same evidence that block uses on a routed draw -- a VS with bone weights
+    // and a palette the seam actually captured -- and let the tail reconcile a
+    // wrong guess (it detaches a capture from a draw that turns out skinned).
+    if (RtxOptions::captureSourceGeometry()) {
+      const bool predictSkinned = (c.geo->numBonesPerVertex > 0) && pend.hasBone;
+      if (!predictSkinned) {
+        captureSourceGeometry(dcs, c.indexed);
+      }
+      pend.seamSrcGeo = true;
+    }
+
+    // (3) THE FRAME-SCOPED PUBLISHERS -- engine sun and engine lights. They
+    // read the live VS/PS state (here it is this draw's) and SubmitEngineLights
+    // EmitCs's the frame's lights, which only this thread may do. Same option
+    // gates, same order as the tail's calls.
+    if (RtxOptions::useEngineSun()
+        || RtxOptions::dumpEngineSunCBFields()
+        || RtxOptions::dumpEngineSunCBValues()) {
+      CaptureEngineSunFromCb(dcs);
+    }
+    if (RtxOptions::dumpEngineLightsBuffer()) {
+      DumpEngineLightsBufferFromSrv();
+    }
+    if (RtxOptions::dumpEngineLightFieldStats()) {
+      DumpEngineLightFieldStats();
+    }
+    if (RtxOptions::submitEngineLights()) {
+      SubmitEngineLights();
+    }
+    pend.seamPublish = true;
+  }
+
   // Frame thread. Moves this draw into a slot and publishes it. Returns without
   // publishing if the ring is full, and the caller then runs the draw inline --
   // see the header block on why the pole thread must never wait here.
@@ -33557,9 +33817,14 @@ namespace dxvk {
     //
     // Every slot the chain processed since the last join is in [replayed,
     // consumed). The aborted ones never staged anything, so replaying is just
-    // running the deferred half again -- this time NOT inside a deferred scope,
-    // so xfLiveState() hands back the real context and xfMayWriteShared()
-    // permits. Whatever the worker refused is what the re-run performs.
+    // running the deferred half again, on the frame thread, in draw order.
+    //
+    // NV-DXVK [XfDefer] slice 4: IT IS NOT "WHERE THE READ IS LEGAL" ANY MORE.
+    // This used to say the re-run performs whatever the worker refused, against
+    // the real context. At the join the real context is the frame's LAST
+    // draw's, so it performed it against the wrong draw. The re-run now runs in
+    // a replay scope (s_xfReplaying): record and seam captures serve, live
+    // reads and instant-bound shared writes are refused and counted.
     //
     // IN DRAW ORDER, and that is not decoration: a replayed draw appends to
     // `items` with its original seq, and B3's merge is a two-way merge that
@@ -33609,7 +33874,16 @@ namespace dxvk {
       m_drawSnapCur   = s.snap;
       m_drawSnapValid = s.snapValid;
       t_matsysMatPtr  = s.matsysMatPtr;
-      SubmitDrawDeferred(rc);
+      {
+        // NV-DXVK [XfDefer] slice 4: THE REPLAY SCOPE -- see s_xfReplaying. RAII
+        // for the same reason the worker's ScopeGuard is: the moved body has
+        // many early returns.
+        struct ReplayGuard {
+          ReplayGuard()  { s_xfReplaying = true;  }
+          ~ReplayGuard() { s_xfReplaying = false; }
+        } replayGuard;
+        SubmitDrawDeferred(rc);
+      }
       m_drawSnapCur   = prevSnap;
       m_drawSnapValid = prevValid;
       t_matsysMatPtr  = prevMat;
@@ -34140,6 +34414,13 @@ namespace dxvk {
           && m_drawSnapCur->liveStateEscapes != UINT16_MAX)
         ++m_drawSnapCur->liveStateEscapes;
       return nullptr;   // caller must treat this as "cannot serve", not "empty"
+    }
+    // NV-DXVK [XfDefer] slice 4: a join replay refuses too -- see s_xfReplaying.
+    // The live buffer is a later draw's, and learning the span below would bill
+    // it to s_xtVsLocCur, which is that later draw's VS, not this one's.
+    if (s_xfReplaying) {
+      s_xfReplayRefuseLive.fetch_add(1u, std::memory_order_relaxed);
+      return nullptr;
     }
     // ==================================================================
     size_t len = 0;
@@ -60898,10 +61179,14 @@ namespace dxvk {
     // draw's value.
     residentGateJudge(dcs);
 
-    if (c.arena == SubmitDrawTailCtx::TailArena::Chain)
+    if (c.arena == SubmitDrawTailCtx::TailArena::Chain) {
+      // Slice 4: the instant-bound half runs HERE, before the draw leaves the
+      // frame thread -- see xfSeamCaptures.
+      xfSeamCaptures(c);
       xfChainSubmit(c);
-    else
+    } else {
       SubmitDrawDeferred(c);
+    }
   }
 
   void D3D11Rtx::censusRecordO2w(const Matrix4& o2w) {
@@ -61359,6 +61644,17 @@ namespace dxvk {
           && dcs.geometryData.texcoord1Buffer.vertexFormat() == VK_FORMAT_R32G32B32A32_SFLOAT) {
         dcs.geometryData.texcoordBuffer = dcs.geometryData.texcoord1Buffer;
         dcs.geometryData.texcoord1Buffer = RasterBuffer();
+        // NV-DXVK [XfDefer] slice 4: a routed draw's source-geometry capture was
+        // taken at the dispatch, BEFORE this swap, so its stream->group map
+        // still names the pre-swap slots. Move it with the streams: texcoord
+        // now reads what texcoord1 was, and texcoord1 is gone. The CS-side copy
+        // lambda never reads streamGroup, and commitGeometryToRT reads it only
+        // after the join, so this write races nothing.
+        if (pend.seamSrcGeo && dcs.geometryData.gpuCapture) {
+          auto& sg = dcs.geometryData.gpuCapture->streamGroup;
+          sg[2] = sg[3];
+          sg[3] = RasterGeometry::GeometryCapture::kStreamNotCaptured;
+        }
       }
 
       // NV-DXVK: capture the 3 VGUI structured-buffer SRVs (g_fontBounds,
@@ -61378,7 +61674,14 @@ namespace dxvk {
       // (DrawSnapshot::psSrv0to7). Widening that to serve this is the same
       // 128-slot walk the sibling note at the TF2 sky-probe scan rejects on
       // cost. Not a half-conversion: SRV IDENTITY, not buffer contents.
-      const auto* cs2 = drawPixelShaderCom() != nullptr
+      //
+      // NV-DXVK [XfDefer] slice 4: SERVED, NOT LIVE, for a routed draw. The
+      // seam's MatSnapshot already holds the WHOLE 128-entry PS SRV array,
+      // AddRef'd -- the widening the note above declined is already paid for --
+      // so xfPsSource hands the snapshot to the worker and to a join replay,
+      // and the live stage to an inline draw exactly as before.
+      const XfPsSource vguiSrc = xfPsSource(XfLiveSite::VguiStructuredBuffers, pend);
+      const auto* cs2 = (vguiSrc.valid() && drawPixelShaderCom() != nullptr)
         ? drawPixelShaderCom()->GetCommonShader() : nullptr;
       if (cs2 != nullptr) {
         struct VguiSbRole {
@@ -61400,8 +61703,7 @@ namespace dxvk {
           if (slot == UINT32_MAX) continue;
           if (slot >= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) continue;
           D3D11ShaderResourceView* srv =
-            xfLiveState(XfLiveSite::VguiStructuredBuffers)
-              .ps.shaderResources.views[slot].ptr();
+            vguiSrc.ps->shaderResources.views[slot].ptr();
           if (!srv) continue;
           if (srv->GetResourceType() != D3D11_RESOURCE_DIMENSION_BUFFER) continue;
           Rc<DxvkBufferView> view = srv->GetBufferView();
@@ -65610,9 +65912,12 @@ namespace dxvk {
     // Same fanout point as the sky detector since the shaders + cbuffers
     // have just been settled. Diagnostics still gated on dump options.
     const auto tTcSun0 = std::chrono::steady_clock::now();
-    if (RtxOptions::useEngineSun()
-        || RtxOptions::dumpEngineSunCBFields()
-        || RtxOptions::dumpEngineSunCBValues()) {
+    // NV-DXVK [XfDefer] slice 4: a routed draw's dispatch already ran this on
+    // the frame thread against the draw's own live state (pend.seamPublish).
+    if ((RtxOptions::useEngineSun()
+         || RtxOptions::dumpEngineSunCBFields()
+         || RtxOptions::dumpEngineSunCBValues())
+        && !pend.seamPublish) {
       CaptureEngineSunFromCb(dcs);
     }
     {
@@ -65704,7 +66009,7 @@ namespace dxvk {
     {
       const auto tSkyProbe0 = std::chrono::steady_clock::now();
       if (spCapture) {
-        CaptureSkyProbeCubeFromCb(dcs);
+        CaptureSkyProbeCubeFromCb(dcs, &pend);
       }
       const int64_t dNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now() - tSkyProbe0).count();
@@ -65747,14 +66052,21 @@ namespace dxvk {
     // NV-DXVK [EngineLightsCapture]: Tier 2. Submit mirrored
     // s_globalLights entries to the scene as RtxLegacyLight (once per
     // frame internally). Diagnostics dump still gated on dump option.
-    if (RtxOptions::dumpEngineLightsBuffer()) {
-      DumpEngineLightsBufferFromSrv();
-    }
-    if (RtxOptions::dumpEngineLightFieldStats()) {
-      DumpEngineLightFieldStats();
-    }
-    if (RtxOptions::submitEngineLights()) {
-      SubmitEngineLights();
+    //
+    // NV-DXVK [XfDefer] slice 4: a routed draw's dispatch ran all three on the
+    // frame thread (pend.seamPublish). SubmitEngineLights EmitCs's, and from
+    // the chain worker that corrupted the CS stream -- see
+    // XfSharedSite::EngineLightsSubmit.
+    if (!pend.seamPublish) {
+      if (RtxOptions::dumpEngineLightsBuffer()) {
+        DumpEngineLightsBufferFromSrv();
+      }
+      if (RtxOptions::dumpEngineLightFieldStats()) {
+        DumpEngineLightFieldStats();
+      }
+      if (RtxOptions::submitEngineLights()) {
+        SubmitEngineLights();
+      }
     }
 
     {
@@ -68241,378 +68553,21 @@ namespace dxvk {
     markSub(s_perfTePhase2Acc, s_perfTePhase2Max);  // [te_phase2] capturePhase2 block
 
     if (RtxOptions::captureSourceGeometry()) {
-      RasterGeometry& cgeo = dcs.geometryData;
-      // Skinned draws are excluded: they re-bake every frame on boneHash
-      // changes but their VB/IB is static mesh data — the per-frame racy data
-      // is the bone palette, which already rides its own CS-time copy (the
-      // pattern this capture generalizes). Capturing them would copy all
-      // character geometry every frame for no coverage gain.
-      const bool cgeoSkinned = dcs.skinningData.numBones > 0;
-      if (!cgeoSkinned && cgeo.positionBuffer.defined() && cgeo.vertexCount > 0) {
-        constexpr uint32_t kMaxVtxGroups = RasterGeometry::GeometryCapture::kMaxVertexGroups;
-        constexpr uint8_t  kNotCaptured = RasterGeometry::GeometryCapture::kStreamNotCaptured;
-        // One capture range: a source window to copy, and where its pooled
-        // stash lands in the GeometryCapture (index slot or a vertex group).
-        struct GeomCaptureRange {
-          Rc<DxvkBuffer> buf;
-          VkDeviceSize   off = 0;
-          VkDeviceSize   len = 0;
-          int8_t         vtxGroup = -1;   // -1 = index range
-        };
-        GeomCaptureRange ranges[1 + kMaxVtxGroups];
-        uint32_t numRanges = 0;
-        uint8_t streamGroup[5] = { kNotCaptured, kNotCaptured, kNotCaptured,
-                                   kNotCaptured, kNotCaptured };
-        bool wantIndex = false;
-        // A capture that cannot cover EVERY device-local stream must not
-        // happen at all: a left-live stream would tear behind
-        // sourceIsGpuCapture=true, which suppresses srcPending AND the
-        // recovery latch — frozen garbage with no way back. Unreachable now
-        // that kMaxVertexGroups == stream count, kept as the structural
-        // guarantee.
-        bool captureIncomplete = false;
-        // Predictor key: identity of every captured-range source. splitmix-
-        // style fold; collisions only cost a wasted capture or a missed warm
-        // window, never correctness of rendered data.
-        uint64_t predKey = 0x243F6A8885A308D3ull;
-        const auto mixKey = [&predKey](uint64_t v) {
-          predKey ^= v + 0x9E3779B97F4A7C15ull + (predKey << 6) + (predKey >> 2);
-        };
-
-        // Vertex streams, grouped by (buffer, slice offset, stride): streams
-        // declared on the same D3D11 slot share all three, so one window of
-        // vertexCount*stride bytes from the slice offset serves the whole
-        // group and keeps every stream's offsetFromSlice valid inside it.
-        // Only device-local sources qualify (mapPtr()==nullptr): DYNAMIC
-        // buffers are CPU-written and already covered by the snapshot/stash
-        // paths, and host-visible slices don't tear.
-        RasterBuffer* const cgeoStreams[5] = {
-          &cgeo.positionBuffer, &cgeo.normalBuffer, &cgeo.texcoordBuffer,
-          &cgeo.texcoord1Buffer, &cgeo.color0Buffer,
-        };
-        for (uint32_t s = 0; s < 5; ++s) {
-          const RasterBuffer& rb = *cgeoStreams[s];
-          if (!rb.defined() || rb.stride() == 0 || rb.buffer() == nullptr
-              || rb.mapPtr() != nullptr) {
-            continue;
-          }
-          const VkDeviceSize bufSize = rb.buffer()->info().size;
-          const VkDeviceSize off = rb.offset();
-          if (off >= bufSize) {
-            continue;
-          }
-          const VkDeviceSize len = std::min<VkDeviceSize>(
-            VkDeviceSize(cgeo.vertexCount) * rb.stride(), bufSize - off);
-          if (len == 0) {
-            continue;
-          }
-          // Find or open this stream's group.
-          uint32_t g = 0;
-          for (; g < numRanges; ++g) {
-            if (ranges[g].vtxGroup >= 0 && ranges[g].buf.ptr() == rb.buffer().ptr()
-                && ranges[g].off == off) {
-              break;
-            }
-          }
-          if (g == numRanges) {
-            if (numRanges >= kMaxVtxGroups) {
-              captureIncomplete = true;  // cannot cover this stream — abort capture below
-              continue;
-            }
-            ranges[numRanges] = GeomCaptureRange {
-              rb.buffer(), off, len, int8_t(numRanges) };
-            ++numRanges;
-            mixKey(reinterpret_cast<uintptr_t>(rb.buffer().ptr()));
-            mixKey(off);
-            mixKey(len);
-            mixKey(rb.stride());
-          } else if (len > ranges[g].len) {
-            ranges[g].len = len;  // widest stride in the group wins
-          }
-          streamGroup[s] = uint8_t(ranges[g].vtxGroup);
-        }
-
-        // Index window. Skip when the dynamic-IB machinery already owns it
-        // (indexNeedsGpuStash / CPU snapshot) — those paths are proven.
-        if (indexed && cgeo.indexBuffer.defined() && cgeo.indexCount > 0
-            && cgeo.indexBuffer.buffer() != nullptr
-            && cgeo.indexBuffer.mapPtr() == nullptr
-            && !cgeo.indexNeedsGpuStash && cgeo.indexDataSnapshot == nullptr) {
-          const VkDeviceSize bufSize = cgeo.indexBuffer.buffer()->info().size;
-          const VkDeviceSize off = cgeo.indexBuffer.offset() + cgeo.indexBuffer.offsetFromSlice();
-          const VkDeviceSize len = VkDeviceSize(cgeo.indexCount) * cgeo.indexBuffer.stride();
-          if (len > 0 && off < bufSize && off + len <= bufSize) {
-            ranges[numRanges] = GeomCaptureRange { cgeo.indexBuffer.buffer(), off, len, -1 };
-            ++numRanges;
-            wantIndex = true;
-            mixKey(reinterpret_cast<uintptr_t>(cgeo.indexBuffer.buffer().ptr()));
-            mixKey(off);
-            mixKey(len);
-          }
-        }
-
-        if (numRanges > 0 && !captureIncomplete) {
-          // Mark the geometry capturable-by-construction: the CS-side
-          // capture-feedback latch only arms for draws that flowed through
-          // this site (see RasterGeometry::captureEligible).
-          // captureIncomplete draws are deliberately NOT eligible: they fall
-          // back to the legacy srcPending path, whose recovery latch stays
-          // armed — honest raciness beats a false "stable" stamp.
-          cgeo.captureEligible = true;
-          mixKey(static_cast<uint64_t>(dcs.transformData.vertexShaderHash));
-          mixKey(cgeo.vertexCount);
-          // NV-DXVK [capture stability contract]: ship the identity key with
-          // the geometry so the CS thread publishes verdicts under the same
-          // key this site checks (see rtx_types.h captureIdentityKey).
-          cgeo.captureIdentityKey = predKey;
-
-          const uint32_t fid = m_context->m_device->getCurrentFrameId();
-
-          // NV-DXVK [flicker V8 follow-up: capture feedback]: refresh the
-          // per-frame snapshot of the CS-published capture-wanted ring, then
-          // check whether the CS thread asked for THIS draw. This is what
-          // covers steady-state re-batch bakes: their buffers (and thus the
-          // predictor key) are unchanged for hundreds of frames, so the warm
-          // window below cannot fire — but the previous frame's bake ran
-          // uncaptured, latched pendingSrcBake, and published this key.
-          // Keep entries from the last 6 frames: the CS thread lags the game
-          // thread by a frame or two, so a real recovery is captured on the
-          // very next submit. A LONG window is actively harmful — the sprite
-          // renderers create per-frame-unique entries whose latch can never
-          // converge (the entry dies before its recovery bake), and a 30-frame
-          // window kept re-arming captures for ~115 such keys all session
-          // (2026-08-02 21:23 run, [GeoCapture.wanted] = 100% sprite VSes).
-          // [XfDefer] step 4c: unordered_set clear+insert. A concurrent insert
-          // rehashes the bucket table under the other thread, which no abort
-          // can undo -- so it is refused on the chain, not detected.
-          if (m_geomCaptureWantedSnapshotFrame != fid
-              && xfMayWriteShared(XfSharedSite::GeomCaptureWantedSet)) {
-            m_geomCaptureWantedSnapshotFrame = fid;
-            m_geomCaptureWantedSnapshot.clear();
-            // NV-DXVK [capture feedback v2]: one lock per frame. Stale keys
-            // (older than the 6-frame window) are erased here — the consumer
-            // is the only reader, so its sweep keeps the map at exactly the
-            // live working set and the publisher normally never prunes.
-            std::lock_guard<std::mutex> lkFb(dxvk::tf2::g_geomCaptureWantedMutex);
-            auto& wanted = dxvk::tf2::g_geomCaptureWantedMap;
-            for (auto it = wanted.begin(); it != wanted.end();) {
-              if (fid > it->second && fid - it->second > 6u) {
-                it = wanted.erase(it);
-              } else {
-                m_geomCaptureWantedSnapshot.insert(it->first);
-                ++it;
-              }
-            }
-          }
-          const uint64_t fbKey = RasterGeometry::captureFeedbackKey(
-            static_cast<uint64_t>(dcs.transformData.vertexShaderHash),
-            cgeo.vertexCount, cgeo.indexCount);
-          const bool feedbackWantsCapture =
-            !m_geomCaptureWantedSnapshot.empty()
-            && m_geomCaptureWantedSnapshot.find(fbKey) != m_geomCaptureWantedSnapshot.end();
-
-          // NV-DXVK [capture stability contract] — the decision, inverted.
-          // The warm-window predictor this replaces captured a key's first
-          // few SIGHTINGS — but a re-batch REUSES the same buffer windows
-          // (the predictor key recurs, firstSeenFrame is ancient), while
-          // minting a brand-new BlasEntry whose FIRST bake is the one that
-          // needs the capture. Retrospective feedback can't reach it either:
-          // its (vs,vtx,idx) key is born with that bake. Measured end state
-          // of both mechanisms: capState=none, isNew=1 on 100% of starving
-          // lines while the flicker ran (2026-08-03 01:57). So: capture
-          // UNLESS the CS thread has RECENTLY proven this key stable. A key
-          // is stable while its entry keeps resolving kUpdateInstance with
-          // no pending recovery; any bake taints it. Unknown keys — first
-          // sightings, re-batches, level changes — are captured by default:
-          // the failure direction is bandwidth, never a torn bake.
-          // No per-frame dedup: several BlasEntries can share one key and
-          // which submit's DrawCallState lands on which entry is decided
-          // later by the cache, so every submit of an unstable key carries
-          // its own capture (same rationale the feedback path had).
-          // [XfDefer] step 4c: see the sibling guard on the wanted set above.
-          if (m_geomCaptureStableSnapshotFrame != fid
-              && xfMayWriteShared(XfSharedSite::GeomCaptureStableSet)) {
-            m_geomCaptureStableSnapshotFrame = fid;
-            m_geomCaptureStableSnapshot.clear();
-            std::lock_guard<std::mutex> lkSt(dxvk::tf2::g_geomCaptureStableMutex);
-            auto& stableM = dxvk::tf2::g_geomCaptureStableMap;
-            auto& taintM = dxvk::tf2::g_geomCaptureTaintMap;
-            // Taint freshness: a bake in the last 2 frames vetoes stability
-            // even if another same-key entry re-confirmed it.
-            for (auto it2 = stableM.begin(); it2 != stableM.end();) {
-              if (fid > it2->second && fid - it2->second > 6u) {
-                it2 = stableM.erase(it2);  // stale — no recent re-confirmation
-                continue;
-              }
-              const auto tIt = taintM.find(it2->first);
-              const bool freshTaint = (tIt != taintM.end())
-                && !(fid > tIt->second && fid - tIt->second > 2u);
-              if (!freshTaint) {
-                m_geomCaptureStableSnapshot.insert(it2->first);
-              }
-              ++it2;
-            }
-            for (auto it2 = taintM.begin(); it2 != taintM.end();) {
-              it2 = (fid > it2->second && fid - it2->second > 6u)
-                ? taintM.erase(it2) : std::next(it2);
-            }
-          }
-          const bool provenStable =
-            m_geomCaptureStableSnapshot.find(predKey) != m_geomCaptureStableSnapshot.end();
-          // NV-DXVK [capture stability contract — content veto]: key-granular
-          // stability is blind to CONTENT changes inside a reused buffer
-          // window. The engine re-batches by uploading new indices/vertices
-          // into the SAME window with the same counts: same identity key,
-          // sibling entries still confirming "stable", while the submit at
-          // hand references bytes that will spawn a brand-new BlasEntry
-          // whose first bake needs the capture (measured 02:18 run: stable
-          // contract live, victims' capState=none/isNew=1 lines and the
-          // census signature UNCHANGED). An engine upload in flight is
-          // directly observable here: isPendingGpuWrite (atomic use-count,
-          // Write accesses only). A hot source buffer vetoes stability —
-          // exactly the buffers being rewritten are the ones whose stability
-          // cannot be trusted at this instant. Settled static buffers read
-          // not-pending and keep their zero-capture steady state; a buffer
-          // the engine rewrites continuously stays vetoed continuously,
-          // which is the price of its content actually changing.
-          // NV-DXVK [srcHot A/B]: the reasoning above is sound only if the
-          // buffer maps to the draw. isInUse(Write) is a WHOLE-BUFFER refcount,
-          // and TF2 packs many meshes into shared buffers it rewrites every
-          // frame, so this reads true for a draw whose own bytes nobody wrote.
-          // Measured over five 5-second windows: 6655-8932 captures per window
-          // (~107/frame at ~15 fps, ~1 GB/s of copyBuffer) while 186-231 keys
-          // were proven stable, and fbDraws — the captures actually requested —
-          // was under 10% of the total. So >90% of this traffic is this veto
-          // firing at buffer granularity on a per-draw question.
-          //
-          // rtx.captureSourceHotVeto=false drops the term so the A/B can be run
-          // in one session. Default true = unchanged behaviour. See the option
-          // doc: this is a measurement switch, not a shipping setting.
-          const bool hotVetoEnabled = RtxOptions::captureSourceHotVeto();
-          bool srcHot = false;
-          if (hotVetoEnabled) {
-            for (uint32_t i = 0; i < numRanges && !srcHot; ++i) {
-              srcHot = ranges[i].buf->isInUse(DxvkAccess::Write);
-            }
-          }
-          // [XfDefer] 2026-08-19f: the EmitCs below is single-producer. The
-          // && is SHORT-CIRCUIT ON PURPOSE -- a draw that would not capture
-          // anyway never asks permission, so only draws that would actually
-          // emit refuse. See XfSharedSite::GeomCaptureEmit.
-          const bool doCapture = (srcHot || !provenStable || feedbackWantsCapture)
-                              && xfMayWriteShared(XfSharedSite::GeomCaptureEmit);
-
-          if (doCapture) {
-            auto cap = std::make_shared<RasterGeometry::GeometryCapture>();
-            std::memcpy(cap->streamGroup, streamGroup, sizeof(streamGroup));
-            cap->wantIndex = wantIndex;
-            cgeo.gpuCapture = cap;
-
-            // Fixed-size packet so the lambda captures plain values (Rc copies).
-            struct GeomCapturePacket {
-              GeomCaptureRange ranges[1 + RasterGeometry::GeometryCapture::kMaxVertexGroups];
-              uint32_t numRanges = 0;
-            } packet;
-            for (uint32_t i = 0; i < numRanges; ++i) {
-              packet.ranges[i] = ranges[i];
-            }
-            packet.numRanges = numRanges;
-
-            // Recorded at THIS position in the CS stream — the entire fix.
-            m_context->EmitCs([cap, packet](DxvkContext* ctx) {
-              auto& pool = static_cast<RtxContext*>(ctx)->getSceneManager().getIndexStashPool();
-              bool ok = true;
-              bool barrierEmitted = false;
-              for (uint32_t i = 0; i < packet.numRanges && ok; ++i) {
-                const auto& r = packet.ranges[i];
-                auto stash = pool.acquire(r.len);
-                if (stash == nullptr) {
-                  // A failed acquire invalidates the whole capture (the bake
-                  // falls back to the live source and the feedback loop keeps
-                  // retrying) — if this fires persistently, non-convergence
-                  // is a VRAM/pool problem, not a theory problem. Say so.
-                  static std::atomic<uint32_t> sAcqFail { 0u };
-                  const uint32_t n = sAcqFail.fetch_add(1u, std::memory_order_relaxed);
-                  if (n < 16u || (n & 0x3FFu) == 0u) {
-                    Logger::warn(str::format("[GeoCapture] stash acquire FAILED",
-                      " len=", r.len, " failCount=", n + 1));
-                  }
-                  ok = false;
-                  break;
-                }
-                if (!barrierEmitted) {
-                  barrierEmitted = true;
-                  // Order the engine's upload (transfer or compute write,
-                  // recorded earlier in this stream) before our copy reads
-                  // the source; srcStage also covers prior stash READS so a
-                  // recycled pool buffer can't be rewritten under a pending
-                  // consumer (WAR needs only the execution dependency).
-                  ctx->emitMemoryBarrier(0,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT,
-                    VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-                }
-                ctx->copyBuffer(stash->buffer, 0, r.buf, r.off, r.len);
-                if (r.vtxGroup < 0) {
-                  cap->index = std::move(stash);
-                } else {
-                  cap->vertex[r.vtxGroup] = std::move(stash);
-                }
-              }
-              cap->valid = ok;
-            });
-
-            // [GeoCapture] heartbeat: aggregate only (any per-draw logging on
-            // the affected VSes perturbs timing and masks the bug — V8 §2).
-            // fbDraws counts captures triggered by the CS feedback ring — the
-            // number that proves the steady-state recovery loop is closing
-            // (warm-window captures cannot cover re-batch bakes).
-            static thread_local uint64_t sCapDraws = 0, sCapBytes = 0, sCapFbDraws = 0;
-            static thread_local std::chrono::steady_clock::time_point sCapLast{};
-            static thread_local bool sCapInit = false;
-            // Frame id at the start of the current window, so bytes/draws can be
-            // normalised per frame at emit time (the window is wall-clock).
-            static thread_local uint32_t sCapFrameFirst = UINT32_MAX;
-            ++sCapDraws;
-            if (feedbackWantsCapture) {
-              ++sCapFbDraws;
-            }
-            for (uint32_t i = 0; i < numRanges; ++i) {
-              sCapBytes += ranges[i].len;
-            }
-            const auto nowCap = std::chrono::steady_clock::now();
-            if (!sCapInit) {
-              sCapLast = nowCap;
-              sCapFrameFirst = m_context->m_device->getCurrentFrameId();
-              sCapInit = true;
-            }
-            if (std::chrono::duration_cast<std::chrono::milliseconds>(nowCap - sCapLast).count() >= 5000) {
-              // The window is 5 s of WALL CLOCK, not frames — bytes must be
-              // divided by the frames that actually elapsed before it means
-              // anything per-frame. Both are stamped here so a line can be read
-              // on its own, and hotVeto is stamped so an A/B log cannot be
-              // attributed to the wrong configuration.
-              const uint32_t capFrameNow = m_context->m_device->getCurrentFrameId();
-              const uint32_t capFrames = (sCapFrameFirst != UINT32_MAX && capFrameNow > sCapFrameFirst)
-                ? (capFrameNow - sCapFrameFirst) : 0u;
-              Logger::info(str::format("[GeoCapture] window capturedDraws=", sCapDraws,
-                " fbDraws=", sCapFbDraws,
-                " bytes=", sCapBytes,
-                " windowFrames=", capFrames,
-                " bytesPerFrame=", (capFrames ? (sCapBytes / capFrames) : 0ull),
-                " drawsPerFrame=", (capFrames ? (sCapDraws / capFrames) : 0ull),
-                " hotVeto=", (RtxOptions::captureSourceHotVeto() ? 1 : 0),
-                " stableKeys=", m_geomCaptureStableSnapshot.size(),
-                " wantedKeys=", m_geomCaptureWantedSnapshot.size()));
-              sCapFrameFirst = capFrameNow;
-              sCapLast = nowCap;
-              sCapDraws = 0;
-              sCapBytes = 0;
-              sCapFbDraws = 0;
-            }
-          }
-        }
+      // NV-DXVK [XfDefer] slice 4: lifted into captureSourceGeometry() so a
+      // routed draw's dispatch runs it on the frame thread, at the draw's own
+      // CS stream position (pend.seamSrcGeo). An inline draw runs it here,
+      // exactly where it always ran.
+      if (!pend.seamSrcGeo) {
+        captureSourceGeometry(dcs, indexed);
+      } else if (dcs.skinningData.numBones > 0 && dcs.geometryData.gpuCapture) {
+        // The dispatch predicted "not skinned" from the seam's bone capture,
+        // and the skinning block above has decided otherwise. This site
+        // excludes skinned draws, so detach what the dispatch attached. The
+        // copy it emitted is wasted bandwidth, never wrong data: nothing
+        // rebinds onto a capture that is not attached.
+        dcs.geometryData.gpuCapture.reset();
+        dcs.geometryData.captureEligible    = false;
+        dcs.geometryData.captureIdentityKey = 0;
       }
     }
 
@@ -68792,6 +68747,398 @@ namespace dxvk {
     sdStallMark(6);  // [SdStall] seg6 "emit": commitGeometryToRT / EmitCs + dcs copy
 
     markStg(s_perfSubmitDrawStageTailAcc, s_perfSubmitDrawStageTailMax);
+  }
+
+  // ==================================================================
+  // NV-DXVK [XfDefer] slice 4: THE captureSourceGeometry BLOCK, lifted out of
+  // SubmitDrawDeferred unchanged apart from indentation.
+  //
+  // Two callers. The tail, for an inline draw, at the original position. And
+  // xfSeamCaptures, for a routed draw, on the frame thread at the dispatch:
+  // the EmitCs below is order-critical against the engine's next upload, the
+  // chain worker may not emit at all (XfSharedSite::GeomCaptureEmit -- 2,320
+  // aborts per window), and the abort's join replay would have emitted it at
+  // the END-OF-FRAME stream position, after the uploads it orders against.
+  //
+  // It reads dcs.geometryData, dcs.skinningData.numBones and
+  // dcs.transformData.vertexShaderHash. Between the dispatch and the old
+  // position the tail writes those in two places only -- the VGUI texcoord
+  // swap and the skinning block -- and both reconcile against pend.seamSrcGeo.
+  // ==================================================================
+  void D3D11Rtx::captureSourceGeometry(DrawCallState& dcs, bool indexed) {
+    RasterGeometry& cgeo = dcs.geometryData;
+    // Skinned draws are excluded: they re-bake every frame on boneHash
+    // changes but their VB/IB is static mesh data — the per-frame racy data
+    // is the bone palette, which already rides its own CS-time copy (the
+    // pattern this capture generalizes). Capturing them would copy all
+    // character geometry every frame for no coverage gain.
+    const bool cgeoSkinned = dcs.skinningData.numBones > 0;
+    if (!cgeoSkinned && cgeo.positionBuffer.defined() && cgeo.vertexCount > 0) {
+      constexpr uint32_t kMaxVtxGroups = RasterGeometry::GeometryCapture::kMaxVertexGroups;
+      constexpr uint8_t  kNotCaptured = RasterGeometry::GeometryCapture::kStreamNotCaptured;
+      // One capture range: a source window to copy, and where its pooled
+      // stash lands in the GeometryCapture (index slot or a vertex group).
+      struct GeomCaptureRange {
+        Rc<DxvkBuffer> buf;
+        VkDeviceSize   off = 0;
+        VkDeviceSize   len = 0;
+        int8_t         vtxGroup = -1;   // -1 = index range
+      };
+      GeomCaptureRange ranges[1 + kMaxVtxGroups];
+      uint32_t numRanges = 0;
+      uint8_t streamGroup[5] = { kNotCaptured, kNotCaptured, kNotCaptured,
+                                 kNotCaptured, kNotCaptured };
+      bool wantIndex = false;
+      // A capture that cannot cover EVERY device-local stream must not
+      // happen at all: a left-live stream would tear behind
+      // sourceIsGpuCapture=true, which suppresses srcPending AND the
+      // recovery latch — frozen garbage with no way back. Unreachable now
+      // that kMaxVertexGroups == stream count, kept as the structural
+      // guarantee.
+      bool captureIncomplete = false;
+      // Predictor key: identity of every captured-range source. splitmix-
+      // style fold; collisions only cost a wasted capture or a missed warm
+      // window, never correctness of rendered data.
+      uint64_t predKey = 0x243F6A8885A308D3ull;
+      const auto mixKey = [&predKey](uint64_t v) {
+        predKey ^= v + 0x9E3779B97F4A7C15ull + (predKey << 6) + (predKey >> 2);
+      };
+
+      // Vertex streams, grouped by (buffer, slice offset, stride): streams
+      // declared on the same D3D11 slot share all three, so one window of
+      // vertexCount*stride bytes from the slice offset serves the whole
+      // group and keeps every stream's offsetFromSlice valid inside it.
+      // Only device-local sources qualify (mapPtr()==nullptr): DYNAMIC
+      // buffers are CPU-written and already covered by the snapshot/stash
+      // paths, and host-visible slices don't tear.
+      RasterBuffer* const cgeoStreams[5] = {
+        &cgeo.positionBuffer, &cgeo.normalBuffer, &cgeo.texcoordBuffer,
+        &cgeo.texcoord1Buffer, &cgeo.color0Buffer,
+      };
+      for (uint32_t s = 0; s < 5; ++s) {
+        const RasterBuffer& rb = *cgeoStreams[s];
+        if (!rb.defined() || rb.stride() == 0 || rb.buffer() == nullptr
+            || rb.mapPtr() != nullptr) {
+          continue;
+        }
+        const VkDeviceSize bufSize = rb.buffer()->info().size;
+        const VkDeviceSize off = rb.offset();
+        if (off >= bufSize) {
+          continue;
+        }
+        const VkDeviceSize len = std::min<VkDeviceSize>(
+          VkDeviceSize(cgeo.vertexCount) * rb.stride(), bufSize - off);
+        if (len == 0) {
+          continue;
+        }
+        // Find or open this stream's group.
+        uint32_t g = 0;
+        for (; g < numRanges; ++g) {
+          if (ranges[g].vtxGroup >= 0 && ranges[g].buf.ptr() == rb.buffer().ptr()
+              && ranges[g].off == off) {
+            break;
+          }
+        }
+        if (g == numRanges) {
+          if (numRanges >= kMaxVtxGroups) {
+            captureIncomplete = true;  // cannot cover this stream — abort capture below
+            continue;
+          }
+          ranges[numRanges] = GeomCaptureRange {
+            rb.buffer(), off, len, int8_t(numRanges) };
+          ++numRanges;
+          mixKey(reinterpret_cast<uintptr_t>(rb.buffer().ptr()));
+          mixKey(off);
+          mixKey(len);
+          mixKey(rb.stride());
+        } else if (len > ranges[g].len) {
+          ranges[g].len = len;  // widest stride in the group wins
+        }
+        streamGroup[s] = uint8_t(ranges[g].vtxGroup);
+      }
+
+      // Index window. Skip when the dynamic-IB machinery already owns it
+      // (indexNeedsGpuStash / CPU snapshot) — those paths are proven.
+      if (indexed && cgeo.indexBuffer.defined() && cgeo.indexCount > 0
+          && cgeo.indexBuffer.buffer() != nullptr
+          && cgeo.indexBuffer.mapPtr() == nullptr
+          && !cgeo.indexNeedsGpuStash && cgeo.indexDataSnapshot == nullptr) {
+        const VkDeviceSize bufSize = cgeo.indexBuffer.buffer()->info().size;
+        const VkDeviceSize off = cgeo.indexBuffer.offset() + cgeo.indexBuffer.offsetFromSlice();
+        const VkDeviceSize len = VkDeviceSize(cgeo.indexCount) * cgeo.indexBuffer.stride();
+        if (len > 0 && off < bufSize && off + len <= bufSize) {
+          ranges[numRanges] = GeomCaptureRange { cgeo.indexBuffer.buffer(), off, len, -1 };
+          ++numRanges;
+          wantIndex = true;
+          mixKey(reinterpret_cast<uintptr_t>(cgeo.indexBuffer.buffer().ptr()));
+          mixKey(off);
+          mixKey(len);
+        }
+      }
+
+      if (numRanges > 0 && !captureIncomplete) {
+        // Mark the geometry capturable-by-construction: the CS-side
+        // capture-feedback latch only arms for draws that flowed through
+        // this site (see RasterGeometry::captureEligible).
+        // captureIncomplete draws are deliberately NOT eligible: they fall
+        // back to the legacy srcPending path, whose recovery latch stays
+        // armed — honest raciness beats a false "stable" stamp.
+        cgeo.captureEligible = true;
+        mixKey(static_cast<uint64_t>(dcs.transformData.vertexShaderHash));
+        mixKey(cgeo.vertexCount);
+        // NV-DXVK [capture stability contract]: ship the identity key with
+        // the geometry so the CS thread publishes verdicts under the same
+        // key this site checks (see rtx_types.h captureIdentityKey).
+        cgeo.captureIdentityKey = predKey;
+
+        const uint32_t fid = m_context->m_device->getCurrentFrameId();
+
+        // NV-DXVK [flicker V8 follow-up: capture feedback]: refresh the
+        // per-frame snapshot of the CS-published capture-wanted ring, then
+        // check whether the CS thread asked for THIS draw. This is what
+        // covers steady-state re-batch bakes: their buffers (and thus the
+        // predictor key) are unchanged for hundreds of frames, so the warm
+        // window below cannot fire — but the previous frame's bake ran
+        // uncaptured, latched pendingSrcBake, and published this key.
+        // Keep entries from the last 6 frames: the CS thread lags the game
+        // thread by a frame or two, so a real recovery is captured on the
+        // very next submit. A LONG window is actively harmful — the sprite
+        // renderers create per-frame-unique entries whose latch can never
+        // converge (the entry dies before its recovery bake), and a 30-frame
+        // window kept re-arming captures for ~115 such keys all session
+        // (2026-08-02 21:23 run, [GeoCapture.wanted] = 100% sprite VSes).
+        // [XfDefer] step 4c: unordered_set clear+insert. A concurrent insert
+        // rehashes the bucket table under the other thread, which no abort
+        // can undo -- so it is refused on the chain, not detected.
+        if (m_geomCaptureWantedSnapshotFrame != fid
+            && xfMayWriteShared(XfSharedSite::GeomCaptureWantedSet)) {
+          m_geomCaptureWantedSnapshotFrame = fid;
+          m_geomCaptureWantedSnapshot.clear();
+          // NV-DXVK [capture feedback v2]: one lock per frame. Stale keys
+          // (older than the 6-frame window) are erased here — the consumer
+          // is the only reader, so its sweep keeps the map at exactly the
+          // live working set and the publisher normally never prunes.
+          std::lock_guard<std::mutex> lkFb(dxvk::tf2::g_geomCaptureWantedMutex);
+          auto& wanted = dxvk::tf2::g_geomCaptureWantedMap;
+          for (auto it = wanted.begin(); it != wanted.end();) {
+            if (fid > it->second && fid - it->second > 6u) {
+              it = wanted.erase(it);
+            } else {
+              m_geomCaptureWantedSnapshot.insert(it->first);
+              ++it;
+            }
+          }
+        }
+        const uint64_t fbKey = RasterGeometry::captureFeedbackKey(
+          static_cast<uint64_t>(dcs.transformData.vertexShaderHash),
+          cgeo.vertexCount, cgeo.indexCount);
+        const bool feedbackWantsCapture =
+          !m_geomCaptureWantedSnapshot.empty()
+          && m_geomCaptureWantedSnapshot.find(fbKey) != m_geomCaptureWantedSnapshot.end();
+
+        // NV-DXVK [capture stability contract] — the decision, inverted.
+        // The warm-window predictor this replaces captured a key's first
+        // few SIGHTINGS — but a re-batch REUSES the same buffer windows
+        // (the predictor key recurs, firstSeenFrame is ancient), while
+        // minting a brand-new BlasEntry whose FIRST bake is the one that
+        // needs the capture. Retrospective feedback can't reach it either:
+        // its (vs,vtx,idx) key is born with that bake. Measured end state
+        // of both mechanisms: capState=none, isNew=1 on 100% of starving
+        // lines while the flicker ran (2026-08-03 01:57). So: capture
+        // UNLESS the CS thread has RECENTLY proven this key stable. A key
+        // is stable while its entry keeps resolving kUpdateInstance with
+        // no pending recovery; any bake taints it. Unknown keys — first
+        // sightings, re-batches, level changes — are captured by default:
+        // the failure direction is bandwidth, never a torn bake.
+        // No per-frame dedup: several BlasEntries can share one key and
+        // which submit's DrawCallState lands on which entry is decided
+        // later by the cache, so every submit of an unstable key carries
+        // its own capture (same rationale the feedback path had).
+        // [XfDefer] step 4c: see the sibling guard on the wanted set above.
+        if (m_geomCaptureStableSnapshotFrame != fid
+            && xfMayWriteShared(XfSharedSite::GeomCaptureStableSet)) {
+          m_geomCaptureStableSnapshotFrame = fid;
+          m_geomCaptureStableSnapshot.clear();
+          std::lock_guard<std::mutex> lkSt(dxvk::tf2::g_geomCaptureStableMutex);
+          auto& stableM = dxvk::tf2::g_geomCaptureStableMap;
+          auto& taintM = dxvk::tf2::g_geomCaptureTaintMap;
+          // Taint freshness: a bake in the last 2 frames vetoes stability
+          // even if another same-key entry re-confirmed it.
+          for (auto it2 = stableM.begin(); it2 != stableM.end();) {
+            if (fid > it2->second && fid - it2->second > 6u) {
+              it2 = stableM.erase(it2);  // stale — no recent re-confirmation
+              continue;
+            }
+            const auto tIt = taintM.find(it2->first);
+            const bool freshTaint = (tIt != taintM.end())
+              && !(fid > tIt->second && fid - tIt->second > 2u);
+            if (!freshTaint) {
+              m_geomCaptureStableSnapshot.insert(it2->first);
+            }
+            ++it2;
+          }
+          for (auto it2 = taintM.begin(); it2 != taintM.end();) {
+            it2 = (fid > it2->second && fid - it2->second > 6u)
+              ? taintM.erase(it2) : std::next(it2);
+          }
+        }
+        const bool provenStable =
+          m_geomCaptureStableSnapshot.find(predKey) != m_geomCaptureStableSnapshot.end();
+        // NV-DXVK [capture stability contract — content veto]: key-granular
+        // stability is blind to CONTENT changes inside a reused buffer
+        // window. The engine re-batches by uploading new indices/vertices
+        // into the SAME window with the same counts: same identity key,
+        // sibling entries still confirming "stable", while the submit at
+        // hand references bytes that will spawn a brand-new BlasEntry
+        // whose first bake needs the capture (measured 02:18 run: stable
+        // contract live, victims' capState=none/isNew=1 lines and the
+        // census signature UNCHANGED). An engine upload in flight is
+        // directly observable here: isPendingGpuWrite (atomic use-count,
+        // Write accesses only). A hot source buffer vetoes stability —
+        // exactly the buffers being rewritten are the ones whose stability
+        // cannot be trusted at this instant. Settled static buffers read
+        // not-pending and keep their zero-capture steady state; a buffer
+        // the engine rewrites continuously stays vetoed continuously,
+        // which is the price of its content actually changing.
+        // NV-DXVK [srcHot A/B]: the reasoning above is sound only if the
+        // buffer maps to the draw. isInUse(Write) is a WHOLE-BUFFER refcount,
+        // and TF2 packs many meshes into shared buffers it rewrites every
+        // frame, so this reads true for a draw whose own bytes nobody wrote.
+        // Measured over five 5-second windows: 6655-8932 captures per window
+        // (~107/frame at ~15 fps, ~1 GB/s of copyBuffer) while 186-231 keys
+        // were proven stable, and fbDraws — the captures actually requested —
+        // was under 10% of the total. So >90% of this traffic is this veto
+        // firing at buffer granularity on a per-draw question.
+        //
+        // rtx.captureSourceHotVeto=false drops the term so the A/B can be run
+        // in one session. Default true = unchanged behaviour. See the option
+        // doc: this is a measurement switch, not a shipping setting.
+        const bool hotVetoEnabled = RtxOptions::captureSourceHotVeto();
+        bool srcHot = false;
+        if (hotVetoEnabled) {
+          for (uint32_t i = 0; i < numRanges && !srcHot; ++i) {
+            srcHot = ranges[i].buf->isInUse(DxvkAccess::Write);
+          }
+        }
+        // [XfDefer] 2026-08-19f: the EmitCs below is single-producer. The
+        // && is SHORT-CIRCUIT ON PURPOSE -- a draw that would not capture
+        // anyway never asks permission, so only draws that would actually
+        // emit refuse. See XfSharedSite::GeomCaptureEmit.
+        const bool doCapture = (srcHot || !provenStable || feedbackWantsCapture)
+                            && xfMayWriteShared(XfSharedSite::GeomCaptureEmit);
+
+        if (doCapture) {
+          auto cap = std::make_shared<RasterGeometry::GeometryCapture>();
+          std::memcpy(cap->streamGroup, streamGroup, sizeof(streamGroup));
+          cap->wantIndex = wantIndex;
+          cgeo.gpuCapture = cap;
+
+          // Fixed-size packet so the lambda captures plain values (Rc copies).
+          struct GeomCapturePacket {
+            GeomCaptureRange ranges[1 + RasterGeometry::GeometryCapture::kMaxVertexGroups];
+            uint32_t numRanges = 0;
+          } packet;
+          for (uint32_t i = 0; i < numRanges; ++i) {
+            packet.ranges[i] = ranges[i];
+          }
+          packet.numRanges = numRanges;
+
+          // Recorded at THIS position in the CS stream — the entire fix.
+          m_context->EmitCs([cap, packet](DxvkContext* ctx) {
+            auto& pool = static_cast<RtxContext*>(ctx)->getSceneManager().getIndexStashPool();
+            bool ok = true;
+            bool barrierEmitted = false;
+            for (uint32_t i = 0; i < packet.numRanges && ok; ++i) {
+              const auto& r = packet.ranges[i];
+              auto stash = pool.acquire(r.len);
+              if (stash == nullptr) {
+                // A failed acquire invalidates the whole capture (the bake
+                // falls back to the live source and the feedback loop keeps
+                // retrying) — if this fires persistently, non-convergence
+                // is a VRAM/pool problem, not a theory problem. Say so.
+                static std::atomic<uint32_t> sAcqFail { 0u };
+                const uint32_t n = sAcqFail.fetch_add(1u, std::memory_order_relaxed);
+                if (n < 16u || (n & 0x3FFu) == 0u) {
+                  Logger::warn(str::format("[GeoCapture] stash acquire FAILED",
+                    " len=", r.len, " failCount=", n + 1));
+                }
+                ok = false;
+                break;
+              }
+              if (!barrierEmitted) {
+                barrierEmitted = true;
+                // Order the engine's upload (transfer or compute write,
+                // recorded earlier in this stream) before our copy reads
+                // the source; srcStage also covers prior stash READS so a
+                // recycled pool buffer can't be rewritten under a pending
+                // consumer (WAR needs only the execution dependency).
+                ctx->emitMemoryBarrier(0,
+                  VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                  VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                  VK_PIPELINE_STAGE_TRANSFER_BIT,
+                  VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+              }
+              ctx->copyBuffer(stash->buffer, 0, r.buf, r.off, r.len);
+              if (r.vtxGroup < 0) {
+                cap->index = std::move(stash);
+              } else {
+                cap->vertex[r.vtxGroup] = std::move(stash);
+              }
+            }
+            cap->valid = ok;
+          });
+
+          // [GeoCapture] heartbeat: aggregate only (any per-draw logging on
+          // the affected VSes perturbs timing and masks the bug — V8 §2).
+          // fbDraws counts captures triggered by the CS feedback ring — the
+          // number that proves the steady-state recovery loop is closing
+          // (warm-window captures cannot cover re-batch bakes).
+          static thread_local uint64_t sCapDraws = 0, sCapBytes = 0, sCapFbDraws = 0;
+          static thread_local std::chrono::steady_clock::time_point sCapLast{};
+          static thread_local bool sCapInit = false;
+          // Frame id at the start of the current window, so bytes/draws can be
+          // normalised per frame at emit time (the window is wall-clock).
+          static thread_local uint32_t sCapFrameFirst = UINT32_MAX;
+          ++sCapDraws;
+          if (feedbackWantsCapture) {
+            ++sCapFbDraws;
+          }
+          for (uint32_t i = 0; i < numRanges; ++i) {
+            sCapBytes += ranges[i].len;
+          }
+          const auto nowCap = std::chrono::steady_clock::now();
+          if (!sCapInit) {
+            sCapLast = nowCap;
+            sCapFrameFirst = m_context->m_device->getCurrentFrameId();
+            sCapInit = true;
+          }
+          if (std::chrono::duration_cast<std::chrono::milliseconds>(nowCap - sCapLast).count() >= 5000) {
+            // The window is 5 s of WALL CLOCK, not frames — bytes must be
+            // divided by the frames that actually elapsed before it means
+            // anything per-frame. Both are stamped here so a line can be read
+            // on its own, and hotVeto is stamped so an A/B log cannot be
+            // attributed to the wrong configuration.
+            const uint32_t capFrameNow = m_context->m_device->getCurrentFrameId();
+            const uint32_t capFrames = (sCapFrameFirst != UINT32_MAX && capFrameNow > sCapFrameFirst)
+              ? (capFrameNow - sCapFrameFirst) : 0u;
+            Logger::info(str::format("[GeoCapture] window capturedDraws=", sCapDraws,
+              " fbDraws=", sCapFbDraws,
+              " bytes=", sCapBytes,
+              " windowFrames=", capFrames,
+              " bytesPerFrame=", (capFrames ? (sCapBytes / capFrames) : 0ull),
+              " drawsPerFrame=", (capFrames ? (sCapDraws / capFrames) : 0ull),
+              " hotVeto=", (RtxOptions::captureSourceHotVeto() ? 1 : 0),
+              " stableKeys=", m_geomCaptureStableSnapshot.size(),
+              " wantedKeys=", m_geomCaptureWantedSnapshot.size()));
+            sCapFrameFirst = capFrameNow;
+            sCapLast = nowCap;
+            sCapDraws = 0;
+            sCapBytes = 0;
+            sCapFbDraws = 0;
+          }
+        }
+      }
+    }
   }
 
   // NV-DXVK [SkyAutoCb2]: cb2-driven sky categorization, with cross-frame
@@ -71955,7 +72302,8 @@ namespace dxvk {
     }
   }
 
-  bool D3D11Rtx::CaptureSkyProbeCubeFromCb(DrawCallState& dcs) {
+  bool D3D11Rtx::CaptureSkyProbeCubeFromCb(DrawCallState& dcs,
+                                           const PendingDrawSlot* pend) {
     auto& cap = dcs.skyProbeCubeCapture;
     cap.valid = false;
 
@@ -71996,25 +72344,45 @@ namespace dxvk {
     // Placed after both memoCBFieldLoc resolutions so a draw whose shader has
     // no such fields returns above without ever counting an escape. Contract
     // and the reason this refuses rather than converts: XfLiveSite::SkyProbeCb2.
-    if (!xfMayReadLive(XfLiveSite::SkyProbeCb2)) return false;
-
-    const auto& cb = m_context->m_state.vs.constantBuffers[matLoc->slot];
-    if (cb.buffer == nullptr) return false;
-    const auto map = cb.buffer->GetMappedSlice();
-    const uint8_t* p = reinterpret_cast<const uint8_t*>(map.mapPtr);
+    //
+    // NV-DXVK [XfDefer] slice 4: CONVERTED. Three sources, one per kind of draw:
+    //   - routed and pinned: the bytes xfSeamCaptures pinned at the dispatch.
+    //     Right on the worker AND on a join replay, where the live mapping is
+    //     the frame's last draw's.
+    //   - routed, not pinned: the dispatch did not know this VS reaches here.
+    //     Learn it so the next draw is pinned, count it (xfEsc{ skyProbeCb2= }
+    //     now means exactly this), and skip the capture. No abort -- a replay
+    //     could only read another draw's cb2 -- and no live read.
+    //   - inline (no seam capture at all): the live read, as it always was.
+    const uint8_t* p              = nullptr;
+    size_t         byteWidth      = 0;
+    uint32_t       constantOffset = 0;
+    if (pend != nullptr && pend->hasSkyCb2 && pend->skyCb2.slot == matLoc->slot) {
+      p              = pend->skyCb2.base;
+      byteWidth      = pend->skyCb2.byteWidth;
+      constantOffset = pend->skyCb2.constantOffset;
+    } else if (pend != nullptr && pend->hasMatSnap) {
+      xfSkyCb2Learn(dcs.transformData.vertexShaderHash);
+      s_xfLiveEscapeBySite[size_t(XfLiveSite::SkyProbeCb2)]
+        .fetch_add(1u, std::memory_order_relaxed);
+      return false;
+    } else {
+      if (!xfMayReadLive(XfLiveSite::SkyProbeCb2)) return false;
+      const auto& cb = m_context->m_state.vs.constantBuffers[matLoc->slot];
+      if (cb.buffer == nullptr) return false;
+      p              = reinterpret_cast<const uint8_t*>(cb.buffer->GetMappedSlice().mapPtr);
+      byteWidth      = cb.buffer->Desc()->ByteWidth;
+      constantOffset = cb.constantOffset;
+    }
     if (p == nullptr) return false;
 
-    const size_t base       = static_cast<size_t>(cb.constantOffset) * 16;
-    const size_t totalBytes = cb.buffer->Desc()->ByteWidth;
-    if (base + totalBytes > cb.buffer->Desc()->ByteWidth + base) {
-      // Overflow guard, never triggers in practice but keeps the
-      // bounds-check explicit.
-    }
+    const size_t base       = static_cast<size_t>(constantOffset) * 16;
+    const size_t totalBytes = byteWidth;
     const size_t snapBytes = std::min<size_t>(totalBytes,
         DrawCallState::SkyProbeCubeCapture::kSnapshotMax);
-    if (base + snapBytes > cb.buffer->Desc()->ByteWidth) return false;
-    if (base + matLoc->offset + 64 > cb.buffer->Desc()->ByteWidth) return false;
-    if (base + orgLoc->offset + 12 > cb.buffer->Desc()->ByteWidth) return false;
+    if (base + snapBytes > byteWidth) return false;
+    if (base + matLoc->offset + 64 > byteWidth) return false;
+    if (base + orgLoc->offset + 12 > byteWidth) return false;
 
     // Snapshot full cb2 contents â€” used by RtxContext when it
     // discard-allocates fresh cb2 slices for each cube face.
@@ -72507,6 +72875,12 @@ namespace dxvk {
   // counter so calling this from the per-draw fanout point is cheap.
   void D3D11Rtx::SubmitEngineLights() {
     if (!RtxOptions::submitEngineLights()) return;
+
+    // NV-DXVK [XfDefer] slice 4: THE EmitCs BELOW IS SINGLE-PRODUCER. See
+    // XfSharedSite::EngineLightsSubmit for the crash it caused on the chain
+    // worker. Refused BEFORE the once-per-frame claim on purpose: a refused
+    // thread must not consume the frame's submit, or no thread submits.
+    if (!xfMayWriteShared(XfSharedSite::EngineLightsSubmit)) return;
 
     // Once-per-frame gate. Per-draw fanout calls this many times; we
     // only run on the first call where the frame counter changes.
@@ -82095,6 +82469,14 @@ namespace dxvk {
                                  "}",
                                  xfLiveEscapeCensus(),
                                  xfSharedRefuseCensus(),
+                                 // [XfDefer] slice 4: what join replays were
+                                 // refused (s_xfReplaying). Non-zero names work
+                                 // the seam still does not capture.
+                                 " xfReplayRef{live=",
+                                 s_xfReplayRefuseLive.load(std::memory_order_relaxed),
+                                 " shared=",
+                                 s_xfReplayRefuseShared.load(std::memory_order_relaxed),
+                                 "}",
                                  // [XfDefer] step 4b: THE SIZE OF THE ONLY
                                  // OFFLOAD THAT IS ACTUALLY AVAILABLE -- the
                                  // post-verdict region. Reads 0 unless
@@ -83885,6 +84267,8 @@ namespace dxvk {
           s_xfLiveEscapeBySite[i].store(0u, std::memory_order_relaxed);
         for (uint32_t i = 0; i < uint32_t(XfSharedSite::Count); ++i)
           s_xfSharedRefuseBySite[i].store(0u, std::memory_order_relaxed);
+        s_xfReplayRefuseLive.store(0u, std::memory_order_relaxed);
+        s_xfReplayRefuseShared.store(0u, std::memory_order_relaxed);
         // [GenVal]: same rule -- it is a RATE over the window's lookups, and
         // the ratio genHitStale/(genHitHit+genHitStale) is only meaningful
         // against the same window's serve count. s_genValCur is NOT cleared:

@@ -1195,6 +1195,14 @@ namespace dxvk {
     // population rather than to once-per-frame. It is bounded, it is correct
     // (the frame thread re-derives and captures properly), and it is now
     // MEASURED instead of silent -- watch xfEsc{ skyProbeCb2= }.
+    //
+    // NV-DXVK [XfDefer] slice 4: SUPERSEDED. The "correct" re-derivation ran at
+    // the join, against the frame's last draw's cb2, and the census read 832
+    // aborts/window. xfSeamCaptures now pins cb2 at the dispatch for sub-view
+    // draws and learned sky VSes; the tail reads the pin. This count is now
+    // ONLY routed draws the dispatch did not pin (a VS seen for the first
+    // time), which skip the capture and do NOT abort. A handful per new sky
+    // VS, then 0.
     SkyProbeCb2,            // cb2 snapshot + viewProj/origin decode
     // NV-DXVK [XfDefer] 2026-08-19f. VB/IB CONTENT read out of a live mapping
     // in the tail's geometry diagnostics ([ShipSkinDiag], the skyTriWatch
@@ -1282,7 +1290,24 @@ namespace dxvk {
     // rtx.conf says "with batchSubmitDrawStages off the tail's terminal act is
     // EmitCs, which is order-critical". This is a SECOND EmitCs that batching
     // does not route away.
+    //
+    // NV-DXVK [XfDefer] slice 4: census 2,320/window. A routed draw now runs
+    // the whole capture block at the dispatch (xfSeamCaptures ->
+    // captureSourceGeometry), so the tail never reaches this refusal for it;
+    // EngineSunCapture likewise. Both should read 0 on a routed run.
     GeomCaptureEmit,        // m_context->EmitCs for the index/vertex stash
+    // NV-DXVK [XfDefer] slice 4 -- APPENDED (positional names). The THIRD tail
+    // EmitCs, and the one that crashed the chain: SubmitEngineLights hands the
+    // frame's engine lights to the CS thread with m_context->EmitCs, once per
+    // frame, from whichever thread wins its compare_exchange. On a routed draw
+    // that was the chain worker -- two producers in the immediate context's CS
+    // chunk. Measured 2026-09-13: a queued invalidateBuffer command had its
+    // captured slice's mapPtr overwritten by the next command's vptr, the slice
+    // went back to a 208-byte cbuffer's free list, and materialsystem's
+    // Map(WRITE_DISCARD) upload then wrote into d3d11.dll's .rdata. A routed
+    // draw now runs the publisher at the dispatch (xfSeamCaptures); this
+    // refusal is the backstop and should read 0.
+    EngineLightsSubmit,     // SubmitEngineLights' m_context->EmitCs(addLights)
     Count
   };
 
@@ -5581,7 +5606,9 @@ namespace dxvk {
     // cb slot via computeConstantBufferBinding, field offsets via the
     // same FindCBField path as the sun/sky-tint capture. Returns true on
     // successful snapshot.
-    bool CaptureSkyProbeCubeFromCb(DrawCallState& dcs);
+    // pend (slice 4): the draw's pending slot. A routed draw reads cb2 from the
+    // pin xfSeamCaptures took and never from the live mapping.
+    bool CaptureSkyProbeCubeFromCb(DrawCallState& dcs, const PendingDrawSlot* pend);
     // NV-DXVK [SubViewSkyTexDump]: dump the bound PS textures of a TF2
     // 3D-skybox sub-view draw (SubmitDraw, "[subPassSky]"). Deduped by image
     // hash and capped, so the GPU readback runs at most once per unique
@@ -5796,6 +5823,19 @@ namespace dxvk {
     // stencilEnabled / isNdcScreenQuad appear zero times past the seam and this
     // TU builds with werror, where an unused local is an error.
     void SubmitDrawDeferred(SubmitDrawTailCtx& c);
+
+    // NV-DXVK [XfDefer] slice 4: THE OBSERVE HALF OF A ROUTED DRAW'S TAIL.
+    // Frame thread, at the dispatch, immediately before xfChainSubmit: the
+    // three pieces of the tail that are bound to the draw's INSTANT rather
+    // than to its data -- the sky-probe cb2 (pinned), the source-geometry
+    // capture EmitCs (stream position) and the engine-sun publish (live
+    // state). The tail skips each one the dispatch took. Contract at the
+    // definition.
+    void xfSeamCaptures(SubmitDrawTailCtx& c);
+    // The captureSourceGeometry block, lifted out of SubmitDrawDeferred
+    // verbatim so the dispatch can run it for routed draws. Inline draws still
+    // call it from the tail at the original position.
+    void captureSourceGeometry(DrawCallState& dcs, bool indexed);
 
     // NV-DXVK [XfDefer] §5.1 -- THE ORDERED CHAIN. Defined in d3d11_rtx.cpp.
     //
