@@ -321,7 +321,14 @@ public:
   // and ONLY then may the caller skip the draw. False means there is nothing to
   // keep alive, the caller must commit in full, and the miss is reported through
   // [ResidentScene] touchMiss rather than swallowed.
-  bool touchResidentRecord(uint64_t key, uint32_t frameId);
+  //
+  // Takes the draw rather than the key because a served draw still owes the
+  // frame one thing that is not geometry: its fog state. m_fog and m_fogStates
+  // are cleared every frame and rediscovered from the draws that carry fog, so
+  // a skip that returned before registering it would leave a fully served frame
+  // with no fog. Registration is idempotent, so a touch that misses and falls
+  // through to submitDrawState registers the same state twice harmlessly.
+  bool touchResidentRecord(const DrawCallState& drawCallState, uint32_t frameId);
 
   // One live surface about to be uploaded carries this bindless buffer slot.
   //
@@ -656,7 +663,12 @@ private:
   void printAllRtInstances();
   
   MaterialData determineMaterialData(const MaterialData* overrideMaterialData, const DrawCallState& input);
-  
+
+  // The per-draw fog discovery -- first sighting of a fog state this frame, its
+  // replacement material, and the first unreplaced fog becoming m_fog. ONE copy,
+  // called by submitDrawState, the Phase2b pre-pass and the resident skip.
+  void registerFogState(const DrawCallState& input);
+
   const uint32_t kInvalidMaterialCacheIndex = UINT32_MAX;
   uint32_t m_beginUsdExportFrameNum = -1;
   bool m_enqueueDelayedClear = false;

@@ -390,6 +390,28 @@ namespace dxvk {
     // as a success is a silent retirement.
     bool touch(uint64_t key, uint32_t frame);
 
+    // NV-DXVK slice 7: THE TOUCH'S VERDICT WITHOUT THE TOUCH.
+    //
+    // The flush-side pre-pass (SceneManager::processDeferredDrawBatch) decides
+    // whether a draw enters the shard graph at all, and it has to decide with
+    // the same rule touch() will apply on CS, or the two disagree about which
+    // draws are unchanged. So both call judge(): probe() is the const half and
+    // counts nothing, touch() counts the verdict and stamps on kServable.
+    //
+    // The flush side may read the store because the caller drained CS before
+    // the pre-pass runs -- the same strict alternation that lets the pre-pass
+    // stamp BlasEntry::frameLastTouched. CS still makes the final call: a draw
+    // the probe passed is routed kLegacyCS, and its own touch() at consume is
+    // what skips it. A record that changed in between just commits in full.
+    enum class ServeVerdict : uint8_t {
+      kServable = 0,
+      kUnknown,      // no record under this key
+      kInvalid,      // invalidated or emptied -- an instance it named died
+      kUnsafe,       // skipUnsafe: billboards, ray portals, decals, bone-driven
+      kOmmPending,   // an instance still owes the OMM handler work; see judge()
+    };
+    ServeVerdict probe(uint64_t key, uint32_t frame) const;
+
     // VERIFY SCORING. Answers the only question that matters while verify is on:
     // if the gate had skipped this draw, would the record it served have named
     // the instances the full path actually produced? Returns true when they
@@ -457,6 +479,11 @@ namespace dxvk {
       // cannot speak for -- billboards, ray portals or decals. Not a defect and
       // not self-correcting either: it is a permanent property of those draws.
       uint32_t touchMissUnsafe = 0;
+      // Refused because an instance in the record still owes the OMM handler
+      // work: created this frame, or a numTexelsPerMicroTriangle calculation
+      // pending. Self-correcting -- the full path delivers the event, the
+      // calculation completes, and the record serves once the flag clears.
+      uint32_t touchMissOmm = 0;
       uint32_t invalidated = 0;
       uint32_t invalidatedOtherKey = 0; // Records the single back-pointer missed.
       uint32_t evicted    = 0;
@@ -619,6 +646,10 @@ namespace dxvk {
     size_t size() const { return m_records.size(); }
 
   private:
+    // The one serve rule, shared by touch() and probe(). See touch() for why
+    // each refusal exists.
+    static ServeVerdict judge(const Record* rec, uint32_t frame);
+
     // Records this store erased, and the frame it happened on. DIAGNOSTIC ONLY:
     // it exists so score() can tell "this key's record was filed and then went
     // away" from "this key never had a record", which are opposite findings that

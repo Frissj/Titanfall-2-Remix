@@ -245,9 +245,7 @@ namespace dxvk {
     m_stats.built += 1;
   }
 
-  bool ResidentScene::touch(uint64_t key, uint32_t frame) {
-    Record* rec = find(key);
-
+  ResidentScene::ServeVerdict ResidentScene::judge(const Record* rec, uint32_t frame) {
     // A failed touch treated as a success is a SILENT RETIREMENT: the caller
     // would skip the full path believing the instances were kept alive, and they
     // would age out one frame later with nothing to catch it. So the caller acts
@@ -266,32 +264,77 @@ namespace dxvk {
     //             an instance it named was destroyed. THIS is the one the plan's
     //             "touchMiss ~0" gate is about, and it wants finding.
     if (rec == nullptr) {
-      m_stats.touchMissUnknown += 1;
-      m_stats.touchMiss += 1;
-      return false;
+      return ServeVerdict::kUnknown;
     }
     if (!rec->valid || rec->instances.empty()) {
-      m_stats.touchMissInvalid += 1;
-      m_stats.touchMiss += 1;
-      return false;
+      return ServeVerdict::kInvalid;
     }
     // Billboards, ray portals and decals rebuild per-frame state that the gate's
     // three tests say nothing about -- see Record::skipUnsafe.
     //
-    // OPACITY MICROMAPS ARE THE FOURTH, and read from the option rather than
-    // latched at build time because it is a runtime switch: the micromap manager
-    // subscribes to the instance-update event and keeps its per-instance
-    // bookkeeping on the assumption that a live instance is updated every frame.
-    // Skipping the draw stops delivering that event, so with micromaps on the
-    // manager would age out data for objects that are still on screen. It is a
-    // cost rather than a correctness failure, but it is the opposite of what
-    // this feature exists to do, and residency and micromaps working together
-    // wants its own measurement rather than an assumption here.
-    //
     // Counted on their own so a scene reading touched=0 says WHY rather than
     // merely reading zero.
-    if (rec->skipUnsafe || RtxOptions::getEnableOpacityMicromap()) {
+    if (rec->skipUnsafe) {
+      return ServeVerdict::kUnsafe;
+    }
+    // OPACITY MICROMAPS, PER INSTANCE RATHER THAN PER SWITCH.
+    //
+    // This used to refuse every record whenever micromaps were on, on the
+    // premise that the micromap manager "keeps its per-instance bookkeeping on
+    // the assumption that a live instance is updated every frame". With OMM on
+    // by default that made the skip unreachable: touch() could never return
+    // true, and nothing above it could be measured.
+    //
+    // The premise does not survive reading the handler. For an instance that
+    // was not created this frame, OpacityMicromapManager::onInstanceUpdated is
+    // a memory early-out, a staging arm that requires frameAge == 0, and
+    // `if (needsToCalculateNumTexelsPerMicroTriangle) calculate()`. Nothing else.
+    // The candidate walk reads the instance table, not the event, and the bake's
+    // "kept around by other means" test reads frameLastUpdated, which the stamp
+    // below sets. That is the contract the handler already declares as
+    // skippableWhenNoPendingOmmWork, and the fast instance path already relies
+    // on it: [Perf.FastInst] ommSkip= tracks fast= almost exactly.
+    //
+    // So refuse only an instance that still owes the handler work. The full
+    // path delivers the event, the incremental calculation completes, the flag
+    // clears, and the record serves from then on -- the same frame the fast
+    // path would have picked the work up.
+    if (RtxOptions::getEnableOpacityMicromap()) {
+      for (const RtInstance* inst : rec->instances) {
+        if (inst != nullptr
+            && (inst->isCreatedThisFrame(frame)
+                || inst->getOpacityMicromapInstanceData().hasPendingNumTexelsCalculation())) {
+          return ServeVerdict::kOmmPending;
+        }
+      }
+    }
+    return ServeVerdict::kServable;
+  }
+
+  ResidentScene::ServeVerdict ResidentScene::probe(uint64_t key, uint32_t frame) const {
+    return judge(find(key), frame);
+  }
+
+  bool ResidentScene::touch(uint64_t key, uint32_t frame) {
+    Record* rec = find(key);
+
+    switch (judge(rec, frame)) {
+    case ServeVerdict::kServable:
+      break;
+    case ServeVerdict::kUnknown:
+      m_stats.touchMissUnknown += 1;
+      m_stats.touchMiss += 1;
+      return false;
+    case ServeVerdict::kInvalid:
+      m_stats.touchMissInvalid += 1;
+      m_stats.touchMiss += 1;
+      return false;
+    case ServeVerdict::kUnsafe:
       m_stats.touchMissUnsafe += 1;
+      m_stats.touchMiss += 1;
+      return false;
+    case ServeVerdict::kOmmPending:
+      m_stats.touchMissOmm += 1;
       m_stats.touchMiss += 1;
       return false;
     }

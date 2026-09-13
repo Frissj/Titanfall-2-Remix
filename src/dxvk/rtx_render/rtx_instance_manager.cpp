@@ -4462,11 +4462,15 @@ namespace dxvk {
             " missUnk=", rs.touchMissUnknown,
             " missInval=", rs.touchMissInvalid,
             // Refused because the record's instances carry per-frame work the
-            // gate cannot speak for: billboards, ray portals, decals, or opacity
-            // micromaps being on. Permanent for those draws, not a fault -- but
-            // if this reads close to hit= then residency is being refused almost
-            // everywhere and the reason is one of those four, not the key.
+            // gate cannot speak for: billboards, ray portals, decals. Permanent
+            // for those draws, not a fault -- but if this reads close to hit=
+            // then residency is being refused almost everywhere and the reason
+            // is one of those, not the key.
             " missUnsafe=", rs.touchMissUnsafe,
+            // An instance still owes the OMM handler work (created this frame,
+            // or a numTexels calculation pending). Self-correcting; a steady
+            // value close to hit= means some instance's flag never clears.
+            " missOmm=", rs.touchMissOmm,
             " invalidated=", rs.invalidated,
             " invalidatedOtherKey=", rs.invalidatedOtherKey,
             " evicted=", rs.evicted,

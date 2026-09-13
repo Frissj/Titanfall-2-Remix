@@ -5718,11 +5718,20 @@ namespace dxvk {
       // That ordering is what the
       // [PropIdKeepLong attempt reverted] note exists to enforce: a long keep on
       // an unstable identity made things measurably WORSE, not merely no better.
+      //
+      // NV-DXVK slice 7: NEVER A kSharded ITEM. The flush-side pre-pass routes
+      // every draw it expects to serve kLegacyCS (SceneManager::
+      // processDeferredDrawBatch, [ChangedSet]), so a draw that reaches here
+      // kSharded was judged changed there and its shard has already run the
+      // instance work -- stamps, spatial ops, and the pendingOps this draw's
+      // consume replays. Skipping it would drop those ops on the floor; the
+      // consume below is the only correct continuation.
       if (drawCallState.residentPredictHit
           && drawCallState.residentKey != 0ull
           && RtxOptions::ResidentScene::enable()
           && !RtxOptions::ResidentScene::verify()
-          && getSceneManager().touchResidentRecord(drawCallState.residentKey,
+          && (shardInfo == nullptr || shardInfo->route != ShardedDrawInfo::Route::kSharded)
+          && getSceneManager().touchResidentRecord(drawCallState,
                                                    m_device->getCurrentFrameId())) {
         return;
       }

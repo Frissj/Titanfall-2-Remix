@@ -2339,6 +2339,42 @@ namespace dxvk {
     };
   }
 
+  void SceneManager::registerFogState(const DrawCallState& input) {
+    if (input.getFogState().mode == FogMode::None) {
+      return;
+    }
+    XXH64_hash_t fogHash = input.getFogState().getHash();
+    if (m_fogStates.find(fogHash) != m_fogStates.end()) {
+      return;
+    }
+    // Only do anything if we haven't seen this fog before.
+    m_fogStates[fogHash] = input.getFogState();
+
+    MaterialData* pFogReplacement = m_pReplacer->getReplacementMaterial(fogHash);
+    if (pFogReplacement) {
+      // Track this replacement material hash for hash checking
+      trackReplacementMaterialHash(fogHash);
+      // Fog has been replaced by a translucent material to start the camera in,
+      // meaning that it was being used to indicate 'underwater' or something similar.
+      if (pFogReplacement->getType() != MaterialDataType::Translucent) {
+        Logger::warn(str::format("Fog replacement materials must be translucent.  Ignoring material for ", std::hex, m_fog.getHash()));
+      } else {
+        uint32_t id = UINT32_MAX;
+        createSurfaceMaterial(*pFogReplacement, input, &id);
+        assert(id != UINT32_MAX);
+        // NV-DXVK: the FOG member. The Phase2b pre-pass's copy of this block
+        // wrote m_startInMediumMaterialIndex_inCache instead -- the resolved
+        // value prepareSceneData recomputes every frame FROM this one (external
+        // override, else fog) -- so on the sharded path a fog replacement's
+        // start-in-medium material was overwritten before it was ever read.
+        m_fogStartInMediumMaterialIndex_inCache = id;
+      }
+    } else if (m_fog.mode == FogMode::None) {
+      // render the first unreplaced fog.
+      m_fog = input.getFogState();
+    }
+  }
+
   void SceneManager::submitDrawState(Rc<DxvkContext> ctx, const DrawCallState& input, const MaterialData* overrideMaterialData) {
     ScopedCpuProfileZone();
     s_spawnDiagSubmitTotal.fetch_add(1, std::memory_order_relaxed);
@@ -2824,33 +2860,7 @@ namespace dxvk {
       return;
     }
 
-    if (input.getFogState().mode != FogMode::None) {
-      XXH64_hash_t fogHash = input.getFogState().getHash();
-      if (m_fogStates.find(fogHash) == m_fogStates.end()) {
-        // Only do anything if we haven't seen this fog before.
-        m_fogStates[fogHash] = input.getFogState();
-
-        MaterialData* pFogReplacement = m_pReplacer->getReplacementMaterial(fogHash);
-        if (pFogReplacement) {
-          // Track this replacement material hash for hash checking
-          trackReplacementMaterialHash(fogHash);
-          // Fog has been replaced by a translucent material to start the camera in,
-          // meaning that it was being used to indicate 'underwater' or something similar.
-          if (pFogReplacement->getType() != MaterialDataType::Translucent) {
-            Logger::warn(str::format("Fog replacement materials must be translucent.  Ignoring material for ", std::hex, m_fog.getHash()));
-          } else {
-            uint32_t id = UINT32_MAX;
-            createSurfaceMaterial(*pFogReplacement, input, &id);
-            assert(id != UINT32_MAX);
-            m_fogStartInMediumMaterialIndex_inCache = id;
-          }
-        } else if (m_fog.mode == FogMode::None) {
-          // render the first unreplaced fog.
-          m_fog = input.getFogState();
-        }
-      }
-    }
-
+    registerFogState(input);
 
     ssGuard.mark1();   // NV-DXVK [Perf.SubmitState]: end of `entry`
 
@@ -3602,8 +3612,9 @@ namespace dxvk {
     return result;
   }
   
-  bool SceneManager::touchResidentRecord(uint64_t key, uint32_t frameId) {
-    return m_instanceManager.getResidentScene().touch(key, frameId);
+  bool SceneManager::touchResidentRecord(const DrawCallState& drawCallState, uint32_t frameId) {
+    registerFogState(drawCallState);
+    return m_instanceManager.getResidentScene().touch(drawCallState.residentKey, frameId);
   }
 
   void SceneManager::onSceneObjectDestroyed(const BlasEntry& blas) {
@@ -5195,6 +5206,46 @@ namespace dxvk {
             std::chrono::steady_clock::now() - t0).count();
       }
     };
+    const auto preSince = [preSplitOn](const std::chrono::steady_clock::time_point& t0) -> int64_t {
+      return preSplitOn
+        ? std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()
+        : 0;
+    };
+
+    // NV-DXVK slice 7 (ARCHITECTURE_OVERHAUL.md sec 7): THE GRAPH IS FED BY THE
+    // CHANGED SET, NOT THE DRAW LIST.
+    //
+    // Every sharded-eligible draw below pays determineMaterialData and
+    // DrawCallCache::get here, then its shard's instance work on a worker --
+    // and only THEN, at CS consume, does commitGeometryToRT's resident skip ask
+    // whether the draw was unchanged. So the skip, once armed, saves the CS
+    // record half and leaves every unchanged draw paying the flush half. I4
+    // says an unchanged object is zero work; the place to act on the verdict is
+    // before the graph is built, not after it has run.
+    //
+    // A draw the frame-thread gate predicted unchanged, whose record the store
+    // would serve (ResidentScene::probe -- the same rule touch() applies), is
+    // routed kLegacyCS instead of into a shard. CS then takes the existing skip:
+    // its own touch() decides, and a record that changed in between commits the
+    // draw in full on the legacy path. No new route, no new CS behaviour.
+    //
+    // UNDER rtx.residentScene.verify NOTHING IS ROUTED. The candidates are
+    // counted and their flush cost is billed, so [ChangedSet] says what the
+    // graph would shrink to before anything is allowed to shrink it -- I8.
+    //
+    // THE FALSIFIER, printed on the same line: servable= against cand=. If the
+    // probe refuses most predicted hits, the changed set is not smaller than
+    // the draw list and there is nothing here to take; miss{} says why.
+    const bool serveArmed =
+      RtxOptions::ResidentScene::enable() && !RtxOptions::ResidentScene::verify();
+    uint32_t nServeCand = 0, nServable = 0, nServed = 0;
+    uint32_t nServeMiss[5] = {};
+    int64_t preMatServNs = 0, preGetServNs = 0;
+    // Per item: 1 = servable under verify (its shard time is billed). Read by
+    // the workers below through a pointer, like sShards, and not written again
+    // until the next call.
+    static thread_local std::vector<uint8_t> sServable;
+    sServable.assign(batch.size(), 0u);
 
     // ---- ORDERED PRE-PASS (Step 1), arena order --------------------------
     const bool shardingAdmissible =
@@ -5272,26 +5323,7 @@ namespace dxvk {
       // path skips them — see the [Phase2b] block in submitDrawState).
       // Fog block first, exactly like submitDrawState:2452.
       const auto tPreFog = preNow();
-      if (dcs.getFogState().mode != FogMode::None) {
-        const XXH64_hash_t fogHash = dcs.getFogState().getHash();
-        if (m_fogStates.find(fogHash) == m_fogStates.end()) {
-          m_fogStates[fogHash] = dcs.getFogState();
-          MaterialData* pFogReplacement = m_pReplacer->getReplacementMaterial(fogHash);
-          if (pFogReplacement) {
-            trackReplacementMaterialHash(fogHash);
-            if (pFogReplacement->getType() != MaterialDataType::Translucent) {
-              Logger::warn(str::format("Fog replacement materials must be translucent.  Ignoring material for ", std::hex, m_fog.getHash()));
-            } else {
-              uint32_t id = UINT32_MAX;
-              createSurfaceMaterial(*pFogReplacement, dcs, &id);
-              m_startInMediumMaterialIndex_inCache = id;
-            }
-          } else if (m_fog.mode == FogMode::None) {
-            m_fog = dcs.getFogState();
-          }
-        }
-      }
-
+      registerFogState(dcs);
       preAdd(preFogNs, tPreFog);
 
       // Replacement lookup — the same three probes submitDrawState makes. Any
@@ -5320,11 +5352,39 @@ namespace dxvk {
         continue;
       }
 
+      // NV-DXVK slice 7: the changed-set filter -- see serveArmed above. AFTER
+      // fog and the replacement lookup on purpose: fog discovery is per frame
+      // and per draw, and a replaced draw is legacy whatever its residency.
+      // What it saves is everything from here down, plus the shard.
+      const uint32_t itemIdx = static_cast<uint32_t>(&item - batch.data());
+      bool itemServable = false;
+      if (dcs.residentPredictHit && dcs.residentKey != 0ull && RtxOptions::ResidentScene::enable()) {
+        ++nServeCand;
+        const ResidentScene::ServeVerdict sv =
+          m_instanceManager.getResidentScene().probe(dcs.residentKey, fid);
+        if (sv == ResidentScene::ServeVerdict::kServable) {
+          if (serveArmed) {
+            info.route = ShardedDrawInfo::Route::kLegacyCS;
+            ++nServed;
+            continue;
+          }
+          ++nServable;
+          itemServable = true;
+          sServable[itemIdx] = 1u;
+        } else {
+          ++nServeMiss[static_cast<uint32_t>(sv)];
+        }
+      }
+
       // Material — computed ONCE, here; the sidecar copy is what both the
       // flush-side instance work and every CS-side consumer read.
       const auto tPreMat = preNow();
       info.renderMaterial = std::make_shared<MaterialData>(determineMaterialData(nullptr, dcs));
-      preAdd(preMatNs, tPreMat);
+      {
+        const int64_t d = preSince(tPreMat);
+        preMatNs += d;
+        if (itemServable) { preMatServNs += d; }
+      }
 
       info.route = ShardedDrawInfo::Route::kSharded;
 
@@ -5346,9 +5406,12 @@ namespace dxvk {
       info.blasFirstDrawOfFrame = (pBlas->frameLastTouched != fid);
       pBlas->frameLastTouched = fid;
       pBlas->noteDraw(fid);
-      preAdd(preGetNs, tPreGet);
+      {
+        const int64_t d = preSince(tPreGet);
+        preGetNs += d;
+        if (itemServable) { preGetServNs += d; }
+      }
 
-      const uint32_t itemIdx = static_cast<uint32_t>(&item - batch.data());
       auto shardIt = sShardOf.find(pBlas);
       if (shardIt == sShardOf.end()) {
         if (liveShards == sShards.size()) {
@@ -5425,21 +5488,43 @@ namespace dxvk {
         return schedule(std::move(fn)).valid();
       });
     }
+    // NV-DXVK slice 7: per-item shard CPU time, all items and the servable
+    // subset, so [ChangedSet] can say what fraction of the graph's work is
+    // draws that did not change. Summed across workers, so it is compared with
+    // itself, not with parUs (a wall time). Same gate as the pre-pass split.
+    std::atomic<int64_t> itemNsAll { 0 };
+    std::atomic<int64_t> itemNsServ { 0 };
     {
-      // sShards / sBundleStart are game-thread thread_locals of static duration
-      // and are not touched again until the join, so pointers into them are
-      // safe on a worker.
+      // sShards / sBundleStart / sServable are game-thread thread_locals of
+      // static duration and are not touched again until the join, so pointers
+      // into them are safe on a worker. The two atomics are written only inside
+      // bundle bodies, and every body completes before waitAll returns.
       std::vector<std::vector<uint32_t>>* pShards = &sShards;
       const std::vector<uint32_t>* pBundleStart = &sBundleStart;
+      const std::vector<uint8_t>* pServable = &sServable;
       std::vector<ShardedDrawBatchItem>* pBatch = &batch;
+      std::atomic<int64_t>* pItemNsAll = &itemNsAll;
+      std::atomic<int64_t>* pItemNsServ = &itemNsServ;
       SceneManager* self = this;
       const JobGraph::JobHandle shardJoin = shardGraph.createNode("Shard.join", nullptr);
-      shardGraph.parallelFor(shardJoin, nBundles, [self, pShards, pBundleStart, pBatch](uint32_t b) {
+      shardGraph.parallelFor(shardJoin, nBundles,
+                             [self, pShards, pBundleStart, pBatch, pServable, pItemNsAll, pItemNsServ, preSplitOn](uint32_t b) {
         const uint32_t s0 = (*pBundleStart)[b];
         const uint32_t s1 = (*pBundleStart)[b + 1u];
         for (uint32_t s = s0; s < s1; ++s) {
           for (const uint32_t idx : (*pShards)[s]) {
+            if (!preSplitOn) {
+              self->runShardedDrawItem((*pBatch)[idx]);
+              continue;
+            }
+            const auto tItem = std::chrono::steady_clock::now();
             self->runShardedDrawItem((*pBatch)[idx]);
+            const int64_t d = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - tItem).count();
+            pItemNsAll->fetch_add(d, std::memory_order_relaxed);
+            if ((*pServable)[idx] != 0u) {
+              pItemNsServ->fetch_add(d, std::memory_order_relaxed);
+            }
           }
         }
       });
@@ -5494,8 +5579,18 @@ namespace dxvk {
       static thread_local int64_t sPreHashNs = 0, sPreMatNs = 0, sPreGetNs = 0;
       // NV-DXVK [JobGraph] slice 6: the bundle graph. threw/stale must read 0.
       static thread_local uint64_t sGraphDisp = 0, sGraphInline = 0, sGraphThrew = 0, sGraphStale = 0;
+      // NV-DXVK slice 7: the changed-set filter.
+      static thread_local uint64_t sServeCand = 0, sServableN = 0, sServed = 0;
+      static thread_local uint64_t sServeMiss[5] = {};
+      static thread_local int64_t sPreMatServNs = 0, sPreGetServNs = 0;
+      static thread_local int64_t sItemNsAll = 0, sItemNsServ = 0;
       if (!sInit) { sLast = t2b0; sInit = true; }
       ++sFrames;
+      sServeCand += nServeCand; sServableN += nServable; sServed += nServed;
+      for (uint32_t m = 0; m < 5u; ++m) { sServeMiss[m] += nServeMiss[m]; }
+      sPreMatServNs += preMatServNs; sPreGetServNs += preGetServNs;
+      sItemNsAll += itemNsAll.load(std::memory_order_relaxed);
+      sItemNsServ += itemNsServ.load(std::memory_order_relaxed);
       sGraphDisp += shardGraphStats.dispatched; sGraphInline += shardGraphStats.ranInline;
       sGraphThrew += shardGraphStats.threw;     sGraphStale += shardGraphStats.staleHandles;
       sSharded += nSharded; sLegacy += nLegacy; sIgnored += nIgnored;
@@ -5567,12 +5662,46 @@ namespace dxvk {
             (sPreFinNs + sPreFogNs + sPreHashNs + sPreMatNs) / 1000 / fr, "us"));
         }
 
+        // NV-DXVK slice 7: [ChangedSet]. How to read it:
+        //   cand      sharded-eligible draws the frame-thread gate predicted
+        //             unchanged (residentPredictHit, key, enable).
+        //   servable  of cand, the store would serve them (probe == touch's
+        //             rule). THE FALSIFIER: servable << cand means the changed
+        //             set is not smaller than the draw list; miss{} says why.
+        //   served    routed around the graph. 0 while verify is on, BY DESIGN;
+        //             once verify is off it replaces servable and the graph is
+        //             fed only what is left (graphIn).
+        //   billed    what the servable draws cost here while still in the
+        //             graph: pre-pass material + cacheGet, and their share of
+        //             the per-item shard CPU (shardUs of itemUs, both summed
+        //             across workers). That share is what serving removes.
+        // sharded+legacy+ignored+served == items per frame.
+        if (sServeCand != 0 || sServed != 0) {
+          Logger::info(str::format(
+            "[ChangedSet] perFrame cand=", sServeCand / uint64_t(fr),
+            " servable=", sServableN / uint64_t(fr),
+            " served=", sServed / uint64_t(fr),
+            " miss{unk=", sServeMiss[static_cast<uint32_t>(ResidentScene::ServeVerdict::kUnknown)] / uint64_t(fr),
+            " inval=", sServeMiss[static_cast<uint32_t>(ResidentScene::ServeVerdict::kInvalid)] / uint64_t(fr),
+            " unsafe=", sServeMiss[static_cast<uint32_t>(ResidentScene::ServeVerdict::kUnsafe)] / uint64_t(fr),
+            " omm=", sServeMiss[static_cast<uint32_t>(ResidentScene::ServeVerdict::kOmmPending)] / uint64_t(fr), "}",
+            " graphIn=", sSharded / uint64_t(fr),
+            " changed=", (sSharded - std::min(sSharded, sServableN)) / uint64_t(fr),
+            " | billed matUs=", sPreMatServNs / 1000 / fr, " of ", sPreMatNs / 1000 / fr,
+            " getUs=", sPreGetServNs / 1000 / fr, " of ", sPreGetNs / 1000 / fr,
+            " shardUs=", sItemNsServ / 1000 / fr, " of itemUs=", sItemNsAll / 1000 / fr,
+            " armed=", (serveArmed ? 1 : 0)));
+        }
+
         sLast = t2b1;
         sFrames = sSharded = sLegacy = sIgnored = sDeferred = sShardCnt = sBundleCnt = 0;
         sPreNs = sParNs = sTailNs = 0;
         sGraphDisp = sGraphInline = sGraphThrew = sGraphStale = 0;
         sLgAdmit = sLgFut = sLgFinal = sLgSky = sLgTerrain = sLgCam = sLgGeom = sLgRepl = 0;
         sPreFinNs = sPreCamNs = sPreFogNs = sPreHashNs = sPreMatNs = sPreGetNs = 0;
+        sServeCand = sServableN = sServed = 0;
+        for (uint32_t m = 0; m < 5u; ++m) { sServeMiss[m] = 0; }
+        sPreMatServNs = sPreGetServNs = sItemNsAll = sItemNsServ = 0;
       }
     }
   }
