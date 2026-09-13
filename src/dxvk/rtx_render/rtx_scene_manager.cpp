@@ -263,7 +263,37 @@ namespace dxvk {
     }
   }
 
+  namespace {
+    // NV-DXVK [Perf.Gc] I4: the anti-cull frustum test's parallel phase. See
+    // the anti-culling branch of SceneManager::garbageCollection for why.
+    //
+    // ITS OWN POOL, NOT THE d3d11 GEOMETRY POOL: that one's AtomicQueue is SPSC
+    // with the game thread as its one producer, and the game thread is running
+    // frame N+1 while dxvk-cs is in prepScene for frame N. This one is only ever
+    // scheduled from dxvk-cs.
+    //
+    // A RAW POINTER, deleted by ~SceneManager: a static unique_ptr would join
+    // worker threads from a static destructor at DLL unload, under the loader
+    // lock. A process that exits without tearing the device down leaks it, and
+    // the OS reclaims the threads.
+    struct AntiCullParallel {
+      using Pool = WorkerThreadPool<16, /*WorkStealing*/ true, /*LowLatency*/ false>;
+      std::unique_ptr<Pool> pool;
+      std::unique_ptr<JobGraph> graph;
+      std::vector<const RtInstance*> flat;   // the BLAS walk's instances, in walk order
+      std::vector<uint8_t> inside;           // the verdict for flat[i]
+      // calculateAntiCullingHash() for flat[i], filled only where the walk will
+      // use it: outside the frustum and not IgnoreAntiCulling. A pure function of
+      // the instance (position, material hash, bounding box), so it rides the
+      // parallel phase; the duplicate cache it keys stays in the serial walk.
+      std::vector<XXH64_hash_t> hash;
+    };
+    AntiCullParallel* s_antiCull = nullptr;
+  }
+
   SceneManager::~SceneManager() {
+    delete s_antiCull;
+    s_antiCull = nullptr;
   }
 
   bool SceneManager::areAllReplacementsLoaded() const {
@@ -477,6 +507,12 @@ namespace dxvk {
     auto tGc = std::chrono::steady_clock::now();
     int64_t gc_blas = 0, gc_repl = 0, gc_inst = 0, gc_accel = 0, gc_light = 0,
             gc_portal = 0, gc_reclaim = 0;
+    // The anti-cull split inside gc_blas: the parallel verdict phase's wall
+    // time, how many instances it tested, how many chunks it ran as, and THE
+    // FALSIFIER -- instances the serial walk met out of step with the gathered
+    // list and had to re-test inline. Must read 0.
+    int64_t gc_acTestUs = 0;
+    uint32_t gcAcN = 0, gcAcChunks = 0, gcAcMismatch = 0;
     auto markGc = [&tGc](int64_t& sink) {
       const auto now = std::chrono::steady_clock::now();
       sink = std::chrono::duration_cast<std::chrono::microseconds>(now - tGc).count();
@@ -605,37 +641,162 @@ namespace dxvk {
       fast_unordered_cache<const RtInstance*> outsideFrustumInstancesCache;
 
       auto& entries = m_drawCallCache.getEntries();
+
+      // NV-DXVK [Perf.Gc] I4: THE FRUSTUM VERDICT RUNS IN PARALLEL, THE WALK
+      // STAYS SERIAL.
+      //
+      // MEASURED 2026-09-13: [Perf.GpuPass]/[Perf.Block] gpuIdleMs tracks
+      // [Perf.Stall] prepScene wall window by window (5.24 vs 5.42, 5.27 vs
+      // 5.24, 5.09 vs 4.76, 6.41 vs 5.58 ms): the GPU sits idle while dxvk-cs
+      // builds the scene, so every ms of prepScene is a ms of frame. This loop
+      // is gc.blas=1.5-1.6 ms of it -- one SAT frustum test per instance, 2820
+      // of them, one after another on dxvk-cs while ~30 cores idle.
+      //
+      // The verdict is a pure function of the camera (read-only here) and the
+      // instance's transform and bounding box, so it splits cleanly. Everything
+      // ORDER-DEPENDENT stays in the serial walk below, unchanged and in the
+      // same order: the IgnoreAntiCulling split, the duplicate cache (which of
+      // two duplicates survives depends on which is met first), the marks, the
+      // BLAS erase, and the counters and diagnostics. The walk consumes the
+      // verdicts by position and checks that the instance at that position is
+      // the one it is holding -- gcAcMismatch on [Perf.Gc] is the falsifier.
+      //
+      // Check for camera cut. Anti-Culling should NOT be enabled during a camera cut.
+      // In some cases, we can't reliably detect a camera cut (e.g., when the game doesn't set up the View Matrix),
+      // so we must disable Anti-Culling to prevent visual corruption.
+      const bool acTest = !getCamera().isCameraCut() && m_isAntiCullingSupported;
+      const bool acBox  = RtxOptions::needsMeshBoundingBox();
+      const bool acSat  = acBox && RtxOptions::AntiCulling::Object::enableHighPrecisionAntiCulling();
+      // [InfFar] Source the isInfFrustum flag from the camera's
+      // actual state, not just the user option. Reverse-Z
+      // infinite-far engines (TF2) report farPlane=+Inf even
+      // when the option is off; the SAT culler's finite-far
+      // code path applied to an infinite-far frustum produces
+      // over-culling (sky-only views). See RtCamera::
+      // shouldUseInfiniteFarFrustum() for the predicate.
+      // Per frame, not per instance: it reads the camera and an option.
+      const bool acInfFar = getCamera().shouldUseInfiniteFarFrustum();
+      const Matrix4d acW2v = getCamera().getWorldToView(false);
+      RtCamera& acCam = getCamera();
+      auto acVerdict = [&](const RtInstance* instance) -> bool {
+        const Matrix4 objectToView = acW2v * instance->getTransform();
+        if (acBox) {
+          const AxisAlignedBoundingBox& boundingBox = instance->getBlas()->input.getGeometryData().boundingBox;
+          if (acSat) {
+            return boundingBoxIntersectsFrustumSAT(
+              acCam,
+              boundingBox.minPos,
+              boundingBox.maxPos,
+              objectToView,
+              acInfFar);
+          }
+          return boundingBoxIntersectsFrustum(acCam.getFrustum(), boundingBox.minPos, boundingBox.maxPos, objectToView);
+        }
+        // Fallback to check object center under view space
+        return acCam.getFrustum().CheckSphere(
+          float3(objectToView[3][0], objectToView[3][1], objectToView[3][2]), 0);
+      };
+
+      if (s_antiCull == nullptr) {
+        s_antiCull = new AntiCullParallel();
+        s_antiCull->pool = std::make_unique<AntiCullParallel::Pool>(uint8_t(8), "rtx-gc-anticull");
+        s_antiCull->graph = std::make_unique<JobGraph>(JobGraph::Dispatch {});
+      }
+      std::vector<const RtInstance*>& acFlat = s_antiCull->flat;
+      std::vector<uint8_t>& acInside = s_antiCull->inside;
+      std::vector<XXH64_hash_t>& acHash = s_antiCull->hash;
+      acFlat.clear();
+      for (const auto& acEntry : entries) {
+        for (const RtInstance* instance : acEntry.second.getLinkedInstances()) {
+          acFlat.push_back(instance);
+        }
+      }
+      acInside.assign(acFlat.size(), uint8_t(1));
+      acHash.resize(acFlat.size());
+      gcAcN = static_cast<uint32_t>(acFlat.size());
+      // Built from empty every pass and filled with nearly every off-screen
+      // instance (~2,500 of 2,730), so size it once instead of rehashing its
+      // way up.
+      outsideFrustumInstancesCache.reserve(acFlat.size());
+
+      const auto tAc0 = std::chrono::steady_clock::now();
+      if (acTest && gcAcN > 0u) {
+        auto acRange = [&acFlat, &acInside, &acHash, &acVerdict](uint32_t begin, uint32_t end) {
+          for (uint32_t i = begin; i < end; ++i) {
+            const RtInstance* instance = acFlat[i];
+            const bool inside = acVerdict(instance);
+            acInside[i] = inside ? uint8_t(1) : uint8_t(0);
+            // The walk keys the duplicate cache only for this case -- see the
+            // third branch below.
+            if (!inside && !instance->testCategoryFlags(InstanceCategories::IgnoreAntiCulling)) {
+              acHash[i] = instance->calculateAntiCullingHash();
+            }
+          }
+        };
+        // ~256 instances a chunk, at most one chunk per worker: the 1x rule
+        // Phase B settled on in flushGeometryBatch (kChunksPerWorker).
+        const uint32_t acWorkers = s_antiCull->pool->numThreads();
+        const uint32_t acChunks = (gcAcN >= 512u)
+          ? std::min<uint32_t>(acWorkers, (gcAcN + 255u) / 256u) : 1u;
+        gcAcChunks = acChunks;
+        if (acChunks <= 1u) {
+          acRange(0u, gcAcN);
+        } else {
+          // Same shape as Phase B: a parallelFor on a join node, drained by
+          // waitAll on this thread. Dispatch only from dxvk-cs -- a node made
+          // runnable on a worker is refused and waitAll runs it here.
+          JobGraph& acGraph = *s_antiCull->graph;
+          acGraph.reset();
+          {
+            AntiCullParallel::Pool* acPool = s_antiCull->pool.get();
+            const std::thread::id csThread = std::this_thread::get_id();
+            acGraph.setDispatch([acPool, csThread](std::function<void()> fn) -> bool {
+              if (std::this_thread::get_id() != csThread) {
+                return false;
+              }
+              return acPool->Schedule(std::move(fn)).valid();
+            });
+          }
+          const uint32_t acChunkSz = (gcAcN + acChunks - 1u) / acChunks;
+          const JobGraph::JobHandle acJoin = acGraph.createNode("AntiCull.join", nullptr);
+          acGraph.parallelFor(acJoin, acChunks, [&acRange, acChunkSz, n = gcAcN](uint32_t c) {
+            const uint32_t begin = c * acChunkSz;
+            acRange(begin, std::min(begin + acChunkSz, n));
+          });
+          acGraph.waitAll();
+        }
+      }
+      gc_acTestUs = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - tAc0).count();
+
+      // One clock read for the walk's [InfFar.diag.SAT] throttle rather than
+      // one per instance: the throttle is 500 ms of wall time, and a whole GC
+      // pass is a few ms.
+      const auto acDiagNow = std::chrono::steady_clock::now();
+      size_t acIdx = 0;
       for (auto iter = entries.begin(); iter != entries.end();) {
         bool isAllInstancesInCurrentBlasInsideFrustum = true;
         for (const RtInstance* instance : iter->second.getLinkedInstances()) {
-          const Matrix4 objectToView = getCamera().getWorldToView(false) * instance->getTransform();
-
           bool isInsideFrustum = true;
-          // Check for camera cut. Anti-Culling should NOT be enabled during a camera cut.
-          // In some cases, we can't reliably detect a camera cut (e.g., when the game doesn't set up the View Matrix),
-          // so we must disable Anti-Culling to prevent visual corruption.
-          if (!getCamera().isCameraCut() && m_isAntiCullingSupported) {
-            if (RtxOptions::needsMeshBoundingBox()) {
-              const AxisAlignedBoundingBox& boundingBox = instance->getBlas()->input.getGeometryData().boundingBox;
-              if (RtxOptions::AntiCulling::Object::enableHighPrecisionAntiCulling()) {
-                // [InfFar] Source the isInfFrustum flag from the camera's
-                // actual state, not just the user option. Reverse-Z
-                // infinite-far engines (TF2) report farPlane=+Inf even
-                // when the option is off; the SAT culler's finite-far
-                // code path applied to an infinite-far frustum produces
-                // over-culling (sky-only views). See RtCamera::
-                // shouldUseInfiniteFarFrustum() for the predicate.
-                const bool useInfFar = getCamera().shouldUseInfiniteFarFrustum();
-                isInsideFrustum = boundingBoxIntersectsFrustumSAT(
-                  getCamera(),
-                  boundingBox.minPos,
-                  boundingBox.maxPos,
-                  objectToView,
-                  useInfFar);
+          // Whether this instance's verdict (and, off-screen, its hash) came
+          // from the parallel phase, and from which slot.
+          const size_t acSlot = acIdx;
+          const bool acAligned = acTest && acSlot < acFlat.size() && acFlat[acSlot] == instance;
+          if (acTest) {
+            if (acAligned) {
+              isInsideFrustum = acInside[acSlot] != 0;
+            } else {
+              ++gcAcMismatch;
+              isInsideFrustum = acVerdict(instance);
+            }
+          }
+          ++acIdx;
+          if (acTest && acSat) {
                 // [InfFar.diag] Log SAT-culler decisions wall-clock
                 // throttled. Counts inside vs outside per camera type
                 // to spot flicker between "everything inside" and
                 // "everything outside" (the over-cull symptom).
+                const bool useInfFar = acInfFar;
                 {
                   static thread_local uint64_t sIn[8]  = {0,0,0,0,0,0,0,0};
                   static thread_local uint64_t sOut[8] = {0,0,0,0,0,0,0,0};
@@ -651,7 +812,7 @@ namespace dxvk {
                   };
                   const int idx = std::min<int>(static_cast<int>(getCamera().getCameraType()), 7);
                   if (isInsideFrustum) ++sIn[idx]; else ++sOut[idx];
-                  const auto now = std::chrono::steady_clock::now();
+                  const auto now = acDiagNow;
                   const bool dueByClock =
                     std::chrono::duration_cast<std::chrono::milliseconds>(now - sLastT[idx]).count() >= 500;
                   if (dueByClock) {
@@ -668,17 +829,6 @@ namespace dxvk {
                     sOut[idx] = 0;
                   }
                 }
-              } else {
-                isInsideFrustum = boundingBoxIntersectsFrustum(getCamera().getFrustum(), boundingBox.minPos, boundingBox.maxPos, objectToView);
-              }
-            }
-            else {
-              // Fallback to check object center under view space
-              auto getViewSpacePosition = [](const Matrix4& objectToView) -> float3 {
-                return float3(objectToView[3][0], objectToView[3][1], objectToView[3][2]);
-              };
-              isInsideFrustum = getCamera().getFrustum().CheckSphere(getViewSpacePosition(objectToView), 0);
-            }
           }
 
           // NV-DXVK [HullSAT]: instrument WHY the anti-frustum test drops the
@@ -711,6 +861,9 @@ namespace dxvk {
             const uint64_t hullVs = static_cast<uint64_t>(
               instance->getBlas()->input.getTransformData().vertexShaderHash);
             if (hullVs == 0x292b6ba0d1854f28ull) {
+              // The verdict phase no longer leaves this in scope; the same
+              // product it tested with.
+              const Matrix4 objectToView = acW2v * instance->getTransform();
               static thread_local uint32_t s_hullSatFrame = 0xFFFFFFFFu;
               static thread_local uint32_t s_hullSatCount = 0u;
               const uint32_t fid = m_device->getCurrentFrameId();
@@ -794,7 +947,8 @@ namespace dxvk {
             //   1. The game frustum is different to our frustum
             //   2. The game culling method is NOT frustum culling
 
-            const XXH64_hash_t antiCullingHash = instance->calculateAntiCullingHash();
+            const XXH64_hash_t antiCullingHash =
+              acAligned ? acHash[acSlot] : instance->calculateAntiCullingHash();
 
             auto it = outsideFrustumInstancesCache.find(antiCullingHash);
             if (it == outsideFrustumInstancesCache.end()) {
@@ -891,7 +1045,10 @@ namespace dxvk {
         " accel=", gc_accel, " light=", gc_light, " portal=", gc_portal,
         " reclaim=", gc_reclaim,
         " | blasIterated=", sceneGcBlasIterated, " instSeen=", sceneGcInstSeen,
-        " antiCull=", (RtxOptions::AntiCulling::isObjectAntiCullingEnabled() ? 1 : 0)));
+        " antiCull=", (RtxOptions::AntiCulling::isObjectAntiCullingEnabled() ? 1 : 0),
+        // I4: the parallel verdict phase inside blas=. mismatch MUST be 0.
+        " ac{n=", gcAcN, " chunks=", gcAcChunks, " testUs=", gc_acTestUs,
+        " mismatch=", gcAcMismatch, "}"));
     }
   }
 
@@ -3612,9 +3769,106 @@ namespace dxvk {
     return result;
   }
   
+  // NV-DXVK slice 7: the transform INPUT a draw writes onto its instances --
+  // final objectToWorld plus the placement bytes, when there is a placement
+  // list. Stored by ResidentScene::build as Record::builtXformHash and compared
+  // at every serve (ResidentScene::judge). Never 0 for a real draw, since the
+  // matrix is always hashed.
+  static uint64_t residentXformHash(const DrawCallState& dcs) {
+    const DrawCallTransforms& tf = dcs.getTransformData();
+    uint64_t h = XXH64(&tf.objectToWorld, sizeof(Matrix4), 0x7f0a11ull);
+    if (tf.instancesToObject != nullptr && !tf.instancesToObject->empty()) {
+      h = XXH64(tf.instancesToObject->data(),
+                tf.instancesToObject->size() * sizeof(Matrix4), h);
+    }
+    return h;
+  }
+
   bool SceneManager::touchResidentRecord(const DrawCallState& drawCallState, uint32_t frameId) {
     registerFogState(drawCallState);
-    return m_instanceManager.getResidentScene().touch(drawCallState.residentKey, frameId);
+    return ResidentScene::served(residentServe(drawCallState, frameId, /*commit*/ true));
+  }
+
+  // NV-DXVK slice 7: CS-skip serve audit state. dxvk-cs is one thread and the
+  // snapshot is consumed by the SAME commitGeometryToRT call that took it
+  // (submitDrawState -> processDrawCallState), so one slot keyed by (key,
+  // frame) is enough: a draw that returns early never consumes its slot, and
+  // the next draw's key cannot match it.
+  namespace {
+    struct CsServeAuditSlot {
+      uint64_t key = 0ull;
+      uint32_t frame = kInvalidFrameIndex;
+      ResidentScene::ServeAudit before;
+      std::vector<const RtInstance*> recSet;
+    };
+    thread_local CsServeAuditSlot t_csAudit;
+    // Read and reset by the [Shard2b] heartbeat on the game thread.
+    // fail[] order as the flush audit: o2w, tex, clip, mat, geo, geom, set.
+    std::atomic<uint64_t> s_csAuditCand { 0 };
+    std::atomic<uint64_t> s_csAuditServable { 0 };
+    std::atomic<uint64_t> s_csAuditN { 0 };
+    std::atomic<uint64_t> s_csAuditOk { 0 };
+    std::atomic<uint64_t> s_csAuditLost { 0 };
+    std::atomic<uint64_t> s_csAuditFail[7];
+  }
+
+  void SceneManager::residentCsAuditBefore(const DrawCallState& dcs, uint32_t frameId) {
+    s_csAuditCand.fetch_add(1u, std::memory_order_relaxed);
+    t_csAudit.key = 0ull;
+    if (!ResidentScene::served(residentServe(dcs, frameId, /*commit*/ false))) {
+      return;
+    }
+    s_csAuditServable.fetch_add(1u, std::memory_order_relaxed);
+    ResidentScene& rs = m_instanceManager.getResidentScene();
+    t_csAudit.key = dcs.residentKey;
+    t_csAudit.frame = frameId;
+    t_csAudit.before = rs.audit(dcs.residentKey);
+    t_csAudit.recSet.clear();
+    if (const ResidentScene::Record* rec = rs.find(dcs.residentKey)) {
+      for (const RtInstance* inst : rec->instances) {
+        if (inst != nullptr) {
+          t_csAudit.recSet.push_back(inst);
+        }
+      }
+    }
+    std::sort(t_csAudit.recSet.begin(), t_csAudit.recSet.end());
+    t_csAudit.recSet.erase(std::unique(t_csAudit.recSet.begin(), t_csAudit.recSet.end()),
+                           t_csAudit.recSet.end());
+  }
+
+  ResidentScene::ServeVerdict SceneManager::residentServe(const DrawCallState& dcs, uint32_t frame, bool commit) {
+    // A material that converts to a light produces the light from the draw, on
+    // every draw (createEffectLight in processDrawCallState). The record holds
+    // instances, not lights, so a served draw would drop the light for the
+    // frame. Refused before the store is consulted.
+    if (RtxOptions::shouldConvertToLight(dcs.getMaterialData().getHash())) {
+      return ResidentScene::ServeVerdict::kEffectLight;
+    }
+    ResidentScene& rs = m_instanceManager.getResidentScene();
+    ResidentScene::ServeDraw draw;
+    draw.boneHash = dcs.getSkinningState().boneHash;
+    // The FINAL transform and placement list, for judge()'s output tests. The
+    // placement list is passed ONLY when the draw takes the split-fanout path
+    // (the same condition runShardedDrawItem routes on): there each instance is
+    // one composed placement. Otherwise the full path writes the draw's own
+    // transform onto its instance and the placements are composed at upload --
+    // the single-instance test applies, and xformHash covers the list's bytes.
+    const DrawCallTransforms& tf = dcs.getTransformData();
+    const bool splitFanout =
+      RtxOptions::splitFanoutInstances() && tf.isFanoutBatch
+      && tf.instancesToObject != nullptr && tf.instancesToObject->size() > 1;
+    draw.o2w = &tf.objectToWorld;
+    draw.placements = splitFanout ? tf.instancesToObject.get() : nullptr;
+    draw.xformHash = residentXformHash(dcs);
+    if (!commit) {
+      return rs.probe(dcs.residentKey, frame, draw);
+    }
+    const ResidentScene::ServeVerdict v = rs.touch(dcs.residentKey, frame, draw);
+    if (ResidentScene::served(v)) {
+      RenderObjectDB& objectDb = m_instanceManager.getRenderObjectDB();
+      objectDb.noteObserved(objectDb.findByResidentKey(dcs.residentKey), frame);
+    }
+    return v;
   }
 
   void SceneManager::onSceneObjectDestroyed(const BlasEntry& blas) {
@@ -4742,6 +4996,67 @@ namespace dxvk {
         residentScene.score(drawCallState.residentKey, sFanoutInstances, drawCallState.residentOrdinal);
       }
 
+      // NV-DXVK slice 7: the CS-skip serve audit's AFTER -- see
+      // residentCsAuditBefore. Same fields as the flush audit, and membership
+      // against this full path's produced list. Before build(), which is what
+      // would overwrite the record being compared.
+      if (RtxOptions::ResidentScene::verify()
+          && t_csAudit.key != 0ull
+          && t_csAudit.key == drawCallState.residentKey
+          && t_csAudit.frame == m_device->getCurrentFrameId()) {
+        s_csAuditN.fetch_add(1u, std::memory_order_relaxed);
+        const ResidentScene::ServeAudit after = residentScene.audit(drawCallState.residentKey);
+        const ResidentScene::ServeAudit& before = t_csAudit.before;
+        if (after.n == 0u || after.n != before.n) {
+          s_csAuditLost.fetch_add(1u, std::memory_order_relaxed);
+        } else {
+          static thread_local std::vector<const RtInstance*> sProdSetCs;
+          sProdSetCs.clear();
+          for (const RtInstance* inst : sFanoutInstances) {
+            if (inst != nullptr) {
+              sProdSetCs.push_back(inst);
+            }
+          }
+          std::sort(sProdSetCs.begin(), sProdSetCs.end());
+          sProdSetCs.erase(std::unique(sProdSetCs.begin(), sProdSetCs.end()), sProdSetCs.end());
+          const bool fails[7] = {
+            after.o2w  != before.o2w,
+            after.tex  != before.tex,
+            after.clip != before.clip,
+            after.mat  != before.mat,
+            after.geo  != before.geo,
+            result != ObjectCacheState::kUpdateInstance,
+            sProdSetCs != t_csAudit.recSet,
+          };
+          bool ok = true;
+          for (uint32_t f = 0; f < 7u; ++f) {
+            if (fails[f]) {
+              s_csAuditFail[f].fetch_add(1u, std::memory_order_relaxed);
+              ok = false;
+            }
+          }
+          if (ok) {
+            s_csAuditOk.fetch_add(1u, std::memory_order_relaxed);
+          } else {
+            static std::atomic<uint32_t> sCsAuditSamples { 0 };
+            if (sCsAuditSamples.fetch_add(1u, std::memory_order_relaxed) < 24u) {
+              Logger::info(str::format(
+                "[ServeAuditCs] f=", m_device->getCurrentFrameId(),
+                " vs=0x", std::hex, static_cast<uint64_t>(drawCallState.getTransformData().vertexShaderHash), std::dec,
+                " cam=", static_cast<uint32_t>(drawCallState.cameraType),
+                " n=", after.n,
+                " fail{o2w=", fails[0] ? 1 : 0, " tex=", fails[1] ? 1 : 0, " clip=", fails[2] ? 1 : 0,
+                " mat=", fails[3] ? 1 : 0, " geo=", fails[4] ? 1 : 0,
+                " geom=", fails[5] ? static_cast<int32_t>(result) : -1,
+                " set=", fails[6] ? 1 : 0, "}",
+                " prod=", static_cast<uint32_t>(sProdSetCs.size()),
+                " rec=", static_cast<uint32_t>(t_csAudit.recSet.size())));
+            }
+          }
+        }
+        t_csAudit.key = 0ull;
+      }
+
       // NV-DXVK [RsPlace]: THE CANDIDATE DISCRIMINATOR, MEASURED BEFORE IT IS
       // WIRED INTO A KEY.
       //
@@ -5038,7 +5353,8 @@ namespace dxvk {
                             drawCallState.residentSrcIndexBuffer,
                             m_device->getCurrentFrameId(),
                             sFanoutInstances,
-                            engineHandle);
+                            engineHandle,
+                            residentXformHash(drawCallState));
 
         // NV-DXVK [RenderObject] slice 1: THE RESOLVER, fed from the same point
         // and under the same condition as the record above.
@@ -5223,29 +5539,95 @@ namespace dxvk {
     // says an unchanged object is zero work; the place to act on the verdict is
     // before the graph is built, not after it has run.
     //
-    // A draw the frame-thread gate predicted unchanged, whose record the store
-    // would serve (ResidentScene::probe -- the same rule touch() applies), is
-    // routed kLegacyCS instead of into a shard. CS then takes the existing skip:
-    // its own touch() decides, and a record that changed in between commits the
-    // draw in full on the legacy path. No new route, no new CS behaviour.
+    // A draw the frame-thread gate predicted unchanged is served HERE, by the
+    // same rule the CS skip uses (SceneManager::residentServe ->
+    // ResidentScene::touch), and routed kResidentServed: no material, no cache
+    // lookup, no shard, nothing on CS. Anything the store refuses goes on into
+    // the graph exactly as before.
     //
-    // UNDER rtx.residentScene.verify NOTHING IS ROUTED. The candidates are
-    // counted and their flush cost is billed, so [ChangedSet] says what the
-    // graph would shrink to before anything is allowed to shrink it -- I8.
+    // UNDER rtx.residentScene.verify NOTHING IS SERVED. The same verdict is
+    // probed, the flush cost of the servable draws is billed, and THE SERVE
+    // AUDIT runs: the servable draw's instances are hashed before the shards
+    // and again after the tail, and any field the full path moved is a draw
+    // that serving would have got wrong. score() cannot see that -- it checks
+    // WHICH instances, not what state they are left in.
     //
-    // THE FALSIFIER, printed on the same line: servable= against cand=. If the
-    // probe refuses most predicted hits, the changed set is not smaller than
-    // the draw list and there is nothing here to take; miss{} says why.
+    // THE FALSIFIERS, both on [ChangedSet]: servable= against cand= (if the
+    // store refuses most predicted hits, the changed set is not smaller than
+    // the draw list; miss{} and unsafeBy{} say why), and audit fail{} (must
+    // read 0 across a pitch-and-yaw sweep before verify goes off -- I8).
     const bool serveArmed =
       RtxOptions::ResidentScene::enable() && !RtxOptions::ResidentScene::verify();
-    uint32_t nServeCand = 0, nServable = 0, nServed = 0;
-    uint32_t nServeMiss[5] = {};
+    uint32_t nServeCand = 0, nServable = 0, nServed = 0, nServePose = 0;
+    constexpr uint32_t kVerdicts = static_cast<uint32_t>(ResidentScene::ServeVerdict::kCount);
+    uint32_t nServeMiss[kVerdicts] = {};
+    // kUnsafe billed to ResidentScene::UnsafeWhy bits (a record can carry
+    // several), plus the two populations one narrowed clause would release:
+    // refused for bones ALONE, and for blending ALONE.
+    uint32_t nUnsafeWhy[8] = {};
+    uint32_t nBoneOnly = 0, nBlendOnly = 0;
+    // WHY THE POSE TEST REFUSED a bone-only record, first match:
+    //   none    the draw carries no palette hash (boneHash == 0)
+    //   anim    the palette moved since the record was built -- the GPU skin
+    //           path re-skins this frame, so the draw really changed
+    //   stolen  same palette as the build, but an instance's entry was since
+    //           re-skinned with ANOTHER palette -- entry pairing, not animation
+    //   pos     palette matches, the entry's position content moved
+    //   other   none of the above (should read 0)
+    uint32_t nPoseWhy[5] = {};
     int64_t preMatServNs = 0, preGetServNs = 0;
     // Per item: 1 = servable under verify (its shard time is billed). Read by
     // the workers below through a pointer, like sShards, and not written again
     // until the next call.
     static thread_local std::vector<uint8_t> sServable;
     sServable.assign(batch.size(), 0u);
+    static thread_local std::vector<ResidentScene::ServeAudit> sServeAudit;
+    sServeAudit.assign(batch.size(), ResidentScene::ServeAudit {});
+    // The first instance's objectToWorld at the BEFORE snapshot, so an o2w fail
+    // can say what moved and by how much rather than only that a hash differs.
+    static thread_local std::vector<Matrix4> sServeO2w0;
+    sServeO2w0.assign(batch.size(), Matrix4());
+    const auto firstInstO2w = [this](uint64_t key, Matrix4& out) -> bool {
+      const ResidentScene::Record* rec = m_instanceManager.getResidentScene().find(key);
+      if (rec == nullptr) {
+        return false;
+      }
+      for (const RtInstance* inst : rec->instances) {
+        if (inst != nullptr) {
+          out = inst->surface.objectToWorld;
+          return true;
+        }
+      }
+      return false;
+    };
+    // Multi-instance records: every instance's objectToWorld at BEFORE, flat,
+    // plus an ORDER-INDEPENDENT hash of the set. A fanout o2w fail whose set is
+    // unchanged is the full path handing the same placements to different
+    // instances (perm) -- same geometry on screen -- rather than a transform
+    // that actually moved (real).
+    static thread_local std::vector<Matrix4> sServeO2wFlat;
+    static thread_local std::vector<uint32_t> sServeO2wOff;
+    static thread_local std::vector<uint64_t> sServeO2wSet0;
+    sServeO2wFlat.clear();
+    sServeO2wOff.assign(batch.size(), UINT32_MAX);
+    sServeO2wSet0.assign(batch.size(), 0ull);
+    const auto instO2wSet = [this](uint64_t key, std::vector<Matrix4>* outAll) -> uint64_t {
+      const ResidentScene::Record* rec = m_instanceManager.getResidentScene().find(key);
+      uint64_t set = 0ull;
+      if (rec == nullptr) {
+        return set;
+      }
+      for (const RtInstance* inst : rec->instances) {
+        if (inst == nullptr) {
+          continue;
+        }
+        set += XXH64(&inst->surface.objectToWorld, sizeof(Matrix4), 0ull);
+        if (outAll != nullptr) {
+          outAll->push_back(inst->surface.objectToWorld);
+        }
+      }
+      return set;
+    };
 
     // ---- ORDERED PRE-PASS (Step 1), arena order --------------------------
     const bool shardingAdmissible =
@@ -5360,19 +5742,70 @@ namespace dxvk {
       bool itemServable = false;
       if (dcs.residentPredictHit && dcs.residentKey != 0ull && RtxOptions::ResidentScene::enable()) {
         ++nServeCand;
-        const ResidentScene::ServeVerdict sv =
-          m_instanceManager.getResidentScene().probe(dcs.residentKey, fid);
-        if (sv == ResidentScene::ServeVerdict::kServable) {
+        // ARMED, THIS IS THE TOUCH, here and in arena order -- not a probe
+        // followed by a CS touch. Every sharded draw's cache lookup happens in
+        // this loop, before any CS consume, so a served draw has to claim its
+        // entries at its own position here or an earlier-arena draw's fallback
+        // pairing could take and re-bake them first (see ResidentScene::judge,
+        // kClaimed). CS then does nothing for the item (kResidentServed).
+        const ResidentScene::ServeVerdict sv = residentServe(dcs, fid, /*commit*/ serveArmed);
+        if (ResidentScene::served(sv)) {
+          if (sv == ResidentScene::ServeVerdict::kServablePose) {
+            ++nServePose;
+          }
           if (serveArmed) {
-            info.route = ShardedDrawInfo::Route::kLegacyCS;
+            info.route = ShardedDrawInfo::Route::kResidentServed;
             ++nServed;
             continue;
           }
           ++nServable;
           itemServable = true;
-          sServable[itemIdx] = 1u;
+          // 2 = released by the pose test, so an audit fail can say so.
+          sServable[itemIdx] = (sv == ResidentScene::ServeVerdict::kServablePose) ? 2u : 1u;
+          // The audit's BEFORE, taken ahead of every shard -- see ServeAudit.
+          sServeAudit[itemIdx] = m_instanceManager.getResidentScene().audit(dcs.residentKey);
+          firstInstO2w(dcs.residentKey, sServeO2w0[itemIdx]);
+          if (sServeAudit[itemIdx].n > 1u) {
+            sServeO2wOff[itemIdx] = static_cast<uint32_t>(sServeO2wFlat.size());
+            sServeO2wSet0[itemIdx] = instO2wSet(dcs.residentKey, &sServeO2wFlat);
+          }
         } else {
           ++nServeMiss[static_cast<uint32_t>(sv)];
+          if (sv == ResidentScene::ServeVerdict::kUnsafe) {
+            const uint8_t why = m_instanceManager.getResidentScene().unsafeWhy(dcs.residentKey);
+            for (uint32_t b = 0; b < 8u; ++b) {
+              if ((why & (1u << b)) != 0u) { ++nUnsafeWhy[b]; }
+            }
+            if (why != 0u && (why & ~ResidentScene::kWhyBoneAny) == 0u) {
+              ++nBoneOnly;
+              const ResidentScene::Record* rec = m_instanceManager.getResidentScene().find(dcs.residentKey);
+              const uint64_t drawBone = dcs.getSkinningState().boneHash;
+              uint32_t pw = 4u;
+              if (drawBone == 0ull) {
+                pw = 0u;
+              } else if (rec != nullptr && drawBone != rec->builtBoneHash) {
+                pw = 1u;
+              } else if (rec != nullptr) {
+                for (const RtInstance* inst : rec->instances) {
+                  const BlasEntry* blas = (inst == nullptr || inst->isUnlinkedForGC()) ? nullptr : inst->getBlas();
+                  if (blas == nullptr) {
+                    continue;
+                  }
+                  if (blas->modifiedGeometryData.lastBoneHash != drawBone) {
+                    pw = 2u;
+                    break;
+                  }
+                  if (static_cast<const void*>(blas) == rec->builtBlas
+                      && blas->modifiedGeometryData.hashes[HashComponents::VertexPosition] != rec->builtPosHash) {
+                    pw = 3u;
+                    break;
+                  }
+                }
+              }
+              ++nPoseWhy[pw];
+            }
+            if (why == ResidentScene::kWhyBlend) { ++nBlendOnly; }
+          }
         }
       }
 
@@ -5564,6 +5997,299 @@ namespace dxvk {
       }
     }
 
+    // NV-DXVK slice 7: THE SERVE AUDIT's AFTER. Every flush-side write the full
+    // path makes to these instances is done by here (shards, spatial ops,
+    // tail); the geometry half is on CS, and geomResult is what it will do.
+    // Fields, in fail{} order: o2w, tex, clip, mat, geo (entry/content), geom
+    // (geomResult is not kUpdateInstance, i.e. the full path re-bakes).
+    uint32_t nAudit = 0, nAuditOk = 0, nAuditLost = 0;
+    // fail{} order: o2w, tex, clip, mat, geo, geom, set. `set` is the
+    // MEMBERSHIP question score() asks (realFail), restricted to the draws
+    // serving would take: the record's instances against the full path's
+    // produced list (info.instances, complete once the tail has run), as sets.
+    // under = the full path produced instances the record does not name (a
+    // serve would leave them unstamped); over = the record names instances the
+    // full path did not produce; member = same count, different instances.
+    uint32_t nAuditFail[7] = {};
+    uint32_t setUnder = 0, setOver = 0, setMember = 0;
+    // ATTRIBUTION OF THE TWO FAIL CLASSES THAT FIRED (2026-09-13: o2w ~1/frame
+    // steady on a held scene, geom 0-23/window). Rule 8: bill a count to the
+    // population before proposing a fix.
+    //
+    // o2w: single = one instance, not fanout; multi = several instances, not
+    // fanout; fan = a fanout batch (instancesToObject, where the gate checks
+    // only the placement COUNT). firstSame = the first instance did not move,
+    // so a later one did. The draw-relative pair is the one that decides which
+    // side is wrong: for a single non-fanout instance the full path writes the
+    // draw's own objectToWorld, so beforeNeDraw says the instance was NOT at
+    // the draw's transform when the gate called it unchanged, and afterNeDraw
+    // says something other than the draw placed it.
+    uint32_t o2wSingle = 0, o2wMulti = 0, o2wFan = 0, o2wFirstSame = 0;
+    uint32_t o2wBeforeNeDraw = 0, o2wAfterNeDraw = 0;
+    float o2wMaxDT = 0.f;
+    // Multi-instance o2w fails: perm = same set of transforms, reassigned;
+    // real = the set changed. maxDM = largest |element| change over any
+    // instance by index, for the real ones (catches rotation and 1-ULP noise
+    // that a translation delta cannot).
+    uint32_t o2wPerm = 0, o2wReal = 0;
+    float o2wRealMaxDM = 0.f;
+    // For a real multi-instance fail, the FIRST instance whose matrix changed:
+    //   shared   it is also in ANOTHER draw's produced list this frame -- two
+    //            draws write the same instance and the last one wins. That is a
+    //            full-path defect (a prop drawn by one of them is missing), not
+    //            something serving introduces.
+    //   sole     only this draw produced it.
+    //   inPb/inPa  whether its BEFORE / AFTER matrix is one of THIS draw's
+    //            composed placements. inPb=0 inPa=1 says another writer had it
+    //            before this draw's full path put it back.
+    uint32_t realShared = 0, realSole = 0, realInPb = 0, realInPa = 0;
+    //   ownedElsewhere  the changed instance's last-building record is ANOTHER
+    //            draw's (RtInstance::m_residentKey) -- a second writer, including
+    //            the legacy CS draws `shared` cannot see at flush time.
+    //   fullDrift  after the full path, the record's instance transforms are NOT
+    //            the draw's composed placements as a multiset -- a placement left
+    //            uncovered and another doubled. Since judge() now serves a fanout
+    //            only when BEFORE equals the placements, a fail of this kind is
+    //            the full path diverging from its own inputs, not serving doing so.
+    uint32_t realOwnedElsewhere = 0, realFullDrift = 0;
+    static thread_local std::unordered_map<const RtInstance*, uint32_t> sProducedBy;
+    sProducedBy.clear();
+    if (nServable != 0u) {
+      for (const ShardedDrawBatchItem& it : batch) {
+        if (it.info->route != ShardedDrawInfo::Route::kSharded) {
+          continue;
+        }
+        for (const RtInstance* inst : it.info->instances) {
+          sProducedBy[inst] += 1u;
+        }
+      }
+    }
+    // geom, first match in computeGeometryCacheState's own order: newEntry (the
+    // draw did not re-find its entry -- KBuildBVH), idx, pos, vs, bone,
+    // boneBase (GPU-resident bone base, always dirty), pend (pendingSrcBake),
+    // smooth (smooth-normals flip), other.
+    uint32_t geomBy[9] = {};
+    static const char* const kGeomByName[9] = {
+      "newEntry", "idx", "pos", "vs", "bone", "boneBase", "pend", "smooth", "other" };
+    static thread_local uint32_t sAuditSamples = 0;
+    if (nServable != 0u) {
+      const ResidentScene& rs = m_instanceManager.getResidentScene();
+      for (size_t i = 0; i < batch.size(); ++i) {
+        if (sServable[i] == 0u) {
+          continue;
+        }
+        ++nAudit;
+        const DrawCallState& dcs = *batch[i].dcs;
+        const ShardedDrawInfo& info = *batch[i].info;
+        const ResidentScene::ServeAudit& before = sServeAudit[i];
+        const ResidentScene::ServeAudit after = rs.audit(dcs.residentKey);
+        if (after.n == 0u || after.n != before.n) {
+          ++nAuditLost;
+          continue;
+        }
+        bool ok = true;
+        const bool o2wFail = (after.o2w != before.o2w);
+        if (o2wFail)                   { ++nAuditFail[0]; ok = false; }
+        if (after.tex  != before.tex)  { ++nAuditFail[1]; ok = false; }
+        if (after.clip != before.clip) { ++nAuditFail[2]; ok = false; }
+        if (after.mat  != before.mat)  { ++nAuditFail[3]; ok = false; }
+        if (after.geo  != before.geo)  { ++nAuditFail[4]; ok = false; }
+        const bool geomFail =
+          info.geomResult != static_cast<int8_t>(ObjectCacheState::kUpdateInstance);
+        if (geomFail) {
+          ++nAuditFail[5];
+          ok = false;
+        }
+        int32_t setFail = 0;   // 0 none, 1 under, 2 over, 3 member
+        {
+          static thread_local std::vector<const RtInstance*> sRecSet;
+          static thread_local std::vector<const RtInstance*> sProdSet;
+          sRecSet.clear();
+          sProdSet.clear();
+          if (const ResidentScene::Record* rec = rs.find(dcs.residentKey)) {
+            for (const RtInstance* inst : rec->instances) {
+              if (inst != nullptr) {
+                sRecSet.push_back(inst);
+              }
+            }
+          }
+          for (const RtInstance* inst : info.instances) {
+            if (inst != nullptr) {
+              sProdSet.push_back(inst);
+            }
+          }
+          std::sort(sRecSet.begin(), sRecSet.end());
+          sRecSet.erase(std::unique(sRecSet.begin(), sRecSet.end()), sRecSet.end());
+          std::sort(sProdSet.begin(), sProdSet.end());
+          sProdSet.erase(std::unique(sProdSet.begin(), sProdSet.end()), sProdSet.end());
+          if (sRecSet != sProdSet) {
+            ++nAuditFail[6];
+            ok = false;
+            if (sProdSet.size() > sRecSet.size()) {
+              ++setUnder;
+              setFail = 1;
+            } else if (sProdSet.size() < sRecSet.size()) {
+              ++setOver;
+              setFail = 2;
+            } else {
+              ++setMember;
+              setFail = 3;
+            }
+          }
+        }
+        if (ok) {
+          ++nAuditOk;
+          continue;
+        }
+
+        const DrawCallTransforms& tf = dcs.getTransformData();
+        const bool fan = tf.isFanoutBatch && tf.instancesToObject != nullptr
+                      && tf.instancesToObject->size() > 1;
+        float dT = 0.f;
+        Matrix4 o2wAfter;
+        const bool haveAfter = firstInstO2w(dcs.residentKey, o2wAfter);
+        int32_t permFlag = -1;   // -1 = not a multi-instance o2w fail
+        float dM = 0.f;
+        if (o2wFail && sServeO2wOff[i] != UINT32_MAX) {
+          static thread_local std::vector<Matrix4> sAfterAll;
+          sAfterAll.clear();
+          const uint64_t setAfter = instO2wSet(dcs.residentKey, &sAfterAll);
+          if (setAfter == sServeO2wSet0[i]) {
+            permFlag = 1;
+            ++o2wPerm;
+          } else {
+            permFlag = 0;
+            ++o2wReal;
+            const uint32_t off = sServeO2wOff[i];
+            const size_t nCmp = std::min<size_t>(sAfterAll.size(), before.n);
+            int32_t firstChanged = -1;
+            for (size_t k = 0; k < nCmp && off + k < sServeO2wFlat.size(); ++k) {
+              const Matrix4& a = sAfterAll[k];
+              const Matrix4& b = sServeO2wFlat[off + k];
+              if (firstChanged < 0 && memcmp(a.data, b.data, sizeof(Matrix4)) != 0) {
+                firstChanged = static_cast<int32_t>(k);
+              }
+              for (uint32_t r = 0; r < 4u; ++r) {
+                for (uint32_t c = 0; c < 4u; ++c) {
+                  dM = std::max(dM, std::abs(float(a[r][c] - b[r][c])));
+                }
+              }
+            }
+            o2wRealMaxDM = std::max(o2wRealMaxDM, dM);
+
+            // Shared-writer and placement-membership test on the first changed
+            // instance. Record instances in record order, non-null only, the
+            // same walk instO2wSet uses, so index k lines up.
+            const ResidentScene::Record* rec = rs.find(dcs.residentKey);
+            if (firstChanged >= 0 && rec != nullptr) {
+              const RtInstance* changed = nullptr;
+              int32_t seen = 0;
+              for (const RtInstance* inst : rec->instances) {
+                if (inst == nullptr) {
+                  continue;
+                }
+                if (seen == firstChanged) {
+                  changed = inst;
+                  break;
+                }
+                ++seen;
+              }
+              const auto pb = sProducedBy.find(changed);
+              if (changed != nullptr && pb != sProducedBy.end() && pb->second >= 2u) {
+                ++realShared;
+              } else {
+                ++realSole;
+              }
+              if (changed != nullptr && ResidentScene::ownerKey(changed) != dcs.residentKey) {
+                ++realOwnedElsewhere;
+              }
+              const std::vector<Matrix4>* pl = tf.instancesToObject.get();
+              if (pl != nullptr) {
+                const bool identityBase = isIdentityExact(tf.objectToWorld);
+                const Matrix4& b = sServeO2wFlat[off + static_cast<size_t>(firstChanged)];
+                const Matrix4& a = sAfterAll[static_cast<size_t>(firstChanged)];
+                bool inB = false, inA = false;
+                uint64_t want = 0ull;
+                for (const Matrix4& p : *pl) {
+                  const Matrix4 composed = identityBase ? p : (tf.objectToWorld * p);
+                  inB = inB || memcmp(composed.data, b.data, sizeof(Matrix4)) == 0;
+                  inA = inA || memcmp(composed.data, a.data, sizeof(Matrix4)) == 0;
+                  want += XXH64(&composed, sizeof(Matrix4), 0ull);
+                }
+                realInPb += inB ? 1u : 0u;
+                realInPa += inA ? 1u : 0u;
+                if (setAfter != want || sAfterAll.size() != pl->size()) {
+                  ++realFullDrift;
+                }
+              }
+            }
+          }
+        }
+        if (o2wFail) {
+          if (fan) {
+            ++o2wFan;
+          } else if (after.n > 1u) {
+            ++o2wMulti;
+          } else {
+            ++o2wSingle;
+          }
+          const Matrix4& o2wBefore = sServeO2w0[i];
+          if (haveAfter) {
+            const Vector4 d = o2wAfter[3] - o2wBefore[3];
+            dT = std::sqrt(float(d.x * d.x + d.y * d.y + d.z * d.z));
+            o2wMaxDT = std::max(o2wMaxDT, dT);
+            if (memcmp(o2wAfter.data, o2wBefore.data, sizeof(Matrix4)) == 0) {
+              ++o2wFirstSame;
+            }
+          }
+          if (!fan && after.n == 1u) {
+            if (memcmp(o2wBefore.data, tf.objectToWorld.data, sizeof(Matrix4)) != 0) {
+              ++o2wBeforeNeDraw;
+            }
+            if (haveAfter && memcmp(o2wAfter.data, tf.objectToWorld.data, sizeof(Matrix4)) != 0) {
+              ++o2wAfterNeDraw;
+            }
+          }
+        }
+        uint32_t geomCause = 8u;
+        if (geomFail && info.pBlas != nullptr) {
+          const RasterGeometry& in = dcs.getGeometryData();
+          const RaytraceGeometry& mg = info.pBlas->modifiedGeometryData;
+          if (info.pBlas->frameCreated == fid)                                              geomCause = 0u;
+          else if (in.hashes[HashComponents::Indices] != mg.hashes[HashComponents::Indices])  geomCause = 1u;
+          else if (in.hashes[HashComponents::VertexPosition] != mg.hashes[HashComponents::VertexPosition]) geomCause = 2u;
+          else if (in.hashes[HashComponents::VertexShader] != mg.hashes[HashComponents::VertexShader])     geomCause = 3u;
+          else if (dcs.getSkinningState().boneHash != mg.lastBoneHash)                        geomCause = 4u;
+          else if (in.boneBaseBuffer.defined())                                              geomCause = 5u;
+          else if (mg.pendingSrcBake)                                                        geomCause = 6u;
+          else if (dcs.shouldGenerateSmoothNormals() != mg.smoothNormalsApplied)             geomCause = 7u;
+          ++geomBy[geomCause];
+        }
+        // A handful of named samples per window, so the counts come with a VS.
+        if (sAuditSamples < 6u) {
+          ++sAuditSamples;
+          Logger::info(str::format(
+            "[ServeAuditFail] f=", fid,
+            " vs=0x", std::hex, static_cast<uint64_t>(tf.vertexShaderHash), std::dec,
+            " cam=", static_cast<uint32_t>(dcs.cameraType),
+            " n=", after.n, " fan=", (fan ? 1 : 0),
+            " pose=", (sServable[i] == 2u ? 1 : 0),
+            " first=", (info.blasFirstDrawOfFrame ? 1 : 0),
+            " fail{o2w=", (o2wFail ? 1 : 0), " tex=", (after.tex != before.tex ? 1 : 0),
+            " mat=", (after.mat != before.mat ? 1 : 0), " geo=", (after.geo != before.geo ? 1 : 0),
+            " geom=", (geomFail ? kGeomByName[geomCause] : "-"),
+            " set=", setFail, "}",
+            " nProd=", static_cast<uint32_t>(info.instances.size()),
+            " geomResult=", static_cast<int32_t>(info.geomResult),
+            " perm=", permFlag, " dM=", dM,
+            " dT=", dT,
+            " before.t=(", sServeO2w0[i][3].x, ",", sServeO2w0[i][3].y, ",", sServeO2w0[i][3].z, ")",
+            " after.t=(", o2wAfter[3].x, ",", o2wAfter[3].y, ",", o2wAfter[3].z, ")",
+            " draw.t=(", tf.objectToWorld[3].x, ",", tf.objectToWorld[3].y, ",", tf.objectToWorld[3].z, ")"));
+        }
+      }
+    }
+
     // ---- [Shard2b] heartbeat (3s window) ---------------------------------
     {
       const auto t2b1 = std::chrono::steady_clock::now();
@@ -5580,14 +6306,43 @@ namespace dxvk {
       // NV-DXVK [JobGraph] slice 6: the bundle graph. threw/stale must read 0.
       static thread_local uint64_t sGraphDisp = 0, sGraphInline = 0, sGraphThrew = 0, sGraphStale = 0;
       // NV-DXVK slice 7: the changed-set filter.
-      static thread_local uint64_t sServeCand = 0, sServableN = 0, sServed = 0;
-      static thread_local uint64_t sServeMiss[5] = {};
+      static thread_local uint64_t sServeCand = 0, sServableN = 0, sServed = 0, sServePose = 0;
+      static thread_local uint64_t sServeMiss[kVerdicts] = {};
+      static thread_local uint64_t sUnsafeWhy[8] = {};
+      static thread_local uint64_t sBoneOnly = 0, sBlendOnly = 0;
+      static thread_local uint64_t sPoseWhy[5] = {};
+      static thread_local uint64_t sAudit = 0, sAuditOk = 0, sAuditLost = 0;
+      static thread_local uint64_t sAuditFail[7] = {};
+      static thread_local uint64_t sSetUnder = 0, sSetOver = 0, sSetMember = 0;
+      static thread_local uint64_t sO2wSingle = 0, sO2wMulti = 0, sO2wFan = 0, sO2wFirstSame = 0;
+      static thread_local uint64_t sO2wBeforeNeDraw = 0, sO2wAfterNeDraw = 0;
+      static thread_local float sO2wMaxDT = 0.f;
+      static thread_local uint64_t sO2wPerm = 0, sO2wReal = 0;
+      static thread_local float sO2wRealMaxDM = 0.f;
+      static thread_local uint64_t sRealShared = 0, sRealSole = 0, sRealInPb = 0, sRealInPa = 0;
+      static thread_local uint64_t sRealOwnedElsewhere = 0, sRealFullDrift = 0;
+      static thread_local uint64_t sGeomBy[9] = {};
       static thread_local int64_t sPreMatServNs = 0, sPreGetServNs = 0;
       static thread_local int64_t sItemNsAll = 0, sItemNsServ = 0;
       if (!sInit) { sLast = t2b0; sInit = true; }
       ++sFrames;
-      sServeCand += nServeCand; sServableN += nServable; sServed += nServed;
-      for (uint32_t m = 0; m < 5u; ++m) { sServeMiss[m] += nServeMiss[m]; }
+      sServeCand += nServeCand; sServableN += nServable; sServed += nServed; sServePose += nServePose;
+      for (uint32_t m = 0; m < kVerdicts; ++m) { sServeMiss[m] += nServeMiss[m]; }
+      for (uint32_t b = 0; b < 8u; ++b) { sUnsafeWhy[b] += nUnsafeWhy[b]; }
+      sBoneOnly += nBoneOnly; sBlendOnly += nBlendOnly;
+      for (uint32_t w = 0; w < 5u; ++w) { sPoseWhy[w] += nPoseWhy[w]; }
+      sAudit += nAudit; sAuditOk += nAuditOk; sAuditLost += nAuditLost;
+      for (uint32_t f = 0; f < 7u; ++f) { sAuditFail[f] += nAuditFail[f]; }
+      sSetUnder += setUnder; sSetOver += setOver; sSetMember += setMember;
+      sO2wSingle += o2wSingle; sO2wMulti += o2wMulti; sO2wFan += o2wFan; sO2wFirstSame += o2wFirstSame;
+      sO2wBeforeNeDraw += o2wBeforeNeDraw; sO2wAfterNeDraw += o2wAfterNeDraw;
+      sO2wMaxDT = std::max(sO2wMaxDT, o2wMaxDT);
+      sO2wPerm += o2wPerm; sO2wReal += o2wReal;
+      sO2wRealMaxDM = std::max(sO2wRealMaxDM, o2wRealMaxDM);
+      sRealShared += realShared; sRealSole += realSole;
+      sRealInPb += realInPb; sRealInPa += realInPa;
+      sRealOwnedElsewhere += realOwnedElsewhere; sRealFullDrift += realFullDrift;
+      for (uint32_t g = 0; g < 9u; ++g) { sGeomBy[g] += geomBy[g]; }
       sPreMatServNs += preMatServNs; sPreGetServNs += preGetServNs;
       sItemNsAll += itemNsAll.load(std::memory_order_relaxed);
       sItemNsServ += itemNsServ.load(std::memory_order_relaxed);
@@ -5675,22 +6430,85 @@ namespace dxvk {
         //             graph: pre-pass material + cacheGet, and their share of
         //             the per-item shard CPU (shardUs of itemUs, both summed
         //             across workers). That share is what serving removes.
+        //   pose      of servable/served, released by the bone pose test.
+        //   audit     WINDOW TOTALS, not per frame -- a correctness count must
+        //             not round a real failure down to zero. fail{} must read 0
+        //             across a pitch-and-yaw sweep before verify goes off.
         // sharded+legacy+ignored+served == items per frame.
         if (sServeCand != 0 || sServed != 0) {
           Logger::info(str::format(
             "[ChangedSet] perFrame cand=", sServeCand / uint64_t(fr),
             " servable=", sServableN / uint64_t(fr),
             " served=", sServed / uint64_t(fr),
+            " pose=", sServePose / uint64_t(fr),
             " miss{unk=", sServeMiss[static_cast<uint32_t>(ResidentScene::ServeVerdict::kUnknown)] / uint64_t(fr),
             " inval=", sServeMiss[static_cast<uint32_t>(ResidentScene::ServeVerdict::kInvalid)] / uint64_t(fr),
             " unsafe=", sServeMiss[static_cast<uint32_t>(ResidentScene::ServeVerdict::kUnsafe)] / uint64_t(fr),
-            " omm=", sServeMiss[static_cast<uint32_t>(ResidentScene::ServeVerdict::kOmmPending)] / uint64_t(fr), "}",
+            " omm=", sServeMiss[static_cast<uint32_t>(ResidentScene::ServeVerdict::kOmmPending)] / uint64_t(fr),
+            " claimed=", sServeMiss[static_cast<uint32_t>(ResidentScene::ServeVerdict::kClaimed)] / uint64_t(fr),
+            " light=", sServeMiss[static_cast<uint32_t>(ResidentScene::ServeVerdict::kEffectLight)] / uint64_t(fr),
+            " moved=", sServeMiss[static_cast<uint32_t>(ResidentScene::ServeVerdict::kMoved)] / uint64_t(fr),
+            " pend=", sServeMiss[static_cast<uint32_t>(ResidentScene::ServeVerdict::kPendingBake)] / uint64_t(fr), "}",
+            " unsafeBy{bb=", sUnsafeWhy[0] / uint64_t(fr),
+            " portal=", sUnsafeWhy[1] / uint64_t(fr),
+            " decal=", sUnsafeWhy[2] / uint64_t(fr),
+            " blend=", sUnsafeWhy[3] / uint64_t(fr),
+            " bonePv0=", sUnsafeWhy[4] / uint64_t(fr),
+            " boneRigid=", sUnsafeWhy[5] / uint64_t(fr),
+            " boneSkin=", sUnsafeWhy[6] / uint64_t(fr),
+            " gpuBones=", sUnsafeWhy[7] / uint64_t(fr),
+            " | boneOnly=", sBoneOnly / uint64_t(fr),
+            " poseWhy{none=", sPoseWhy[0] / uint64_t(fr), " anim=", sPoseWhy[1] / uint64_t(fr),
+            " stolen=", sPoseWhy[2] / uint64_t(fr), " pos=", sPoseWhy[3] / uint64_t(fr),
+            " other=", sPoseWhy[4] / uint64_t(fr), "}",
+            " blendOnly=", sBlendOnly / uint64_t(fr), "}",
             " graphIn=", sSharded / uint64_t(fr),
             " changed=", (sSharded - std::min(sSharded, sServableN)) / uint64_t(fr),
             " | billed matUs=", sPreMatServNs / 1000 / fr, " of ", sPreMatNs / 1000 / fr,
             " getUs=", sPreGetServNs / 1000 / fr, " of ", sPreGetNs / 1000 / fr,
             " shardUs=", sItemNsServ / 1000 / fr, " of itemUs=", sItemNsAll / 1000 / fr,
+            " | audit(win){n=", sAudit, " ok=", sAuditOk, " lost=", sAuditLost,
+            " fail{o2w=", sAuditFail[0], " tex=", sAuditFail[1], " clip=", sAuditFail[2],
+            " mat=", sAuditFail[3], " geo=", sAuditFail[4], " geom=", sAuditFail[5],
+            " set=", sAuditFail[6], "(under=", sSetUnder, " over=", sSetOver, " member=", sSetMember, ")}}",
             " armed=", (serveArmed ? 1 : 0)));
+        }
+        // NV-DXVK slice 7: the CS-skip audit (legacy-routed and unbatched draws;
+        // see residentCsAuditBefore). WINDOW TOTALS. Printed whenever there were
+        // candidates, so a population the skip would take can never be silent.
+        {
+          const uint64_t csCand = s_csAuditCand.exchange(0u, std::memory_order_relaxed);
+          const uint64_t csServ = s_csAuditServable.exchange(0u, std::memory_order_relaxed);
+          const uint64_t csN    = s_csAuditN.exchange(0u, std::memory_order_relaxed);
+          const uint64_t csOk   = s_csAuditOk.exchange(0u, std::memory_order_relaxed);
+          const uint64_t csLost = s_csAuditLost.exchange(0u, std::memory_order_relaxed);
+          uint64_t csFail[7];
+          for (uint32_t f = 0; f < 7u; ++f) {
+            csFail[f] = s_csAuditFail[f].exchange(0u, std::memory_order_relaxed);
+          }
+          if (csCand != 0u) {
+            Logger::info(str::format(
+              "[ChangedSet.cs] win cand=", csCand, " servable=", csServ,
+              " audit{n=", csN, " ok=", csOk, " lost=", csLost,
+              " fail{o2w=", csFail[0], " tex=", csFail[1], " clip=", csFail[2],
+              " mat=", csFail[3], " geo=", csFail[4], " geom=", csFail[5],
+              " set=", csFail[6], "}}"));
+          }
+        }
+        // The attribution of audit fails -- see the AFTER loop. WINDOW TOTALS.
+        if (sAudit != 0 && sAuditOk != sAudit) {
+          Logger::info(str::format(
+            "[ServeAudit] win o2w{single=", sO2wSingle, " multi=", sO2wMulti, " fan=", sO2wFan,
+            " firstSame=", sO2wFirstSame,
+            " beforeNeDraw=", sO2wBeforeNeDraw, " afterNeDraw=", sO2wAfterNeDraw,
+            " maxDT=", sO2wMaxDT,
+            " perm=", sO2wPerm, " real=", sO2wReal, " realMaxDM=", sO2wRealMaxDM,
+            " real{shared=", sRealShared, " sole=", sRealSole,
+            " inPb=", sRealInPb, " inPa=", sRealInPa,
+            " ownedElsewhere=", sRealOwnedElsewhere, " fullDrift=", sRealFullDrift, "}}",
+            " geom{newEntry=", sGeomBy[0], " idx=", sGeomBy[1], " pos=", sGeomBy[2],
+            " vs=", sGeomBy[3], " bone=", sGeomBy[4], " boneBase=", sGeomBy[5],
+            " pend=", sGeomBy[6], " smooth=", sGeomBy[7], " other=", sGeomBy[8], "}"));
         }
 
         sLast = t2b1;
@@ -5699,8 +6517,22 @@ namespace dxvk {
         sGraphDisp = sGraphInline = sGraphThrew = sGraphStale = 0;
         sLgAdmit = sLgFut = sLgFinal = sLgSky = sLgTerrain = sLgCam = sLgGeom = sLgRepl = 0;
         sPreFinNs = sPreCamNs = sPreFogNs = sPreHashNs = sPreMatNs = sPreGetNs = 0;
-        sServeCand = sServableN = sServed = 0;
-        for (uint32_t m = 0; m < 5u; ++m) { sServeMiss[m] = 0; }
+        sServeCand = sServableN = sServed = sServePose = 0;
+        for (uint32_t m = 0; m < kVerdicts; ++m) { sServeMiss[m] = 0; }
+        for (uint32_t b = 0; b < 8u; ++b) { sUnsafeWhy[b] = 0; }
+        sBoneOnly = sBlendOnly = 0;
+        for (uint32_t w = 0; w < 5u; ++w) { sPoseWhy[w] = 0; }
+        sAudit = sAuditOk = sAuditLost = 0;
+        for (uint32_t f = 0; f < 7u; ++f) { sAuditFail[f] = 0; }
+        sSetUnder = sSetOver = sSetMember = 0;
+        sO2wSingle = sO2wMulti = sO2wFan = sO2wFirstSame = sO2wBeforeNeDraw = sO2wAfterNeDraw = 0;
+        sO2wMaxDT = 0.f;
+        sO2wPerm = sO2wReal = 0;
+        sO2wRealMaxDM = 0.f;
+        sRealShared = sRealSole = sRealInPb = sRealInPa = 0;
+        sRealOwnedElsewhere = sRealFullDrift = 0;
+        for (uint32_t g = 0; g < 9u; ++g) { sGeomBy[g] = 0; }
+        sAuditSamples = 0;
         sPreMatServNs = sPreGetServNs = sItemNsAll = sItemNsServ = 0;
       }
     }
@@ -7367,10 +8199,14 @@ namespace dxvk {
   #endif
 
     // Needs to happen before garbageCollection to avoid destroying dynamic lights
+    // (it still does: GC now runs later in this same frame, see below).
     m_lightManager.dynamicLightMatching();
     markPs(ps_lightMatch);
 
-    garbageCollection();
+    // NV-DXVK [Perf.Gc] I4: garbageCollection() is NO LONGER CALLED HERE. It
+    // runs at the end of RtxContext::injectRTX, after this frame's ray tracing
+    // has been submitted, so the GPU is not left waiting on it -- see the note
+    // at that call. ps_gc now reads ~0; the collection's own cost is [Perf.Gc].
     markPs(ps_gc);
 
     // Re-register buffers, textures, and materials for anti-culled instances.

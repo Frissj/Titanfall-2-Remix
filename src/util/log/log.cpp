@@ -669,6 +669,7 @@ namespace dxvk {
           // whole family).
           "[MtnDedup]",             // 45,408 -- all from rtx.findSimilarProbeVsHashes (the two trim VSes); re-silenced
           "[HullSAT]",              //  7,188 -- dropship family, with [Ship / [Widow above
+          "[BlasFill]",             //  dropship family too; its gate was two strstr per BLAS fill (2026-09-13)
           "[InstReap]",             //  4,797 -- re-silenced; [Respawn] (the rare case) stays on
           "[BoneWindow]",           //  3,707 -- mutex + map per skinned draw; its fix has landed
           "[ReFile",                //  3,674 Jit + 2,037 Move + the [ReFile] aggregate

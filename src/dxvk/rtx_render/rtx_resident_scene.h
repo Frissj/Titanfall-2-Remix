@@ -8,6 +8,7 @@
 #include <unordered_set>
 
 #include "rtx_constants.h"
+#include "../util/util_matrix.h"
 
 namespace dxvk {
 
@@ -320,6 +321,11 @@ namespace dxvk {
       // by [HeldRaw] dumping properties rather than by a shader allowlist, and
       // cost one clause.
       bool skipUnsafe = false;
+      // NV-DXVK slice 7: WHICH clauses set skipUnsafe, as UnsafeWhy bits.
+      // Diagnostic only -- [ChangedSet] bills serve refusals to them, because
+      // the clauses answer two different questions (may it be HELD without a
+      // draw, may it be SERVED with one) and a flag cannot say which applies.
+      uint8_t unsafeWhy = 0u;
       // DIAGNOSTIC BASELINE for [HeldRaw], captured off the first instance's
       // geometry at build time.
       //
@@ -336,6 +342,13 @@ namespace dxvk {
       // of the same failure without having to name it first.
       uint64_t builtPosHash = 0ull;
       uint64_t builtBoneHash = 0ull;
+      // NV-DXVK slice 7: the transform INPUT the instances were last written
+      // from -- XXH64 of the draw's final objectToWorld and, for a fanout, its
+      // placement bytes (SceneManager's residentXformHash). A serve requires the
+      // arriving draw to carry the same value; a served frame does not rebuild,
+      // so by induction the instances always hold the current transform. See
+      // judge().
+      uint64_t builtXformHash = 0ull;
       // WHICH BlasEntry the baseline above was taken from. The content check is
       // only meaningful against that same entry: a record whose instances span
       // several BLASes would otherwise have one instance's hash validating all
@@ -380,37 +393,108 @@ namespace dxvk {
                uint64_t srcIndexBuffer,
                uint32_t frame,
                const std::vector<RtInstance*>& instances,
-               uint64_t engineHandle);
+               uint64_t engineHandle,
+               uint64_t xformHash);
+
+    // NV-DXVK slice 7: THE SERVE VERDICT. One rule, judge(), behind both the
+    // stamping touch() and the const probe(), so the flush-side pre-pass
+    // (SceneManager::processDeferredDrawBatch) and the CS skip can never
+    // disagree about which draws are unchanged.
+    //
+    // The flush side may read and stamp the store because the caller drained
+    // CS before the pre-pass runs -- the same strict alternation that lets the
+    // pre-pass stamp BlasEntry::frameLastTouched.
+    enum class ServeVerdict : uint8_t {
+      kServable = 0,
+      kServablePose, // bone-only unsafe, released by the pose test in judge()
+      kUnknown,      // no record under this key
+      kInvalid,      // invalidated or emptied -- an instance it named died
+      kUnsafe,       // skipUnsafe: billboards, ray portals, decals, blending,
+                     // or bone-driven with a pose the geometry does not hold
+      kOmmPending,   // an instance still owes the OMM handler work; see judge()
+      kClaimed,      // an instance's BlasEntry was already taken this frame
+      kEffectLight,  // the material converts to a light -- a per-frame product
+                     // (decided by SceneManager, which has the draw)
+      kMoved,        // the draw's final objectToWorld is not the instance's
+      kPendingBake,  // an entry is mid FIX-B recovery (pendingSrcBake)
+      kCount
+    };
+    static bool served(ServeVerdict v) {
+      return v == ServeVerdict::kServable || v == ServeVerdict::kServablePose;
+    }
 
     // THE TOUCH. Keep-alive without reprocessing: stamps frameLastUpdated on
     // every instance in the record, replays the camera set the build captured,
-    // and stamps the geometry entry each instance is linked to. Returns false
-    // if the key is unknown or the record was invalidated, in which case the
-    // caller MUST fall back to the full path -- a failed touch that is treated
-    // as a success is a silent retirement.
-    bool touch(uint64_t key, uint32_t frame);
-
-    // NV-DXVK slice 7: THE TOUCH'S VERDICT WITHOUT THE TOUCH.
+    // re-syncs transform history, and stamps the geometry entry each instance
+    // is linked to. Anything but served() means the caller MUST fall back to
+    // the full path -- a failed touch that is treated as a success is a silent
+    // retirement.
     //
-    // The flush-side pre-pass (SceneManager::processDeferredDrawBatch) decides
-    // whether a draw enters the shard graph at all, and it has to decide with
-    // the same rule touch() will apply on CS, or the two disagree about which
-    // draws are unchanged. So both call judge(): probe() is the const half and
-    // counts nothing, touch() counts the verdict and stamps on kServable.
-    //
-    // The flush side may read the store because the caller drained CS before
-    // the pre-pass runs -- the same strict alternation that lets the pre-pass
-    // stamp BlasEntry::frameLastTouched. CS still makes the final call: a draw
-    // the probe passed is routed kLegacyCS, and its own touch() at consume is
-    // what skips it. A record that changed in between just commits in full.
-    enum class ServeVerdict : uint8_t {
-      kServable = 0,
-      kUnknown,      // no record under this key
-      kInvalid,      // invalidated or emptied -- an instance it named died
-      kUnsafe,       // skipUnsafe: billboards, ray portals, decals, bone-driven
-      kOmmPending,   // an instance still owes the OMM handler work; see judge()
+    // What the arriving draw brings to the serve decision -- see judge().
+    struct ServeDraw {
+      uint64_t boneHash = 0ull;       // SkinningData::boneHash, 0 if none (pose test)
+      const Matrix4* o2w = nullptr;   // the draw's FINAL objectToWorld
+      const std::vector<Matrix4>* placements = nullptr;  // instancesToObject, or
+                                      // nullptr when the draw has no placement list
+      uint64_t xformHash = 0ull;      // final objectToWorld + placement bytes,
+                                      // compared with Record::builtXformHash
     };
-    ServeVerdict probe(uint64_t key, uint32_t frame) const;
+    ServeVerdict touch(uint64_t key, uint32_t frame, const ServeDraw& draw);
+    ServeVerdict probe(uint64_t key, uint32_t frame, const ServeDraw& draw) const;
+
+    // The record key that last BUILT with this instance (RtInstance::
+    // m_residentKey). Diagnostic: an instance whose owner is not the record
+    // being judged has a second writer.
+    static uint64_t ownerKey(const RtInstance* instance);
+
+    // NV-DXVK slice 7: THE SERVE AUDIT -- the output test the verify was
+    // missing.
+    //
+    // score() asks whether the record names the instances the full path
+    // produced. It cannot ask whether serving would have left those instances
+    // AS the full path leaves them, and the gate's tests do not cover every
+    // field the full path writes: the texture transform and clip plane come
+    // straight off the draw, the material index comes through the instance
+    // event, and the geometry decision can re-bake. So under verify the
+    // pre-pass takes this snapshot before the shard runs and again after it;
+    // any field that moved is a draw serving would have got wrong.
+    //
+    // Hashes per field over the record's instances, in record order.
+    struct ServeAudit {
+      uint64_t o2w  = 0ull;   // surface.objectToWorld
+      uint64_t tex  = 0ull;   // surface.textureTransform
+      uint64_t clip = 0ull;   // isClipPlaneEnabled + clipPlane
+      uint64_t mat  = 0ull;   // surfaceMaterialIndex
+      uint64_t geo  = 0ull;   // BlasEntry*, position hash, lastBoneHash
+      uint32_t n    = 0u;     // instances hashed; 0 = no valid record
+    };
+    ServeAudit audit(uint64_t key) const;
+
+    // The skipUnsafe split. The bone clause is split by skinning SHAPE, since
+    // builtBoneHash is non-zero for any draw with a palette (numBones > 0):
+    //   BonePv0      palette present, numBonesPerVertex == 0 -- no per-vertex
+    //                weights, so nothing regenerates positions per draw
+    //   BoneRigid    one bone in use -- a rigid transform of the whole mesh
+    //   BoneSkinned  several bones with per-vertex weights -- real skinning
+    //   GpuBones     the bone base is a GPU buffer (boneBaseBuffer): skinned
+    //                every frame from bones the CPU cannot read, so boneHash is
+    //                0, the bone clause never fires, and nothing can prove the
+    //                pose -- computeGeometryCacheState forces kUpdateBVH for it
+    //                every frame. Unsafe to hold AND to serve; not in BoneAny, so
+    //                the pose test never releases it.
+    enum UnsafeWhy : uint8_t {
+      kWhyBillboard   = 1u << 0,
+      kWhyPortal      = 1u << 1,
+      kWhyDecal       = 1u << 2,
+      kWhyBlend       = 1u << 3,
+      kWhyBonePv0     = 1u << 4,
+      kWhyBoneRigid   = 1u << 5,
+      kWhyBoneSkinned = 1u << 6,
+      kWhyGpuBones    = 1u << 7,
+    };
+    static constexpr uint8_t kWhyBoneAny = kWhyBonePv0 | kWhyBoneRigid | kWhyBoneSkinned;
+    // 0 for an unknown key.
+    uint8_t unsafeWhy(uint64_t key) const;
 
     // VERIFY SCORING. Answers the only question that matters while verify is on:
     // if the gate had skipped this draw, would the record it served have named
@@ -484,6 +568,15 @@ namespace dxvk {
       // pending. Self-correcting -- the full path delivers the event, the
       // calculation completes, and the record serves once the flag clears.
       uint32_t touchMissOmm = 0;
+      // Refused because an instance's BlasEntry was already taken this frame by
+      // another draw, which may have re-baked it. See judge().
+      uint32_t touchMissClaimed = 0;
+      // Refused because the draw would move the instance (judge's transform
+      // test), or because an entry is mid FIX-B recovery bake.
+      uint32_t touchMissMoved = 0;
+      uint32_t touchMissPending = 0;
+      // Of touched: served through the pose test (bone-only records).
+      uint32_t touchedPose = 0;
       uint32_t invalidated = 0;
       uint32_t invalidatedOtherKey = 0; // Records the single back-pointer missed.
       uint32_t evicted    = 0;
@@ -624,6 +717,18 @@ namespace dxvk {
       // count, invalidateAbsent is a no-op and cannot have done any harm.
       uint32_t absentRetired = 0;
       uint32_t absentSkipped = 0;
+      // NV-DXVK I4 (ARCHITECTURE_OVERHAUL sec 3: work is sized by what changed).
+      // onFrameEnd erases the records that went invalid since the last sweep --
+      // m_invalidKeys -- instead of walking all ~10.8k records to find a handful.
+      //
+      // THE FALSIFIER: invalidLeft is a full-walk census of invalid records
+      // still in the store right after a sweep, taken every 300 frames and kept
+      // across windows. It must read 0. Anything else is a valid -> false site
+      // that does not queue its key, and its records would never be erased.
+      // sweepFull counts sweeps that still walked every record because a source
+      // buffer died or keepFrames is set; per window, like the rest.
+      uint32_t invalidLeft = 0;
+      uint32_t sweepFull = 0;
     };
 
     const Stats& stats() const { return m_stats; }
@@ -634,7 +739,9 @@ namespace dxvk {
       const uint32_t keepSrcDrained = m_stats.srcDrained;
       const uint32_t keepAbsentRetired = m_stats.absentRetired;
       const uint32_t keepAbsentSkipped = m_stats.absentSkipped;
+      const uint32_t keepInvalidLeft = m_stats.invalidLeft;
       m_stats = Stats();
+      m_stats.invalidLeft = keepInvalidLeft;
       m_stats.wiped = keepWiped;
       m_stats.sourceDestroyed = keepSourceDestroyed;
       m_stats.srcNotices = keepSrcNotices;
@@ -648,7 +755,7 @@ namespace dxvk {
   private:
     // The one serve rule, shared by touch() and probe(). See touch() for why
     // each refusal exists.
-    static ServeVerdict judge(const Record* rec, uint32_t frame);
+    static ServeVerdict judge(const Record* rec, uint32_t frame, const ServeDraw& draw);
 
     // Records this store erased, and the frame it happened on. DIAGNOSTIC ONLY:
     // it exists so score() can tell "this key's record was filed and then went
@@ -669,6 +776,17 @@ namespace dxvk {
     std::unordered_map<uint64_t, Record> m_records;
     std::unordered_map<const RtInstance*, std::unordered_set<uint64_t>> m_instanceRecords;
     std::unordered_map<uint64_t, Tombstone> m_tombstones;
+    // NV-DXVK I4: keys whose record went valid -> false since the last
+    // onFrameEnd. Pushed by the two sites that invalidate outside the sweep
+    // (invalidateFor, invalidateAbsent); onFrameEnd's own death test erases in
+    // place. Drained by onFrameEnd. May hold a key twice or a key since rebuilt
+    // -- the sweep re-checks both.
+    std::vector<uint64_t> m_invalidKeys;
+    // NV-DXVK I4: keys whose record carries an engine handle, i.e. everything
+    // invalidateAbsent() has authority over. Maintained at build() and at every
+    // erase; entries left stale by a handle cleared elsewhere are dropped by the
+    // walk itself.
+    std::unordered_set<uint64_t> m_handleKeys;
     Stats m_stats;
   };
 

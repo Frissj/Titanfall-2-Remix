@@ -2458,6 +2458,11 @@ namespace dxvk {
     }
   }
 
+  // NV-DXVK [Perf.Gc] I4: garbage collection runs AFTER the frame's ray tracing
+  // is submitted, not in front of it. Set when prepareSceneData ran this frame;
+  // consumed at the end of injectRTX. See the consume site. dxvk-cs only.
+  static bool s_gcDeferredPending = false;
+
   // Hooked into presentImage (same place HUD rendering is)
   void RtxContext::injectRTX(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage, bool skipBackbufferBlit) {
     ScopedCpuProfileZone();
@@ -2939,8 +2944,17 @@ namespace dxvk {
         }
       }
 
+      // NV-DXVK [Perf.Gc] I4: a GC deferred by an earlier frame that never
+      // reached the consume site at the end of injectRTX runs HERE, in its old
+      // place in front of the scene build, so no frame's collection is skipped.
+      if (s_gcDeferredPending) {
+        s_gcDeferredPending = false;
+        getSceneManager().garbageCollection();
+      }
+
       // Update all the GPU buffers needed to describe the scene
       getSceneManager().prepareSceneData(this, m_execBarriers);
+      s_gcDeferredPending = true;
 
       // NV-DXVK [SerializeSceneBuild]: hard barrier between the scene build and
       // everything that reads it. See rtx.debugSerializeSceneBuild for why.
@@ -3423,6 +3437,33 @@ namespace dxvk {
       } else {
         m_framesWithoutValidScene = 0;
       }
+    }
+
+    // NV-DXVK [Perf.Gc] I4: THE FRAME'S GARBAGE COLLECTION, MOVED BEHIND ITS
+    // RAY TRACING.
+    //
+    // MEASURED 2026-09-13: [Perf.Block] gpuIdleMs tracked [Perf.Stall]
+    // prepScene wall window for window -- the GPU waits while dxvk-cs builds
+    // the scene, because nothing is submitted until Present. GC was the first
+    // 1.3-1.7 ms of that build, and none of it feeds THIS frame's TLAS: it
+    // retires what has stopped being drawn.
+    //
+    // So: submit what this frame recorded, THEN collect, while the GPU runs it.
+    // GC sees exactly the inputs it saw in front of the build -- same frame id,
+    // this frame's draws already processed, this frame's camera (nothing
+    // advances either before onInjectRtxFrameEnd) -- and the next frame's draws
+    // still see the collected scene, as they did. The one difference is that an
+    // instance or BLAS dying THIS frame is in this frame's TLAS one last time;
+    // its buffers are still alive then, the way the previous frame's were
+    // while the GPU drew it.
+    //
+    // Order kept from before: dynamicLightMatching still runs ahead of GC in
+    // the same frame (prepareSceneData starts with it), and SceneManager::
+    // onFrameEnd still runs after it.
+    if (s_gcDeferredPending) {
+      s_gcDeferredPending = false;
+      flushCommandList();
+      getSceneManager().garbageCollection();
     }
 
     onInjectRtxFrameEnd(raytracedThisFrame);
@@ -5190,6 +5231,15 @@ namespace dxvk {
       ~ShardedConsumeScope() { t_shardedConsume = nullptr; }
     } shardedConsumeScope(shardInfo);
 
+    // NV-DXVK slice 7: SERVED AT FLUSH, so there is nothing left to do here.
+    // The pre-pass registered its fog, classified its camera and touched its
+    // record in arena order (SceneManager::processDeferredDrawBatch). Everything
+    // below is for a draw that will be committed -- including the index stash
+    // copy, which for a served draw would be GPU work whose result nothing reads.
+    if (shardInfo != nullptr && shardInfo->route == ShardedDrawInfo::Route::kResidentServed) {
+      return;
+    }
+
     // NV-DXVK [perf, GPU index stash]: record the dynamic-IB stash copy HERE —
     // this lambda replays IN-ORDER on the CS stream, after this draw's bindings
     // and before any later Map(DISCARD) rename replay, so the logical buffer
@@ -5719,13 +5769,25 @@ namespace dxvk {
       // [PropIdKeepLong attempt reverted] note exists to enforce: a long keep on
       // an unstable identity made things measurably WORSE, not merely no better.
       //
-      // NV-DXVK slice 7: NEVER A kSharded ITEM. The flush-side pre-pass routes
-      // every draw it expects to serve kLegacyCS (SceneManager::
-      // processDeferredDrawBatch, [ChangedSet]), so a draw that reaches here
-      // kSharded was judged changed there and its shard has already run the
-      // instance work -- stamps, spatial ops, and the pendingOps this draw's
-      // consume replays. Skipping it would drop those ops on the floor; the
-      // consume below is the only correct continuation.
+      // NV-DXVK slice 7: NEVER A kSharded ITEM. The flush-side pre-pass serves
+      // every batched draw it can (kResidentServed, returned above), so a draw
+      // that reaches here kSharded was refused there and its shard has already
+      // run the instance work -- stamps, spatial ops, and the pendingOps this
+      // draw's consume replays. Skipping it would drop those ops on the floor;
+      // the consume below is the only correct continuation. What still takes
+      // this skip: legacy-routed and unbatched draws.
+      //
+      // Under verify, THOSE draws are audited here the way the flush-side
+      // pre-pass audits the batched ones: snapshot now, compare after the full
+      // path (SceneManager::residentCsAuditBefore, [ChangedSet] csAudit{}).
+      // Arming verify=False arms this skip too, so it needs its own zero.
+      if (drawCallState.residentPredictHit
+          && drawCallState.residentKey != 0ull
+          && RtxOptions::ResidentScene::enable()
+          && RtxOptions::ResidentScene::verify()
+          && (shardInfo == nullptr || shardInfo->route != ShardedDrawInfo::Route::kSharded)) {
+        getSceneManager().residentCsAuditBefore(drawCallState, m_device->getCurrentFrameId());
+      }
       if (drawCallState.residentPredictHit
           && drawCallState.residentKey != 0ull
           && RtxOptions::ResidentScene::enable()

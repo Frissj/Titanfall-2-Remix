@@ -18307,6 +18307,8 @@ namespace dxvk {
     uint64_t full = 0;         // draws that ran the full path (any reason)
     uint64_t keyMiss = 0;      // record existed but binding identity differed
     uint64_t genMiss = 0;      // identity matched, cb2 rewritten, carryover unavailable/failed
+    uint64_t p3LiveBail = 0;   // v7.1: genOk/carried path-3 hit whose live w2v refresh
+                               // could not run -> full path (never the recorded w2v)
     uint64_t inelig = 0;       // record's routes outside the replayable population
     uint64_t quarantined = 0;  // VS disqualified by a verify failure
     // v6.9: replays refused because a route input changed since capture.
@@ -23932,6 +23934,9 @@ namespace dxvk {
             " full=", s_xtReplayStats.full,
             " keyMiss=", s_xtReplayStats.keyMiss,
             " genMiss=", s_xtReplayStats.genMiss,
+            // v7.1: path-3 hits that could not refresh their view live and so
+            // took the full path. The cost of never replaying a recorded w2v.
+            " p3LiveBail=", s_xtReplayStats.p3LiveBail,
             " inelig=", s_xtReplayStats.inelig,
             " quar=", s_xtReplayStats.quarantined,
             " verify=", s_xtReplayStats.verifyRuns,
@@ -24752,7 +24757,9 @@ namespace dxvk {
                  rec->o2wPathId == 1u || rec->o2wPathId == 2u
               || rec->o2wPathId == 3u || rec->o2wPathId == 4u
               || o2wNeedsCamO || o2wIs13;
-            if (!genOk && !carried && rec->eligible && rec->wtvPathId == 3u
+            // v7.1: on EVERY path-3 attempt, not only after a cb2 rewrite --
+            // see the refresh below for why a genOk/carried hit needs it too.
+            if (rec->eligible && rec->wtvPathId == 3u
                 && o2wNeedsCamO && o2wHasCamO) {
               const auto& cb2Co = cbsRp[2];
               if (cb2Co.buffer != nullptr) {
@@ -24775,7 +24782,26 @@ namespace dxvk {
             const bool camOReady = o2wIs13
               ? p13LiveOk
               : (!o2wNeedsCamO || !o2wHasCamO || refreshCamOOk);
-            if (!genOk && !carried && rec->eligible
+            // v7.1: THE REFRESH RUNS ON HITS TOO, and the recorded worldToView
+            // of a path-3 record is never replayed.
+            //
+            // The v6.5 premise was that only a cb2 rewrite can stale the view:
+            // genOk means "every camera-side byte is literally the same buffer
+            // content the record was derived from". That is true of cb2 and
+            // false of path 3, whose rotation does not come from cb2 at all --
+            // derivePath3WorldToView prefers the fanout VP rows of the nearest
+            // m_fanoutSkySlots entry, cross-draw state latched by OTHER draws,
+            // and the v6.4 note above already records that the cb2@16 fallback
+            // "never" runs in gameplay. So the slot rows can move while this
+            // draw's cb2 does not, and a hit then serves a view from another
+            // frame. Measured 2026-09-13 as a sub-view pair failing together:
+            // o2w and v2p identical, w2v translation ~500u apart, wtvPath 3/3.
+            //
+            // Running the cache-or-derive route on every attempt is the route
+            // the full path takes, so it reproduces the full path's view by
+            // construction. A refresh that cannot run falls to the full path
+            // (p3LiveBail below) rather than trusting the recorded matrix.
+            if (rec->eligible
                 && rec->wtvPathId == 3u
                 && o2wRefreshable && camOReady) {
               // FIX: wtvPath 3 has TWO producers. The CamCache hit at ~17268
@@ -24819,6 +24845,20 @@ namespace dxvk {
                   refreshed = true;
                   ++s_xtReplayStats.refreshOk;
                   ++s_xtReplayStats.refreshPath[rec->o2wPathId & 15u];
+                  // v7.1: AND STORE IT, as the site does on a CamCache miss.
+                  // Without this a replayed draw left the cache as it found
+                  // it, so a LATER full-path draw sharing this cb2 derived
+                  // from the slot rows at ITS position instead of hitting the
+                  // value this draw would have stored -- the replay changing
+                  // another draw's output. Same key, same non-identity guard.
+                  if (cb2BufRf != nullptr && !isIdentityExact(refreshW2v)) {
+                    m_camFallbackCache.cb2Buffer   = cb2BufRf;
+                    m_camFallbackCache.cb2Gen      = cb2GenRf;
+                    m_camFallbackCache.cb2Offset   = cb2OffRf;
+                    m_camFallbackCache.frameId     = camFrameRf;
+                    m_camFallbackCache.worldToView = refreshW2v;
+                    m_camFallbackCache.valid       = true;
+                  }
                 } else {
                   ++s_xtReplayStats.refreshFail;
                 }
@@ -24840,7 +24880,14 @@ namespace dxvk {
             const Vector3 camORp = o2wIs13
               ? p13LiveCamO
               : (refreshCamOOk ? refreshCamO : rec->p13CamOrigin);
-            if (!genOk && !carried && !refreshed) {
+            // v7.1: a path-3 record replays ONLY through the refresh -- see the
+            // refresh above. A genOk/carried hit whose refresh could not run
+            // (not refreshable, camO unproven, derive refused) takes the full
+            // path and is counted apart from genMiss.
+            if ((genOk || carried) && rec->wtvPathId == 3u && !refreshed) {
+              ++s_xtReplayStats.p3LiveBail;
+              closeRpSel(false);
+            } else if (!genOk && !carried && !refreshed) {
               ++s_xtReplayStats.genMiss;
               // v6.3: name the blocker. crossOk records that got here had
               // their bytes move (real camera motion); the rest were never

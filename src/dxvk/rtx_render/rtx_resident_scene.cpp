@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstring>
 #include <iterator>
 #include <mutex>
 #include <unordered_set>
@@ -102,7 +103,8 @@ namespace dxvk {
                             uint64_t srcIndexBuffer,
                             uint32_t frame,
                             const std::vector<RtInstance*>& instances,
-                            uint64_t engineHandle) {
+                            uint64_t engineHandle,
+                            uint64_t xformHash) {
     if (key == 0ull) {
       // 0 is the "no record" sentinel on RtInstance::m_residentKey, exactly as
       // it is on m_batchRecordKey. A record under key 0 could never be
@@ -126,6 +128,7 @@ namespace dxvk {
     rec.srcGenHash = srcGenHash;
     rec.srcVertexBuffer = srcVertexBuffer;
     rec.srcIndexBuffer = srcIndexBuffer;
+    rec.builtXformHash = xformHash;
     rec.frameLastSeen = frame;
     rec.frameLastBuilt = frame;
     rec.valid = true;
@@ -134,6 +137,7 @@ namespace dxvk {
     // the declaration.
     if (engineHandle != 0ull) {
       rec.engineHandle = engineHandle;
+      m_handleKeys.insert(key);
     }
 
     // Arm the death notice. Doing it here rather than at construction means a
@@ -150,9 +154,13 @@ namespace dxvk {
     // m_seenCameraTypes is exactly what this draw registered.
     rec.cameraMask = 0u;
     rec.skipUnsafe = false;
+    rec.unsafeWhy = 0u;
     rec.builtPosHash = 0ull;
     rec.builtBoneHash = 0ull;
     rec.builtBlas = nullptr;
+    // Skinning shape of the baseline entry, for the bone clause's split.
+    uint32_t builtBonesPerVertex = 0u;
+    uint32_t builtBonesInUse = 0u;
     for (RtInstance* inst : rec.instances) {
       if (inst != nullptr) {
         inst->m_residentKey = key;
@@ -188,6 +196,22 @@ namespace dxvk {
             || inst->surface.alphaState.isDecal
             || !inst->surface.alphaState.isBlendingDisabled) {
           rec.skipUnsafe = true;
+          rec.unsafeWhy |= static_cast<uint8_t>(
+              (inst->getBillboardCount() != 0u ? kWhyBillboard : 0u)
+            | (inst->getMaterialType() == MaterialDataType::RayPortal ? kWhyPortal : 0u)
+            | (inst->surface.alphaState.isDecal ? kWhyDecal : 0u)
+            | (!inst->surface.alphaState.isBlendingDisabled ? kWhyBlend : 0u));
+        }
+        // NV-DXVK slice 7: GPU-RESIDENT BONES, the skinned class the bone clause
+        // below cannot see -- see UnsafeWhy::kWhyGpuBones. Measured by the serve
+        // audit: every geom fail on a servable draw was boneBase.
+        if (!inst->isUnlinkedForGC()) {
+          if (const BlasEntry* blas = inst->getBlas()) {
+            if (blas->input.getGeometryData().boneBaseBuffer.defined()) {
+              rec.skipUnsafe = true;
+              rec.unsafeWhy |= static_cast<uint8_t>(kWhyGpuBones);
+            }
+          }
         }
         // Baseline for [HeldRaw], off the first instance that has geometry AND
         // a live entry to read it from -- isUnlinkedForGC() means m_linkedBlas
@@ -201,6 +225,9 @@ namespace dxvk {
             rec.builtPosHash = blas->modifiedGeometryData.hashes[HashComponents::VertexPosition];
             rec.builtBoneHash = blas->modifiedGeometryData.lastBoneHash;
             rec.builtBlas = static_cast<const void*>(blas);
+            const SkinningData& skin = blas->input.getSkinningState();
+            builtBonesPerVertex = blas->input.getGeometryData().numBonesPerVertex;
+            builtBonesInUse = (skin.numBones > skin.minBoneIndex) ? (skin.numBones - skin.minBoneIndex) : 0u;
           }
         }
       }
@@ -240,12 +267,23 @@ namespace dxvk {
     // for the same reason.
     if (rec.builtBoneHash != 0ull) {
       rec.skipUnsafe = true;
+      rec.unsafeWhy |= static_cast<uint8_t>(
+          (builtBonesPerVertex == 0u) ? kWhyBonePv0
+        : (builtBonesInUse <= 1u)     ? kWhyBoneRigid
+                                      : kWhyBoneSkinned);
     }
 
     m_stats.built += 1;
   }
 
-  ResidentScene::ServeVerdict ResidentScene::judge(const Record* rec, uint32_t frame) {
+  uint8_t ResidentScene::unsafeWhy(uint64_t key) const {
+    const Record* rec = find(key);
+    return rec != nullptr ? rec->unsafeWhy : 0u;
+  }
+
+  ResidentScene::ServeVerdict ResidentScene::judge(const Record* rec, uint32_t frame, const ServeDraw& draw) {
+    const uint64_t drawBoneHash = draw.boneHash;
+    const Matrix4* drawO2w = draw.o2w;
     // A failed touch treated as a success is a SILENT RETIREMENT: the caller
     // would skip the full path believing the instances were kept alive, and they
     // would age out one frame later with nothing to catch it. So the caller acts
@@ -274,8 +312,142 @@ namespace dxvk {
     //
     // Counted on their own so a scene reading touched=0 says WHY rather than
     // merely reading zero.
+    //
+    // NV-DXVK slice 7: EXCEPT A BONE-ONLY RECORD WHOSE GEOMETRY HOLDS THIS POSE.
+    //
+    // The bone clause exists for HOLDING: an instance kept alive with no draw
+    // has no evidence of its pose, and renders whatever the skinning pass last
+    // wrote. Serving is a different question, because a draw DID arrive and it
+    // carries its pose. The gate cannot see that pose -- residentGeomGenFold
+    // leaves the constant buffers out on purpose -- but the draw's own
+    // SkinningData::boneHash is the palette hash processGeometryInfo stores as
+    // lastBoneHash when it skins the entry. So if every instance's entry was
+    // last skinned with exactly this palette, and the entry's position content
+    // is still what the record was built against, the geometry already IS this
+    // draw's output and re-running the skinning would reproduce it bit for bit.
+    // Anything less -- another reason on the record, no palette on the draw, a
+    // different lastBoneHash, a moved position hash -- stays kUnsafe.
+    bool pose = false;
     if (rec->skipUnsafe) {
-      return ServeVerdict::kUnsafe;
+      const bool boneOnly = rec->unsafeWhy != 0u && (rec->unsafeWhy & ~kWhyBoneAny) == 0u;
+      if (!boneOnly || drawBoneHash == 0ull) {
+        return ServeVerdict::kUnsafe;
+      }
+      for (const RtInstance* inst : rec->instances) {
+        if (inst == nullptr) {
+          continue;
+        }
+        const BlasEntry* blas = inst->isUnlinkedForGC() ? nullptr : inst->getBlas();
+        if (blas == nullptr || blas->modifiedGeometryData.lastBoneHash != drawBoneHash) {
+          return ServeVerdict::kUnsafe;
+        }
+        if (static_cast<const void*>(blas) == rec->builtBlas
+            && blas->modifiedGeometryData.hashes[HashComponents::VertexPosition] != rec->builtPosHash) {
+          return ServeVerdict::kUnsafe;
+        }
+      }
+      pose = true;
+    }
+    // NV-DXVK slice 7: THE INSTANCE MUST ALREADY BE WHERE THIS DRAW PUTS IT.
+    //
+    // The gate hashes objectToWorld byte-exact, but it hashes it in
+    // SubmitDrawTail, and the transform is not final there: the 3D-skybox
+    // sub-view reprojection (SetSkyCategoryFromCb2) multiplies T_reproject in
+    // afterwards, and T_reproject follows the engine's per-frame sub_pos drift
+    // -- deliberately, it is what pins those props at infinity as the camera
+    // moves. So the gate reads "unchanged" for a prop the full path moves every
+    // frame. Measured by the serve audit before this test existed: every o2w
+    // fail was a single non-fanout instance whose transform differed from the
+    // draw's by ~1 ULP before the full path (beforeNeDraw) and equalled it
+    // after (afterNeDraw=0) -- camera sway on a held scene. With the camera
+    // moving, a served skybox prop would slide.
+    //
+    // For one instance with no placement list the full path writes the draw's
+    // objectToWorld straight onto the instance, so the output test is exact:
+    // byte-equal, or the draw goes down the full path. Placement lists
+    // compose per-placement transforms and are left to the audit.
+    if (drawO2w != nullptr && draw.placements == nullptr
+        && rec->instances.size() == 1u && rec->instances[0] != nullptr
+        && memcmp(rec->instances[0]->surface.objectToWorld.data, drawO2w->data, sizeof(Matrix4)) != 0) {
+      return ServeVerdict::kMoved;
+    }
+    // AND A FANOUT BY ITS OUTPUT TOO. The record does not say which instance
+    // took which placement, but it does not need to: the full path writes each
+    // placement's composed matrix onto exactly one instance, so the record's
+    // instance transforms, as a MULTISET, must equal the draw's composed
+    // placements -- same composition as the fanout loop, bit for bit (identity
+    // base -> the placement itself, else o2w * placement). The input test below
+    // cannot see a SECOND writer: measured, a fanout instance 1 ULP off every
+    // one of its draw's placements before the full path and on one after
+    // (inPb=0 inPa=1), with the placement bytes unchanged since the build. A
+    // served record now renders exactly this draw's placements or is refused.
+    if (drawO2w != nullptr && draw.placements != nullptr) {
+      const bool identityBase = isIdentityExact(*drawO2w);
+      uint64_t want = 0ull;
+      for (const Matrix4& p : *draw.placements) {
+        const Matrix4 composed = identityBase ? p : (*drawO2w * p);
+        want += XXH64(&composed, sizeof(Matrix4), 0ull);
+      }
+      uint64_t have = 0ull;
+      size_t nHave = 0;
+      for (const RtInstance* inst : rec->instances) {
+        if (inst == nullptr) {
+          continue;
+        }
+        have += XXH64(&inst->surface.objectToWorld, sizeof(Matrix4), 0ull);
+        ++nHave;
+      }
+      if (nHave != draw.placements->size() || have != want) {
+        return ServeVerdict::kMoved;
+      }
+    }
+    // AND FOR A FANOUT, THE INPUT RATHER THAN THE OUTPUT. Each instance is the
+    // draw's transform times one placement, and the record does not say which
+    // instance took which placement, so the output cannot be compared directly.
+    // The inputs can: builtXformHash is the final objectToWorld plus the
+    // placement bytes the instances were last written from. The gate compares
+    // only the placement COUNT -- its own note names the bytes as the fix "if
+    // held fanout geometry ever shows movement artefacts", and the serve audit
+    // measured exactly that: after the transform test above, every remaining
+    // o2w fail was a fanout (fan=55-145/window, maxDT to 0.13). Covers single
+    // instances too, so a record the full path last wrote under another
+    // transform can never be served even when its instance was moved since.
+    if (draw.xformHash != 0ull && draw.xformHash != rec->builtXformHash) {
+      return ServeVerdict::kMoved;
+    }
+    // NV-DXVK slice 7: AN ENTRY IN FIX-B RECOVERY IS RE-BAKED EVERY FRAME UNTIL
+    // A CLEAN BAKE LANDS (computeGeometryCacheState's pendingSrcBake override)
+    // -- its cached geometry is known to have been caught mid-upload. Serving
+    // would skip the very re-bake that repairs it. Measured: the audit's only
+    // geom fails were this.
+    for (const RtInstance* inst : rec->instances) {
+      if (inst == nullptr) {
+        continue;
+      }
+      const BlasEntry* blas = inst->isUnlinkedForGC() ? nullptr : inst->getBlas();
+      if (blas != nullptr && blas->modifiedGeometryData.pendingSrcBake) {
+        return ServeVerdict::kPendingBake;
+      }
+    }
+    // NV-DXVK slice 7: AN ENTRY ALREADY TAKEN THIS FRAME IS NOT OURS TO SERVE.
+    //
+    // DrawCallCache::get's fallback pairs a draw with any same-bucket entry not
+    // yet touched this frame, and processGeometryInfo may then re-bake it with
+    // that draw's content. On CS the served draw's own touch() stamped its entry
+    // at its position in the stream; the flush-side pre-pass runs every sharded
+    // draw's cache lookup BEFORE any CS consume, so a draw earlier in the arena
+    // can take the entry first. A record whose instance sits on such an entry
+    // would stamp an instance whose geometry is now someone else's. Refused
+    // here, so touch() only ever claims entries nobody has claimed, and once it
+    // has, the fallback skips them for the rest of the frame.
+    for (const RtInstance* inst : rec->instances) {
+      if (inst == nullptr) {
+        continue;
+      }
+      const BlasEntry* blas = inst->isUnlinkedForGC() ? nullptr : inst->getBlas();
+      if (blas != nullptr && blas->frameLastTouched == frame) {
+        return ServeVerdict::kClaimed;
+      }
     }
     // OPACITY MICROMAPS, PER INSTANCE RATHER THAN PER SWITCH.
     //
@@ -308,35 +480,91 @@ namespace dxvk {
         }
       }
     }
-    return ServeVerdict::kServable;
+    return pose ? ServeVerdict::kServablePose : ServeVerdict::kServable;
   }
 
-  ResidentScene::ServeVerdict ResidentScene::probe(uint64_t key, uint32_t frame) const {
-    return judge(find(key), frame);
+  ResidentScene::ServeVerdict ResidentScene::probe(uint64_t key, uint32_t frame, const ServeDraw& draw) const {
+    return judge(find(key), frame, draw);
   }
 
-  bool ResidentScene::touch(uint64_t key, uint32_t frame) {
+  uint64_t ResidentScene::ownerKey(const RtInstance* instance) {
+    return instance != nullptr ? instance->m_residentKey : 0ull;
+  }
+
+  ResidentScene::ServeAudit ResidentScene::audit(uint64_t key) const {
+    ServeAudit a;
+    const Record* rec = find(key);
+    if (rec == nullptr || !rec->valid) {
+      return a;
+    }
+    for (const RtInstance* inst : rec->instances) {
+      if (inst == nullptr) {
+        continue;
+      }
+      const RtSurface& s = inst->surface;
+      a.o2w = XXH64(&s.objectToWorld, sizeof(s.objectToWorld), a.o2w);
+      a.tex = XXH64(&s.textureTransform, sizeof(s.textureTransform), a.tex);
+      const uint32_t clipOn = s.isClipPlaneEnabled ? 1u : 0u;
+      a.clip = XXH64(&clipOn, sizeof(clipOn), a.clip);
+      a.clip = XXH64(&s.clipPlane, sizeof(s.clipPlane), a.clip);
+      a.mat = XXH64(&s.surfaceMaterialIndex, sizeof(s.surfaceMaterialIndex), a.mat);
+      const BlasEntry* blas = inst->isUnlinkedForGC() ? nullptr : inst->getBlas();
+      const uintptr_t blasAddr = reinterpret_cast<uintptr_t>(blas);
+      a.geo = XXH64(&blasAddr, sizeof(blasAddr), a.geo);
+      if (blas != nullptr) {
+        const uint64_t posHash = blas->modifiedGeometryData.hashes[HashComponents::VertexPosition];
+        const uint64_t boneHash = blas->modifiedGeometryData.lastBoneHash;
+        a.geo = XXH64(&posHash, sizeof(posHash), a.geo);
+        a.geo = XXH64(&boneHash, sizeof(boneHash), a.geo);
+      }
+      a.n += 1u;
+    }
+    return a;
+  }
+
+  ResidentScene::ServeVerdict ResidentScene::touch(uint64_t key, uint32_t frame, const ServeDraw& draw) {
     Record* rec = find(key);
 
-    switch (judge(rec, frame)) {
+    const ServeVerdict verdict = judge(rec, frame, draw);
+    switch (verdict) {
     case ServeVerdict::kServable:
+      break;
+    case ServeVerdict::kServablePose:
+      m_stats.touchedPose += 1;
       break;
     case ServeVerdict::kUnknown:
       m_stats.touchMissUnknown += 1;
       m_stats.touchMiss += 1;
-      return false;
+      return verdict;
     case ServeVerdict::kInvalid:
       m_stats.touchMissInvalid += 1;
       m_stats.touchMiss += 1;
-      return false;
+      return verdict;
     case ServeVerdict::kUnsafe:
       m_stats.touchMissUnsafe += 1;
       m_stats.touchMiss += 1;
-      return false;
+      return verdict;
     case ServeVerdict::kOmmPending:
       m_stats.touchMissOmm += 1;
       m_stats.touchMiss += 1;
-      return false;
+      return verdict;
+    case ServeVerdict::kClaimed:
+      m_stats.touchMissClaimed += 1;
+      m_stats.touchMiss += 1;
+      return verdict;
+    case ServeVerdict::kMoved:
+      m_stats.touchMissMoved += 1;
+      m_stats.touchMiss += 1;
+      return verdict;
+    case ServeVerdict::kPendingBake:
+      m_stats.touchMissPending += 1;
+      m_stats.touchMiss += 1;
+      return verdict;
+    case ServeVerdict::kEffectLight:
+    case ServeVerdict::kCount:
+      // Not produced by judge(); here only so the switch is total.
+      m_stats.touchMiss += 1;
+      return verdict;
     }
 
     for (RtInstance* inst : rec->instances) {
@@ -348,6 +576,21 @@ namespace dxvk {
       // and nothing else, which is why keep-alive without reprocessing is
       // expressible at all.
       inst->setFrameLastUpdated(frame);
+
+      // NV-DXVK slice 7: AND THE TRANSFORM HISTORY MUST CATCH UP.
+      //
+      // The gate proves objectToWorld equals what the record was built with, so
+      // this frame's motion is zero -- but prevObjectToWorld still holds the
+      // frame BEFORE the build. An instance served on the frame after it last
+      // moved would carry that stale prev for as long as it kept being served,
+      // i.e. a permanent non-zero motion vector on a still object. The full path
+      // gets this from move() (prev := cur), the fast instance path from its
+      // explicit history advance, and upstream's preserve path from exactly this
+      // re-sync (SceneManager, "Re-sync on the first preserve frame").
+      if (!inst->surface.isStatic) {
+        inst->surface.prevObjectToWorld = inst->surface.objectToWorld;
+        inst->surface.isStatic = true;
+      }
 
       // AND THE CAMERA MUST BE RE-REGISTERED. setFrameLastUpdated() CLEARS
       // m_seenCameraTypes on the first stamp of a frame (see its body), so a
@@ -402,7 +645,7 @@ namespace dxvk {
     rec->frameLastSeen = frame;
     m_stats.touched += 1;
     m_stats.instancesStamped += static_cast<uint32_t>(rec->instances.size());
-    return true;
+    return verdict;
   }
 
   bool ResidentScene::score(uint64_t key, const std::vector<RtInstance*>& produced, uint32_t ordinal) {
@@ -930,29 +1173,39 @@ namespace dxvk {
 
   uint32_t ResidentScene::invalidateAbsent(const ExistenceSource& source, uint32_t frame) {
     uint32_t retired = 0u;
-    uint32_t skipped = 0u;
+    uint32_t withHandle = 0u;
 
-    for (auto& kv : m_records) {
-      Record& rec = kv.second;
+    // NV-DXVK I4: WALK THE RECORDS THAT CARRY A HANDLE, NOT EVERY RECORD. This
+    // used to visit the whole store every frame to skip ~99% of it -- measured
+    // absentSkipped=10765 of records=10835 -- which is O(scene) work that
+    // decides nothing. m_handleKeys is exactly the set this source can name.
+    for (auto hk = m_handleKeys.begin(); hk != m_handleKeys.end(); ) {
+      const auto it = m_records.find(*hk);
+      // Stale entry: the record was erased, or its handle was dropped.
+      if (it == m_records.end() || it->second.engineHandle == 0ull) {
+        hk = m_handleKeys.erase(hk);
+        continue;
+      }
+      Record& rec = it->second;
       if (!rec.valid) {
+        ++hk;
         continue;
       }
 
       // NO HANDLE, NO AUTHORITY. Not a retirement, not even a candidate --
       // this source cannot name the record, so it cannot have an opinion about
-      // whether it is gone. Counted so the no-op case is visible AS a no-op:
-      // while absentSkipped tracks the record count, this function provably has
-      // not touched the scene.
-      if (rec.engineHandle == 0ull) {
-        ++skipped;
-        continue;
-      }
+      // whether it is gone. Those records are no longer visited at all; the
+      // no-op case stays visible AS a no-op through absentSkipped below, which
+      // tracks the record count while this function provably has not touched
+      // the scene.
+      ++withHandle;
 
       if (source.listed(rec.engineHandle)) {
         // Present. sec 1.4: an enumeration is an ASSERTION that the object
         // exists, so this is a positive liveness statement and the record's
         // instances may be kept on it without a draw.
         rec.frameLastSeen = frame;
+        ++hk;
         continue;
       }
 
@@ -960,12 +1213,14 @@ namespace dxvk {
       // where absence is allowed to mean death, and the parameter's type is
       // what makes that legal.
       rec.valid = false;
+      m_invalidKeys.push_back(it->first);
       // The handle died with the object. A rebuild of this key is a new claim
       // and must bring its own handle; keeping the dead one would re-retire
       // every rebuild of a key the latch then misses.
       rec.engineHandle = 0ull;
+      hk = m_handleKeys.erase(hk);
 
-      detachRecord(kv.first, rec);
+      detachRecord(it->first, rec);
 
       // Counted in BOTH places on purpose. invalidated= is "records that went
       // invalid this window, whatever did it" and is what the eviction and
@@ -978,7 +1233,11 @@ namespace dxvk {
     }
 
     m_stats.absentRetired += retired;
-    m_stats.absentSkipped = skipped;
+    // Every valid record without a handle. onFrameEnd ran earlier in this same
+    // GC pass and erased the invalid ones, so the store less the handle-bearing
+    // valid records is that count without walking it.
+    const uint32_t storeSize = static_cast<uint32_t>(m_records.size());
+    m_stats.absentSkipped = storeSize > withHandle ? storeSize - withHandle : 0u;
 
     return retired;
   }
@@ -1037,6 +1296,9 @@ namespace dxvk {
           }
         }
         // A partial draw output cannot be replayed: retire the whole record.
+        if (it->second.valid) {
+          m_invalidKeys.push_back(key);
+        }
         it->second.valid = false;
         detachRecord(key, it->second);
       }
@@ -1086,6 +1348,12 @@ namespace dxvk {
     // have to be kept in step through build, invalidate, age-eviction and wipe
     // -- four places to keep consistent, to speed up a walk that is already
     // being paid for.
+    //
+    // NV-DXVK I4: THAT WALK IS NO LONGER PAID FOR EVERY FRAME, so the premise
+    // above now holds only on the frames it runs. Pass 1 walks every record only
+    // when something died (srcDrained= reads ~2 per SESSION), and erases the
+    // queued invalid keys otherwise. The no-index trade is still the right one
+    // at that death rate.
     std::unordered_set<uint64_t> dead;
     {
       SourceBufferDeaths& deaths = sourceBufferDeaths();
@@ -1099,11 +1367,44 @@ namespace dxvk {
     m_stats.srcNotices = g_srcDeathNotices.load(std::memory_order_relaxed);
     m_stats.srcDrained += static_cast<uint32_t>(dead.size());
 
+    // Every way a record leaves the store: detach its back-pointers, remember
+    // that it was filed, and drop it from the handle set.
+    auto eraseRecord = [&](std::unordered_map<uint64_t, Record>::iterator it) {
+      detachRecord(it->first, it->second);
+      recordTombstone(it->first, frame, it->second.skipUnsafe);
+      m_handleKeys.erase(it->first);
+      m_stats.evicted += 1;
+      return m_records.erase(it);
+    };
+
     // Pass 1: erase records that were invalidated. They cannot serve, and
     // leaving them resident makes the map grow without bound in exactly the
     // scene where identity is churning -- i.e. the case we most need to see in
     // the stats rather than absorb silently.
-    for (auto it = m_records.begin(); it != m_records.end(); ) {
+    //
+    // NV-DXVK I4: SIZED BY WHAT CHANGED. The walk below visited all ~10.8k
+    // records every frame to find the few that went invalid -- [Perf.GcInst]
+    // rs=1275us of CS time inside prepScene, while the GPU sat idle ~9 ms/frame
+    // waiting for it. Every valid -> false transition queues its key in
+    // m_invalidKeys, so the common frame erases exactly those. The full walk
+    // stays for the two cases that must see every record: a source buffer
+    // died (no buffer -> record index, see above), or the bisect-only
+    // keepFrames age bound is set. Stats::invalidLeft is the falsifier.
+    const bool fullSweep = !dead.empty() || keepFrames != 0u;
+    if (!fullSweep) {
+      for (const uint64_t key : m_invalidKeys) {
+        const auto it = m_records.find(key);
+        // Gone already (a duplicate queue entry), or rebuilt valid since.
+        if (it != m_records.end() && !it->second.valid) {
+          eraseRecord(it);
+        }
+      }
+    } else {
+      ++m_stats.sweepFull;
+    }
+    m_invalidKeys.clear();
+
+    for (auto it = m_records.begin(); fullSweep && it != m_records.end(); ) {
       // The death signal, folded in. Invalidate rather than erase directly, so
       // that the back-pointer clearing below runs exactly once for every way a
       // record can leave -- a record erased without it leaves instances naming a
@@ -1146,10 +1447,7 @@ namespace dxvk {
       }
 
       if (erase) {
-        detachRecord(it->first, it->second);
-        recordTombstone(it->first, frame, it->second.skipUnsafe);
-        it = m_records.erase(it);
-        m_stats.evicted += 1;
+        it = eraseRecord(it);
       } else {
         ++it;
       }
@@ -1214,10 +1512,7 @@ namespace dxvk {
           if (it->second.frameLastSeen != kInvalidFrameIndex
               && frame > it->second.frameLastSeen
               && (frame - it->second.frameLastSeen) > maxAge) {
-            detachRecord(it->first, it->second);
-            recordTombstone(it->first, frame, it->second.skipUnsafe);
-            it = m_records.erase(it);
-            m_stats.evicted += 1;
+            it = eraseRecord(it);
           } else {
             ++it;
           }
@@ -1241,6 +1536,7 @@ namespace dxvk {
         }
         m_stats.evicted += static_cast<uint32_t>(m_records.size());
         m_records.clear();
+        m_handleKeys.clear();
         m_stats.wiped += 1;
         // NOT TOMBSTONED, and wiped= is what says so. A wipe erases the whole
         // store at once, so tombstoning it would mint one entry per record and
@@ -1251,6 +1547,18 @@ namespace dxvk {
       }
     }
 
+    // THE FALSIFIER for the queued sweep -- see Stats::invalidLeft. Every queued
+    // key has just been processed, so no invalid record may remain. A full walk,
+    // so it runs at the log cadence rather than every frame.
+    if (RtxOptions::ResidentScene::logStats() && (frame % 300u) == 0u) {
+      uint32_t left = 0u;
+      for (const auto& kv : m_records) {
+        if (!kv.second.valid) {
+          ++left;
+        }
+      }
+      m_stats.invalidLeft = left;
+    }
   }
 
   void ResidentScene::recordTombstone(uint64_t key, uint32_t frame, bool skipUnsafe) {
@@ -1271,6 +1579,8 @@ namespace dxvk {
     assert(m_instanceRecords.empty());
     m_records.clear();
     m_tombstones.clear();
+    m_invalidKeys.clear();
+    m_handleKeys.clear();
   }
 
 }

@@ -330,6 +330,14 @@ public:
   // through to submitDrawState registers the same state twice harmlessly.
   bool touchResidentRecord(const DrawCallState& drawCallState, uint32_t frameId);
 
+  // NV-DXVK slice 7: the serve audit for the draws the CS skip above takes
+  // (legacy-routed and unbatched -- the flush-side audit covers the batched
+  // ones). Under verify, commitGeometryToRT calls this where the skip would
+  // run; if the store would serve the draw, the record's state is snapshotted,
+  // and processDrawCallState compares it after the full path. [ChangedSet]
+  // csAudit{}.
+  void residentCsAuditBefore(const DrawCallState& drawCallState, uint32_t frameId);
+
   // One live surface about to be uploaded carries this bindless buffer slot.
   //
   // Called from AccelManager::uploadSurfaceData, which rewrites every live
@@ -668,6 +676,13 @@ private:
   // replacement material, and the first unreplaced fog becoming m_fog. ONE copy,
   // called by submitDrawState, the Phase2b pre-pass and the resident skip.
   void registerFogState(const DrawCallState& input);
+
+  // NV-DXVK slice 7: the serve decision for one draw the gate predicted
+  // unchanged, shared by the flush-side pre-pass and the CS skip. commit=false
+  // is the probe (verify); commit=true is the touch, and on success the draw's
+  // primitive is noted as observed -- a served draw is still an observation of
+  // its object, and RenderObjectDB would otherwise retire it after quietFrames.
+  ResidentScene::ServeVerdict residentServe(const DrawCallState& dcs, uint32_t frame, bool commit);
 
   const uint32_t kInvalidMaterialCacheIndex = UINT32_MAX;
   uint32_t m_beginUsdExportFrameNum = -1;

@@ -589,13 +589,51 @@ namespace dxvk {
   static uint64_t       s_srbIdxAddr   = 0;   // mg.indexBuffer.getDeviceAddress()
   static uint64_t       s_srbPosAddr   = 0;   // mg.positionBuffer.getDeviceAddress()
 
+  // NV-DXVK [Perf.Merge] I4: fillGeometryInfoFromBlasEntry SPLIT IN TWO HALVES.
+  //
+  // It writes two things: the BlasEntry's build geometry, which is SHARED by
+  // every instance of that BLAS, and the instance's own billboard geometry
+  // indices. mergeInstancesIntoBlas called it once per dynamic INSTANCE, and
+  // [Perf.Merge] reads uniqueBlas=49 against ->dyn=1425: each shared entry was
+  // rebuilt ~29 times a frame, and only the last write survived to the dynBlas
+  // loop. The merge loop now runs the per-instance half inline and the whole
+  // fill once per unique BLAS with the instance that used to write last, which
+  // is the same final state by construction.
+  //
+  // The billboard split predicate, shared by both halves and by the caller so it
+  // cannot drift between them.
+  static bool fillSplitsBillboards(const BlasEntry& blasEntry, RtInstance& instance, const OpacityMicromapManager* opacityMicromapManager) {
+    return blasEntry.modifiedGeometryData.usesIndices()
+        && opacityMicromapManager
+        && opacityMicromapManager->isActive()
+        && OpacityMicromapManager::usesOpacityMicromap(instance)
+        && OpacityMicromapManager::usesSplitBillboardOpacityMicromap(instance);
+  }
+
+  // The per-INSTANCE half: which build geometry each of the instance's
+  // billboards maps to. Two primitives (one quad) per billboard.
+  static void fillInstanceGeometryIndices(RtInstance& instance, bool splitBillboards) {
+    instance.billboardIndices.clear();
+    instance.indexOffsets.clear();
+    instance.clearBillboardGeometryDirty();
+    if (splitBillboards) {
+      constexpr uint32_t kNumIndicesPerBillboardQuad = 2u * 3u;
+      for (uint32_t billboardIndex = 0; billboardIndex < instance.getBillboardCount(); billboardIndex++) {
+        instance.billboardIndices.push_back(billboardIndex);
+        instance.indexOffsets.push_back(billboardIndex * kNumIndicesPerBillboardQuad);
+      }
+    } else {
+      instance.billboardIndices.push_back(0);
+      instance.indexOffsets.push_back(0);
+    }
+  }
+
   static void fillGeometryInfoFromBlasEntry(BlasEntry& blasEntry, RtInstance& instance, const OpacityMicromapManager* opacityMicromapManager) {
     ScopedCpuProfileZone();
     blasEntry.buildGeometries.clear();
     blasEntry.buildRanges.clear();
-    instance.billboardIndices.clear();
-    instance.indexOffsets.clear();
-    instance.clearBillboardGeometryDirty();
+    const bool splitBillboards = fillSplitsBillboards(blasEntry, instance, opacityMicromapManager);
+    fillInstanceGeometryIndices(instance, splitBillboards);
 
     // [ZigBlas] DECISIVE: the buffer address + transform the AS build ACTUALLY
     // consumes for the viewmodel. Match posAddr against [ZigDispatch] (the buffer
@@ -675,15 +713,11 @@ namespace dxvk {
       }
     }
 
-    const bool usesIndices = blasEntry.modifiedGeometryData.usesIndices();
-
     // Associate each billboard with a unique geometry entry
     // ToDo: get rid of usesIndices requirement, it's not needed to build OMMs. It's only used below
-    if (usesIndices && 
-        opacityMicromapManager &&
-        opacityMicromapManager->isActive() &&
-        OpacityMicromapManager::usesOpacityMicromap(instance) &&
-        OpacityMicromapManager::usesSplitBillboardOpacityMicromap(instance)) {
+    // (The predicate is fillSplitsBillboards; the instance's half of each
+    // billboard mapping was written by fillInstanceGeometryIndices above.)
+    if (splitBillboards) {
 
       VkAccelerationStructureGeometryKHR geometry = {};
       geometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
@@ -708,8 +742,6 @@ namespace dxvk {
         buildRange.primitiveOffset = (billboardIndex * kNumIndicesPerBillboardQuad * blasEntry.modifiedGeometryData.indexBuffer.stride());
         blasEntry.buildGeometries.push_back(geometry);
         blasEntry.buildRanges.push_back(buildRange);
-        instance.billboardIndices.push_back(billboardIndex);
-        instance.indexOffsets.push_back(billboardIndex * kNumIndicesPerBillboardQuad);
       }
     } else {
       VkAccelerationStructureGeometryKHR geometry = {};
@@ -751,7 +783,14 @@ namespace dxvk {
       //   indexCount==80988 here             -> something clears buildRanges after this
       //   inst ptr differs from the modIdx=80988 census inst -> FANOUT (wrong instance built)
       // m_frameLastUpdated doubles as a staleness signal (lags => geometry not updated this frame).
-      if (blasEntry.input.studioModelName[0] != '\0'
+      //
+      // NV-DXVK [perf] slice 0 (2026-09-13): in log.cpp's default deny list with
+      // the rest of the dropship family ([HullSAT], [Ship*], [Widow*]); this was
+      // two strstr over the model name on every fill. Re-enable with
+      // rtx.logDenyTags = -[BlasFill].
+      static const bool kBlasFillDenied = Logger::tagDenied("[BlasFill]");
+      if (!kBlasFillDenied
+          && blasEntry.input.studioModelName[0] != '\0'
           && (std::strstr(blasEntry.input.studioModelName, "Crow_dropship") != nullptr
            || std::strstr(blasEntry.input.studioModelName, "widow") != nullptr)) {
         Logger::warn(str::format(
@@ -767,8 +806,6 @@ namespace dxvk {
 
       blasEntry.buildGeometries.push_back(geometry);
       blasEntry.buildRanges.push_back(buildRange);
-      instance.billboardIndices.push_back(0);
-      instance.indexOffsets.push_back(0);
     }
   }
   int AccelManager::getCurrentFramePrimitiveIDPrefixSumBufferID() const {
@@ -1160,6 +1197,9 @@ namespace dxvk {
     auto tMrg = std::chrono::steady_clock::now();
     int64_t mrg_setup = 0, mrg_loop = 0, mrg_census = 0, mrg_tcFlush = 0,
             mrg_dynBlas = 0, mrg_tail = 0, mrg_buildBlases = 0;
+    // I4 split of the old loop= bucket: loopInst is the per-instance routing
+    // walk plus the once-per-BLAS fill; loop= is now the persistent-bucket pass.
+    int64_t mrg_loopInst = 0;
     // [Perf.Merge] mechanism counters for the unique-dynamic-BLAS loop: how many
     // are full-rebuilt this frame (build => createPooledBlas GPU alloc) vs refit
     // (update/BVH-refit) vs reused unchanged. Tells us whether dynBlas's 7-24ms is
@@ -2028,11 +2068,18 @@ namespace dxvk {
         // buildGeometries/buildRanges this frame. Same per-instance call the
         // old site made, so shared-BlasEntry linked instances refill exactly
         // as before.
-        fillGeometryInfoFromBlasEntry(*blasEntry, *instance, opacityMicromapManager);
+        //
+        // NV-DXVK [Perf.Merge] I4: ONLY THE PER-INSTANCE HALF HERE. The shared
+        // BlasEntry half runs once per unique BLAS right after this loop, with
+        // the instance that would have written it last -- see the split at
+        // fillGeometryInfoFromBlasEntry.
+        fillInstanceGeometryIndices(*instance, fillSplitsBillboards(*blasEntry, *instance, opacityMicromapManager));
         // Since this loop is iterating over instances, and instances can share BLAS, we will build these later after identifying unique ones.
         auto [uniqueBlasIt, inserted] = uniqueBlas.try_emplace(blasEntry);
         if (inserted) {
           uniqueBlasOrder.push_back(blasEntry);
+          // ~29 instances a BLAS on average; size once rather than regrow.
+          uniqueBlasIt->second.reserve(blasEntry->getLinkedInstances().size());
         }
         uniqueBlasIt->second.push_back(instance);
       } else {
@@ -2135,6 +2182,22 @@ namespace dxvk {
         }
       }
     }
+
+    // NV-DXVK [Perf.Merge] I4: THE SHARED HALF, ONCE PER UNIQUE BLAS. The loop
+    // above used to run the whole fill for every dynamic instance, rewriting
+    // the same BlasEntry once per instance (->dyn=1425 over uniqueBlas=49), and
+    // only the last write reached the dynBlas loop. Run it once, with that same
+    // last instance -- the vector is still in push order here; the
+    // cacheIdentity sort comes later -- and before the persistent-bucket pass,
+    // so any merged fill of a shared entry still lands after this one, as it
+    // did.
+    for (BlasEntry* fillBlas : uniqueBlasOrder) {
+      const auto fillIt = uniqueBlas.find(fillBlas);
+      if (fillIt != uniqueBlas.end() && !fillIt->second.empty()) {
+        fillGeometryInfoFromBlasEntry(*fillBlas, *fillIt->second.back(), opacityMicromapManager);
+      }
+    }
+    markMrg(mrg_loopInst);
 
     // NV-DXVK [GpuScene] slice 8: the merged sequence in a table-order-free
     // order. See the note where the stable partition used to be. cacheIdentity
@@ -2826,7 +2889,7 @@ namespace dxvk {
         double(mrg_setup + mrg_tail + mrg_tcFlush) / 1000.0);
 
       Logger::warn(str::format("[Perf.Merge] frame=", m_device->getCurrentFrameId(),
-        " setup=", mrg_setup, " loop=", mrg_loop, " (census=", mrg_census / 1000, ")",
+        " setup=", mrg_setup, " loopInst=", mrg_loopInst, " loop=", mrg_loop, " (census=", mrg_census / 1000, ")",
         " tcFlush=", mrg_tcFlush,
         " dynBlas=", mrg_dynBlas, " tail=", mrg_tail, " buildBlases=", mrg_buildBlases,
         " inst=", instances.size(), " uniqueBlas=", uniqueBlas.size(),
@@ -8097,6 +8160,12 @@ namespace dxvk {
     std::swap(currIndex, prevIndex);
   }
 
+  // [Perf.BuildBlas] upload{} split, written by uploadSurfaceData and read by
+  // the buildBlases emit on the same thread in the same frame (dxvk-cs only):
+  // [0] pack loop us, [1] prev->current mapping loop us, [2] delta upload +
+  // [StaleTape] + verify us, [3] live surfaces packed.
+  static int64_t s_uploadSurfaceSplitUs[4] = {};
+
   void AccelManager::uploadSurfaceData(Rc<DxvkContext> ctx) {
     ScopedCpuProfileZone();
     if (m_reorderedSurfaces.empty()) {
@@ -8204,6 +8273,10 @@ namespace dxvk {
     uint32_t deadIndices = 0;
     uint32_t liveSurfaces = 0;
 
+    // [Perf.BuildBlas] upload{} split: the pack loop, the previous->current
+    // mapping loop, and everything else. Published through
+    // s_uploadSurfaceSplitUs for the line in buildBlases, which runs this.
+    const auto tUpPack0 = std::chrono::steady_clock::now();
     for (uint32_t i = 0; i < slotCount; ++i) {
       RtInstance* const currentInstancePtr = m_reorderedSurfaces[i];
       if (currentInstancePtr == nullptr) {
@@ -8282,6 +8355,10 @@ namespace dxvk {
       }
     }
 
+    const auto tUpPack1 = std::chrono::steady_clock::now();
+    s_uploadSurfaceSplitUs[0] = std::chrono::duration_cast<std::chrono::microseconds>(tUpPack1 - tUpPack0).count();
+    s_uploadSurfaceSplitUs[3] = liveSurfaces;
+
     m_surfaceDelta.upload(ctx.ptr(), m_surfaceBuffer);
 
     // Silent when clean. A non-zero count is the defect, so it must not be
@@ -8340,6 +8417,8 @@ namespace dxvk {
     // entered m_reorderedSurfaces via addBlas or bucket insertion rather than the
     // early setSurfaceIndex path for zero-mask OMM/billboard instances).
     // Also populate the previous-->current frame surface index mapping.
+    const auto tUpMap0 = std::chrono::steady_clock::now();
+    s_uploadSurfaceSplitUs[2] = std::chrono::duration_cast<std::chrono::microseconds>(tUpMap0 - tUpPack1).count();
     for (uint32_t surfaceIndex = 0; surfaceIndex < m_reorderedSurfaces.size(); surfaceIndex++) {
       if (m_reorderedSurfaces[surfaceIndex] == nullptr) {
         continue;  // [GpuScene] hole
@@ -8438,6 +8517,9 @@ namespace dxvk {
         surface.setPreviousSurfaceCount(1);
       }
     }
+
+    s_uploadSurfaceSplitUs[1] = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - tUpMap0).count();
 
     if (RtxOptions::trackParticleObjects()) {
       buildParticleSurfaceMapping(surfaceIndexMapping);
@@ -9381,7 +9463,10 @@ namespace dxvk {
     //   build      - the vkCmdBuildAccelerationStructuresKHR block
     if (RtxOptions::logPrepSceneSplit() && (m_device->getCurrentFrameId() % 10u) == 5u) {
       Logger::warn(str::format("[Perf.BuildBlas] frame=", m_device->getCurrentFrameId(),
-        " upload=", bb_upload, " omm=", bb_omm, " census=", bb_census,
+        " upload=", bb_upload,
+        "{pack=", s_uploadSurfaceSplitUs[0], " map=", s_uploadSurfaceSplitUs[1],
+        " send=", s_uploadSurfaceSplitUs[2], " live=", s_uploadSurfaceSplitUs[3], "}",
+        " omm=", bb_omm, " census=", bb_census,
         " createBufs=", bb_createBufs, " scratch=", bb_scratch, " build=", bb_build,
         " buckets=", blasBuckets.size(), " toBuild=", blasToBuild.size(),
         " geomDiag=", (geomDiagOn ? 1 : 0)));

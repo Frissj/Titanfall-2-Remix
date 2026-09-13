@@ -4471,6 +4471,13 @@ namespace dxvk {
             // or a numTexels calculation pending). Self-correcting; a steady
             // value close to hit= means some instance's flag never clears.
             " missOmm=", rs.touchMissOmm,
+            // Another draw took one of the record's BlasEntries this frame first
+            // (ResidentScene::judge). Of touched=, pose= were bone-driven draws
+            // served because their entry already holds this palette.
+            " missClaimed=", rs.touchMissClaimed,
+            " missMoved=", rs.touchMissMoved,
+            " missPend=", rs.touchMissPending,
+            " pose=", rs.touchedPose,
             " invalidated=", rs.invalidated,
             " invalidatedOtherKey=", rs.invalidatedOtherKey,
             " evicted=", rs.evicted,
@@ -4498,6 +4505,11 @@ namespace dxvk {
             // while [ReapJoin] starved= falls is the scene draining (sec 3.1).
             " absentRetired=", rs.absentRetired,
             " absentSkipped=", rs.absentSkipped,
+            // I4: the queued sweep. invalidLeft MUST read 0 (a full-walk
+            // census every 300 frames); sweepFull = sweeps that still walked
+            // every record (a buffer died, or keepFrames set).
+            " invalidLeft=", rs.invalidLeft,
+            " sweepFull=", rs.sweepFull,
             " instStamped=", rs.instancesStamped,
             " liveInst=", static_cast<uint32_t>(m_instances.size()),
             // THE VERIFY VERDICT, and it is the gate for arming this feature.

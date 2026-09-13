@@ -1284,7 +1284,8 @@ struct DeferredSpatialOp {
 };
 
 struct ShardedDrawInfo {
-  // TWO live routes, not the four the spec's first draft listed. A `kDropped`
+  // TWO live routes, not the four the spec's first draft listed (slice 7 added a
+  // third, kResidentServed, for draws that never enter the graph). A `kDropped`
   // value existed for ignored materials and was removed as dead: an ignored draw
   // is routed kSharded with NO shard membership (no cache touch, no stamps, no
   // instance work), which lets the CS slim path reach processDrawCallState's own
@@ -1300,6 +1301,10 @@ struct ShardedDrawInfo {
                    // routes away from the shard path)
     kSharded,      // geom decision + instance work precomputed at flush; CS consumes
                    // the results and records the GPU work
+    kResidentServed, // NV-DXVK slice 7: the flush-side ResidentScene::touch()
+                     // served it (unchanged, record servable), in arena order.
+                     // No shard, no material, no cache touch; CS does nothing
+                     // for it. See SceneManager::processDeferredDrawBatch.
   };
   Route route = Route::kNone;
   bool cameraDone = false;           // dcs.cameraType classified in the pre-pass; CS must not re-run
